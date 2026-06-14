@@ -34,12 +34,14 @@ jobs:
           args: "--release"
           strip: true
 
-      # 将编译产物存为 Artifacts (临时存放)
+      - name: Rename artifact
+        run: mv target/${{ matrix.target }}/release/tlsvpn target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: tlsvpn-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/tlsvpn
+          path: target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}
 
   # 发布任务：等待所有 build 任务完成后执行
   release:
