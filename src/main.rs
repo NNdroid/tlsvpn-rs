@@ -276,6 +276,12 @@ fn get_padding_length(data_len: usize) -> usize {
     })
 }
 
+pub fn gen_session_id() -> String {
+    let mut buf = [0u8; 16];
+    RNG.with(|rng| rng.borrow_mut().fill(&mut buf));
+    hex::encode(buf)
+}
+
 fn append_tls_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], key: &[u8], iv: &[u8]) {
     let pad_len = get_padding_length(data.len());
     let start_idx = buf.len();
@@ -449,6 +455,8 @@ pub struct HandshakeResp {
     pub success: bool,
     pub message: String,
     pub client_id: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub ipv4: String,
     pub ipv6: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -498,6 +506,11 @@ impl DeDuplicator {
         self.idx = (self.idx + 1) % 4096;
         false
     }
+	pub fn reset(&mut self) {
+        self.set.clear();
+        self.ring.fill(0);
+        self.idx = 0;
+    }
 }
 
 pub struct ReorderBuffer {
@@ -514,7 +527,6 @@ impl ReorderBuffer {
             last_out_of_order: None,
         }
     }
-
     pub fn insert(&mut self, seq: u32, data: Vec<u8>) -> Vec<Vec<u8>> {
         if seq == 0 { return vec![data]; }
         let mut ready = Vec::new();
@@ -561,6 +573,11 @@ impl ReorderBuffer {
             }
         }
         ready
+    }
+	pub fn reset(&mut self) {
+        self.next_seq = 1;
+        self.buffer.clear();
+        self.last_out_of_order = None;
     }
 }
 
@@ -809,6 +826,7 @@ impl ClientStat {
 type StatRegistry = Arc<RwLock<HashMap<String, Arc<ClientStat>>>>;
 
 pub struct ClientSession {
+	pub session_id: String,
     stat: Arc<ClientStat>,
     port: Arc<AsyncPort>,
     reorder_buf: Arc<Mutex<ReorderBuffer>>,
@@ -1218,12 +1236,24 @@ fn start_server(args: &Args) {
                 if let (Some(c_sess), Some(backend)) = (s.client_session, s.tx_backend) {
                     c_sess.port.unregister_backend(&backend.ch);
                     if c_sess.stat.active_conns.fetch_sub(1, Ordering::Relaxed) <= 1 {
-                        let cid = &c_sess.stat.client_id;
-                        active_client_sessions.write().remove(cid);
-                        vswitch.remove_port(cid);
-                        stats_registry.write().remove(cid);
-                        info!("[{}] Client Offline.", cid);
-                    }
+                            let cid = c_sess.stat.client_id.clone();
+                            let act_clone = active_client_sessions.clone();
+                            let vs_clone = vswitch.clone();
+                            let sr_clone = stats_registry.clone();
+                            let stat_clone = c_sess.stat.clone();
+                            
+                            info!("[{}] ⚠️ 客户端所有物理连接已断开，会话进入 120 秒保留期...", cid);
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_secs(120));
+                                // 120秒後檢查，如果依然是 0，才徹底刪除
+                                if stat_clone.active_conns.load(Ordering::Relaxed) == 0 {
+                                    act_clone.write().remove(&cid);
+                                    vs_clone.remove_port(&cid);
+                                    sr_clone.write().remove(&cid);
+                                    info!("[{}] 💀 会话超时彻底销毁，释放资源", cid);
+                                }
+                            });
+                        }
                 }
             }
         }
@@ -1294,6 +1324,7 @@ fn start_server(args: &Args) {
                                                         let c_sess = {
                                                             let mut sessions_lock = active_client_sessions.write();
                                                             if let Some(exist) = sessions_lock.get(&req.client_id) {
+																info!("[{}] ⚡ 會話在銷毀倒計時內成功復活！(無縫接續)", req.client_id);
                                                                 assigned_v4 = exist.stat.ipv4.clone();
                                                                 assigned_v6 = exist.stat.ipv6.clone();
                                                                 exist.clone()
@@ -1332,6 +1363,7 @@ fn start_server(args: &Args) {
                                                                 vswitch.add_port(req.client_id.clone(), port.clone());
 
                                                                 let new_sess = Arc::new(ClientSession {
+																	session_id: gen_session_id(),
                                                                     stat, port,
                                                                     reorder_buf: Arc::new(Mutex::new(ReorderBuffer::new())),
                                                                     dedup: Arc::new(Mutex::new(DeDuplicator::new())),
@@ -1353,6 +1385,7 @@ fn start_server(args: &Args) {
 
                                                         let resp = HandshakeResp {
                                                             success: true, message: "OK".into(), client_id: req.client_id,
+															session_id: Some(c_sess.session_id.clone()),
                                                             ipv4: assigned_v4, ipv6: assigned_v6, gw_v4: Some(v4_gw.clone()), gw_v6: Some(v6_gw.clone()),
                                                             padding: None, brutal_tx: Some(server_tx_rate), brutal_rx: Some(client_tx_rate), fec: req.fec, encrypt: Some(args.encrypt),
                                                         };
@@ -1440,10 +1473,23 @@ fn start_server(args: &Args) {
                     if let (Some(c_sess), Some(backend)) = (s.client_session, s.tx_backend) {
                         c_sess.port.unregister_backend(&backend.ch);
                         if c_sess.stat.active_conns.fetch_sub(1, Ordering::Relaxed) <= 1 {
-                            let cid = &c_sess.stat.client_id;
-                            active_client_sessions.write().remove(cid);
-                            vswitch.remove_port(cid);
-                            stats_registry.write().remove(cid);
+                            let cid = c_sess.stat.client_id.clone();
+                            let act_clone = active_client_sessions.clone();
+                            let vs_clone = vswitch.clone();
+                            let sr_clone = stats_registry.clone();
+                            let stat_clone = c_sess.stat.clone();
+                            
+                            info!("[{}] ⚠️ 客户端所有物理连接已断开，会话进入 120 秒保留期...", cid);
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_secs(120));
+                                // 120秒後檢查，如果依然是 0，才徹底刪除
+                                if stat_clone.active_conns.load(Ordering::Relaxed) == 0 {
+                                    act_clone.write().remove(&cid);
+                                    vs_clone.remove_port(&cid);
+                                    sr_clone.write().remove(&cid);
+                                    info!("[{}] 💀 会话超时彻底销毁，释放资源", cid);
+                                }
+                            });
                         }
                     }
                 }
@@ -1546,6 +1592,9 @@ fn start_client(args: &Args) {
     
     let client_config = Arc::new(config);
 
+	// 客戶端保存服務端的 SessionID 狀態
+    let server_session_id = Arc::new(Mutex::new(String::new()));
+	
     for i in 0..args.conns {
         let addr = args.addr.clone(); let sni = args.sni.clone(); let cid = client_id.clone(); let p_hash = psk_hash.clone();
         let port = tx_port.clone(); let c_key = cipher_key.clone(); let c_iv = cipher_iv.clone(); let encrypt = args.encrypt;
@@ -1560,6 +1609,7 @@ fn start_client(args: &Args) {
         let reorder_clone = reorder_buf.clone(); 
         let dedup_clone = dedup.clone();
         let conns_count = args.conns as u64;
+		let sid_clone = server_session_id.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -1606,6 +1656,16 @@ fn start_client(args: &Args) {
                                     if seq == 0 {
                                         if let Ok(resp) = serde_json::from_slice::<HandshakeResp>(&data) {
                                             if resp.success && resp.encrypt == Some(encrypt) {
+												// 智能比對並重置緩衝區
+                                                let mut current_sid = sid_clone.lock();
+                                                let new_sid = resp.session_id.clone().unwrap_or_default();
+                                                if *current_sid != new_sid {
+                                                    info!("[Conn {}] 🔄 检测到服务端重置了会话，正在清理本地旧的接收缓冲池...", i);
+                                                    *current_sid = new_sid;
+                                                    reorder_clone.lock().reset();
+                                                    dedup_clone.lock().reset();
+                                                }
+												
                                                 handshake_ok = true;
                                                 if brutal && resp.brutal_rx.unwrap_or(0) > 0 { apply_tcp_brutal(&socket, resp.brutal_rx.unwrap()); }
                                                 if i == 0 {
