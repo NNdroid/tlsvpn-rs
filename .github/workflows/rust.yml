@@ -1,0 +1,25 @@
+name: Rust Tests and Benchmark
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test-and-bench:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Test Core Logic
+      run: cargo test --verbose
+
+    - name: Benchmark Protocol
+      run: cargo test --release bench_protocol_throughput -- --nocapture
