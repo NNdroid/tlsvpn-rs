@@ -21,3 +21,5 @@ target
 #.idea/
 
 .codebuddy/
+# Rust-generated golden vector bootstrap artifact (Go repo is source of truth)
+protocol_golden.rust.json
