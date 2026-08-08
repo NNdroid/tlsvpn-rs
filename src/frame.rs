@@ -1,10 +1,6 @@
 use aes::Aes256;
 use byteorder::{BigEndian, ByteOrder};
-use ctr::cipher::KeyIvInit;
-use sha2::Digest;
 use std::io::{self, ErrorKind, Read};
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 

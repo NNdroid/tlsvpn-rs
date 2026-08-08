@@ -1,12 +1,7 @@
 use aes::Aes256;
 use crossbeam_queue::ArrayQueue;
-use ctr::cipher::KeyIvInit;
 use lazy_static::lazy_static;
-use sha2::Digest;
 use std::collections::HashSet;
-use std::io::Read;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;

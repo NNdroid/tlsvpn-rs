@@ -6,7 +6,6 @@ impl<T> AsRawFd for T {}
 use crate::Args;
 use aes::Aes256;
 use crossbeam_channel::bounded;
-use ctr::cipher::KeyIvInit;
 use parking_lot::{Mutex, RwLock};
 use rustls::{ClientConfig, ClientConnection};
 use sha2::{Digest, Sha256};

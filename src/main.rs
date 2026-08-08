@@ -1,9 +1,5 @@
 use aes::Aes256;
 use clap::Parser;
-use ctr::cipher::KeyIvInit;
-use sha2::Digest;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use tracing::error;
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
@@ -143,7 +139,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::*;
     use crate::crypto::*;
     use crate::frame::*;
 

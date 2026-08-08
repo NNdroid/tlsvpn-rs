@@ -1,11 +1,6 @@
 use aes::Aes256;
-use ctr::cipher::KeyIvInit;
 use parking_lot::{Mutex, RwLock};
-use sha2::Digest;
 use std::collections::HashMap;
-use std::io::Read;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tiny_http::{Header, Method, Response, Server as HttpServer};

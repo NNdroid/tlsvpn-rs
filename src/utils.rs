@@ -1,6 +1,4 @@
 use aes::Aes256;
-use ctr::cipher::KeyIvInit;
-use sha2::Digest;
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;

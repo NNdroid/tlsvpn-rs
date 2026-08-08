@@ -5,18 +5,16 @@ impl<T> AsRawFd for T {}
 
 use aes::Aes256;
 use crossbeam_channel::Sender;
-use ctr::cipher::KeyIvInit;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use sha2::Digest;
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 

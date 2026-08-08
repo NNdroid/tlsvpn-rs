@@ -5,14 +5,11 @@ impl<T> AsRawFd for T {}
 
 use crate::Args;
 use aes::Aes256;
-use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
-use ctr::cipher::KeyIvInit;
 use mio::net::{TcpListener, TcpStream as MioTcpStream};
 use mio::{Events, Interest, Poll, Token};
 use parking_lot::{Mutex, RwLock};
 use rustls::{ServerConfig, ServerConnection};
-use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Write};
 #[cfg(target_os = "linux")]
