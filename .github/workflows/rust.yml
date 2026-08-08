@@ -32,4 +32,6 @@ jobs:
         cargo test --verbose --test protocol_conformance
 
     - name: Benchmark Protocol
-      run: cargo test --release bench_protocol_throughput -- --nocapture
+      # bench_protocol_throughput is #[ignore]d so it doesn't slow `cargo test`;
+      # invoke it explicitly here (release build for accurate numbers).
+      run: cargo test --release bench_protocol_throughput -- --ignored --nocapture

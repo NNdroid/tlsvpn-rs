@@ -143,6 +143,7 @@ mod tests {
     use crate::frame::*;
 
     #[test]
+    #[ignore = "benchmark: long-running (1M iterations); run with `cargo test -- --ignored`"]
     fn bench_protocol_throughput() {
         use std::time::Instant;
         let (key, iv) = get_cipher_context("benchmark_secret_key");

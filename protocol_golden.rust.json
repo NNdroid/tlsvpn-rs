@@ -1,0 +1,143 @@
+{
+  "cipher_contexts": [
+    {
+      "iv_hex": "249226194c5108b045cd2f03cd9d316f",
+      "key_hex": "cea84a0380a09d388d828de9dd92f91f1c1900c269380ae0396aa58948eafdf5",
+      "psk": ""
+    },
+    {
+      "iv_hex": "1d3415a57415753c0724f14a1701cecc",
+      "key_hex": "c6321f3b6cd90b032a201b8a82ce7a4f08ec1cbdacb1d54fa6324db994a3f0eb",
+      "psk": "test_psk"
+    },
+    {
+      "iv_hex": "77e170ff740334f8f5b1d2611fe2522a",
+      "key_hex": "81d73ec2fb877be5291dcfb3eb33aac377ae731193a41d150504961778c53cd4",
+      "psk": "my_super_secret_test_key"
+    },
+    {
+      "iv_hex": "3aace9fd2c1de67b826c9889abc1fe9b",
+      "key_hex": "78de5cce388313ed58b9e672531c598262280de81787f7ff4bd2de5fe3b907c7",
+      "psk": "中文密钥🔑"
+    },
+    {
+      "iv_hex": "08b687a9a54305a16b93fd5bb97cc945",
+      "key_hex": "ea381936117db42540cef908e86cf0fee86942fc833fb6689378310d6488b3b2",
+      "psk": "a"
+    }
+  ],
+  "frame_headers": [
+    {
+      "data_len": 0,
+      "header_hex": "00000000000000000000",
+      "pad_len": 0,
+      "seq": 0
+    },
+    {
+      "data_len": 1,
+      "header_hex": "00000001000200000003",
+      "pad_len": 2,
+      "seq": 3
+    },
+    {
+      "data_len": 1400,
+      "header_hex": "00000578006400010000",
+      "pad_len": 100,
+      "seq": 65536
+    },
+    {
+      "data_len": 65535,
+      "header_hex": "0000ffffffffffffffff",
+      "pad_len": 65535,
+      "seq": 4294967295
+    }
+  ],
+  "handshake_req_keys": [
+    "brutal_rx",
+    "brutal_tx",
+    "client_id",
+    "encrypt",
+    "fec",
+    "ipv4",
+    "ipv6",
+    "mac",
+    "padding",
+    "psk"
+  ],
+  "handshake_resp_keys": [
+    "brutal_rx",
+    "brutal_tx",
+    "client_id",
+    "encrypt",
+    "fec",
+    "gw_v4",
+    "gw_v6",
+    "ipv4",
+    "ipv6",
+    "message",
+    "padding",
+    "session_id",
+    "success"
+  ],
+  "psk_hashes": [
+    {
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "psk": ""
+    },
+    {
+      "hash": "f5d533019f1f68ca8f48956c2e00e7208a2c4a17dac07204570dc1ef166c1ecf",
+      "psk": "test_psk"
+    },
+    {
+      "hash": "977b4aa0442ab5b43884857609ac975da3d719b841793d616d943c0e19e9aa3f",
+      "psk": "my_super_secret_test_key"
+    },
+    {
+      "hash": "c32433580ee4a49069094fffe6cdf1dec1737a5feae33d0cfb7ed6bf547cc0fd",
+      "psk": "中文密钥🔑"
+    },
+    {
+      "hash": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+      "psk": "a"
+    }
+  ],
+  "version": 1,
+  "xor_vectors": [
+    {
+      "ciphertext_hex": "280cc13852",
+      "plaintext_hex": "68656c6c6f",
+      "psk": "test_psk",
+      "seq": 0
+    },
+    {
+      "ciphertext_hex": "5a3d6c1004",
+      "plaintext_hex": "68656c6c6f",
+      "psk": "test_psk",
+      "seq": 1
+    },
+    {
+      "ciphertext_hex": "2ebf73e5832695e50d37cb522e63c0d880f3903bd8535794ddf00857a5aa9935b57ef6aa8a5ef5f6194906",
+      "plaintext_hex": "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f67",
+      "psk": "test_psk",
+      "seq": 42
+    },
+    {
+      "ciphertext_hex": "ff7fb196",
+      "plaintext_hex": "00ff7f80",
+      "psk": "test_psk",
+      "seq": 4294967295
+    },
+    {
+      "ciphertext_hex": "226a4f68d128446b4bbff1ae6cc6ffc5c45f0d77361136ec5196ebfc9d1b9ed45046200eac618ebef32fbe3093612b6dc65b4f97424554ca2fd00672687c306f",
+      "plaintext_hex": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "psk": "my_super_secret_test_key",
+      "seq": 12345
+    },
+    {
+      "ciphertext_hex": "5264d38a8fbee74f98c0107b2e08434104a6fe54ce45f920799336c7c0d18da7",
+      "plaintext_hex": "e5a49ae5ad97e88a822050534b20e6b4bee7949fe5bf85e9a1bbe4b880e887b4",
+      "psk": "中文密钥🔑",
+      "seq": 7
+    }
+  ]
+}
