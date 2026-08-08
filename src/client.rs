@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{error, info};
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
@@ -27,6 +27,7 @@ use crate::buffer::*;
 use crate::crypto::*;
 use crate::frame::*;
 use crate::net::*;
+use crate::socks5::{split_host_port, Socks5Proxy};
 
 // 自定义验证器，用于对齐 Go 客户端的 SHA256 哈希证书校验功能
 struct CertHashVerifier {
@@ -189,6 +190,21 @@ pub fn start_client(args: &Args) {
     // 客戶端保存服務端的 SessionID 狀態
     let server_session_id = Arc::new(Mutex::new(String::new()));
 
+    // SOCKS5 is a client-only feature: when set, the outbound connection to the
+    // server is established through the proxy. The server is unaware of it.
+    let socks5_proxy: Option<Socks5Proxy> = if args.socks5.is_empty() {
+        None
+    } else {
+        match Socks5Proxy::parse(&args.socks5) {
+            Some(p) => Some(p),
+            None => {
+                error!("Invalid SOCKS5 proxy spec: {}", args.socks5);
+                return;
+            }
+        }
+    };
+    let (target_host, target_port) = split_host_port(&args.addr);
+
     for i in 0..args.conns {
         let addr = args.addr.clone();
         let sni = args.sni.clone();
@@ -227,16 +243,29 @@ pub fn start_client(args: &Args) {
         let dedup_clone = dedup.clone();
         let conns_count = args.conns as u64;
         let sid_clone = server_session_id.clone();
+        let socks5_proxy = socks5_proxy.clone();
+        let target_host = target_host.clone();
+        let proxied = socks5_proxy.is_some();
 
         std::thread::spawn(move || {
             loop {
                 info!("[Conn {}] Connecting...", i);
-                let mut socket = match std::net::TcpStream::connect(&addr) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_secs(3));
-                        continue;
-                    }
+                let mut socket = match &socks5_proxy {
+                    Some(p) => match p.connect(&target_host, target_port) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("[Conn {}] SOCKS5 connect failed: {}", i, e);
+                            std::thread::sleep(Duration::from_secs(3));
+                            continue;
+                        }
+                    },
+                    None => match std::net::TcpStream::connect(&addr) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_secs(3));
+                            continue;
+                        }
+                    },
                 };
 
                 socket.set_nodelay(true).unwrap();
@@ -315,7 +344,7 @@ pub fn start_client(args: &Args) {
                                                 }
 
                                                 handshake_ok = true;
-                                                if brutal && resp.brutal_rx.unwrap_or(0) > 0 {
+                                                if !proxied && brutal && resp.brutal_rx.unwrap_or(0) > 0 {
                                                     apply_tcp_brutal(
                                                         &socket,
                                                         resp.brutal_rx.unwrap(),
@@ -385,7 +414,13 @@ pub fn start_client(args: &Args) {
                     if idle_time >= 5 {
                         rtt.store(100000, Ordering::Relaxed);
                     } else if rtt_timer.elapsed() > Duration::from_millis(200) {
-                        rtt.store(get_tcp_rtt(&socket), Ordering::Relaxed);
+                        // For proxied sockets the RTT we could read is to the
+                        // proxy, not the server; keep the default and avoid
+                        // touching the tunnel (matches Go's nil-TCPConn path).
+                        rtt.store(
+                            if proxied { 50000 } else { get_tcp_rtt(&socket) },
+                            Ordering::Relaxed,
+                        );
                         rtt_timer = Instant::now();
                     }
 

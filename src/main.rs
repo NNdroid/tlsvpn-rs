@@ -12,6 +12,7 @@ pub mod api;
 pub mod buffer;
 pub mod client;
 pub mod crypto;
+pub mod socks5;
 pub mod frame;
 pub mod net;
 pub mod server;
@@ -115,6 +116,13 @@ pub struct Args {
         help = "Enable inner payload AES-CTR XOR encryption"
     )]
     encrypt: bool,
+    #[arg(
+        long,
+        default_value = "",
+        help = "Use SOCKS5 proxy for the outbound connection (Client only). \
+                Format: [user:pass@]host:port, socks5://host:port or socks5h://host:port"
+    )]
+    socks5: String,
 }
 
 fn main() {
