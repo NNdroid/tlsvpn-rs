@@ -113,10 +113,7 @@ fn load_golden() -> Option<GoldenVectors> {
                 "../../tlsvpn/testdata/protocol_golden.json",
                 "testdata/protocol_golden.json",
             ];
-            candidates
-                .iter()
-                .map(PathBuf::from)
-                .find(|p| p.exists())
+            candidates.iter().map(PathBuf::from).find(|p| p.exists())
         })?;
 
     if !path.exists() {

@@ -48,7 +48,13 @@ fn xor_crypt(data: &mut [u8], seq: u32, key: &[u8], base_iv: &[u8]) {
 fn generate_golden_vectors() {
     use serde_json::json;
 
-    let psks = ["", "test_psk", "my_super_secret_test_key", "中文密钥🔑", "a"];
+    let psks = [
+        "",
+        "test_psk",
+        "my_super_secret_test_key",
+        "中文密钥🔑",
+        "a",
+    ];
 
     let mut cipher_contexts = Vec::new();
     let mut psk_hashes = Vec::new();

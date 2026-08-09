@@ -224,41 +224,173 @@ mod tests {
     #[test]
     fn parse_socks5() {
         let cases = vec![
-            Case { name: "bare host:port", in_spec: "127.0.0.1:1080", want_host: "127.0.0.1", want_port: 1080, want_user: None, want_pass: None, want_err: false },
-            Case { name: "with auth", in_spec: "alice:s3cret@127.0.0.1:1080", want_host: "127.0.0.1", want_port: 1080, want_user: Some("alice"), want_pass: Some("s3cret"), want_err: false },
-            Case { name: "socks5 scheme", in_spec: "socks5://1.2.3.4:1080", want_host: "1.2.3.4", want_port: 1080, want_user: None, want_pass: None, want_err: false },
-            Case { name: "socks5h scheme", in_spec: "socks5h://1.2.3.4:1080", want_host: "1.2.3.4", want_port: 1080, want_user: None, want_pass: None, want_err: false },
-            Case { name: "scheme with auth", in_spec: "socks5://bob:pw@1.2.3.4:1080", want_host: "1.2.3.4", want_port: 1080, want_user: Some("bob"), want_pass: Some("pw"), want_err: false },
-            Case { name: "ipv6", in_spec: "[::1]:1080", want_host: "::1", want_port: 1080, want_user: None, want_pass: None, want_err: false },
-            Case { name: "empty password", in_spec: "user:@127.0.0.1:1080", want_host: "127.0.0.1", want_port: 1080, want_user: Some("user"), want_pass: Some(""), want_err: false },
-            Case { name: "surrounding whitespace", in_spec: "  127.0.0.1:1080  ", want_host: "127.0.0.1", want_port: 1080, want_user: None, want_pass: None, want_err: false },
-            Case { name: "empty string", in_spec: "", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
-            Case { name: "whitespace only", in_spec: "   ", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
-            Case { name: "missing port", in_spec: "127.0.0.1", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
-            Case { name: "http scheme must be rejected", in_spec: "http://1.2.3.4:8080", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
-            Case { name: "socks4 scheme must be rejected", in_spec: "socks4://1.2.3.4:1080", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
-            Case { name: "scheme missing host", in_spec: "socks5://", want_host: "", want_port: 0, want_user: None, want_pass: None, want_err: true },
+            Case {
+                name: "bare host:port",
+                in_spec: "127.0.0.1:1080",
+                want_host: "127.0.0.1",
+                want_port: 1080,
+                want_user: None,
+                want_pass: None,
+                want_err: false,
+            },
+            Case {
+                name: "with auth",
+                in_spec: "alice:s3cret@127.0.0.1:1080",
+                want_host: "127.0.0.1",
+                want_port: 1080,
+                want_user: Some("alice"),
+                want_pass: Some("s3cret"),
+                want_err: false,
+            },
+            Case {
+                name: "socks5 scheme",
+                in_spec: "socks5://1.2.3.4:1080",
+                want_host: "1.2.3.4",
+                want_port: 1080,
+                want_user: None,
+                want_pass: None,
+                want_err: false,
+            },
+            Case {
+                name: "socks5h scheme",
+                in_spec: "socks5h://1.2.3.4:1080",
+                want_host: "1.2.3.4",
+                want_port: 1080,
+                want_user: None,
+                want_pass: None,
+                want_err: false,
+            },
+            Case {
+                name: "scheme with auth",
+                in_spec: "socks5://bob:pw@1.2.3.4:1080",
+                want_host: "1.2.3.4",
+                want_port: 1080,
+                want_user: Some("bob"),
+                want_pass: Some("pw"),
+                want_err: false,
+            },
+            Case {
+                name: "ipv6",
+                in_spec: "[::1]:1080",
+                want_host: "::1",
+                want_port: 1080,
+                want_user: None,
+                want_pass: None,
+                want_err: false,
+            },
+            Case {
+                name: "empty password",
+                in_spec: "user:@127.0.0.1:1080",
+                want_host: "127.0.0.1",
+                want_port: 1080,
+                want_user: Some("user"),
+                want_pass: Some(""),
+                want_err: false,
+            },
+            Case {
+                name: "surrounding whitespace",
+                in_spec: "  127.0.0.1:1080  ",
+                want_host: "127.0.0.1",
+                want_port: 1080,
+                want_user: None,
+                want_pass: None,
+                want_err: false,
+            },
+            Case {
+                name: "empty string",
+                in_spec: "",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
+            Case {
+                name: "whitespace only",
+                in_spec: "   ",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
+            Case {
+                name: "missing port",
+                in_spec: "127.0.0.1",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
+            Case {
+                name: "http scheme must be rejected",
+                in_spec: "http://1.2.3.4:8080",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
+            Case {
+                name: "socks4 scheme must be rejected",
+                in_spec: "socks4://1.2.3.4:1080",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
+            Case {
+                name: "scheme missing host",
+                in_spec: "socks5://",
+                want_host: "",
+                want_port: 0,
+                want_user: None,
+                want_pass: None,
+                want_err: true,
+            },
         ];
 
         for c in cases {
             let parsed = Socks5Proxy::parse(c.in_spec);
             if c.want_err {
-                assert!(parsed.is_none(), "case '{}': expected err, got {:?}", c.name, parsed);
+                assert!(
+                    parsed.is_none(),
+                    "case '{}': expected err, got {:?}",
+                    c.name,
+                    parsed
+                );
                 continue;
             }
             let p = parsed.unwrap_or_else(|| panic!("case '{}': expected ok, got None", c.name));
             assert_eq!(p.host, c.want_host, "case '{}': host", c.name);
             assert_eq!(p.port, c.want_port, "case '{}': port", c.name);
-            assert_eq!(p.username.as_deref(), c.want_user, "case '{}': user", c.name);
-            assert_eq!(p.password.as_deref(), c.want_pass, "case '{}': pass", c.name);
+            assert_eq!(
+                p.username.as_deref(),
+                c.want_user,
+                "case '{}': user",
+                c.name
+            );
+            assert_eq!(
+                p.password.as_deref(),
+                c.want_pass,
+                "case '{}': pass",
+                c.name
+            );
         }
     }
 
     #[test]
     fn split_host_port_ok() {
-        assert_eq!(split_host_port("1.2.3.4:4000"), ("1.2.3.4".to_string(), 4000));
+        assert_eq!(
+            split_host_port("1.2.3.4:4000"),
+            ("1.2.3.4".to_string(), 4000)
+        );
         assert_eq!(split_host_port("[::1]:4000"), ("::1".to_string(), 4000));
-        assert_eq!(split_host_port("host.example.com:9000"), ("host.example.com".to_string(), 9000));
+        assert_eq!(
+            split_host_port("host.example.com:9000"),
+            ("host.example.com".to_string(), 9000)
+        );
     }
 }
-

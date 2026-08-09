@@ -343,7 +343,10 @@ pub fn start_client(args: &Args) {
                                                 }
 
                                                 handshake_ok = true;
-                                                if !proxied && brutal && resp.brutal_rx.unwrap_or(0) > 0 {
+                                                if !proxied
+                                                    && brutal
+                                                    && resp.brutal_rx.unwrap_or(0) > 0
+                                                {
                                                     apply_tcp_brutal(
                                                         &socket,
                                                         resp.brutal_rx.unwrap(),
