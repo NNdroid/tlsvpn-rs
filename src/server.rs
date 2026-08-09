@@ -27,6 +27,7 @@ use crate::buffer::*;
 use crate::crypto::*;
 use crate::frame::*;
 use crate::net::*;
+use crate::tap::{MemTap, TapDevice};
 use crate::utils::*;
 
 pub fn start_server(args: &Args) {
@@ -88,26 +89,32 @@ pub fn start_server(args: &Args) {
     let tap_port = Arc::new(AsyncPort::new("TAP_LOCAL".to_string(), args.fec));
     vswitch.add_port("TAP_LOCAL".to_string(), tap_port.clone());
 
-    let device = tun_rs::DeviceBuilder::new()
-        .name(&args.tap)
-        .layer(tun_rs::Layer::L2)
-        .mtu(1500)
-        .build_sync()
-        .unwrap();
+    let device: Arc<dyn TapDevice> = if args.tap == "mem" {
+        info!("Using in-memory TAP backend (no real device)");
+        Arc::new(MemTap)
+    } else {
+        let dev = tun_rs::DeviceBuilder::new()
+            .name(&args.tap)
+            .layer(tun_rs::Layer::L2)
+            .mtu(1500)
+            .build_sync()
+            .unwrap();
 
-    info!("Configuring Server TAP Interface IP...");
-    Command::new("ip")
-        .args(["addr", "add", &args.v4cidr, "dev", &args.tap])
-        .output()
-        .ok();
-    Command::new("ip")
-        .args(["-6", "addr", "add", &args.v6cidr, "dev", &args.tap])
-        .output()
-        .ok();
-    Command::new("ip")
-        .args(["link", "set", "dev", &args.tap, "up"])
-        .output()
-        .ok();
+        info!("Configuring Server TAP Interface IP...");
+        Command::new("ip")
+            .args(["addr", "add", &args.v4cidr, "dev", &args.tap])
+            .output()
+            .ok();
+        Command::new("ip")
+            .args(["-6", "addr", "add", &args.v6cidr, "dev", &args.tap])
+            .output()
+            .ok();
+        Command::new("ip")
+            .args(["link", "set", "dev", &args.tap, "up"])
+            .output()
+            .ok();
+        Arc::new(dev)
+    };
 
     let stats_registry = Arc::new(RwLock::new(HashMap::new()));
     if !args.web.is_empty() {
@@ -118,7 +125,7 @@ pub fn start_server(args: &Args) {
         );
     }
 
-    let dev_writer = Arc::new(device);
+    let dev_writer = device.clone();
     let dev_reader = dev_writer.clone();
 
     let tap_tx_backend = Arc::new(Backend {

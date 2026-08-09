@@ -27,6 +27,7 @@ use crate::crypto::*;
 use crate::frame::*;
 use crate::net::*;
 use crate::socks5::{split_host_port, Socks5Proxy};
+use crate::tap::{MemTap, TapDevice};
 
 // 自定义验证器，用于对齐 Go 客户端的 SHA256 哈希证书校验功能
 struct CertHashVerifier {
@@ -112,13 +113,19 @@ pub fn start_client(args: &Args) {
     });
     let dedup = Arc::new(Mutex::new(DeDuplicator::new())); // 客户端也增加去重器
 
-    let device = tun_rs::DeviceBuilder::new()
-        .name(&args.tap)
-        .layer(tun_rs::Layer::L2)
-        .mtu(1500)
-        .build_sync()
-        .unwrap();
-    let dev_writer = Arc::new(device);
+    let device: Arc<dyn TapDevice> = if args.tap == "mem" {
+        info!("Using in-memory TAP backend (no real device)");
+        Arc::new(MemTap)
+    } else {
+        let dev = tun_rs::DeviceBuilder::new()
+            .name(&args.tap)
+            .layer(tun_rs::Layer::L2)
+            .mtu(1500)
+            .build_sync()
+            .unwrap();
+        Arc::new(dev)
+    };
+    let dev_writer = device.clone();
     let dev_reader = dev_writer.clone();
 
     std::thread::spawn(move || {

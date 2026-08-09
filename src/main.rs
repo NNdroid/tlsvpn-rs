@@ -12,6 +12,7 @@ pub mod frame;
 pub mod net;
 pub mod server;
 pub mod socks5;
+pub mod tap;
 pub mod utils;
 
 use crate::buffer::*;
