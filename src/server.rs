@@ -198,7 +198,14 @@ pub fn start_server(args: &Args) {
 
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(4096);
-    let mut server = TcpListener::bind(args.addr.parse().unwrap()).unwrap();
+    // Accept bare ":port" (listen on all interfaces) like the Go server does,
+    // since Rust's SocketAddr::parse requires an explicit IP.
+    let bind_addr: String = if args.addr.starts_with(':') {
+        format!("0.0.0.0{}", args.addr)
+    } else {
+        args.addr.clone()
+    };
+    let mut server = TcpListener::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
         .register(&mut server, Token(0), Interest::READABLE)
         .unwrap();
