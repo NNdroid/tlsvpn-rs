@@ -249,11 +249,18 @@ struct HandshakeReqShape {
     brutal_rx: u64,
     #[serde(skip_serializing_if = "is_false")]
     fec: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    fec_group: i64,
     #[serde(skip_serializing_if = "is_false")]
     encrypt: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    enc_algo: i64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 fn is_false(v: &bool) -> bool {
@@ -274,7 +281,9 @@ fn test_handshake_req_field_names() {
         brutal_tx: 1,
         brutal_rx: 1,
         fec: true,
+        fec_group: 4,
         encrypt: true,
+        enc_algo: 2,
     };
     let val: serde_json::Value = serde_json::to_value(&full).unwrap();
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
@@ -297,8 +306,12 @@ fn test_handshake_resp_field_names_present_in_go() {
         "brutal_rx",
         "brutal_tx",
         "client_id",
+        "enc_algo",
+        "enc_salt",
+        "enc_salt2",
         "encrypt",
         "fec",
+        "fec_group",
         "gw_v4",
         "gw_v6",
         "ipv4",

@@ -1,7 +1,5 @@
 use aes::Aes256;
 use std::net::{Ipv4Addr, Ipv6Addr};
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::Level;
