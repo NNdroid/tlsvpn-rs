@@ -5,6 +5,7 @@ on:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   test-and-bench:
@@ -37,3 +38,32 @@ jobs:
       # target-cpu=native so the reported number reflects the runner's full
       # ISA (AES-NI/AVX2 paths) rather than the generic x86-64 baseline.
       run: RUSTFLAGS="-C target-cpu=native" cargo test --release bench_protocol_throughput -- --ignored --nocapture
+
+  # Network performance tests over a REAL TAP tunnel: ping (v4/v6, 0% loss),
+  # traceroute (v4/v6 through the tunnel), iperf3 up/down throughput and an
+  # optional librespeed run (scripts/net_perf_test.sh).
+  #
+  # GitHub-hosted runners have no CAP_NET_ADMIN: the script detects that and
+  # reports SKIP with exit 0, so this job stays green here. To execute the
+  # tests for real, point runs-on at a privileged self-hosted runner (or run
+  # the script manually on any Linux box with root: both endpoints run on one
+  # machine, so throughput measures the tunnel stack itself).
+  net-perf:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build release binaries
+      run: cargo build --release
+
+    - name: Ping / traceroute / throughput over real tunnel
+      env:
+        BIN_SRV: ${{ github.workspace }}/target/release/tlsvpn
+        BIN_CLI: ${{ github.workspace }}/target/release/tlsvpn
+        FLAVOR_SRV: rs
+        FLAVOR_CLI: rs
+      run: bash scripts/net_perf_test.sh
