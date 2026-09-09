@@ -590,6 +590,100 @@ mod tests {
     }
 
     #[test]
+    fn fec_recover_first_frame_loss() {
+        // 验收标准（对齐 Go TestFECRecoverFirstFrameLoss）：组首帧丢失时
+        // 待定组不得被错误锚定，校验帧到达后按 group_start 对齐恢复 seq=1
+        let k = 4;
+        let mut enc = FecEncoder::new(k, None);
+        let dec = FecDecoder::new(k, None);
+        let got: StdMutex<Vec<(u32, Vec<u8>)>> = StdMutex::new(Vec::new());
+        {
+            let mut sink = |seq: u32, f: Arc<Vec<u8>>| {
+                got.lock().unwrap().push((seq, (*f).clone()));
+            };
+            let payloads: Vec<Vec<u8>> = (0..4).map(|i| vec![(i + 1) as u8; 50 + i * 10]).collect();
+            // 组首（seq=1）丢失：仅 seq 2,3,4 到达
+            for i in 1..4 {
+                dec.on_data(
+                    (i + 1) as u32,
+                    &Arc::new(payloads[i].clone()),
+                    &mut |_, _| {},
+                );
+            }
+            let mut parity = None;
+            for (i, p) in payloads.iter().enumerate() {
+                if let Some(pp) = enc.add((i + 1) as u32, p) {
+                    parity = Some(pp);
+                }
+            }
+            dec.on_parity(&parity.unwrap(), &mut sink);
+        }
+        let g = got.lock().unwrap();
+        assert_eq!(g.len(), 1, "应恰好恢复组首帧");
+        assert_eq!(g[0].0, 1, "恢复帧必须是组首 seq=1");
+        assert_eq!(g[0].1, payloads_ref(), "恢复内容不符");
+    }
+
+    fn payloads_ref() -> Vec<u8> {
+        vec![1u8; 50]
+    }
+
+    #[test]
+    fn fec_parity_before_members() {
+        // 验收标准：校验帧先于其成员到达也要正确（乱序宽容）——
+        // 组先由校验帧创建，成员迟到后仍能完成恢复
+        let k = 2;
+        let mut enc = FecEncoder::new(k, None);
+        let dec = FecDecoder::new(k, None);
+        let got: StdMutex<Vec<u32>> = StdMutex::new(Vec::new());
+        {
+            let mut sink = |seq: u32, _f: Arc<Vec<u8>>| {
+                got.lock().unwrap().push(seq);
+            };
+            let p1 = vec![0xAu8; 40];
+            let p2 = vec![0xBu8; 40];
+            // 编码端先产出校验帧
+            assert!(enc.add(1, &p1).is_none());
+            let parity = enc.add(2, &p2).expect("K=2 组满应产出校验帧");
+            // 校验帧先到（成员尚未到达）
+            dec.on_parity(&parity, &mut sink);
+            assert!(got.lock().unwrap().is_empty(), "无成员时不得产出恢复帧");
+            // 成员 seq=1 后到：恰好缺 1 帧 + 校验帧在 → 立即恢复 seq=2
+            dec.on_data(1, &Arc::new(p1), &mut sink);
+            assert_eq!(*got.lock().unwrap(), vec![2], "应立即恢复 seq=2");
+            // 迟到的真帧 seq=2：组已终结，不得重复输出
+            dec.on_data(2, &Arc::new(p2), &mut sink);
+            assert_eq!(got.lock().unwrap().len(), 1, "终结组吸收迟到成员");
+        }
+    }
+
+    #[test]
+    fn fec_zero_length_frames_do_not_consume_slots() {
+        // 对齐 Go a2701e4 验收：零长数据帧必须被忽略且不得占用分组槽位
+        let k = 2;
+        let mut enc = FecEncoder::new(k, None);
+        let dec = FecDecoder::new(k, None);
+        let got: StdMutex<Vec<u32>> = StdMutex::new(Vec::new());
+        {
+            let mut sink = |seq: u32, _f: Arc<Vec<u8>>| {
+                got.lock().unwrap().push(seq);
+            };
+            let p1 = vec![7u8; 40];
+            // 零长帧：编码器忽略、解码器忽略
+            assert!(enc.add(1, &[]).is_none(), "零长帧不参与分组");
+            dec.on_data(1, &Arc::new(Vec::new()), &mut |_, _| {});
+            assert!(enc.add(2, &p1).is_none());
+            // 正常帧 seq=2 到达（分组起点仍 ≡1 mod K，与零长帧无关）
+            let parity = enc.add(3, &p1).expect("seq 2+3 组满");
+            dec.on_data(2, &Arc::new(p1.clone()), &mut |_, _| {});
+            dec.on_data(3, &Arc::new(p1), &mut sink);
+            dec.on_parity(&parity, &mut sink);
+            // 若零长帧曾占用槽位，组 1..3 会被视为缺 seq=1 而伪造恢复
+            assert!(got.lock().unwrap().is_empty(), "零长帧不得毒化分组恢复");
+        }
+    }
+
+    #[test]
     fn fec_recovered_seq_in_order() {
         // 恢复帧的 seq 必须是组内缺失成员的原 seq
         let k = 3;

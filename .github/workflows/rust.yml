@@ -34,4 +34,6 @@ jobs:
     - name: Benchmark Protocol
       # bench_protocol_throughput is #[ignore]d so it doesn't slow `cargo test`;
       # invoke it explicitly here (release build for accurate numbers).
-      run: cargo test --release bench_protocol_throughput -- --ignored --nocapture
+      # target-cpu=native so the reported number reflects the runner's full
+      # ISA (AES-NI/AVX2 paths) rather than the generic x86-64 baseline.
+      run: RUSTFLAGS="-C target-cpu=native" cargo test --release bench_protocol_throughput -- --ignored --nocapture

@@ -103,6 +103,7 @@ Values and defaults match the Go implementation 1:1; the only Rust-specific fiel
 | --- | --- | --- |
 | `addr` | (Empty) | Dashboard listen address (e.g. `:8080`) |
 | `auth` | (Empty) | Basic Auth as `user:pass`. Strongly recommended when binding a non-loopback address |
+| `bind` | `all` | `all` listens on every interface; `tunnel` binds only the tunnel IP(s) — server: the pool gateway IPv4+IPv6, client: the assigned tunnel IP (rebinds automatically within 2s as IPs appear/change) |
 
 ### 🔵 server (Server mode only)
 

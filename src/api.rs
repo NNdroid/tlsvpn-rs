@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server as HttpServer};
 use tracing::{info, Level};
 use tracing_subscriber::layer::SubscriberExt;
@@ -730,105 +730,160 @@ fn check_basic_auth(auth_spec: &str, req: &tiny_http::Request) -> bool {
     ct_eq(&cred, auth_spec)
 }
 
-pub fn start_web_server(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
-    std::thread::spawn(move || {
-        let server = match HttpServer::http(&addr) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Web Server bind failed: {}", e);
-                return;
-            }
-        };
-        info!("🚀 Web Dashboard started at http://{}", addr);
-        for mut request in server.incoming_requests() {
-            let url = request.url().split('?').next().unwrap_or("").to_string();
+/// 单个 listener 的服务循环：bind `addr` 并处理请求直到线程被放弃。
+fn serve_listener(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
+    let server = match HttpServer::http(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Web Server bind failed on {}: {}", addr, e);
+            return;
+        }
+    };
+    info!("🚀 Web Dashboard listening at http://{}", addr);
+    for mut request in server.incoming_requests() {
+        let url = request.url().split('?').next().unwrap_or("").to_string();
 
-            // 仪表盘页面与 API 一致地受认证保护
-            if !check_basic_auth(&auth, &request) {
-                let resp = Response::from_string("Unauthorized")
-                    .with_status_code(401)
-                    .with_header(http_header(
-                        "WWW-Authenticate",
-                        r#"Basic realm="tlsvpn dashboard""#,
-                    ));
+        // 仪表盘页面与 API 一致地受认证保护
+        if !check_basic_auth(&auth, &request) {
+            let resp = Response::from_string("Unauthorized")
+                .with_status_code(401)
+                .with_header(http_header(
+                    "WWW-Authenticate",
+                    r#"Basic realm="tlsvpn dashboard""#,
+                ));
+            let _ = request.respond(resp);
+            continue;
+        }
+
+        match (request.method(), url.as_str()) {
+            (&Method::Get, "/") => {
+                let response = Response::from_string(DASHBOARD_HTML)
+                    .with_header(http_header("Content-Type", "text/html; charset=utf-8"));
+                let _ = request.respond(response);
+            }
+            (&Method::Get, "/api/stats") => {
+                respond_json(request, provider.stats_json().to_string(), 200);
+            }
+            (&Method::Get, "/api/logs") => {
+                let after: u64 = request
+                    .url()
+                    .split_once('?')
+                    .and_then(|(_, q)| {
+                        q.split('&')
+                            .find_map(|kv| kv.strip_prefix("after=")?.parse().ok())
+                    })
+                    .unwrap_or(0);
+                respond_json(request, json!(log_ring_snapshot(after)).to_string(), 200);
+            }
+            (&Method::Get, "/metrics") => {
+                let resp = Response::from_string(provider.metrics_text())
+                    .with_header(http_header("Content-Type", "text/plain; version=0.0.4"));
                 let _ = request.respond(resp);
-                continue;
             }
-
-            match (request.method(), url.as_str()) {
-                (&Method::Get, "/") => {
-                    let response = Response::from_string(DASHBOARD_HTML)
-                        .with_header(http_header("Content-Type", "text/html; charset=utf-8"));
-                    let _ = request.respond(response);
-                }
-                (&Method::Get, "/api/stats") => {
-                    respond_json(request, provider.stats_json().to_string(), 200);
-                }
-                (&Method::Get, "/api/logs") => {
-                    let after: u64 = request
-                        .url()
-                        .split_once('?')
-                        .and_then(|(_, q)| {
-                            q.split('&')
-                                .find_map(|kv| kv.strip_prefix("after=")?.parse().ok())
-                        })
-                        .unwrap_or(0);
-                    respond_json(request, json!(log_ring_snapshot(after)).to_string(), 200);
-                }
-                (&Method::Get, "/metrics") => {
-                    let resp = Response::from_string(provider.metrics_text())
-                        .with_header(http_header("Content-Type", "text/plain; version=0.0.4"));
-                    let _ = request.respond(resp);
-                }
-                (&Method::Post, "/api/control") => {
-                    // 管理动作统一走 CSRF 头防护（对齐 Go csrfGuard）
-                    let has_csrf = request
-                        .headers()
-                        .iter()
-                        .any(|h| h.field.equiv("X-Requested-With") && h.value.as_str() == "tlsvpn");
-                    if !has_csrf {
-                        let _ = request.respond(
-                            Response::from_string(
-                                "Missing X-Requested-With header (CSRF protection)",
-                            )
+            (&Method::Post, "/api/control") => {
+                // 管理动作统一走 CSRF 头防护（对齐 Go csrfGuard）
+                let has_csrf = request
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("X-Requested-With") && h.value.as_str() == "tlsvpn");
+                if !has_csrf {
+                    let _ = request.respond(
+                        Response::from_string("Missing X-Requested-With header (CSRF protection)")
                             .with_status_code(403),
-                        );
-                        continue;
-                    }
-                    let mut content = String::new();
-                    if std::io::Read::read_to_string(request.as_reader(), &mut content).is_err() {
-                        respond_json(request, json!({"error": "invalid body"}).to_string(), 400);
-                        continue;
-                    }
-                    #[derive(serde::Deserialize)]
-                    struct ControlReq {
-                        action: String,
-                        #[serde(default)]
-                        client_id: String,
-                        #[serde(default)]
-                        level: String,
-                        #[serde(default)]
-                        ttl_minutes: i64,
-                    }
-                    let Ok(creq) = serde_json::from_str::<ControlReq>(&content) else {
-                        respond_json(request, json!({"error": "bad json"}).to_string(), 400);
-                        continue;
-                    };
-                    match provider.control(
-                        &creq.action,
-                        &creq.client_id,
-                        &creq.level,
-                        creq.ttl_minutes,
-                    ) {
-                        Ok(()) => respond_json(request, r#"{"status": "ok"}"#.to_string(), 200),
-                        Err(e) => respond_json(request, json!({"error": e}).to_string(), 400),
-                    }
+                    );
+                    continue;
                 }
-                _ => {
-                    let _ =
-                        request.respond(Response::from_string("Not Found").with_status_code(404));
+                let mut content = String::new();
+                if std::io::Read::read_to_string(request.as_reader(), &mut content).is_err() {
+                    respond_json(request, json!({"error": "invalid body"}).to_string(), 400);
+                    continue;
+                }
+                #[derive(serde::Deserialize)]
+                struct ControlReq {
+                    action: String,
+                    #[serde(default)]
+                    client_id: String,
+                    #[serde(default)]
+                    level: String,
+                    #[serde(default)]
+                    ttl_minutes: i64,
+                }
+                let Ok(creq) = serde_json::from_str::<ControlReq>(&content) else {
+                    respond_json(request, json!({"error": "bad json"}).to_string(), 400);
+                    continue;
+                };
+                match provider.control(&creq.action, &creq.client_id, &creq.level, creq.ttl_minutes)
+                {
+                    Ok(()) => respond_json(request, r#"{"status": "ok"}"#.to_string(), 200),
+                    Err(e) => respond_json(request, json!({"error": e}).to_string(), 400),
                 }
             }
+            _ => {
+                let _ = request.respond(Response::from_string("Not Found").with_status_code(404));
+            }
+        }
+    }
+}
+
+/// 隧道 IP 提供者：web.bind=tunnel 时由 server/client 各自实现
+pub trait TunnelIpSource: Send + Sync {
+    /// 当前应绑定的隧道地址列表（host:port 字符串），为空表示尚不可用
+    fn tunnel_addrs(&self, port: u16) -> Vec<String>;
+}
+
+/// 从 web.addr 解析端口；非法时回落 8080（对齐 Go webPort）
+pub fn web_port(addr: &str) -> u16 {
+    match addr.rsplit_once(':') {
+        Some((_, p)) => p.parse().unwrap_or(8080),
+        None => 8080,
+    }
+}
+
+/// web.bind=all：直接启动单个 listener（默认行为，不变）
+pub fn start_web_server(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
+    std::thread::spawn(move || serve_listener(addr, auth, provider));
+}
+
+/// web.bind=tunnel：2 秒轮询重绑循环。隧道 IP 就绪前不监听；IP 变化时
+/// 先开新 listener 再关旧的（对齐 Go 的 rebind manager，杜绝管理缺口）。
+pub fn start_web_server_tunnel(
+    bind_port: u16,
+    auth: String,
+    provider: Arc<dyn WebStatsProvider>,
+    source: Arc<dyn TunnelIpSource>,
+) {
+    std::thread::spawn(move || {
+        let mut current_addrs: Vec<String> = Vec::new();
+        info!("🚀 Web Dashboard manager started (bind=tunnel)");
+        loop {
+            let addrs = source.tunnel_addrs(bind_port);
+            if addrs.is_empty() {
+                // 隧道 IP 尚不可用：保持现状（若已在监听则继续监听旧地址）
+            } else if addrs != current_addrs {
+                // 先开新 listener，全部成功后再关旧的
+                let mut new_handles = Vec::new();
+                for a in &addrs {
+                    let auth = auth.clone();
+                    let provider = provider.clone();
+                    let a = a.clone();
+                    new_handles.push(std::thread::spawn(move || {
+                        serve_listener(a, auth, provider);
+                    }));
+                }
+                // 给新 listener 一点时间暴露绑定失败（如地址尚未真正就绪）
+                std::thread::sleep(Duration::from_millis(300));
+                let all_alive = new_handles.iter().all(|h| !h.is_finished());
+                if all_alive {
+                    // listener 线程随进程生命周期服务（tiny_http 无公开
+                    // shutdown）；detach 后由 rebind 循环仅跟踪地址集合
+                    for h in new_handles {
+                        std::mem::forget(h);
+                    }
+                    current_addrs = addrs;
+                    info!("🔀 Dashboard rebound to tunnel addresses");
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
     });
 }

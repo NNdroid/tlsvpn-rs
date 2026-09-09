@@ -155,6 +155,13 @@ pub struct Args {
     )]
     pub web_auth: String,
     #[arg(
+        long = "web_bind",
+        alias = "web-bind",
+        default_value = "all",
+        help = "Dashboard listen scope: all (default) or tunnel (tunnel IP only)"
+    )]
+    pub web_bind: String,
+    #[arg(
         long,
         default_value_t = false,
         help = "Enable inner payload encryption (AES-256-GCM with per-session salts when the peer supports it)"
@@ -213,6 +220,7 @@ struct ConfigFile {
 struct WebConfigFile {
     addr: String,
     auth: String,
+    bind: String,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -280,6 +288,11 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         web: cfg.web.addr,
         web_auth: cfg.web.auth,
+        web_bind: if cfg.web.bind.is_empty() {
+            "all".into()
+        } else {
+            cfg.web.bind
+        },
         v4cidr: if cfg.server.v4_cidr.is_empty() {
             "10.0.0.0/24".into()
         } else {
@@ -503,6 +516,7 @@ fn example_config_json() -> String {
   "web": {{
     "addr": ":8080",
     "auth": "admin:change-me",
+    "bind": "all"
   }},
   "client": {{
     "conns": 4,

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -260,6 +261,23 @@ impl ServerCore {
         self.registry.write().remove(cid);
         self.pool.lock().release(mac, ipv4, ipv6);
         info!("[{}] 💀 会话超时彻底销毁，释放 IP 及内存资源", cid);
+    }
+}
+
+impl TunnelIpSource for ServerCore {
+    fn tunnel_addrs(&self, port: u16) -> Vec<String> {
+        let mut out = Vec::new();
+        if Ipv4Addr::from_str(&self.gw_v4).is_ok() {
+            out.push(format!("{}:{}", self.gw_v4, port));
+        }
+        let v6 = self
+            .gw_v6
+            .trim_matches(|c| c == '[' || c == ']')
+            .to_string();
+        if Ipv6Addr::from_str(&v6).is_ok() {
+            out.push(format!("[{}]:{}", v6, port));
+        }
+        out
     }
 }
 
@@ -558,7 +576,15 @@ pub fn start_server(args: &Args) {
     };
 
     if !args.web.is_empty() {
-        start_web_server(args.web.clone(), args.web_auth.clone(), core.clone());
+        match args.web_bind.as_str() {
+            "tunnel" => start_web_server_tunnel(
+                web_port(&args.web),
+                args.web_auth.clone(),
+                core.clone(),
+                core.clone(),
+            ),
+            _ => start_web_server(args.web.clone(), args.web_auth.clone(), core.clone()),
+        }
     }
 
     let dev_writer = device.clone();
@@ -970,6 +996,12 @@ fn process_plain_frames(
     loop {
         match sess.scanner.read_frame(&mut sess.tls.reader()) {
             Ok(Some((raw, seq))) => {
+                // 心跳帧（空负载）：对齐 Go —— 不计统计、不入 FEC/重排，
+                // 刷新连接活跃度保持空闲隧道存活
+                if raw.is_empty() {
+                    sess.last_rx = Instant::now();
+                    continue;
+                }
                 let mut data = raw;
                 if let Some(s) = &sess.client_session {
                     s.stat

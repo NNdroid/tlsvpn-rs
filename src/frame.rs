@@ -136,7 +136,18 @@ impl FrameScanner {
                 self.offset += HEADER_SIZE + total_len;
 
                 if data_len == 0 {
-                    continue; // 忽略空包（心跳/填充帧），对齐 Go
+                    // 心跳/控制帧：返回空帧给调用方，由读循环刷新读超时。
+                    // 旧实现（Go 与本仓库）在此静默跳过，导致空闲隧道的
+                    // 30 秒读超时永不刷新、每 30 秒被误杀重连一次
+                    // （对齐 Go a2701e4 后的 ReadFrame 语义）。
+                    if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384)
+                    {
+                        let remain = self.buffer.len() - self.offset;
+                        self.buffer.copy_within(self.offset.., 0);
+                        self.buffer.truncate(remain);
+                        self.offset = 0;
+                    }
+                    return Ok(Some((Vec::new(), seq)));
                 }
 
                 let mut data = Vec::with_capacity(data_len.max(64));

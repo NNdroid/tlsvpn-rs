@@ -576,6 +576,12 @@ impl AsyncPort {
     }
 
     pub fn write_frame(&self, frame: Arc<Vec<u8>>) {
+        if frame.is_empty() {
+            // 零长帧不携带数据：不消耗 seq、不参与 FEC 分组
+            // （对齐 Go a2701e4：否则接收端按算术分组会把该槽位视为
+            // 永久缺失，毒化整组恢复）
+            return;
+        }
         let backends = self.backends.read();
         if backends.is_empty() {
             self.drop_n(1);

@@ -232,6 +232,30 @@ pub struct Client {
     pub started_at: Instant,
 }
 
+impl TunnelIpSource for Client {
+    fn tunnel_addrs(&self, port: u16) -> Vec<String> {
+        let mut out = Vec::new();
+        for ip in [
+            self.assigned_v4.lock().clone(),
+            self.assigned_v6
+                .lock()
+                .clone()
+                .trim_matches(|c| c == '[' || c == ']')
+                .to_string(),
+        ] {
+            if ip.is_empty() {
+                continue;
+            }
+            if ip.contains(':') {
+                out.push(format!("[{}]:{}", ip, port));
+            } else {
+                out.push(format!("{}:{}", ip, port));
+            }
+        }
+        out
+    }
+}
+
 impl WebStatsProvider for Client {
     fn stats_json(&self) -> serde_json::Value {
         let (rec, lost) = self
@@ -562,7 +586,15 @@ pub fn start_client(args: &Args) {
     let client = Arc::new(client);
 
     if !args.web.is_empty() {
-        start_web_server(args.web.clone(), args.web_auth.clone(), client.clone());
+        match args.web_bind.as_str() {
+            "tunnel" => start_web_server_tunnel(
+                web_port(&args.web),
+                args.web_auth.clone(),
+                client.clone(),
+                client.clone(),
+            ),
+            _ => start_web_server(args.web.clone(), args.web_auth.clone(), client.clone()),
+        }
     }
 
     if args.conns < 2 && args.fec {
@@ -1094,6 +1126,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         loop {
             match scanner.read_frame(&mut tls.reader()) {
                 Ok(Some((raw, seq))) => {
+                    // 心跳帧（空负载）：刷新活跃度、不计统计、不入 FEC/重排
+                    if raw.is_empty() {
+                        continue;
+                    }
                     let mut data = raw;
                     cl.rx_bytes
                         .fetch_add((data.len() + 10) as u64, Ordering::Relaxed);
@@ -1256,6 +1292,9 @@ fn tls_exchange_resp(
         }
         match scanner.read_frame(&mut tls.reader()) {
             Ok(Some((data, _seq))) => {
+                if data.is_empty() {
+                    continue; // 空帧（心跳）不是握手响应
+                }
                 if let Ok(r) = serde_json::from_slice::<HandshakeResp>(&data) {
                     if r.success {
                         debug!(
