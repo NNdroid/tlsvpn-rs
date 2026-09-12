@@ -288,12 +288,18 @@ run_group() {
   PIDS+=($!)
   wait_for_port 127.0.0.1 "$PORT" 20 || { fail "server did not start"; return 1; }
 
-  local cm_flag ca_flag ct_flag ce_flag cl_flag
+  # 自签证书：客户端必须 pin 指纹（或 insecure），否则 TLS 校验失败
+  local fp
+  fp=$(openssl x509 -in "$SRV_DIR/e2e_cert.pem" -noout -fingerprint -sha256 \
+       | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z')
+  log "server cert sha256 pinned: $fp"
+
+  local cm_flag ca_flag ct_flag ce_flag cl_flag cs_flag
   cm_flag=$(flag_for "$FLAVOR_CLI" mode); ca_flag=$(flag_for "$FLAVOR_CLI" addr)
   ct_flag=$(flag_for "$FLAVOR_CLI" tap);  ce_flag=$(flag_for "$FLAVOR_CLI" encrypt)
-  cl_flag=$(flag_for "$FLAVOR_CLI" loglevel)
+  cl_flag=$(flag_for "$FLAVOR_CLI" loglevel); cs_flag=$(flag_for "$FLAVOR_CLI" certsha)
   "$BIN_CLI" $cm_flag client $ca_flag "127.0.0.1:$PORT" $ct_flag "$TAP_CLI" \
-    $ce_flag $cl_flag info > "$SRV_DIR/cli.log" 2>&1 &
+    $cs_flag "$fp" $ce_flag $cl_flag info > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
 
   if ! wait_for_client_ip; then
