@@ -95,6 +95,7 @@ flag_for() {
       cert) echo "--cert";; key) echo "--key";; v4cidr) echo "--v4cidr";;
       v6cidr) echo "--v6cidr";; encrypt) echo "--encrypt";;
       loglevel) echo "--loglevel";; certsha) echo "--cert_sha256";;
+      insecure) echo "--insecure";;
     esac
   else
     case "$verb" in
@@ -102,6 +103,7 @@ flag_for() {
       cert) echo "-cert";; key) echo "-key";; v4cidr) echo "-v4cidr";;
       v6cidr) echo "-v6cidr";; encrypt) echo "-encrypt";;
       loglevel) echo "-loglevel";; certsha) echo "-cert-sha256";;
+      insecure) echo "-insecure";;
     esac
   fi
 }
@@ -298,8 +300,15 @@ run_group() {
   cm_flag=$(flag_for "$FLAVOR_CLI" mode); ca_flag=$(flag_for "$FLAVOR_CLI" addr)
   ct_flag=$(flag_for "$FLAVOR_CLI" tap);  ce_flag=$(flag_for "$FLAVOR_CLI" encrypt)
   cl_flag=$(flag_for "$FLAVOR_CLI" loglevel); cs_flag=$(flag_for "$FLAVOR_CLI" certsha)
+  # Go 客户端的 -cert-sha256 仅设置 VerifyPeerCertificate，链验证先行失败
+  # （自签证书），需配合 -insecure 才能真正生效；Rust 客户端的 cert_sha256
+  # 走 dangerous() 完整替换验证器，无需也不应叠加 insecure。
+  local extra_cli=""
+  if [[ "$FLAVOR_CLI" == "go" ]]; then
+    extra_cli="$(flag_for go insecure)"
+  fi
   "$BIN_CLI" $cm_flag client $ca_flag "127.0.0.1:$PORT" $ct_flag "$TAP_CLI" \
-    $cs_flag "$fp" $ce_flag $cl_flag info > "$SRV_DIR/cli.log" 2>&1 &
+    $cs_flag "$fp" $extra_cli $ce_flag $cl_flag info > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
 
   if ! wait_for_client_ip; then
