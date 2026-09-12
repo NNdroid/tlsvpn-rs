@@ -171,6 +171,14 @@ rustup component add llvm-tools-preview
 ./scripts/build_pgo.sh   # requires the e2e cert pair in the repo root; see script
 ```
 
+Real-network tests over an actual TAP tunnel (ping v4/v6, traceroute, iperf3
+throughput, optional librespeed) live in `scripts/net_perf_test.sh` and run as
+the `net-perf` CI job. GitHub-hosted runners lack `CAP_NET_ADMIN` so the job
+self-skips there (visible in its log); point `runs-on` at a privileged
+self-hosted runner — or run `sudo bash scripts/net_perf_test.sh` on any Linux
+box — to execute them for real. `scripts/build.sh` mirrors the release matrix
+(musl static binaries via `cross`, GNU fallback for local use).
+
 ---
 
 ## 📎 Appendix: Command-Line Flags

@@ -246,9 +246,10 @@ librespeed_check() {
   local srv_pid=$!
   PIDS+=($srv_pid)
   sleep 1
-  cat > "$dir/servers.json" <<EOF
-[{"name":"tunnel","id":1,"server":"http://${GW_V4}:8080","dl":"\\\\/backend\\\\/garbage.php","ul":"\\\\/backend\\\\/empty.php","ping":"\\\\/backend\\\\/empty.php","getIP":"\\\\/backend\\\\/getIP.php"}]
-EOF
+  cat > "$dir/servers.json" <<'JSONEOF'
+[{"name":"tunnel","id":1,"server":"http://SERVERURL","dl":"/backend/garbage.php","ul":"/backend/empty.php","ping":"/backend/empty.php","getIP":"/backend/getIP.php"}]
+JSONEOF
+  sed -i "s|SERVERURL|${GW_V4}:8080|" "$dir/servers.json"
   local out
   out=$("$cli" --server-json "$dir/servers.json" --json 2>/dev/null) || true
   kill "$srv_pid" 2>/dev/null || true

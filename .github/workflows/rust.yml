@@ -43,27 +43,54 @@ jobs:
   # traceroute (v4/v6 through the tunnel), iperf3 up/down throughput and an
   # optional librespeed run (scripts/net_perf_test.sh).
   #
-  # GitHub-hosted runners have no CAP_NET_ADMIN: the script detects that and
-  # reports SKIP with exit 0, so this job stays green here. To execute the
-  # tests for real, point runs-on at a privileged self-hosted runner (or run
-  # the script manually on any Linux box with root: both endpoints run on one
-  # machine, so throughput measures the tunnel stack itself).
+  # The script is capability-gated: GitHub-hosted runners have no
+  # CAP_NET_ADMIN, so there it reports SKIP and exits 0 (job stays green,
+  # the reason is visible in the job log). Point runs-on at a privileged
+  # self-hosted runner to execute the checks for real.
   net-perf:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Build release binaries
-      run: cargo build --release
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
 
-    - name: Ping / traceroute / throughput over real tunnel
+    - name: Checkout Go implementation (cross-language matrix)
+      uses: actions/checkout@v4
+      with:
+        repository: NNdroid/tlsvpn
+        path: go-impl
+
+    - name: Build release binaries (Rust + Go)
+      run: |
+        cargo build --release
+        (cd go-impl && go build -o "$GITHUB_WORKSPACE/tlsvpn_go" .)
+
+    - name: rs_srv <- rs_cli (ping / traceroute / throughput)
       env:
         BIN_SRV: ${{ github.workspace }}/target/release/tlsvpn
         BIN_CLI: ${{ github.workspace }}/target/release/tlsvpn
         FLAVOR_SRV: rs
         FLAVOR_CLI: rs
-      run: bash scripts/net_perf_test.sh
+      run: sudo -E bash scripts/net_perf_test.sh
+
+    - name: rs_srv <- go_cli (cross-language)
+      env:
+        BIN_SRV: ${{ github.workspace }}/target/release/tlsvpn
+        BIN_CLI: ${{ github.workspace }}/tlsvpn_go
+        FLAVOR_SRV: rs
+        FLAVOR_CLI: go
+      run: sudo -E bash scripts/net_perf_test.sh
+
+    - name: go_srv <- rs_cli (cross-language)
+      env:
+        BIN_SRV: ${{ github.workspace }}/tlsvpn_go
+        BIN_CLI: ${{ github.workspace }}/target/release/tlsvpn
+        FLAVOR_SRV: go
+        FLAVOR_CLI: rs
+      run: sudo -E bash scripts/net_perf_test.sh
