@@ -94,14 +94,14 @@ flag_for() {
       mode) echo "--mode";; addr) echo "--addr";; tap) echo "--tap";;
       cert) echo "--cert";; key) echo "--key";; v4cidr) echo "--v4cidr";;
       v6cidr) echo "--v6cidr";; encrypt) echo "--encrypt";;
-      loglevel) echo "--loglevel";;
+      loglevel) echo "--loglevel";; certsha) echo "--cert_sha256";;
     esac
   else
     case "$verb" in
       mode) echo "-mode";; addr) echo "-addr";; tap) echo "-tap";;
       cert) echo "-cert";; key) echo "-key";; v4cidr) echo "-v4cidr";;
       v6cidr) echo "-v6cidr";; encrypt) echo "-encrypt";;
-      loglevel) echo "-loglevel";;
+      loglevel) echo "-loglevel";; certsha) echo "-cert-sha256";;
     esac
   fi
 }
