@@ -1,94 +1,144 @@
 #!/usr/bin/env bash
-# build.sh — release-aligned build for tlsvpn-rs.
+# build.sh — tlsvpn-rs multi-mode build.
 #
-# The GitHub release workflow (build_and_release.yml) publishes STATIC musl
-# binaries (x86_64 / aarch64 / armv7), and the cross-language e2e suite in
-# the Go repo downloads exactly those asset names. This script mirrors that:
+# Usage: scripts/build.sh [MODE] [OUTPUT_DIR]
 #
-#   * with `cross` (docker) available: builds the same musl targets the
-#     release publishes — this is the supported, reproducible path;
-#   * without cross: falls back to gnu targets via local cargo for
-#     development use only (prints a warning; these are NOT release assets).
+#   native (default)  Build the current host target with cargo. Fast, no
+#                     cross toolchain needed — this is what CI and local
+#                     development want.
+#   musl              Build the three STATIC musl targets that the GitHub
+#                     release workflow publishes (x86_64 / aarch64 / armv7);
+#                     these are exactly the asset names the Go repo's e2e
+#                     suite downloads. Requires `cross` (docker).
+#   gnu               Build x86_64 + aarch64 GNU targets with the local
+#                     toolchain (installs the aarch64 cross-gcc if missing).
+#                     Static musl is preferred for distribution; gnu is for
+#                     local-use fallback when cross/docker is unavailable.
+#   all               musl + gnu.
 #
-# Note: mimalloc + ring compile C, so the gnu fallback requires a host C
-# compiler (and the aarch64 cross-gcc, which this script installs).
+# Artifacts are copied to OUTPUT_DIR (default: dist/) as
+#   dist/tlsvpn-<target-triple>   (native also writes plain dist/tlsvpn)
+#
+# Env:
+#   CARGO_ARGS   extra args appended to cargo/cross build (e.g. --offline)
 set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+MODE="${1:-native}"
+OUT_DIR="${2:-dist}"
+HOST_TRIPLE="$(rustc -vV | awk -F': ' '/^host:/{print $2}')"
 
 MUSL_TARGETS=(
     x86_64-unknown-linux-musl
     aarch64-unknown-linux-musl
     armv7-unknown-linux-musleabihf
 )
+
 GNU_TARGETS=(
     x86_64-unknown-linux-gnu
     aarch64-unknown-linux-gnu
 )
 
-if command -v cross >/dev/null 2>&1; then
-    echo "🚀 'cross' found — building STATIC musl binaries (release-aligned)."
-    echo "   (docker images are pulled on first use; may take a while)"
-    rustup target add "${MUSL_TARGETS[@]}"
-    for t in "${MUSL_TARGETS[@]}"; do
-        echo "==========================================="
-        echo "🔨 cross build --release --target $t"
-        cross build --release --target "$t"
-    done
-    echo "==========================================="
-    echo "✅ musl binaries built (same targets as the release workflow):"
-    for t in "${MUSL_TARGETS[@]}"; do
-        echo "   - target/$t/release/tlsvpn"
-    done
-    exit 0
-fi
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
 
-echo "⚠️  'cross' not found — falling back to GNU targets via local cargo."
-echo "   These binaries are for LOCAL USE ONLY: GitHub release assets and"
-echo "   the cross-language e2e suite expect musl static builds. Install"
-echo "   cross (cargo install cross) + docker to build release-aligned ones."
+case "$MODE" in
+    -h|--help|help) usage 0 ;;
+    native|musl|gnu|all) ;;
+    *) echo "❌ unknown mode: $MODE" >&2; usage 1 ;;
+esac
 
-# mimalloc / ring build C code → a C compiler is mandatory on this path.
-if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-    echo "❌ No host C compiler found (required by mimalloc/ring)."
-    echo "   Install build-essential (apt) / base-devel (pacman) / gcc (dnf),"
-    echo "   or use 'cross' which compiles inside its docker images."
-    exit 1
-fi
-
-rustup target add "${GNU_TARGETS[@]}"
-
-# aarch64 cross toolchain for the gnu path
-if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-    echo "📦 'aarch64-linux-gnu-gcc' not found. Attempting to install it..."
-    if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-    elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y gcc-aarch64-linux-gnu
-    elif command -v yum >/dev/null 2>&1; then
-        sudo yum install -y gcc-aarch64-linux-gnu
-    elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --noconfirm aarch64-linux-gnu-gcc
+copy_artifact() {
+    # $1 = cargo target dir ("" for host), $2 = artifact base name
+    local triple_dir="$1" name="$2" src
+    if [[ -z "$triple_dir" ]]; then
+        src="target/release/tlsvpn"
     else
-        echo "❌ Could not determine package manager. Install the aarch64"
-        echo "   cross-compiler (aarch64-linux-gnu-gcc) manually and re-run."
+        src="target/$triple_dir/release/tlsvpn"
+    fi
+    # Windows hosts produce tlsvpn.exe
+    [[ -f "$src" ]] || src="$src.exe"
+    if [[ ! -f "$src" ]]; then
+        echo "❌ artifact not found: $src" >&2
+        return 1
+    fi
+    mkdir -p "$OUT_DIR"
+    cp "$src" "$OUT_DIR/$name"
+    echo "   -> $OUT_DIR/$name"
+}
+
+require_c_compiler() {
+    # mimalloc + ring compile C on the plain-cargo paths
+    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+        echo "❌ No host C compiler found (required by mimalloc/ring)." >&2
+        echo "   Install build-essential / base-devel / gcc, or use 'musl'" >&2
+        echo "   mode with cross (compiles inside docker images)." >&2
         exit 1
     fi
-fi
+}
 
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+build_native() {
+    echo "🔨 native build ($HOST_TRIPLE)"
+    require_c_compiler
+    cargo build --release ${CARGO_ARGS:-}
+    copy_artifact "" "tlsvpn-$HOST_TRIPLE"
+    copy_artifact "" "tlsvpn"
+}
+
+build_musl() {
+    if ! command -v cross >/dev/null 2>&1; then
+        echo "❌ musl mode needs 'cross' (cargo install cross) + docker." >&2
+        echo "   It builds the same static binaries the release workflow ships." >&2
+        exit 1
+    fi
+    rustup target add "${MUSL_TARGETS[@]}"
+    for t in "${MUSL_TARGETS[@]}"; do
+        echo "🔨 cross build --release --target $t"
+        cross build --release --target "$t" ${CARGO_ARGS:-}
+        copy_artifact "$t" "tlsvpn-$t"
+    done
+}
+
+build_gnu() {
+    require_c_compiler
+    if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+        echo "📦 installing aarch64 cross toolchain..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y gcc-aarch64-linux-gnu
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y gcc-aarch64-linux-gnu
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --noconfirm aarch64-linux-gnu-gcc
+        else
+            echo "❌ unknown package manager; install aarch64-linux-gnu-gcc manually" >&2
+            exit 1
+        fi
+    fi
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+    export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+    rustup target add "${GNU_TARGETS[@]}"
+    for t in "${GNU_TARGETS[@]}"; do
+        echo "🔨 cargo build --release --target $t"
+        cargo build --release --target "$t" ${CARGO_ARGS:-}
+        copy_artifact "$t" "tlsvpn-$t"
+    done
+}
+
+echo "🦀 tlsvpn-rs build — mode: $MODE, output: $OUT_DIR/"
+case "$MODE" in
+    native) build_native ;;
+    musl)   build_musl ;;
+    gnu)    build_gnu ;;
+    all)    build_musl; build_gnu ;;
+esac
 
 echo "==========================================="
-echo "🔨 Building for Linux x86_64 (x86_64-unknown-linux-gnu)..."
-cargo build --release --target x86_64-unknown-linux-gnu
-
-echo "==========================================="
-echo "🔨 Building for Linux aarch64 (aarch64-unknown-linux-gnu)..."
-cargo build --release --target aarch64-unknown-linux-gnu
-
-echo "==========================================="
-echo "✅ Build completed successfully!"
-echo "📂 Binaries (gnu, local-use):"
-echo "   - target/x86_64-unknown-linux-gnu/release/tlsvpn"
-echo "   - target/aarch64-unknown-linux-gnu/release/tlsvpn"
+echo "✅ done. artifacts:"
+ls -lh "$OUT_DIR"

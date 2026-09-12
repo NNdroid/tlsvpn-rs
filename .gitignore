@@ -25,3 +25,4 @@ target
 protocol_golden.rust.json
 *.pem
 /interop/
+dist/

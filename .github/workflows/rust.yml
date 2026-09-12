@@ -66,31 +66,32 @@ jobs:
         repository: NNdroid/tlsvpn
         path: go-impl
 
-    - name: Build release binaries (Rust + Go)
-      run: |
-        cargo build --release
-        (cd go-impl && go build -o "$GITHUB_WORKSPACE/tlsvpn_go" .)
+    - name: Build Rust binary (scripts/build.sh native)
+      run: bash scripts/build.sh native
+
+    - name: Build Go binary (Go repo's own scripts/build.sh)
+      run: (cd go-impl && bash scripts/build.sh)
 
     - name: rs_srv <- rs_cli (ping / traceroute / throughput)
       env:
-        BIN_SRV: ${{ github.workspace }}/target/release/tlsvpn
-        BIN_CLI: ${{ github.workspace }}/target/release/tlsvpn
+        BIN_SRV: ${{ github.workspace }}/dist/tlsvpn
+        BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
         FLAVOR_SRV: rs
         FLAVOR_CLI: rs
       run: sudo -E bash scripts/net_perf_test.sh
 
     - name: rs_srv <- go_cli (cross-language)
       env:
-        BIN_SRV: ${{ github.workspace }}/target/release/tlsvpn
-        BIN_CLI: ${{ github.workspace }}/tlsvpn_go
+        BIN_SRV: ${{ github.workspace }}/dist/tlsvpn
+        BIN_CLI: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
         FLAVOR_SRV: rs
         FLAVOR_CLI: go
       run: sudo -E bash scripts/net_perf_test.sh
 
     - name: go_srv <- rs_cli (cross-language)
       env:
-        BIN_SRV: ${{ github.workspace }}/tlsvpn_go
-        BIN_CLI: ${{ github.workspace }}/target/release/tlsvpn
+        BIN_SRV: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+        BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
         FLAVOR_SRV: go
         FLAVOR_CLI: rs
       run: sudo -E bash scripts/net_perf_test.sh

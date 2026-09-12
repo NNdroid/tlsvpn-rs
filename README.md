@@ -176,8 +176,10 @@ throughput, optional librespeed) live in `scripts/net_perf_test.sh` and run as
 the `net-perf` CI job. GitHub-hosted runners lack `CAP_NET_ADMIN` so the job
 self-skips there (visible in its log); point `runs-on` at a privileged
 self-hosted runner — or run `sudo bash scripts/net_perf_test.sh` on any Linux
-box — to execute them for real. `scripts/build.sh` mirrors the release matrix
-(musl static binaries via `cross`, GNU fallback for local use).
+box — to execute them for real. `scripts/build.sh` supports `native` (default — host
+build for CI/dev), `musl` (the three static targets the release workflow
+ships, via `cross`), `gnu` (x86_64+aarch64 cross via local toolchain) and
+`all`; artifacts land in `dist/` named `tlsvpn-<target-triple>`.
 
 ---
 
