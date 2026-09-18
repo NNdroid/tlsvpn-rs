@@ -327,13 +327,11 @@ fn test_handshake_req_field_names() {
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
     keys.sort();
 
-    // Go 黄金向量里的字段清单是生成器硬编码的，早于 session_token 这一项
-    // （Go 侧 frame.go 的 HandshakeReq 已有该字段）。因此期望集合是
-    // 「黄金向量 ∪ session_token」，而不是逐字相等。
+    // 黄金向量的键列表由 Go 生成器从活动结构体 marshal 得出（omitempty 字段需
+    // 全填充样本才能出现），Go 侧另有 TestHandshakeJSONContract 用硬编码
+    // wantReq 独立锁定，所以这里是逐字相等，不再是「∪ session_token」的妥协。
     let mut want = g.handshake_req_keys.clone();
-    want.push("session_token".to_string());
     want.sort();
-    want.dedup();
 
     assert_eq!(
         keys, want,
@@ -397,11 +395,12 @@ fn test_handshake_resp_field_names() {
 }
 
 #[test]
-fn test_golden_handshake_keys_subset_of_rust() {
-    // 黄金向量里的每个字段名，Rust 都必须认识（子集关系）。用子集而不是相等：
-    // Go 生成器的清单硬编码且早于 session_token，逐字相等会把正确的 Rust 变更
-    // 判成失败。方向是单向的——Go 有的 Rust 必须有；Rust 新增的由上面的
-    // test_handshake_req/resp_field_names 锁定。
+fn test_golden_handshake_keys_match_rust() {
+    // 黄金向量的键列表必须与 Rust 端完全相等，双向锁定：任何一端单方面加/删
+    // 字段都会在这里失败。
+    // 曾一度只能做单向子集——Go 生成器的样本漏填了 session_token，omitempty 把
+    // 它吞掉后 golden 只剩 12/17 个键。现已在 Go 侧补全样本并重跑
+    // -update-golden，golden 变成 13/18，相等关系成立。
     let g = golden_or_skip!();
 
     let req_full = HandshakeReqShape {
@@ -444,14 +443,17 @@ fn test_golden_handshake_keys_subset_of_rust() {
     ] {
         let have: std::collections::BTreeSet<String> =
             shape.as_object().unwrap().keys().cloned().collect();
-        for k in golden {
-            assert!(
-                have.contains(k),
-                "Go 黄金向量的 {} 字段 {} 在 Rust 端不存在",
-                what,
-                k
-            );
-        }
+        let golden_set: std::collections::BTreeSet<String> =
+            golden.iter().cloned().collect();
+        let go_only: Vec<&String> = golden_set.difference(&have).collect();
+        let rust_only: Vec<&String> = have.difference(&golden_set).collect();
+        assert!(
+            go_only.is_empty() && rust_only.is_empty(),
+            "Go 黄金向量的 {} 字段集与 Rust 端不一致\n  Go 有 Rust 无: {:?}\n  Rust 有 Go 无: {:?}",
+            what,
+            go_only,
+            rust_only
+        );
     }
 }
 
