@@ -173,6 +173,58 @@ pub fn pad_mode_invalid_error(mode: &str) -> String {
     )
 }
 
+// ======================= 加密强度下限（min_enc） =======================
+//
+// 旧实现里"是否加密"是布尔开关：一端把 encrypt 关掉，整条链路（含 FEC 校验帧）
+// 就只剩 TLS 一层。min_enc 把开关换成强度下限，允许运维强制"低于 GCM 一律拒连"。
+//
+// 取值："" 或 "any"（无下限，保持旧行为）、"ctr"/"legacy"、"gcm"
+
+// 强度排序（数值越大越强），与算法 ID 是两套编码。
+// 注意：ENC_ALGO_LEGACY_CTR 的值恰为 0，若直接拿算法 ID 当强度用，
+// "最低要求 CTR" 会被解析成"不设下限"。
+pub const ENC_RANK_NONE: i64 = 0;
+pub const ENC_RANK_CTR: i64 = 1;
+pub const ENC_RANK_GCM: i64 = 2;
+
+pub const MIN_ENC_CTR: &str = "ctr";
+pub const MIN_ENC_LEGACY: &str = "legacy";
+pub const MIN_ENC_GCM: &str = "gcm";
+
+/// 算法强度排序；未知算法视为最弱（CTR 档）。
+/// 0 / 1 / 任何其它值都算 CTR——只有恰好等于 ENC_ALGO_GCM 才算 GCM。
+pub fn enc_algo_rank(algo: i64) -> i64 {
+    if algo == ENC_ALGO_GCM {
+        ENC_RANK_GCM
+    } else {
+        ENC_RANK_CTR
+    }
+}
+
+/// 解析最低强度配置；0 表示不设下限
+pub fn min_enc_rank(mode: &str) -> i64 {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        MIN_ENC_GCM => ENC_RANK_GCM,
+        MIN_ENC_CTR | MIN_ENC_LEGACY => ENC_RANK_CTR,
+        _ => ENC_RANK_NONE,
+    }
+}
+
+/// 对端声明的算法位集是否恰好等于某算法。
+/// 刻意用精确比较而非 >=：Go 侧正是因为 >= 比出了 bug——未知算法值
+/// 会被误判为"满足 GCM 下限"。未来若定义算法 3，旧实现对端不该被放过。
+pub fn enc_algo_supported(declared: i64, want: i64) -> bool {
+    declared == want
+}
+
+/// 配置加载层的错误文案，与 Go Validate 逐字一致
+pub fn min_enc_invalid_error(mode: &str) -> String {
+    format!(
+        "invalid min_enc {:?} (want {}, {} or empty)",
+        mode, MIN_ENC_CTR, MIN_ENC_GCM
+    )
+}
+
 pub fn get_cipher_context(psk: &str) -> (Vec<u8>, Vec<u8>) {
     let mut k_hasher = Sha256::new();
     k_hasher.update(format!("{}_enc_key", psk).as_bytes());
@@ -673,6 +725,109 @@ mod tests {
         assert_eq!(
             pad_mode_invalid_error("bogus"),
             "invalid pad_mode \"bogus\" (want off, legacy or bucket)"
+        );
+    }
+
+    // ---------- 加密强度下限（档 D） ----------
+
+    /// Go 端 server.go 的拒连条件，逐字复现以便矩阵化测试。
+    fn server_rejects_min_enc(encrypt: bool, min_enc: i64, declared_algo: i64) -> bool {
+        encrypt && min_enc > 0 && enc_algo_rank(declared_algo) < min_enc
+    }
+
+    /// Go 端 client.go 的拒连条件：不看 encrypt（协商结果已是最终值），
+    /// 低于本地下限即视为握手失败并触发重连。
+    fn client_rejects_min_enc(min_enc: i64, negotiated_algo: i64) -> bool {
+        min_enc > 0 && enc_algo_rank(negotiated_algo) < min_enc
+    }
+
+    #[test]
+    fn enc_algo_rank_treats_unknown_as_weakest() {
+        // 回归锁：只有恰好等于 ENC_ALGO_GCM 才算 GCM。未知算法必须落到 CTR 档，
+        // 绝不能因为"数值更大"就算满足 GCM 下限。
+        assert_eq!(enc_algo_rank(ENC_ALGO_GCM), ENC_RANK_GCM);
+        for algo in [0i64, 1, 3, 7, 99, -1, i64::MAX] {
+            assert_eq!(
+                enc_algo_rank(algo),
+                ENC_RANK_CTR,
+                "算法 ID {} 应被视为 CTR 档（未知算法算最弱）",
+                algo
+            );
+        }
+    }
+
+    #[test]
+    fn min_enc_rank_parses_case_insensitively() {
+        assert_eq!(min_enc_rank(""), ENC_RANK_NONE);
+        assert_eq!(min_enc_rank("any"), ENC_RANK_NONE);
+        assert_eq!(min_enc_rank("ctr"), ENC_RANK_CTR);
+        assert_eq!(min_enc_rank("legacy"), ENC_RANK_CTR);
+        assert_eq!(min_enc_rank("gcm"), ENC_RANK_GCM);
+        // 解析层宽容（大小写/空白），校验层严格 —— 见 validate_args
+        for v in ["GCM", "Ctr", "LEGACY", "ANY"] {
+            assert_eq!(
+                min_enc_rank(v),
+                min_enc_rank(&v.to_ascii_lowercase()),
+                "min_enc 解析不区分大小写：{:?}",
+                v
+            );
+        }
+        assert_eq!(min_enc_rank("  gcm  "), ENC_RANK_GCM, "必须 trim");
+        assert_eq!(min_enc_rank("bogus"), ENC_RANK_NONE);
+        assert_eq!(min_enc_rank("gc"), ENC_RANK_NONE);
+        assert_eq!(
+            min_enc_invalid_error("bogus"),
+            "invalid min_enc \"bogus\" (want ctr, gcm or empty)"
+        );
+    }
+
+    #[test]
+    fn enc_algo_supported_is_exact_not_magnitude() {
+        assert!(enc_algo_supported(ENC_ALGO_GCM, ENC_ALGO_GCM));
+        assert!(!enc_algo_supported(ENC_ALGO_LEGACY_CTR, ENC_ALGO_GCM));
+        // 关键：未来若定义算法 3，旧实现对端不得被当成"支持 GCM"
+        assert!(!enc_algo_supported(3, ENC_ALGO_GCM));
+        assert!(!enc_algo_supported(99, ENC_ALGO_GCM));
+        assert!(!enc_algo_supported(ENC_ALGO_GCM, ENC_ALGO_LEGACY_CTR));
+    }
+
+    #[test]
+    fn min_enc_floor_matrix() {
+        // 无下限：任何算法都放行
+        assert!(!server_rejects_min_enc(true, ENC_RANK_NONE, ENC_ALGO_LEGACY_CTR));
+        assert!(!server_rejects_min_enc(true, ENC_RANK_NONE, ENC_ALGO_GCM));
+        // 下限 CTR：legacy CTR 与 GCM 都够
+        assert!(!server_rejects_min_enc(true, ENC_RANK_CTR, ENC_ALGO_LEGACY_CTR));
+        assert!(!server_rejects_min_enc(true, ENC_RANK_CTR, ENC_ALGO_GCM));
+        // 下限 GCM：CTR 客户端被拒，GCM 放行
+        assert!(
+            server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_LEGACY_CTR),
+            "GCM 下限必须拒绝 CTR 客户端"
+        );
+        assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM));
+        // encrypt=false 时下限失效（此时本不该配置 min_enc，校验层已拦）
+        assert!(!server_rejects_min_enc(false, ENC_RANK_GCM, ENC_ALGO_LEGACY_CTR));
+        // 未知算法 ID 必须被 GCM 下限拦下——用 >= 比较会让它漏过去
+        assert!(
+            server_rejects_min_enc(true, ENC_RANK_GCM, 3),
+            "未知算法 ID 必须算 CTR 档并被 GCM 下限拒绝"
+        );
+    }
+
+    #[test]
+    fn client_floor_rejects_downgrade_without_encrypt_guard() {
+        // 客户端侧不判断 encrypt：协商结果已经是最终值，低于本地下限就是失败。
+        // 缺这一层就会出现"静默降级"——用户明明要求 GCM，实际跑的是 CTR。
+        assert!(!client_rejects_min_enc(ENC_RANK_NONE, ENC_ALGO_LEGACY_CTR));
+        assert!(!client_rejects_min_enc(ENC_RANK_CTR, ENC_ALGO_LEGACY_CTR));
+        assert!(
+            client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_LEGACY_CTR),
+            "服务端降级到 CTR 时必须判定握手失败并重连"
+        );
+        assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM));
+        assert!(
+            client_rejects_min_enc(ENC_RANK_GCM, 3),
+            "未知算法 ID 的协商结果不得被当成 GCM"
         );
     }
 }

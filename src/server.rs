@@ -246,6 +246,8 @@ pub struct ServerCore {
     pub gw_v6: String,
     pub v4_mask_bits: u32,
     pub v6_mask_bits: u32,
+    // 内层加密强度下限（ENC_RANK_* 值，0 = 不限）
+    pub min_enc: i64,
 }
 
 impl ServerCore {
@@ -541,6 +543,8 @@ pub fn start_server(args: &Args) {
         psk_hash: hash_psk(&args.psk),
         encrypt: args.encrypt,
         session_token: args.session_token,
+        // 强度下限解析一次，握手热路径只读整数
+        min_enc: min_enc_rank(&args.min_enc),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
@@ -1205,6 +1209,18 @@ fn handle_handshake(
         );
         return HandshakeOutcome::TarpitClose;
     }
+    // 强度下限：运维强制 GCM 时拒绝能力不足的客户端。这里刻意**不**走焦油坑——
+    // 这是运维侧的期望结果（客户端版本过旧），需要一条明确可查的失败记录。
+    // 位置在会话查找之前：能力不足的客户端连接管既有会话都不该被允许。
+    if core.encrypt && core.min_enc > 0 && enc_algo_rank(req.enc_algo) < core.min_enc {
+        // 此时还没有 client_id（它在下面才算出），algo 是唯一定位线索。
+        // mio 的流取对端地址需要消费 socket，不为此改结构体。
+        warn!(
+            "拒绝连接: 客户端加密能力 (algo={}) 低于 min_enc 下限 (要求 {})",
+            req.enc_algo, core.min_enc
+        );
+        return HandshakeOutcome::Close;
+    }
     let client_id = req.client_id.clone();
     if client_id.is_empty() {
         warn!("拒绝连接: 缺少 ClientID");
@@ -1257,7 +1273,7 @@ fn handle_handshake(
             let salt_a = new_random_salt();
             let salt_b = new_random_salt();
             let (enc_algo, ic_tx, ic_rx) = if core.encrypt {
-                if req.enc_algo >= ENC_ALGO_GCM {
+                if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM) {
                     (
                         ENC_ALGO_GCM,
                         Some(Arc::new(

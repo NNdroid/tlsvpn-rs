@@ -208,6 +208,8 @@ pub struct Client {
     pub fec_mode: bool,
     pub fec_group_req: usize,
     pub encrypt: bool,
+    // 内层加密强度下限（ENC_RANK_* 值，0 = 不限）
+    pub min_enc: i64,
     pub tap: Arc<dyn TapDevice>,
     pub mac: String,
     pub tx_port: Arc<AsyncPort>,
@@ -573,6 +575,8 @@ pub fn start_client(args: &Args) {
         fec_mode: args.fec,
         fec_group_req,
         encrypt: args.encrypt,
+        // 强度下限解析一次，协商热路径只读整数
+        min_enc: min_enc_rank(&args.min_enc),
         tap: device.clone(),
         mac: actual_mac.clone(),
         tx_port: tx_port.clone(),
@@ -921,7 +925,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut ic_tx: Option<Arc<InnerCipher>> = None;
     let mut ic_rx: Option<Arc<InnerCipher>> = None;
     if cl.encrypt {
-        if resp.enc_algo >= ENC_ALGO_GCM {
+        if enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM) {
             let salt_tx = hex::decode(&resp.enc_salt).ok();
             let salt_rx = hex::decode(&resp.enc_salt2).ok();
             if let (Some(stx), Some(srx)) = (salt_tx, salt_rx) {
@@ -961,6 +965,16 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             ic_tx = cl.ic_legacy.clone();
             ic_rx = cl.ic_legacy.clone();
         }
+    }
+
+    // 强度下限：协商结果低于本地要求时拒绝这条连接（服务端可能跑的是旧版，
+    // 或中间被降级）。这是运维显式声明的硬要求，不能静默降级。
+    if cl.min_enc > 0 && enc_algo_rank(enc_algo) < cl.min_enc {
+        *ci.state.lock() = "retrying".into();
+        *ci.last_error.lock() =
+            format!("server negotiated inner cipher {} is below min_enc={}", enc_algo, cl.min_enc);
+        warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
+        return Duration::ZERO;
     }
 
     // 5. 会话级协商（对齐 Go sessionMu 段）

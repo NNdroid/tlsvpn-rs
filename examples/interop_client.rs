@@ -217,6 +217,9 @@ fn main() {
     let mut stay_sec: u64 = 0;
     let mut bcast = false;
     let mut parity_test = false;
+    // 声明的内层加密能力：0 = legacy CTR，2 = GCM。
+    // 测试服务端 min_enc 下限时需要能声明弱能力。
+    let mut enc_algo: i64 = 2;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -266,6 +269,10 @@ fn main() {
             }
             "--timeout" => {
                 timeout_sec = args[i + 1].parse().unwrap_or(10);
+                i += 1;
+            }
+            "--enc-algo" => {
+                enc_algo = args[i + 1].parse().unwrap_or(2);
                 i += 1;
             }
             _ => {}
@@ -413,7 +420,7 @@ fn main() {
         fec,
         fec_group,
         encrypt,
-        enc_algo: 2,
+        enc_algo,
         brutal_tx: 100,
         brutal_rx: 500,
     };
@@ -447,7 +454,10 @@ fn main() {
     let mut ic_tx: Option<ProbeCipher> = None;
     let mut ic_rx: Option<ProbeCipher> = None;
     if encrypt {
-        if resp.enc_algo.unwrap_or(0) >= 2 {
+        // 精确比较而非 >=：enc_algo 是枚举不是强度量级，
+        // 未知算法 ID 不得被当成 GCM 能力（与 crypto::enc_algo_supported 一致）。
+        // fec_group 那边用 >= 是对的——K 单调递增，K=3 严格强于 K=2。
+        if resp.enc_algo.unwrap_or(0) == 2 {
             let stx = hex::decode(resp.enc_salt.as_deref().unwrap_or("")).unwrap_or_default();
             let srx = hex::decode(resp.enc_salt2.as_deref().unwrap_or("")).unwrap_or_default();
             ic_tx = Some(ProbeCipher::new(&psk, &stx).unwrap_or_else(|e| fail(&e)));

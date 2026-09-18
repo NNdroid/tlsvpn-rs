@@ -382,6 +382,18 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if !crypto::pad_mode_valid(&args.pad_mode) {
         return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
     }
+    // min_enc 取大小写敏感的闭集；"any" 与空串等价（都等于不设下限）
+    match args.min_enc.as_str() {
+        "" | "any" | "ctr" | "legacy" | "gcm" => {}
+        _ => return Err(crypto::min_enc_invalid_error(&args.min_enc)),
+    }
+    // 关着 encrypt 配 min_enc 是矛盾配置：没有内层加密谈何强度下限
+    if !args.min_enc.is_empty() && !args.encrypt {
+        return Err(format!(
+            "min_enc {:?} requires encrypt=true",
+            args.min_enc
+        ));
+    }
     if args.mode == "client" {
         if args.conns < 1 {
             return Err("client conns must be >= 1".into());
@@ -499,7 +511,7 @@ mod tests {
     use crate::buffer::*;
     use crate::crypto::*;
     use crate::frame::*;
-    use crate::{ConfigFile, example_config_json, load_config_file};
+    use crate::{Args, ConfigFile, example_config_json, load_config_file, validate_args};
     use std::io::Read;
     use std::time::Instant;
 
@@ -649,6 +661,55 @@ mod tests {
         assert_eq!(args.conns, 4);
         assert_eq!(args.pad_mode, "bucket");
         assert!(args.min_enc.is_empty());
+    }
+
+    #[test]
+    fn min_enc_validation_matches_go() {
+        let mut a = Args::default();
+        a.mode = "client".into();
+        a.addr = "127.0.0.1:1".into();
+        a.conns = 4;
+        a.fec_group = 4;
+        a.encrypt = true;
+
+        // 闭集取值全部放行
+        for v in ["", "any", "ctr", "legacy", "gcm"] {
+            a.min_enc = v.into();
+            assert!(
+                validate_args(&a).is_ok(),
+                "min_enc {:?} + encrypt=true 应放行",
+                v
+            );
+        }
+
+        // 大小写敏感（Go Validate 的 switch 区分大小写）
+        a.min_enc = "GCM".into();
+        let err = validate_args(&a).unwrap_err();
+        assert!(
+            err.contains("invalid min_enc"),
+            "min_enc \"GCM\" 应被拒绝（Go 侧同样拒绝），实际: {}",
+            err
+        );
+
+        // 非法值
+        a.min_enc = "bogus".into();
+        assert!(validate_args(&a).is_err(), "min_enc \"bogus\" 应被拒绝");
+
+        // encrypt=false 时不允许配置 min_enc
+        a.encrypt = false;
+        a.min_enc = "gcm".into();
+        let err = validate_args(&a).unwrap_err();
+        assert!(
+            err.contains("requires encrypt=true"),
+            "encrypt=false 配 min_enc 应报错，实际: {}",
+            err
+        );
+        // 空串例外：无下限不需要 encrypt
+        a.min_enc = String::new();
+        assert!(
+            validate_args(&a).is_ok(),
+            "min_enc 空串 + encrypt=false 是旧版行为，必须放行"
+        );
     }
 
     struct InfiniteReader {
