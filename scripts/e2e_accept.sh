@@ -201,7 +201,8 @@ if [ "$HAVE_OLD" = 1 ]; then
 else
   SKIP_N=$((SKIP_N + 7))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 7 组：缺旧版二进制"
-  echo "             rs: $E2E_RS_OLD_BIN   go: $E2E_GO_OLD_BIN"
+  echo "             rs: ${E2E_RS_OLD_BIN:-(未配置)}   go: ${E2E_GO_OLD_BIN:-(未配置)}"
+  echo "             设置 E2E_RS_OLD_BIN / E2E_RS_OLD_PROBE / E2E_GO_OLD_BIN 后重跑可启用"
 fi
 run_case "goNEW->goNEW"  go go "" ""
 
@@ -219,14 +220,16 @@ else
   SKIP_N=$((SKIP_N + 1))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：rsNEW(tok)->rsOLD 缺旧版 Rust 二进制"
 fi
-go_cfg_now 1 true "" ""; run_case "goNEW(tok)->rsOLD 首次接入" go rsold "" "" "$CFGF"
+if [ "$HAVE_OLD" = 1 ]; then
+  go_cfg_now 1 true "" ""; run_case "goNEW(tok)->rsOLD 首次接入" go rsold "" "" "$CFGF"
+else
+  SKIP_N=$((SKIP_N + 1))
+  echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：goNEW(tok)->rsOLD 缺旧版 Rust 探针"
+fi
 go_cfg_now 1 true "" ""; run_case "goNEW(tok)->go 首次接入"  go go "" "" "$CFGF"
 
 for d in "${TMPDIRS[@]}"; do rm -rf "$d"; done
-if [ "$E2E_OS" = windows ]; then
-  powershell -NoProfile -Command \
-    "Get-Process | Where-Object {\$_.ProcessName -match 'tlsvpn|probe|interop_client'} | Stop-Process -Force -ErrorAction SilentlyContinue" 2>/dev/null
-fi
+e2e_reap_all
 
 echo ""
 echo "=============================== 汇总 ==============================="

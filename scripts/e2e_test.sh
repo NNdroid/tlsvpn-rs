@@ -46,11 +46,10 @@ SUITE_TOTAL=0
 SUITE_FAIL=0
 FAILED_SUITES=()
 
-LOGDIR=""
-if [ -z "${KEEP_TMP:-}" ]; then
-  LOGDIR="$(mktemp -d)"
-  trap 'rm -rf "$LOGDIR"' EXIT
-fi
+# 兜底清扫放 EXIT trap：任何套件泄漏的客户端（Web 面板 bind 失败时不监听任何
+# 端口，按端口清不掉）都会占住后续套件的面板端口。KEEP_TMP=1 时保留日志目录。
+LOGDIR="$(mktemp -d)"
+trap 'e2e_reap_all; [ -n "${KEEP_TMP:-}" ] || rm -rf "$LOGDIR"' EXIT
 
 run_suite() {
   local name="$1"; shift

@@ -101,12 +101,15 @@ e2e_require() {
 # Reap whatever is still listening on a port.
 # On Windows bash's $! is not a usable Windows PID, so port lookup is the only
 # reliable way to clean up after a case that died before it could self-terminate.
+# 注意 -ExpandProperty OwningProcess 输出的已是裸 PID：再取 $_.ProcessId 会得到
+# null，Stop-Process 静默失败（曾因此让全部按端口清理失效，tok 的客户端泄漏进
+# pad 的面板端口段）。
 e2e_kill_port() {
   local port="$1"
   case "$E2E_OS" in
     windows)
       powershell -NoProfile -Command \
-        "Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+        "Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }" \
         2>/dev/null
       ;;
     *)
@@ -122,6 +125,24 @@ e2e_kill_port() {
 
 # Remove ANSI colour escapes from a log.
 e2e_strip() { sed -e 's/\x1b\[[0-9;]*m//g' "$1"; }
+
+# Last-resort sweep: kill every tlsvpn/probe process left over by a suite.
+# Per-case cleanup reaps by port, but a client whose Web panel failed to bind
+# listens on nothing and would survive it — and a leaked client from one suite
+# occupies the next suite's panel port (CI: tok leaked 9500-9511 into pad).
+# Safe on a dedicated runner or dev box; do not run suites concurrently.
+e2e_reap_all() {
+  case "$E2E_OS" in
+    windows)
+      powershell -NoProfile -Command \
+        "Get-Process | Where-Object {\$_.ProcessName -match 'tlsvpn|probe|interop_client'} | Stop-Process -Force -ErrorAction SilentlyContinue" \
+        2>/dev/null
+      ;;
+    *)
+      pkill -f 'tlsvpn|interop_client|/probe' 2>/dev/null || true
+      ;;
+  esac
+}
 
 # Wait for a TCP port to accept, or return 1 after the deadline (default 20s).
 e2e_wait_port() {

@@ -49,6 +49,10 @@ A_LOG="$(e2e_winpath "$TMP/a.log")"
 B_LOG="$(e2e_winpath "$TMP/b.log")"
 cleanup() {
   e2e_kill_port "$PORT"
+  # 两台客户端不监听隧道端口，只能靠各自的 Web 面板端口定位；漏掉任何一个，
+  # 泄漏的进程都会占住下一个套件的面板端口（CI 上 tok 泄漏 9500-9511 坑死 pad）。
+  e2e_kill_port "$WEB_BASE"
+  e2e_kill_port "$((WEB_BASE + 1))"
   rm -rf "$TMP"
   return 0
 }

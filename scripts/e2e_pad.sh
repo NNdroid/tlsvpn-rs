@@ -43,6 +43,8 @@ SRV_LOG="$(e2e_winpath "$TMP/srv.log")"
 CLI_LOG="$(e2e_winpath "$TMP/cli.log")"
 cleanup() {
   e2e_kill_port "$PORT"
+  # 客户端只监听自己的 Web 面板端口，不杀会累积泄漏（16 组 = 16 个残留进程）。
+  e2e_kill_port "$WEB_BASE"
   rm -rf "$TMP"
   return 0
 }
