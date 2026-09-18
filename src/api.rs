@@ -45,6 +45,10 @@ pub struct HandshakeReq {
     pub encrypt: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub enc_algo: i64,
+    // 客户端回带上一次收到的会话令牌（hex）。服务端开启 session_token 时，
+    // 重连既有会话必须携带正确令牌；旧版实现不发送本字段 → 空串。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_token: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
@@ -78,6 +82,10 @@ pub struct HandshakeResp {
     pub enc_salt: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enc_salt2: String,
+    // 本次会话的重连接入令牌（hex）；仅在服务端开启 session_token 时下发，
+    // 客户端须在下一次同一 client_id 的握手里回带。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_token: String,
 }
 
 pub fn is_zero_u64(v: &u64) -> bool {

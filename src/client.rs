@@ -184,6 +184,8 @@ pub struct SessionState {
     enc_algo: i64,
     gw_v4: String,
     gw_v6: String,
+    // 服务端下发的会话令牌；重连同一 client_id 时必须在握手里回带
+    session_token: String,
 }
 
 // ======================= 客户端 =======================
@@ -861,6 +863,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         .reregister(&mut sock, TOKEN_CONN, Interest::READABLE);
 
     // 3. 握手请求（对齐 Go）
+    // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
+    let session_token = cl.session.lock().session_token.clone();
     let req = HandshakeReq {
         client_id: cl.client_id.clone(),
         psk: hash_psk(&cl.psk),
@@ -878,6 +882,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         brutal_rx: client_rx_rate,
         encrypt: cl.encrypt,
         enc_algo: CLIENT_ENC_ALGO_SUPPORT,
+        session_token,
     };
     let req_json = serde_json::to_vec(&req).unwrap();
     let mut send_buf = Vec::with_capacity(2 * 1024);
@@ -993,6 +998,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         st.gw_v4 = resp.gw_v4.clone();
         st.gw_v6 = resp.gw_v6.clone();
+        // 记下服务端下发的会话令牌，供后续重连回带。服务端未开启
+        // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
+        st.session_token = resp.session_token.clone();
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
         cl.enc_algo_display.store(

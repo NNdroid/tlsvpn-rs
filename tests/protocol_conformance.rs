@@ -255,6 +255,43 @@ struct HandshakeReqShape {
     encrypt: bool,
     #[serde(skip_serializing_if = "is_zero_i64")]
     enc_algo: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    session_token: String,
+}
+
+#[derive(serde::Serialize, Default)]
+struct HandshakeRespShape {
+    success: bool,
+    message: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    session_id: String,
+    client_id: String,
+    ipv4: String,
+    ipv6: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    gw_v4: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    gw_v6: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    padding: String,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    brutal_tx: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    brutal_rx: u64,
+    #[serde(skip_serializing_if = "is_false")]
+    fec: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    fec_group: i64,
+    #[serde(skip_serializing_if = "is_false")]
+    encrypt: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    enc_algo: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    enc_salt: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    enc_salt2: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    session_token: String,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -284,13 +321,19 @@ fn test_handshake_req_field_names() {
         fec_group: 4,
         encrypt: true,
         enc_algo: 2,
+        session_token: "t".into(),
     };
     let val: serde_json::Value = serde_json::to_value(&full).unwrap();
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
     keys.sort();
 
+    // Go 黄金向量里的字段清单是生成器硬编码的，早于 session_token 这一项
+    // （Go 侧 frame.go 的 HandshakeReq 已有该字段）。因此期望集合是
+    // 「黄金向量 ∪ session_token」，而不是逐字相等。
     let mut want = g.handshake_req_keys.clone();
+    want.push("session_token".to_string());
     want.sort();
+    want.dedup();
 
     assert_eq!(
         keys, want,
@@ -299,9 +342,32 @@ fn test_handshake_req_field_names() {
 }
 
 #[test]
-fn test_handshake_resp_field_names_present_in_go() {
-    let g = golden_or_skip!();
-    // Go 端 Resp 的字段集合，Rust 端反序列化时必须能全部接受
+fn test_handshake_resp_field_names() {
+    // Rust 端 Resp 的完整字段集合（与 Go frame.go 的 HandshakeResp 对齐）
+    let full = HandshakeRespShape {
+        success: true,
+        message: "OK".into(),
+        session_id: "s".into(),
+        client_id: "c".into(),
+        ipv4: "1".into(),
+        ipv6: "2".into(),
+        gw_v4: "3".into(),
+        gw_v6: "4".into(),
+        padding: "x".into(),
+        brutal_tx: 1,
+        brutal_rx: 1,
+        fec: true,
+        fec_group: 4,
+        encrypt: true,
+        enc_algo: 2,
+        enc_salt: "a".into(),
+        enc_salt2: "b".into(),
+        session_token: "t".into(),
+    };
+    let val: serde_json::Value = serde_json::to_value(&full).unwrap();
+    let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+
     let expected = [
         "brutal_rx",
         "brutal_tx",
@@ -319,16 +385,74 @@ fn test_handshake_resp_field_names_present_in_go() {
         "message",
         "padding",
         "session_id",
+        "session_token",
         "success",
     ];
-    let mut want = g.handshake_resp_keys.clone();
-    want.sort();
     let mut exp: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
     exp.sort();
     assert_eq!(
-        want, exp,
-        "Go 端 HandshakeResp 字段集合发生变化，Rust 端需同步"
+        keys, exp,
+        "HandshakeResp 字段名集合与 Go 端不一致 —— 服务端可能发不出/客户端读不到"
     );
+}
+
+#[test]
+fn test_golden_handshake_keys_subset_of_rust() {
+    // 黄金向量里的每个字段名，Rust 都必须认识（子集关系）。用子集而不是相等：
+    // Go 生成器的清单硬编码且早于 session_token，逐字相等会把正确的 Rust 变更
+    // 判成失败。方向是单向的——Go 有的 Rust 必须有；Rust 新增的由上面的
+    // test_handshake_req/resp_field_names 锁定。
+    let g = golden_or_skip!();
+
+    let req_full = HandshakeReqShape {
+        session_token: "t".into(),
+        mac: "m".into(),
+        ipv4: "1".into(),
+        ipv6: "2".into(),
+        padding: "x".into(),
+        brutal_tx: 1,
+        brutal_rx: 1,
+        fec: true,
+        fec_group: 4,
+        encrypt: true,
+        enc_algo: 2,
+        ..Default::default()
+    };
+    let resp_full = HandshakeRespShape {
+        success: true,
+        message: "OK".into(),
+        session_id: "s".into(),
+        client_id: "c".into(),
+        ipv4: "1".into(),
+        ipv6: "2".into(),
+        gw_v4: "3".into(),
+        gw_v6: "4".into(),
+        padding: "x".into(),
+        brutal_tx: 1,
+        brutal_rx: 1,
+        fec: true,
+        fec_group: 4,
+        encrypt: true,
+        enc_algo: 2,
+        enc_salt: "a".into(),
+        enc_salt2: "b".into(),
+        session_token: "t".into(),
+    };
+    for (what, golden, shape) in [
+        ("HandshakeReq", &g.handshake_req_keys, serde_json::to_value(&req_full).unwrap()),
+        ("HandshakeResp", &g.handshake_resp_keys, serde_json::to_value(&resp_full).unwrap()),
+    ] {
+        let have: std::collections::BTreeSet<String> =
+            shape.as_object().unwrap().keys().cloned().collect();
+        for k in golden {
+            assert!(
+                have.contains(k),
+                "Go 黄金向量的 {} 字段 {} 在 Rust 端不存在",
+                what,
+                k
+            );
+        }
+    }
 }
 
 #[test]
@@ -350,7 +474,11 @@ fn test_omitempty_semantics() {
         "brutal_tx",
         "brutal_rx",
         "fec",
+        "fec_group",
         "encrypt",
+        "enc_algo",
+        // 旧版客户端不发 session_token：空串必须省略，服务端才收得到"无令牌"
+        "session_token",
     ] {
         assert!(
             !obj.contains_key(k),

@@ -1,6 +1,7 @@
 use aes::Aes256;
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::utils::*;
@@ -15,10 +16,52 @@ pub const ENC_SALT_SIZE: usize = 8;
 // 客户端握手请求里声明的本端最高算法支持（对齐 Go clientEncAlgoSupport）
 pub const CLIENT_ENC_ALGO_SUPPORT: i64 = ENC_ALGO_GCM;
 
+type HmacSha256 = Hmac<Sha256>;
+
 pub fn hash_psk(psk: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(psk.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// PSK 派生的 32 字节密钥材料（hash_psk 的二进制形式，对齐 Go pskKey）
+fn psk_key(psk: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(psk.as_bytes());
+    let out = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out);
+    key
+}
+
+fn session_token_mac(psk: &str, session_id: &str) -> HmacSha256 {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&psk_key(psk))
+        .expect("HMAC accepts any key length");
+    mac.update(b"session-token-v1");
+    mac.update(session_id.as_bytes());
+    mac
+}
+
+/// 会话令牌 = hex(HMAC-SHA256(key = sha256(psk), msg = "session-token-v1" ‖ sessionID))
+///
+/// 身份伪造的根因是"共享 PSK + 自报 MAC"：client_id 完全由 (mac, psk) 推导，
+/// 任何持密者只要知道目标 MAC 就能算出对方 client_id，触发会话复活分支接管
+/// 其隧道流量。令牌只在受害者的 TLS 会话内下发一次，重连时必须回带——
+/// 第三方从未见过它，因此无法冒充既有会话。首次接入仍走 PSK 校验。
+pub fn compute_session_token(psk: &str, session_id: &str) -> String {
+    hex::encode(session_token_mac(psk, session_id).finalize().into_bytes())
+}
+
+/// 常量时间比较令牌（对齐 Go verifySessionToken 的 hmac.Equal）。
+/// 非 32 字节的 hex 直接判失败，不 panic。
+pub fn verify_session_token(psk: &str, session_id: &str, want: &str) -> bool {
+    let want_tag = match hex::decode(want) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return false,
+    };
+    session_token_mac(psk, session_id)
+        .verify_slice(&want_tag)
+        .is_ok()
 }
 
 pub fn generate_padding(min: usize, max: usize) -> String {
@@ -302,4 +345,110 @@ pub fn gen_session_id() -> String {
     let mut buf = [0u8; 16];
     RNG.with(|rng| rng.borrow_mut().fill(&mut buf));
     hex::encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 黄金向量由 Go 端 computeSessionToken 直接产出（main_test.go 的算法），
+    // 并与 openssl dgst -sha256 -mac HMAC -macopt hexkey:<sha256(psk)> 交叉核对。
+    // 改这里任何一位都意味着与 Go 端会话令牌不再互通。
+    const KAT: [(&str, &str, &str); 4] = [
+        (
+            "rotate_me_please",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "74b97373c9d7850945c3366d6b0fb941caf47e20b53f8ef11f9d86ad9054c3d0",
+        ),
+        (
+            "e2e_secret",
+            "abc123",
+            "d71ae47993fef02dd2ed9f04df735099bf099851a8ff6246e45674e2c565fe2d",
+        ),
+        (
+            "change-me-please",
+            "abc123",
+            "255e12f98c5e35c3190912037781ab895658bee2bda81e932bc960222e444672",
+        ),
+        ("e2e_secret", "", "7a45c467705e6b9b0a4352194a4d315a2458f1f07a453836754b07da64d38317"),
+    ];
+
+    #[test]
+    fn session_token_matches_go_golden_vectors() {
+        for (psk, sid, want) in KAT {
+            let got = compute_session_token(psk, sid);
+            assert_eq!(
+                &got, want,
+                "compute_session_token(psk={}, sid={:?}) 与 Go 端不一致",
+                psk, sid
+            );
+            assert_eq!(got.len(), 64, "令牌必须是 64 位 hex");
+        }
+    }
+
+    #[test]
+    fn session_token_is_deterministic_and_psk_bound() {
+        // 同一 (psk, sessionID) 必须稳定：客户端与服务端各自独立算出同一个值
+        let a = compute_session_token("rotate_me_please", "sid-1");
+        let b = compute_session_token("rotate_me_please", "sid-1");
+        assert_eq!(a, b, "令牌必须是 (psk, sessionID) 的纯函数");
+        // sessionID 变了令牌就变（不同会话互不通用）
+        assert_ne!(a, compute_session_token("rotate_me_please", "sid-2"));
+        // PSK 轮换后旧令牌失效
+        assert_ne!(a, compute_session_token("another_psk", "sid-1"));
+        // 密钥材料必须是 sha256(psk) 而不是 psk 本身
+        assert_ne!(psk_key("e2e_secret"), compute_session_token("e2e_secret", "abc123").as_bytes());
+    }
+
+    #[test]
+    fn verify_session_token_accepts_valid_rejects_invalid() {
+        for (psk, sid, tok) in KAT {
+            assert!(
+                verify_session_token(psk, sid, tok),
+                "合法令牌校验必须通过 (psk={}, sid={:?})",
+                psk,
+                sid
+            );
+        }
+    }
+
+    #[test]
+    fn verify_session_token_failure_conditions() {
+        let (psk, sid, tok) = KAT[0];
+        // 会话 ID 被换（冒充别人的会话）
+        assert!(
+            !verify_session_token(psk, "00000000-0000-0000-0000-000000000000", tok),
+            "不同会话 ID 必须失败"
+        );
+        // PSK 被换（轮换后旧令牌）
+        assert!(
+            !verify_session_token("another_psk", sid, tok),
+            "不同 PSK 必须失败"
+        );
+        // 空令牌（旧版客户端）——默认关闭该特性时不应误判为合法
+        assert!(!verify_session_token(psk, sid, ""), "空令牌必须失败");
+        // 非 hex 垃圾串
+        assert!(!verify_session_token(psk, sid, "garbage"), "非 hex 必须失败");
+        // 长度不对（63/65 位 hex）
+        assert!(
+            !verify_session_token(psk, sid, &tok[..63]),
+            "长度不足的 hex 必须失败"
+        );
+        assert!(
+            !verify_session_token(psk, sid, &format!("{}f", tok)),
+            "长度过长的 hex 必须失败"
+        );
+        // 64 位 hex 但内容错误
+        let mut bad = tok.as_bytes().to_vec();
+        bad[0] = if bad[0] == b'0' { b'1' } else { b'0' };
+        assert!(
+            !verify_session_token(psk, sid, std::str::from_utf8(&bad).unwrap()),
+            "改一比特必须失败"
+        );
+        // 全零标签
+        assert!(
+            !verify_session_token(psk, sid, &"0".repeat(64)),
+            "全零标签必须失败"
+        );
+    }
 }

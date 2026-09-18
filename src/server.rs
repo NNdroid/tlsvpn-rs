@@ -230,6 +230,8 @@ pub struct ServerCore {
     pub psk: String,
     pub psk_hash: String,
     pub encrypt: bool,
+    // 重连接入既有会话时必须回带会话令牌（opt-in，默认关闭）
+    pub session_token: bool,
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
@@ -525,6 +527,7 @@ pub fn start_server(args: &Args) {
         psk: args.psk.clone(),
         psk_hash: hash_psk(&args.psk),
         encrypt: args.encrypt,
+        session_token: args.session_token,
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
@@ -1208,6 +1211,16 @@ fn handle_handshake(
                 *tarpit_flag = true;
                 return HandshakeOutcome::TarpitClose;
             }
+            // 会话令牌：client_id 完全由 (MAC, PSK) 推导，持密者只要知道目标
+            // MAC 就能算出对方 client_id 走"会话复活"分支接管其隧道流量。令牌
+            // 只在原会话自己的 TLS 会话内下发一次，第三方从未见过，无法冒充。
+            // 这里刻意不走焦油坑——被拒是运维/客户端可见的明确结果。
+            if core.session_token
+                && !verify_session_token(&core.psk, &existing.session_id, &req.session_token)
+            {
+                warn!("[{}] 拒绝重连: 会话令牌无效（疑似冒充在线会话）", client_id);
+                return HandshakeOutcome::Close;
+            }
             info!("[{}] ⚡ 会话在销毁倒计时内成功复活！(无缝接续)", client_id);
             existing.clone()
         } else {
@@ -1360,6 +1373,12 @@ fn handle_handshake(
     } else {
         (String::new(), String::new())
     };
+    // 会话令牌：仅原会话持有者可重连接管（见 handle_handshake 的校验分支）
+    let sess_token = if core.session_token {
+        compute_session_token(&core.psk, &c_sess.session_id)
+    } else {
+        String::new()
+    };
     let resp = HandshakeResp {
         success: true,
         message: "OK".into(),
@@ -1378,6 +1397,7 @@ fn handle_handshake(
         enc_algo: c_sess.enc_algo,
         enc_salt,
         enc_salt2,
+        session_token: sess_token,
     };
     let resp_json = serde_json::to_vec(&resp).unwrap();
     let mut buf = Vec::with_capacity(1024);
