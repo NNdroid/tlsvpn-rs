@@ -187,6 +187,25 @@ pub struct Args {
         help = "TAP device MTU (larger = fewer frames/syscalls; set on BOTH ends)"
     )]
     pub mtu: u16,
+    #[arg(
+        long = "pad-mode",
+        default_value = "",
+        help = "Confusion padding: legacy | bucket | off (default bucket)"
+    )]
+    pub pad_mode: String,
+    #[arg(
+        long = "min-enc",
+        default_value = "",
+        help = "Minimum inner encryption strength: ctr | gcm (reject weaker negotiation)"
+    )]
+    pub min_enc: String,
+    #[arg(
+        long = "session-token",
+        default_value_t = false,
+        help = "Server: require the session token issued on the original TLS connection \
+                for re-attaching to a live session"
+    )]
+    pub session_token: bool,
     /// 内部字段：由配置文件加载时跳过 clap 解析
     #[arg(skip)]
     pub from_file: bool,
@@ -204,6 +223,12 @@ struct ConfigFile {
     addr: String,
     log_level: String,
     encrypt: bool,
+    // 空串 = 无下限（与旧版一致）；见 min_enc_rank
+    #[serde(default)]
+    min_enc: String,
+    // 空串 = 默认 bucket（与 Go applyDefaults 一致）
+    #[serde(default)]
+    pad_mode: String,
     socks5: String,
     brutal: bool,
     brutal_up: u64,
@@ -221,6 +246,13 @@ struct WebConfigFile {
     addr: String,
     auth: String,
     bind: String,
+    // Go 版把面板 HTTPS 证书放在这里（web.cert / web.key）。Rust 版面板目前
+    // 只走明文 HTTP，无法消费这两个值，但必须能解析——Go 的示例配置里恒有
+    // 它们，留空即代表"不启用面板 HTTPS"，丢弃不改变任何行为。
+    #[allow(dead_code)]
+    cert: String,
+    #[allow(dead_code)]
+    key: String,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -230,6 +262,9 @@ struct ServerConfigFile {
     v6_cidr: String,
     cert: String,
     key: String,
+    // 重连接入既有会话时必须回带会话令牌（opt-in，默认关闭）
+    #[serde(default)]
+    session_token: bool,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -272,9 +307,13 @@ fn load_config_file(path: &str) -> Result<Args, String> {
             cfg.log_level
         },
         encrypt: cfg.encrypt,
+        pad_mode: cfg.pad_mode,
+        min_enc: cfg.min_enc,
         socks5: cfg.socks5,
         workers: cfg.workers,
-        mtu: cfg.mtu,
+        // Go 的配置文件不含 mtu 字段；缺省必须取 flag 默认值 1500，
+        // 否则 0 会被当成合法 MTU 传给 TAP 设备
+        mtu: if cfg.mtu == 0 { 1500 } else { cfg.mtu },
         brutal: cfg.brutal,
         brutal_up: if cfg.brutal_up == 0 {
             100
@@ -305,6 +344,7 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         cert: cfg.server.cert,
         key: cfg.server.key,
+        session_token: cfg.server.session_token,
         req_v4: cfg.client.req_v4,
         req_v6: cfg.client.req_v6,
         sni: if cfg.client.sni.is_empty() {
@@ -368,14 +408,17 @@ fn main() {
     // rustls 0.23 需要显式选择 crypto provider（ring：无 cmake/NASM 依赖）
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let parsed = Args::parse();
-
-    // JSON 配置文件优先（对齐 Go -c 语义；-c <path> 忽略其余 flag）
-    let config_path = std::env::args()
+    // JSON 配置文件优先（对齐 Go -c 语义；-c <path> 忽略其余 flag）。
+    // 必须先于 Args::parse() 判定：clap 不认识 -c/--config，会直接以
+    // "unexpected argument" 退出，配置文件路径将完全不可用。
+    let argv: Vec<String> = std::env::args().collect();
+    let config_path = argv
+        .iter()
         .position(|a| a == "-c" || a == "--config")
-        .and_then(|i| std::env::args().nth(i + 1));
+        .and_then(|i| argv.get(i + 1))
+        .cloned();
     let args = match config_path {
-        Some(path) => match load_config_file(&path) {
+        Some(ref path) => match load_config_file(path) {
             Ok(a) => {
                 println!("Loaded configuration from {}", path);
                 a
@@ -385,7 +428,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => parsed,
+        None => Args::parse(),
     };
 
     init_logging(&args.loglevel);
@@ -438,8 +481,157 @@ mod tests {
     use crate::buffer::*;
     use crate::crypto::*;
     use crate::frame::*;
+    use crate::{ConfigFile, example_config_json, load_config_file};
     use std::io::Read;
     use std::time::Instant;
+
+    // ---------- 配置文件兼容性（与 Go 仓库 config.*.json 逐字段对齐） ----------
+
+    // Go 仓库 config.server.json 的原样内容
+    const GO_SERVER_CONFIG: &str = r#"{
+  "mode": "server",
+  "psk": "change-me-please",
+  "addr": ":4000",
+  "log_level": "info",
+  "encrypt": true,
+  "pad_mode": "bucket",
+  "brutal": true,
+  "brutal_up": 100,
+  "brutal_down": 500,
+  "tap": "tap0",
+  "mac": "",
+  "web": {
+    "addr": ":8080",
+    "bind": "tunnel",
+    "auth": "admin:change-me",
+    "cert": "",
+    "key": ""
+  },
+  "server": {
+    "v4_cidr": "10.0.0.0/24",
+    "v6_cidr": "fd00::/64",
+    "cert": "",
+    "key": "",
+    "session_token": false
+  }
+}
+"#;
+
+    // Go 仓库 config.client.json 的原样内容
+    const GO_CLIENT_CONFIG: &str = r#"{
+  "mode": "client",
+  "psk": "change-me-please",
+  "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
+  "log_level": "info",
+  "encrypt": true,
+  "pad_mode": "bucket",
+  "brutal": true,
+  "brutal_up": 100,
+  "brutal_down": 500,
+  "socks5": "",
+  "tap": "tap0",
+  "mac": "",
+  "web": {
+    "addr": ":8080",
+    "bind": "tunnel",
+    "auth": "admin:change-me",
+    "cert": "",
+    "key": ""
+  },
+  "client": {
+    "conns": 4,
+    "fec": true,
+    "fec_group": 4,
+    "sni": "www.cloudflare.com",
+    "insecure": false,
+    "cert_sha256": "",
+    "req_v4": "",
+    "req_v6": "",
+    "fwmark": 0
+  }
+}
+"#;
+
+    #[test]
+    fn go_config_files_parse_verbatim() {
+        // Go 的配置文件必须能被 Rust 原样读入（含 pad_mode / server.session_token /
+        // web.cert / web.key），否则 -c 指向 Go 配置时启动直接失败。
+        for (name, raw) in [("server", GO_SERVER_CONFIG), ("client", GO_CLIENT_CONFIG)] {
+            let cfg = serde_json::from_str::<ConfigFile>(raw)
+                .unwrap_or_else(|e| panic!("Go {} 配置解析失败: {}", name, e));
+            assert_eq!(cfg.mode, name);
+            assert_eq!(cfg.pad_mode, "bucket", "{} 配置的 pad_mode 未读入", name);
+            assert!(!cfg.server.session_token, "{} 配置的 session_token 未读入", name);
+            // Go 配置不含 workers / mtu / min_enc，缺省值必须与 flag 默认一致
+            assert_eq!(cfg.workers, 0);
+            assert_eq!(cfg.mtu, 0, "mtu 缺省应由 load_config_file 归一到 1500");
+            assert!(cfg.min_enc.is_empty());
+        }
+    }
+
+    #[test]
+    fn go_config_files_parse_without_new_fields() {
+        // 反向兼容：删掉三档新增字段（以及 web.cert/web.key）后同样可解析，
+        // 即旧版 Rust 配置不被新字段污染。
+        for (name, raw) in [("server", GO_SERVER_CONFIG), ("client", GO_CLIENT_CONFIG)] {
+            let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let top = v.as_object_mut().unwrap();
+            top.remove("pad_mode");
+            top.remove("min_enc");
+            if let Some(s) = top.get_mut("server").and_then(|s| s.as_object_mut()) {
+                s.remove("session_token");
+            }
+            if let Some(w) = top.get_mut("web").and_then(|w| w.as_object_mut()) {
+                w.remove("cert");
+                w.remove("key");
+            }
+            let cfg = serde_json::from_value::<ConfigFile>(v)
+                .unwrap_or_else(|e| panic!("Go {} 配置去字段后解析失败: {}", name, e));
+            assert!(cfg.pad_mode.is_empty(), "{}: pad_mode 缺省应为空串", name);
+            assert!(cfg.min_enc.is_empty(), "{}: min_enc 缺省应为空串", name);
+            assert!(!cfg.server.session_token, "{}: session_token 缺省应为 false", name);
+        }
+    }
+
+    #[test]
+    fn config_file_still_rejects_unknown_fields() {
+        // 兼容三档字段不是靠放开 deny_unknown_fields 实现的
+        let raw = GO_SERVER_CONFIG.replace(
+            "\"pad_mode\": \"bucket\",",
+            "\"pad_mode\": \"bucket\", \"typo_key\": true,",
+        );
+        assert!(
+            serde_json::from_str::<ConfigFile>(&raw).is_err(),
+            "拼写错误的未知字段必须报错，否则配置静默失效"
+        );
+    }
+
+    #[test]
+    fn example_config_json_is_parseable() {
+        // 模板本身就是最容易被改坏的配置样例
+        let raw = example_config_json();
+        let cfg = serde_json::from_str::<ConfigFile>(&raw)
+            .unwrap_or_else(|e| panic!("--print-config 模板解析失败: {}", e));
+        assert_eq!(cfg.mode, "client");
+        assert_eq!(cfg.min_enc, "gcm");
+        assert_eq!(cfg.pad_mode, "bucket");
+        assert!(!cfg.server.session_token);
+    }
+
+    #[test]
+    fn load_config_file_defaults_mtu_and_workers() {
+        // Go 配置文件不含 mtu/workers；缺省必须取 flag 默认值而非 0
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tlsvpn-cfgtest-{}.json", std::process::id()));
+        std::fs::write(&path, GO_CLIENT_CONFIG).unwrap();
+        let args = load_config_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(args.mtu, 1500);
+        assert_eq!(args.workers, 0);
+        assert_eq!(args.conns, 4);
+        assert_eq!(args.pad_mode, "bucket");
+        assert!(args.min_enc.is_empty());
+    }
 
     struct InfiniteReader {
         data: Vec<u8>,
@@ -505,6 +697,8 @@ fn example_config_json() -> String {
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
   "encrypt": true,
+  "min_enc": "gcm",
+  "pad_mode": "bucket",
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
@@ -516,7 +710,9 @@ fn example_config_json() -> String {
   "web": {{
     "addr": ":8080",
     "auth": "admin:change-me",
-    "bind": "all"
+    "bind": "all",
+    "cert": "",
+    "key": ""
   }},
   "client": {{
     "conns": 4,
@@ -533,7 +729,8 @@ fn example_config_json() -> String {
     "v4_cidr": "10.0.0.0/24",
     "v6_cidr": "fd00::/64",
     "cert": "",
-    "key": ""
+    "key": "",
+    "session_token": false
   }}
 }}"#,
         num_cpus_hint()
