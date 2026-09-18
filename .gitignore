@@ -24,5 +24,9 @@ target
 # Rust-generated golden vector bootstrap artifact (Go repo is source of truth)
 protocol_golden.rust.json
 *.pem
-/interop/
+# interop/ 放 Go 探针（README 有引用）：只放行源码，构建产物 probe* 继续忽略
+/interop/*
+!/interop/probe.go
+!/interop/go.mod
+!/interop/go.sum
 dist/

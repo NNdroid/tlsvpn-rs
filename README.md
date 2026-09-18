@@ -157,6 +157,39 @@ cargo run --release --example interop_client -- --addr 127.0.0.1:4000 --psk secr
 go build -C interop -o probe.exe . && ./interop/probe.exe --addr <server> --psk secret --encrypt --fec --fec-group 4
 ```
 
+### Cross-language e2e suites
+
+`scripts/e2e_test.sh` is the single entry point. It drives four suites against a
+real Rust build and a real Go build over the in-memory TAP (`--tap mem`), so it
+needs no `CAP_NET_ADMIN` — unlike `net_perf_test.sh`, it runs for real on hosted
+CI:
+
+```bash
+./scripts/build.sh native                      # Rust server/client
+cargo build --examples                          # Rust probe
+(cd ../tlsvpn && ./scripts/build.sh)            # Go server/client
+go build -C interop -o interop/probe .          # Go probe
+./scripts/e2e_test.sh                           # all suites
+./scripts/e2e_test.sh accept tok                # selected suites
+```
+
+| suite  | cases | what it covers |
+|--------|------:|----------------|
+| accept | 21    | 档 A/B/C/D matrix — all features on, all off (fallback path), old↔new mixes, opt-in cost to old peers |
+| tok    | 6     | session_token hijack via two same-MAC clients — 4 reject + 2 takeover control |
+| pad    | 16    | pad_mode off / legacy / bucket × server and client implementation, plus the invalid value |
+| minenc | 30    | min_enc "" / ctr / legacy / gcm floors × declared enc_algo, incl. unknown algo IDs |
+
+Each suite is also runnable standalone with its own env knobs (`SRV`, `CLI`,
+`PAD`, `PORT`, … — see the header of each script). Ports are offset per case from
+a `PORT_BASE_*` env var so concurrent runs don't collide. The mixed-version cases
+(`accept` P3/P4) are skipped with a count rather than failing when the
+pre-feature binaries aren't built — point `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`
+and `E2E_GO_OLD_BIN` at them to enable.
+
+`e2e_cert.pem` / `e2e_key.pem` are gitignored; when they're absent the suites
+generate a throwaway self-signed pair with `openssl`. Shared helpers live in
+`scripts/e2e_lib.sh`.
 Protocol-path benchmark (frame scan + legacy inner crypto, 1M iterations, single core):
 
 ```bash

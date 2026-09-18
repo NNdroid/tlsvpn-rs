@@ -39,6 +39,46 @@ jobs:
       # ISA (AES-NI/AVX2 paths) rather than the generic x86-64 baseline.
       run: RUSTFLAGS="-C target-cpu=native" cargo test --release bench_protocol_throughput -- --ignored --nocapture
 
+  # Cross-language e2e suites (scripts/e2e_test.sh): the 档 A/B/C/D acceptance
+  # matrix, session_token hijack, pad_mode and min_enc policy — 73 cases driven
+  # by the in-memory TAP probes. No CAP_NET_ADMIN and no root required, so these
+  # run for real on hosted runners (net-perf below is the one that self-skips).
+  e2e-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Checkout Go implementation (cross-language matrix)
+      uses: actions/checkout@v4
+      with:
+        repository: NNdroid/tlsvpn
+        path: go-impl
+
+    - name: Build Rust binary and probe
+      run: |
+        bash scripts/build.sh native
+        cargo build --examples
+
+    - name: Build Go binary and probe
+      run: |
+        (cd go-impl && bash scripts/build.sh)
+        go build -C interop -o probe .
+
+    - name: Cross-language e2e (accept / tok / pad / minenc)
+      env:
+        E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
+        E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+      run: bash scripts/e2e_test.sh
+
   # Network performance tests over a REAL TAP tunnel: ping (v4/v6, 0% loss),
   # traceroute (v4/v6 through the tunnel), iperf3 up/down throughput and an
   # optional librespeed run (scripts/net_perf_test.sh).
