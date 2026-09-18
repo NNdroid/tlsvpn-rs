@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::sync::atomic::Ordering;
-use tracing::error;
+use tracing::{error, info, warn};
 
 // mimalloc：每帧多次 malloc/free 的场景下比系统分配器快 10-20%
 #[global_allocator]
@@ -378,6 +378,10 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.addr.is_empty() {
         return Err("addr is required".into());
     }
+    // 配置加载层强校验；set_pad_mode 的 legacy 回落只兜住面板热更路径
+    if !crypto::pad_mode_valid(&args.pad_mode) {
+        return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
+    }
     if args.mode == "client" {
         if args.conns < 1 {
             return Err("client conns must be >= 1".into());
@@ -441,6 +445,20 @@ fn main() {
     if let Err(e) = validate_args(&args) {
         error!("Invalid configuration: {}", e);
         std::process::exit(1);
+    }
+
+    // 填充策略全局生效（发送路径读取），面板可热更。
+    // 空串 = 默认 bucket（对齐 Go Config.applyDefaults）。
+    let pad_cfg = if args.pad_mode.is_empty() {
+        crypto::PAD_MODE_BUCKET
+    } else {
+        args.pad_mode.as_str()
+    };
+    let pad_actual = crypto::set_pad_mode(pad_cfg);
+    if pad_actual != pad_cfg {
+        warn!("Invalid pad_mode {:?}, using {}", args.pad_mode, pad_actual);
+    } else {
+        info!("Confusion padding: {}", pad_actual);
     }
 
     install_signal_handler();

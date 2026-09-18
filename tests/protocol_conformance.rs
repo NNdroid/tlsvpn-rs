@@ -493,12 +493,12 @@ fn test_omitempty_semantics() {
 
 // ---------- 填充长度分支 ----------
 
-fn get_padding_length_bounds(data_len: usize) -> (usize, usize) {
-    if data_len == 0 {
+fn get_padding_length_bounds(wire_len: usize) -> (usize, usize) {
+    if wire_len == 0 {
         (100, 300)
-    } else if data_len < 200 {
+    } else if wire_len < 200 {
         (300, 499)
-    } else if data_len < 800 {
+    } else if wire_len < 800 {
         (100, 299)
     } else {
         (0, 99)
@@ -507,9 +507,10 @@ fn get_padding_length_bounds(data_len: usize) -> (usize, usize) {
 
 #[test]
 fn test_padding_length_branches_match_go() {
-    // 校验分支边界与 Go 端一致（Go: 0->[100,300], <200->[300,499],
-    // <800->[100,299], else->[0,99]）
-    for (len, want) in [
+    // 校验 legacy 分支边界与 Go 端一致（Go padLegacy:
+    // 0->[100,300], <200->[300,499], <800->[100,299], else->[0,99]）。
+    // 入参是线路长度（明文 + GCM 标签），不是明文长度。
+    for (wire_len, want) in [
         (0usize, (100usize, 300usize)),
         (1, (300, 499)),
         (199, (300, 499)),
@@ -519,10 +520,10 @@ fn test_padding_length_branches_match_go() {
         (1400, (0, 99)),
     ] {
         assert_eq!(
-            get_padding_length_bounds(len),
+            get_padding_length_bounds(wire_len),
             want,
-            "data_len={} 的填充范围与 Go 端不一致",
-            len
+            "wire_len={} 的填充范围与 Go 端不一致",
+            wire_len
         );
     }
 }

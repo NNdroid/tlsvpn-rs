@@ -511,6 +511,13 @@ footer { text-align:center; color:#666; font-size:.78em; margin-top:16px; }
           <option value="warn">warn</option><option value="error">error</option>
         </select>
       </label>
+      <label style="font-size:.85em;color:#999">填充
+        <select id="padmode" onchange="setPadMode(this.value)">
+          <option value="legacy">legacy</option>
+          <option value="bucket">bucket</option>
+          <option value="off">off</option>
+        </select>
+      </label>
       <label style="font-size:.85em;color:#999"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
       <button class="btn gray" onclick="logSeq=0;document.getElementById('logbox').innerHTML=''">清屏</button>
     </div>
@@ -563,6 +570,7 @@ async function fetchStats(){
     document.getElementById('ver').innerText=data.version||'-';
     document.getElementById('uptime').innerText=fmtDur(data.uptime_sec||0);
     document.getElementById('loglevel').value=data.log_level||'info';
+    document.getElementById('padmode').value=data.pad_mode||'legacy';
     document.getElementById('tls-flag').innerText=location.protocol==='https:'?'HTTPS':'HTTP（建议 -web-cert 启用 HTTPS）';
 
     let tbody='',tTx=0,tRx=0,tTxS=0,tRxS=0,cur={},tConns=0;
@@ -650,6 +658,7 @@ async function addBan(){const id=document.getElementById('ban-id').value.trim();
 async function unban(id){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'unban',client_id:id})});fetchStats();}
 async function doAction(action,extra){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:action},extra||{}))});fetchStats();}
 async function setLogLevel(v){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'loglevel',level:v})});}
+async function setPadMode(v){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pad_mode',level:v})});}
 
 function startLogPoll(){
   stopLogPoll();pollLogs();logTimer=setInterval(pollLogs,2000);

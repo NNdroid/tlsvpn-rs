@@ -299,6 +299,7 @@ impl WebStatsProvider for Client {
             "global_tx_bytes": 0,
             "global_rx_bytes": 0,
             "log_level": current_log_level_name(),
+            "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
             "fec": {"enabled": self.fec_mode, "parity_tx": self.tx_port.parity_sent(), "recovered": rec, "lost": lost},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
@@ -395,6 +396,17 @@ impl WebStatsProvider for Client {
                 Ok(())
             }
             "loglevel" => set_runtime_log_level(level),
+            // 填充策略是全局发送路径状态；非法值回落 legacy
+            "pad_mode" => {
+                let want = level.to_string();
+                let actual = set_pad_mode(level);
+                if actual != want {
+                    warn!("[WebUI] Invalid pad_mode {:?}, using {}", want, actual);
+                } else {
+                    info!("[WebUI] Confusion padding -> {}", actual);
+                }
+                Ok(())
+            }
             "gc" => Ok(()),
             _ => Err("Unknown action".into()),
         }

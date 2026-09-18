@@ -16,7 +16,10 @@ pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<
         Some(c) if seq != 0 && data_len > 0 => c.tag_len(),
         _ => 0,
     };
-    let pad_len = crate::crypto::get_padding_length(data_len);
+    // 填充按线路长度计算（明文 + GCM 标签），不是明文长度：
+    // GCM 密文比明文多 16B 标签，按明文长度分桶会把同一线路长度
+    // 的帧划进不同的桶，破坏 bucket 模式的"固定长度分布"。
+    let pad_len = crate::crypto::pad_length(data_len + enc_tag);
 
     let start_idx = buf.len();
     let needed = 10 + data_len + enc_tag + pad_len;
@@ -182,4 +185,107 @@ impl FrameScanner {
 pub struct VPNFrame {
     pub seq: u32,
     pub data: std::sync::Arc<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 填充必须按线路长度（明文 + GCM 标签）分桶，而不是明文长度。
+    /// 128 号桶边界落在明文 112B 上（112 + 16B 标签 = 128）：
+    /// 按线路长度算应填 0，误按明文长度算会填 16——两者可区分。
+    #[test]
+    fn padding_is_keyed_on_wire_length() {
+        let _g = crate::crypto::PAD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = crate::crypto::pad_mode_name();
+        let _ = crate::crypto::set_pad_mode("bucket");
+
+        let salt: [u8; 8] = [7; 8];
+        let ic = InnerCipher::gcm("e2e_secret", &salt).unwrap();
+
+        for &(pt_len, want_data_len, want_pad) in
+            &[(112usize, 128usize, 0usize), (113, 129, 127), (0, 0, 0)]
+        {
+            let data = vec![0xABu8; pt_len];
+            let mut buf = Vec::new();
+            append_padded_frame(&mut buf, 1, &data, Some(&ic));
+
+            let data_len =
+                u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+            let pad_len = u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
+
+            assert_eq!(
+                buf.len(),
+                10 + data_len + pad_len,
+                "帧总长必须自洽（头部 + 载荷 + 填充）"
+            );
+            assert_eq!(
+                data_len,
+                want_data_len,
+                "明文 {}B 加密后线路 dataLen 应为 {}（含 16B 标签）",
+                pt_len,
+                want_data_len
+            );
+            assert_eq!(
+                pad_len,
+                want_pad,
+                "明文 {}B（线路 {}B）应填 {}B",
+                pt_len,
+                want_data_len,
+                want_pad
+            );
+        }
+
+        // off 模式：任何长度都不填充
+        let _ = crate::crypto::set_pad_mode("off");
+        let data = vec![0u8; 300];
+        let mut buf = Vec::new();
+        append_padded_frame(&mut buf, 2, &data, Some(&ic));
+        assert_eq!(
+            u16::from_be_bytes(buf[4..6].try_into().unwrap()),
+            0,
+            "off 模式必须零填充"
+        );
+
+        // seq==0 的控制帧恒不加密，标签不占线路长度
+        let mut buf = Vec::new();
+        append_padded_frame(&mut buf, 0, &data, Some(&ic));
+        let data_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            data_len, 300,
+            "seq==0 的帧不得附加加密标签"
+        );
+
+        let _ = crate::crypto::set_pad_mode(&prev);
+    }
+
+    /// legacy 阈值同样以线路长度为输入：明文 184B → 线路 200B 落在
+    /// [100,299] 区间，而不是明文 184B 所在的 [300,499] 区间。
+    #[test]
+    fn legacy_thresholds_use_wire_length() {
+        let _g = crate::crypto::PAD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = crate::crypto::pad_mode_name();
+        let _ = crate::crypto::set_pad_mode("legacy");
+
+        let salt: [u8; 8] = [9; 8];
+        let ic = InnerCipher::gcm("e2e_secret", &salt).unwrap();
+
+        // 明文 184B：线路 200B → [100,299]；若按明文长度算是 [300,499]
+        for _ in 0..300 {
+            let mut buf = Vec::new();
+            append_padded_frame(&mut buf, 3, &[0u8; 184], Some(&ic));
+            let pad_len = u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
+            assert!(
+                (100..=299).contains(&pad_len),
+                "明文 184B / 线路 200B 的 legacy 填充应在 [100,299]，实际 {}",
+                pad_len
+            );
+        }
+
+        let _ = crate::crypto::set_pad_mode(&prev);
+    }
 }

@@ -3,6 +3,7 @@ use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::utils::*;
 
@@ -71,21 +72,105 @@ pub fn generate_padding(min: usize, max: usize) -> String {
     hex::encode(buf)
 }
 
-/// 填充长度策略（对齐 Go getPaddingLength）：
-/// 0 → [100,300]，<200 → [300,499]，<800 → [100,299]，其余 → [0,99]
-pub fn get_padding_length(data_len: usize) -> usize {
+/// 混淆填充策略（对齐 Go frame.go 的 padModeCode）。
+/// 发送路径按整数码分派，接收路径完全不看它——pad_len 在帧头里自带。
+pub const PAD_OFF: u8 = 0;
+pub const PAD_LEGACY: u8 = 1;
+pub const PAD_BUCKET: u8 = 2;
+
+pub const PAD_MODE_OFF: &str = "off";
+pub const PAD_MODE_LEGACY: &str = "legacy";
+pub const PAD_MODE_BUCKET: &str = "bucket";
+
+/// 默认与进程初值都是 legacy（对齐 Go 的 init()），
+/// 但配置层的空串会在应用前被改写成 bucket。
+static PAD_MODE_CODE: AtomicU8 = AtomicU8::new(PAD_LEGACY);
+
+// pad_mode 是进程级全局状态。Rust 测试默认并行，改它的用例必须串行；
+// 这里只放锁，策略分派不持锁，避免发送热路径出现同步开销。
+#[cfg(test)]
+pub static PAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 小帧填充目标桶（覆盖 MTU 1500 常见帧及其含标签长度）
+const PAD_BUCKETS: [usize; 8] = [128, 256, 384, 512, 768, 1024, 1280, 1514];
+
+/// 切换填充策略（非法值回落 legacy），返回实际生效的策略名。
+/// 空串也算非法 → legacy；配置层的"空串即 bucket"改写必须在此之前完成。
+pub fn set_pad_mode(mode: &str) -> String {
+    match mode {
+        PAD_MODE_OFF => PAD_MODE_CODE.store(PAD_OFF, Ordering::Relaxed),
+        PAD_MODE_BUCKET => PAD_MODE_CODE.store(PAD_BUCKET, Ordering::Relaxed),
+        _ => {
+            PAD_MODE_CODE.store(PAD_LEGACY, Ordering::Relaxed);
+            return PAD_MODE_LEGACY.to_string();
+        }
+    }
+    mode.to_string()
+}
+
+pub fn pad_mode_name() -> String {
+    match PAD_MODE_CODE.load(Ordering::Relaxed) {
+        PAD_OFF => PAD_MODE_OFF.to_string(),
+        PAD_BUCKET => PAD_MODE_BUCKET.to_string(),
+        _ => PAD_MODE_LEGACY.to_string(),
+    }
+}
+
+/// 当前策略下该线路长度应加多少填充。
+/// wire_len 必须是线路长度（明文 + GCM 标签），不是明文长度。
+pub fn pad_length(wire_len: usize) -> usize {
+    match PAD_MODE_CODE.load(Ordering::Relaxed) {
+        PAD_OFF => 0,
+        PAD_BUCKET => pad_bucket(wire_len),
+        _ => pad_legacy(wire_len),
+    }
+}
+
+/// 旧版随机填充（阈值语义不变，入参改为线路长度）
+pub fn pad_legacy(wire_len: usize) -> usize {
     RNG.with(|rng| {
         let mut r = rng.borrow_mut();
-        if data_len == 0 {
+        if wire_len == 0 {
             100 + r.gen_range(0, 201)
-        } else if data_len < 200 {
+        } else if wire_len < 200 {
             300 + r.gen_range(0, 200)
-        } else if data_len < 800 {
+        } else if wire_len < 800 {
             100 + r.gen_range(0, 200)
         } else {
             r.gen_range(0, 100)
         }
     })
+}
+
+/// 填充到固定长度桶；超出最大桶的 jumbo 帧只加小额随机填充，
+/// 不为抗流量分析付过大带宽代价。
+pub fn pad_bucket(wire_len: usize) -> usize {
+    if wire_len == 0 {
+        return 0;
+    }
+    for &b in PAD_BUCKETS.iter() {
+        if wire_len <= b {
+            return b - wire_len;
+        }
+    }
+    RNG.with(|rng| rng.borrow_mut().gen_range(0, 100))
+}
+
+/// 校验 pad_mode 取值（配置加载层，对齐 Go Config.Validate）。
+/// 空串合法：等价于默认 bucket。
+pub fn pad_mode_valid(mode: &str) -> bool {
+    mode.is_empty()
+        || mode == PAD_MODE_OFF
+        || mode == PAD_MODE_LEGACY
+        || mode == PAD_MODE_BUCKET
+}
+
+/// 配置加载层的错误文案，与 Go Validate 逐字一致
+pub fn pad_mode_invalid_error(mode: &str) -> String {
+    format!(
+        "invalid pad_mode {:?} (want {}, {} or {})",
+        mode, PAD_MODE_OFF, PAD_MODE_LEGACY, PAD_MODE_BUCKET
+    )
 }
 
 pub fn get_cipher_context(psk: &str) -> (Vec<u8>, Vec<u8>) {
@@ -449,6 +534,145 @@ mod tests {
         assert!(
             !verify_session_token(psk, sid, &"0".repeat(64)),
             "全零标签必须失败"
+        );
+    }
+
+    // ---------- 混淆填充策略（档 C） ----------
+    //
+    // 入参是线路负载长度（明文 + GCM 标签），不是明文长度。
+    // 阈值与桶边界逐个对齐 Go 的 TestPadModeLegacyRanges / Off / Bucket / Fallback。
+
+    /// 串行执行一次改 pad_mode 全局的用例，结束后恢复原值。
+    fn with_pad_mode(mode: &str, f: impl FnOnce()) {
+        let _g = PAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = pad_mode_name();
+        let _ = set_pad_mode(mode);
+        f();
+        let _ = set_pad_mode(&prev);
+    }
+
+    #[test]
+    fn pad_legacy_ranges_match_go() {
+        with_pad_mode("legacy", || {
+            for &(wire_len, (min, max)) in &[
+                (0usize, (100usize, 300usize)),
+                (1, (300, 499)),
+                (199, (300, 499)),
+                (200, (100, 299)),
+                (799, (100, 299)),
+                (800, (0, 99)),
+                (1400, (0, 99)),
+            ] {
+                for _ in 0..200 {
+                    let got = pad_length(wire_len);
+                    assert!(
+                        got >= min && got <= max,
+                        "legacy 模式 wire_len={} 的填充 {} 超出预期范围 [{},{}]",
+                        wire_len,
+                        got,
+                        min,
+                        max
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn pad_off_never_pads() {
+        with_pad_mode("off", || {
+            for &n in &[0usize, 1, 100, 200, 1500, 70000] {
+                assert_eq!(
+                    pad_length(n),
+                    0,
+                    "off 模式下 wire_len={} 的填充应为 0",
+                    n
+                );
+            }
+            assert_eq!(pad_mode_name(), "off", "pad_mode_name 应反映实际生效值");
+        });
+    }
+
+    #[test]
+    fn pad_bucket_fills_exactly_to_boundary() {
+        with_pad_mode("bucket", || {
+            // 逐个桶核对：桶边界本身不填，边界前一字节恰好填 1
+            for &b in PAD_BUCKETS.iter() {
+                assert_eq!(
+                    pad_length(b),
+                    0,
+                    "bucket 模式 wire_len={}（正好在桶边界）应填 0",
+                    b
+                );
+                assert_eq!(
+                    pad_length(b - 1),
+                    1,
+                    "bucket 模式 wire_len={} 应填 1 到 {} 桶",
+                    b - 1,
+                    b
+                );
+            }
+            // Go 用例里的精确期望值
+            for &(wire_len, want) in &[
+                (0usize, 0usize),
+                (1, 127),
+                (128, 0),
+                (129, 127),
+                (1500, 14),
+                (1514, 0),
+            ] {
+                assert_eq!(
+                    pad_length(wire_len),
+                    want,
+                    "bucket 模式 wire_len={} 应填 {}",
+                    wire_len,
+                    want
+                );
+            }
+            // 超出最大桶的 jumbo 帧只加小额随机填充
+            for _ in 0..100 {
+                let got = pad_length(1515);
+                assert!(
+                    got <= 99,
+                    "jumbo 帧填充应为 [0,99]，实际 {}",
+                    got
+                );
+            }
+            assert_eq!(pad_mode_name(), "bucket");
+        });
+    }
+
+    #[test]
+    fn pad_mode_invalid_falls_back_to_legacy() {
+        with_pad_mode("legacy", || {
+            for bad in ["bogus", "", "offf", "LEGACY", "bucket ", "0"] {
+                let got = set_pad_mode(bad);
+                assert_eq!(
+                    got, "legacy",
+                    "非法 pad_mode {:?} 应回落 legacy",
+                    bad
+                );
+                assert_eq!(
+                    pad_mode_name(),
+                    "legacy",
+                    "非法 pad_mode 后生效值应为 legacy"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pad_mode_valid_accepts_the_three_plus_empty() {
+        assert!(pad_mode_valid(""));
+        assert!(pad_mode_valid("off"));
+        assert!(pad_mode_valid("legacy"));
+        assert!(pad_mode_valid("bucket"));
+        for bad in ["bogus", "offf", "LEGACY", "bucket ", "1"] {
+            assert!(!pad_mode_valid(bad), "配置层应拒绝 {:?}", bad);
+        }
+        assert_eq!(
+            pad_mode_invalid_error("bogus"),
+            "invalid pad_mode \"bogus\" (want off, legacy or bucket)"
         );
     }
 }
