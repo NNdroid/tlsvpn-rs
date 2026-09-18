@@ -139,7 +139,12 @@ e2e_reap_all() {
         2>/dev/null
       ;;
     *)
-      pkill -f 'tlsvpn|interop_client|/probe' 2>/dev/null || true
+      # pkill -f 匹配完整命令行。不能用 'tlsvpn' 这种宽模式：本仓库路径
+      # （…/tlsvpn-rs/scripts/e2e_accept.sh）本身就含 "tlsvpn"，会把自己
+      # SIGTERM 掉——CI 实测 accept 的汇总还没打印就 "Terminated"。改为只
+      # 匹配套件真正启动的那几个二进制路径，脚本进程的命令行不含它们。
+      local pat="${E2E_RS_BIN}|${E2E_GO_BIN}|${E2E_RS_PROBE}|${E2E_GO_PROBE}"
+      pkill -f "$pat" 2>/dev/null || true
       ;;
   esac
 }
