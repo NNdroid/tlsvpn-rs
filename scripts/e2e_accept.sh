@@ -79,10 +79,25 @@ run_case() {
       --tap mem --loglevel info
     for w in $srv_extra; do set -- "$@" "$w"; done
   else
-    set -- "$gobin" -mode server -addr "127.0.0.1:$port" -psk "$PSK" -encrypt \
-      -cert "$CERT" -key "$KEY" -v4cidr 10.77.0.0/24 -v6cidr fd77::/64 \
-      -tap mem -loglevel info
-    for w in $srv_extra; do set -- "$@" "$w"; done
+    # Go 服务器：flags 已移除（2026-09-19），一律走配置文件。这里只生成
+    # 「长青字段」（JSON 首发即有），对 pre-feature 的 goold 同样可用——
+    # goold 的 schema 还没有 min_enc/pad_mode/session_token，
+    # DisallowUnknownFields 会拒收这些键。需要新特性字段时用 go_cfg_now
+    # 生成 SRV_CFG 传入（P1/P4 的 go 用例正是这么做的）。
+    if [ -n "$srv_extra" ]; then
+      printf '  %sFAIL%s      [%s] go server 的 srv_extra 必须经 SRV_CFG 传入（flags 已移除）: %s\n' \
+        "$E2E_RED" "$E2E_RESET" "$label" "$srv_extra"
+      FAIL_N=$((FAIL_N + 1)); FAILED_CASES+=("$label")
+      return 0
+    fi
+    local gocfg
+    gocfg="$(e2e_winpath "$tmp/srv.json")"
+    e2e_config "$gocfg" server "127.0.0.1:$port" \
+      "\"psk\": \"$PSK\"" \
+      '"encrypt": true' \
+      '"log_level": "info"' \
+      "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
+    set -- "$gobin" -c "$gocfg"
   fi
   "$@" >"$slog" 2>&1 &
   e2e_wait_port 127.0.0.1 "$port" 15 || {

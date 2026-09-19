@@ -59,9 +59,14 @@ if [ "$PAD" = "bogus" ]; then
       --cert "$CERT" --key "$KEY" --v4cidr 10.77.0.0/24 --v6cidr fd77::/64 \
       --tap mem --pad-mode bogus 2>&1; } | timeout 15 cat )"
   else
-    OUT="$( { "$SRV_BIN" -mode server -addr "127.0.0.1:$PORT" -psk "$PSK" -encrypt \
-      -cert "$CERT" -key "$KEY" -v4cidr 10.77.0.0/24 -v6cidr fd77::/64 \
-      -tap mem -pad-mode bogus 2>&1; } | timeout 15 cat )"
+    # Go 服务端：flags 已移除（2026-09-19），配置里写非法 pad_mode 触发启动期校验失败
+    local_cfg="$TMP/srv_bogus.json"
+    e2e_config "$local_cfg" server "127.0.0.1:$PORT" \
+      "\"psk\": \"$PSK\"" \
+      '"encrypt": true' \
+      '"pad_mode": "bogus"' \
+      "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
+    OUT="$( { "$SRV_BIN" -c "$(e2e_winpath "$local_cfg")" 2>&1; } | timeout 15 cat )"
   fi
   PASS=0
   if echo "$OUT" | grep -q "invalid pad_mode"; then PASS=1; else PASS=0; fi
@@ -78,9 +83,14 @@ if [ "$SRV" = rs ]; then
     --cert "$CERT" --key "$KEY" --v4cidr 10.77.0.0/24 --v6cidr fd77::/64 \
     --tap mem --loglevel info --pad-mode "$PAD" >"$SRV_LOG" 2>&1 &
 else
-  "$SRV_BIN" -mode server -addr "127.0.0.1:$PORT" -psk "$PSK" -encrypt \
-    -cert "$CERT" -key "$KEY" -v4cidr 10.77.0.0/24 -v6cidr fd77::/64 \
-    -tap mem -loglevel info -pad-mode "$PAD" >"$SRV_LOG" 2>&1 &
+  local_cfg="$TMP/srv.json"
+  e2e_config "$local_cfg" server "127.0.0.1:$PORT" \
+    "\"psk\": \"$PSK\"" \
+    '"encrypt": true' \
+    '"log_level": "info"' \
+    "\"pad_mode\": \"$PAD\"" \
+    "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
+  "$SRV_BIN" -c "$(e2e_winpath "$local_cfg")" >"$SRV_LOG" 2>&1 &
 fi
 e2e_wait_port 127.0.0.1 "$PORT" 20
 
@@ -89,9 +99,16 @@ if [ "$CLI" = rs ]; then
     --insecure --tap mem --conns 1 --loglevel info --mac "$MAC" \
     --web "127.0.0.1:$WEB_BASE" --pad-mode "$PAD" >"$CLI_LOG" 2>&1 &
 else
-  "$CLI_BIN" -mode client -addr "127.0.0.1:$PORT" -psk "$PSK" -encrypt \
-    -insecure -tap mem -conns 1 -loglevel info -mac "$MAC" \
-    -web "127.0.0.1:$WEB_BASE" -pad-mode "$PAD" >"$CLI_LOG" 2>&1 &
+  local_cfg="$TMP/cli.json"
+  e2e_config "$local_cfg" client "127.0.0.1:$PORT" \
+    "\"psk\": \"$PSK\"" \
+    '"encrypt": true' \
+    '"log_level": "info"' \
+    "\"pad_mode\": \"$PAD\"" \
+    "\"mac\": \"$MAC\"" \
+    "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\"}" \
+    '"client": {"insecure": true, "conns": 1}'
+  "$CLI_BIN" -c "$(e2e_winpath "$local_cfg")" >"$CLI_LOG" 2>&1 &
 fi
 sleep 8
 

@@ -104,9 +104,16 @@ start_cli() {
       --insecure --tap mem --conns 1 --loglevel info --mac "$MAC" \
       --web "127.0.0.1:$webport" >"$logf" 2>&1 &
   else
-    "$CLI_BIN" -mode client -addr "127.0.0.1:$PORT" -psk "$PSK" -encrypt \
-      -insecure -tap mem -conns 1 -loglevel info -mac "$MAC" \
-      -web "127.0.0.1:$webport" >"$logf" 2>&1 &
+    # Go 客户端：flags 已移除（2026-09-19），一律走配置文件
+    local cfg="$TMP/cli_$webport.json"
+    e2e_config "$cfg" client "127.0.0.1:$PORT" \
+      "\"psk\": \"$PSK\"" \
+      '"encrypt": true' \
+      '"log_level": "info"' \
+      "\"mac\": \"$MAC\"" \
+      "\"web\": {\"addr\": \"127.0.0.1:$webport\"}" \
+      '"client": {"insecure": true, "conns": 1}'
+    "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   fi
 }
 start_cli "$A_LOG" "$WEB_BASE"

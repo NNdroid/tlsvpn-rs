@@ -199,6 +199,28 @@ else
   E2E_GREEN=""; E2E_RED=""; E2E_YELLOW=""; E2E_RESET=""
 fi
 
+# Generate a JSON config for either tlsvpn implementation — both are
+# config-file-only since 2026-09-19 (their command-line flags were removed;
+# launch with `-c <file>`), and both consume the same top-level key names
+# (the Rust ConfigFile is a superset of the Go schema).
+#   e2e_config OUT MODE ADDR [json-fragment...]
+# MODE/ADDR land verbatim, "tap": "mem" is always preset (every suite runs on
+# the in-memory backend), and each fragment is spliced in as a top-level key,
+# e.g. '"psk": "e2e_secret"' or '"client": {"insecure": true}'. Paths embedded
+# in fragments must already be drive-form on Windows (e2e_drvpath) — CERT/KEY
+# from this lib already are.
+e2e_config() {
+  local out="$1" mode="$2" addr="$3"; shift 3
+  {
+    printf '{\n  "mode": "%s",\n  "addr": "%s",\n  "tap": "mem"' "$mode" "$addr"
+    local frag
+    for frag in "$@"; do
+      [ -n "$frag" ] && printf ',\n  %s' "$frag"
+    done
+    printf '\n}\n'
+  } >"$out"
+}
+
 # e2e_result PASS LABEL DETAIL → prints a verdict line and returns 0/1.
 # DETAIL should already carry any leading space.
 e2e_result() {
