@@ -226,6 +226,12 @@ struct MioSession {
 
 // ======================= 服务端共享状态（面板/控制用） =======================
 
+/// 归一会话上限：0 = 默认 1024（对齐 Go applyDefaults）。配置文件路径在
+/// load_config_file 已归一；这里兜住只传 flag 的启动方式。
+fn normalize_max_sessions(n: i32) -> i32 {
+    if n == 0 { 1024 } else { n }
+}
+
 pub struct ServerCore {
     pub psk: String,
     pub psk_hash: String,
@@ -248,6 +254,8 @@ pub struct ServerCore {
     pub v6_mask_bits: u32,
     // 内层加密强度下限（ENC_RANK_* 值，0 = 不限）
     pub min_enc: i64,
+    // 并发会话上限（对齐 Go maxSessions；构造时已把 0 归一为 1024）
+    pub max_sessions: i32,
 }
 
 impl ServerCore {
@@ -545,6 +553,9 @@ pub fn start_server(args: &Args) {
         session_token: args.session_token,
         // 强度下限解析一次，握手热路径只读整数
         min_enc: min_enc_rank(&args.min_enc),
+        // 0 = 默认 1024：直接跑 --max-sessions 0 也不该变成"无上限"，否则
+        // 一个裸参数就能关掉容量保护
+        max_sessions: normalize_max_sessions(args.max_sessions),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
@@ -1266,6 +1277,14 @@ fn handle_handshake(
             info!("[{}] ⚡ 会话在销毁倒计时内成功复活！(无缝接续)", client_id);
             existing.clone()
         } else {
+            // 会话上限：达到即按认证失败处理，走伪装焦油坑——不向探测者泄露
+            // 服务端容量信息。只拦新会话，既有会话的复活分支在上不受影响
+            // （对齐 Go）。
+            if core.max_sessions > 0 && sessions.len() >= core.max_sessions as usize {
+                warn!("拒绝连接: 会话数已达上限 {}", core.max_sessions);
+                return HandshakeOutcome::TarpitClose;
+            }
+
             // MAC→IP 绑定优先（对齐 Go macToIP）
             let (mut req_v4, mut req_v6) = (req.ipv4.clone(), req.ipv6.clone());
             if !mac.is_empty() {
@@ -1329,10 +1348,18 @@ fn handle_handshake(
                 "off".to_string()
             };
 
-            let (v4ip, v6ip) = {
-                let mut pool = core.pool.lock();
-                (pool.alloc_v4(&req_v4), pool.alloc_v6(&req_v6))
-            };
+            let v4ip = core.pool.lock().alloc_v4(&req_v4);
+            if v4ip.is_empty() {
+                // 池耗尽必须拒连：空 IP 会被下游当成合法地址写进应答、注册表与
+                // 统计，产生一个"有会话但无地址"的黑洞。与上限同样走焦油坑。
+                warn!(
+                    "拒绝连接: IPv4 地址池已耗尽 ({})",
+                    core.ipv4_cidr(&core.gw_v4)
+                );
+                return HandshakeOutcome::TarpitClose;
+            }
+            // v4 成功后才占 v6，否则拒连路径会在池里留下一个孤儿地址
+            let v6ip = core.pool.lock().alloc_v6(&req_v6);
 
             let stat = Arc::new(ClientStat::new(
                 client_id.clone(),
@@ -1507,5 +1534,80 @@ fn on_conn_closed(
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- 会话上限（档 D） ----------
+
+    /// Go 端 server.go 的拒连条件，逐字复现以便矩阵化测试。
+    /// 只作用于新建会话：既有会话走复活分支，不受容量限制影响。
+    fn go_refuses_new_session(max_sessions: i32, active: usize) -> bool {
+        max_sessions > 0 && active >= max_sessions as usize
+    }
+
+    #[test]
+    fn session_capacity_gate_matches_go() {
+        let max = 1024i32;
+        assert!(!go_refuses_new_session(max, 0));
+        assert!(!go_refuses_new_session(max, max as usize - 1));
+        // 恰好在位即拒：上限是包含性的，不是"超出才拒"
+        assert!(go_refuses_new_session(max, max as usize));
+        assert!(go_refuses_new_session(max, max as usize + 1));
+
+        for active in [0usize, 1, 1024, 100_000, usize::MAX] {
+            assert!(
+                !go_refuses_new_session(0, active),
+                "0 必须表示不限制，否则会拒绝全部连接"
+            );
+        }
+
+        assert!(go_refuses_new_session(1, 1));
+        assert!(!go_refuses_new_session(1, 0));
+        assert!(go_refuses_new_session(1_048_576, 1_048_576));
+    }
+
+    #[test]
+    fn max_sessions_zero_normalizes_to_default() {
+        // 对齐 Go applyDefaults：0 = 1024，而不是"不限制"。裸 flag 路径与
+        // 配置文件路径必须给出同一个结论。
+        assert_eq!(normalize_max_sessions(0), 1024);
+        assert_eq!(normalize_max_sessions(-1), -1);
+        assert_eq!(normalize_max_sessions(1), 1);
+        assert_eq!(normalize_max_sessions(1024), 1024);
+        assert_eq!(normalize_max_sessions(1_048_576), 1_048_576);
+    }
+
+    // ---------- IPv4 池耗尽（档 D） ----------
+
+    #[test]
+    fn alloc_v4_exhausts_to_empty_and_release_frees_it() {
+        // /30 共 4 个地址：网络号、网关、主机、广播。网关预占 + 主机位被扫描
+        // 分配后，可分配地址数恰好为 1 —— 用它在测试里把池真正耗尽。
+        let (mut p, gw, _) = IpPool::new("10.0.0.0/30", "fd00::/126");
+        assert_eq!(gw, "10.0.0.1");
+        assert_eq!(p.used_v4.len(), 1, "网关应预占用");
+
+        let first = p.alloc_v4("");
+        assert!(!first.is_empty(), "首次分配必须成功: {:?}", first);
+        let v6 = p.alloc_v6("");
+        assert!(!v6.is_empty(), "v6 侧同样应可分配");
+        assert_eq!(p.used_v4.len(), 2);
+        assert_eq!(p.used_v6.len(), 2);
+
+        // 耗尽必须返回空串，且重复失败分配不得再消耗地址
+        for _ in 0..3 {
+            assert_eq!(p.alloc_v4(""), "", "耗尽后必须返回空串");
+        }
+        assert_eq!(p.used_v4.len(), 2, "失败的分配不得占用地址");
+
+        // 会话销毁路径回收后，地址应重新可分配
+        p.release("aa:bb:cc:dd:ee:ff", &first, &v6);
+        let second = p.alloc_v4("");
+        assert!(!second.is_empty(), "回收后应能再次分配");
+        assert_eq!(p.alloc_v4(""), "", "再次分配后池应重新耗尽");
     }
 }
