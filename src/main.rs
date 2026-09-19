@@ -206,6 +206,13 @@ pub struct Args {
                 for re-attaching to a live session"
     )]
     pub session_token: bool,
+    #[arg(
+        long = "max-sessions",
+        default_value_t = 0,
+        help = "Server: max concurrent client sessions (0 = default 1024); \
+                new handshakes at the limit fail as authentication errors"
+    )]
+    pub max_sessions: i32,
     /// 内部字段：由配置文件加载时跳过 clap 解析
     #[arg(skip)]
     pub from_file: bool,
@@ -265,6 +272,10 @@ struct ServerConfigFile {
     // 重连接入既有会话时必须回带会话令牌（opt-in，默认关闭）
     #[serde(default)]
     session_token: bool,
+    // 并发会话数上限（0 = 默认 1024）。Go 示例配置恒含此字段：不声明的话
+    // deny_unknown_fields 会让 -c 指向 Go 的 config.server.json 直接解析失败。
+    #[serde(default)]
+    max_sessions: i32,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -345,6 +356,12 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         cert: cfg.server.cert,
         key: cfg.server.key,
         session_token: cfg.server.session_token,
+        // 0 = 默认 1024（对齐 Go applyDefaults）；客户端模式下该值无人消费
+        max_sessions: if cfg.server.max_sessions == 0 {
+            1024
+        } else {
+            cfg.server.max_sessions
+        },
         req_v4: cfg.client.req_v4,
         req_v6: cfg.client.req_v6,
         sni: if cfg.client.sni.is_empty() {
@@ -410,6 +427,13 @@ fn validate_args(args: &Args) -> Result<(), String> {
                 return Err("client cert_sha256 must be 64 hex chars (sha256)".into());
             }
         }
+    }
+    // 上限是拒绝服务阀值：负数无意义，超大值等于关掉保护（对齐 Go Validate）
+    if args.mode == "server" && !(0..=1 << 20).contains(&args.max_sessions) {
+        return Err(format!(
+            "server.max_sessions {} out of range [0, 1048576]",
+            args.max_sessions
+        ));
     }
     Ok(())
 }
@@ -542,7 +566,8 @@ mod tests {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": false
+    "session_token": false,
+    "max_sessions": 1024
   }
 }
 "#;
@@ -596,6 +621,14 @@ mod tests {
             assert_eq!(cfg.workers, 0);
             assert_eq!(cfg.mtu, 0, "mtu 缺省应由 load_config_file 归一到 1500");
             assert!(cfg.min_enc.is_empty());
+            // 会话上限是 Go 加固版配置的新字段；server 配置给了 1024，
+            // client 配置没有该字段（缺省 0 = 加载后归一为 1024）
+            assert_eq!(
+                cfg.server.max_sessions,
+                if name == "server" { 1024 } else { 0 },
+                "{} 配置的 max_sessions 未按预期读入",
+                name
+            );
         }
     }
 
@@ -610,6 +643,7 @@ mod tests {
             top.remove("min_enc");
             if let Some(s) = top.get_mut("server").and_then(|s| s.as_object_mut()) {
                 s.remove("session_token");
+                s.remove("max_sessions");
             }
             if let Some(w) = top.get_mut("web").and_then(|w| w.as_object_mut()) {
                 w.remove("cert");
@@ -620,7 +654,44 @@ mod tests {
             assert!(cfg.pad_mode.is_empty(), "{}: pad_mode 缺省应为空串", name);
             assert!(cfg.min_enc.is_empty(), "{}: min_enc 缺省应为空串", name);
             assert!(!cfg.server.session_token, "{}: session_token 缺省应为 false", name);
+            assert_eq!(cfg.server.max_sessions, 0, "{}: max_sessions 缺省应为 0", name);
         }
+    }
+
+    #[test]
+    fn max_sessions_default_and_validation_match_go() {
+        // 0 = 默认 1024；越界值直接拒绝（对齐 Go applyDefaults + Validate）
+        for given in [0i32, 42, 1048576] {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("tlsvpn-ms-{}-{}.json", std::process::id(), given));
+            let raw = GO_SERVER_CONFIG.replace(
+                "\"max_sessions\": 1024",
+                &format!("\"max_sessions\": {}", given),
+            );
+            std::fs::write(&path, &raw).unwrap();
+            let args = load_config_file(path.to_str().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let want = if given == 0 { 1024 } else { given };
+            assert_eq!(args.max_sessions, want, "max_sessions={} 应归一为 {}", given, want);
+            assert!(validate_args(&args).is_ok(), "max_sessions={} 应通过校验", given);
+        }
+
+        let mut a = Args::default();
+        a.mode = "server".into();
+        a.addr = "0.0.0.0:4000".into();
+        assert!(validate_args(&a).is_ok(), "flag 默认值应通过校验");
+        for bad in [-1i32, (1 << 20) + 1] {
+            a.max_sessions = bad;
+            assert!(validate_args(&a).is_err(), "max_sessions={} 应被拒绝", bad);
+        }
+        a.max_sessions = 0;
+        assert!(validate_args(&a).is_ok(), "max_sessions=0（默认）应放行");
+        // 客户端模式下该字段不参与校验（Go Validate 同样只在 server 分支检查）
+        a.mode = "client".into();
+        a.conns = 4;
+        a.fec_group = 4;
+        a.max_sessions = -1;
+        assert!(validate_args(&a).is_ok(), "client 模式不校验 max_sessions");
     }
 
     #[test]
@@ -809,7 +880,8 @@ fn example_config_json() -> String {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": false
+    "session_token": false,
+    "max_sessions": 1024
   }}
 }}"#,
         num_cpus_hint()
