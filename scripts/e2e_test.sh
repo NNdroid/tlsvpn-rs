@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # e2e_test.sh — 跨语言 e2e 的唯一入口。
 #
-# 跑四个套件：
+# 跑五个套件：
 #   accept  总验收矩阵（P1 全开 / P2 全关 / P3 新旧混装 / P4 opt-in 代价）
 #   tok     session_token：同 MAC 两台真实客户端互踢，验证接管被拒
 #   pad     pad_mode：off / legacy / bucket 三档 + 非法值
 #   minenc  min_enc："" / ctr / legacy / gcm 下限，含未知算法 ID 回归
+#   cfg     配置维度：v4/v6 网段 / client.conns / web.auth / web.bind=tunnel /
+#           log_level 互通，外加 badlog / badauth / badv4 / badv6 / badmac /
+#           badbind 六个配置校验
 #
 # 全部用 --tap mem 的自包含探针，不需要 CAP_NET_ADMIN，托管 CI 上也能真跑
 # （net_perf_test.sh 那套需要真实 TAP，只能在有权限的 runner 上执行）。
@@ -16,7 +19,7 @@
 #   E2E_RS_BIN / E2E_GO_BIN / E2E_RS_PROBE / E2E_GO_PROBE
 #   E2E_RS_OLD_BIN / E2E_RS_OLD_PROBE / E2E_GO_OLD_BIN   特性引入前的构建
 #   E2E_GO_DIR / E2E_CERT / E2E_KEY / E2E_PSK
-#   PORT_BASE_ACCEPT / _TOK / _PAD / _MINENC   各套件端口基址
+#   PORT_BASE_ACCEPT / _TOK / _PAD / _MINENC / _CFG   各套件端口基址
 #   KEEP_TMP=1   保留套件日志目录（默认退出时清理）
 set -uo pipefail
 
@@ -88,6 +91,7 @@ PORT_BASE_ACCEPT="${PORT_BASE_ACCEPT:-18200}"
 PORT_BASE_TOK="${PORT_BASE_TOK:-18500}"
 PORT_BASE_PAD="${PORT_BASE_PAD:-18700}"
 PORT_BASE_MINENC="${PORT_BASE_MINENC:-19200}"
+PORT_BASE_CFG="${PORT_BASE_CFG:-20000}"
 
 # --- 各套件的用例矩阵（原来是在终端里手工敲的 for 循环，这里固化）--------
 
@@ -179,10 +183,48 @@ suite_minenc() {
   return $((fails > 0 ? 1 : 0))
 }
 
-declare -A SUITE_FN=( [accept]=suite_accept [tok]=suite_tok [pad]=suite_pad [minenc]=suite_minenc )
+suite_cfg() {
+  # 前 5 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
+  # （rs/rs、rs/go、go/rs、go/go），因为「配置生效」必须跨语言成立。
+  # 后 6 个是校验类：进程必须以非零退出并给出对应错误。Go 的 Validate 不检查
+  # mac 和 web.bind，那两个只在 Rust 服务端上跑。
+  local -a interop=(cidr multi webauth webtunnel logquiet)
+  local -a reject=(badlog badauth badv4 badv6)
+  local i=0 s c fails=0 case
+  echo "  互通：5 个配置维度 × 4 种实现组合 = 20 组"
+  for case in "${interop[@]}"; do
+    for s in rs go; do
+      for c in rs go; do
+        SRV="$s" CLI="$c" CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
+          WEB_BASE="$((9700 + i))" LABEL="cfg_${s}->${c}_${case}" \
+          bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))
+        i=$((i + 1))
+      done
+    done
+  done
+  i=20
+  echo "  校验：4 个跨语言用例 × 2 实现 + 2 个仅 Rust 用例 = 10 组"
+  for case in "${reject[@]}"; do
+    for s in rs go; do
+      SRV="$s" CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
+        WEB_BASE="$((9700 + i))" LABEL="cfg_${s}_${case}" \
+        bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))
+      i=$((i + 1))
+    done
+  done
+  for case in badmac badbind; do
+    SRV=rs CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
+      WEB_BASE="$((9700 + i))" LABEL="cfg_rs_${case}" \
+      bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))
+    i=$((i + 1))
+  done
+  return $((fails > 0 ? 1 : 0))
+}
+
+declare -A SUITE_FN=( [accept]=suite_accept [tok]=suite_tok [pad]=suite_pad [minenc]=suite_minenc [cfg]=suite_cfg )
 
 SELECTED=("$@")
-[ ${#SELECTED[@]} -eq 0 ] && SELECTED=(accept tok pad minenc)
+[ ${#SELECTED[@]} -eq 0 ] && SELECTED=(accept tok pad minenc cfg)
 
 echo "e2e_test.sh — 跨语言 e2e（mem TAP，无需 CAP_NET_ADMIN）"
 echo "  RS_BIN   $E2E_RS_BIN"

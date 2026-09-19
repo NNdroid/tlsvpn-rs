@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server as HttpServer};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -748,16 +748,49 @@ fn check_basic_auth(auth_spec: &str, req: &tiny_http::Request) -> bool {
 }
 
 /// 单个 listener 的服务循环：bind `addr` 并处理请求直到线程被放弃。
-fn serve_listener(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
+///
+/// `ready` 若在 bind 前给出，bind 结果会在进入 accept 循环前回报
+/// （true=成功），供 web.bind=tunnel 的重绑管理器逐个采纳。单监听模式
+/// 传 None：失败直接记 error，因为没有下一轮会重试。
+fn serve_listener(
+    addr: String,
+    auth: String,
+    provider: Arc<dyn WebStatsProvider>,
+    ready: Option<std::sync::mpsc::Sender<bool>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
     let server = match HttpServer::http(&addr) {
-        Ok(s) => s,
+        Ok(s) => {
+            if let Some(tx) = ready {
+                let _ = tx.send(true);
+            }
+            s
+        }
         Err(e) => {
-            tracing::error!("Web Server bind failed on {}: {}", addr, e);
+            if let Some(tx) = ready {
+                let _ = tx.send(false);
+            } else {
+                tracing::error!("Web Server bind failed on {}: {}", addr, e);
+            }
             return;
         }
     };
     info!("🚀 Web Dashboard listening at http://{}", addr);
-    for mut request in server.incoming_requests() {
+    // 用 recv_timeout 轮询而不是 incoming_requests()：tiny_http 没有公开的
+    // close()，监听端口只在线程退出这个循环、Server 被 drop 时才释放。
+    // stop 是关闭监听的唯一途径——rebind 回收旧地址、进程退出都靠它。
+    loop {
+        let next = match server.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => None,
+            Err(_) => break,
+        };
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let Some(mut request) = next else {
+            continue;
+        };
         let url = request.url().split('?').next().unwrap_or("").to_string();
 
         // 仪表盘页面与 API 一致地受认证保护
@@ -840,6 +873,8 @@ fn serve_listener(addr: String, auth: String, provider: Arc<dyn WebStatsProvider
             }
         }
     }
+    // 循环退出 = server 被 drop = 监听端口释放
+    info!("Web Dashboard listener on {} closed", addr);
 }
 
 /// 隧道 IP 提供者：web.bind=tunnel 时由 server/client 各自实现
@@ -856,13 +891,32 @@ pub fn web_port(addr: &str) -> u16 {
     }
 }
 
-/// web.bind=all：直接启动单个 listener（默认行为，不变）
+/// web.bind=all：直接启动单个 listener（默认行为，不变）。stop 永不置位。
 pub fn start_web_server(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
-    std::thread::spawn(move || serve_listener(addr, auth, provider));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::spawn(move || serve_listener(addr, auth, provider, None, stop));
 }
 
-/// web.bind=tunnel：2 秒轮询重绑循环。隧道 IP 就绪前不监听；IP 变化时
-/// 先开新 listener 再关旧的（对齐 Go 的 rebind manager，杜绝管理缺口）。
+/// 同一地址 30 秒内只上报一次绑定失败，避免隧道 IP 未就绪时每 2 秒刷一条
+/// （对齐 Go WebManager 的 onceWarn）。
+fn warn_throttled(keys: &mut std::collections::HashMap<String, Instant>, key: &str) -> bool {
+    match keys.get(key) {
+        Some(t) if t.elapsed() < Duration::from_secs(30) => false,
+        _ => {
+            keys.insert(key.to_string(), Instant::now());
+            true
+        }
+    }
+}
+
+/// web.bind=tunnel：2 秒轮询重绑循环，监听隧道自身 IP。
+///
+/// 采纳是「逐个成功」而非「全有或全无」（对齐 Go WebManager）：IPv4 与
+/// IPv6 各自独立打开，某个地址绑定失败（隧道 IP 未就绪、IPv6 被禁、地址
+/// 仍处 tentative）只让该地址缺位并记 warning 等下一轮重试，不会把已经
+/// 能用的监听一起丢掉。这一点在 tiny_http 上没有公开 shutdown 的前提下
+/// 是硬要求——整批放弃会让已 bind 成功的 socket 永久留在自己手里，下一
+/// 轮再撞 EADDRINUSE，结果两个地址都监听不上。
 pub fn start_web_server_tunnel(
     bind_port: u16,
     auth: String,
@@ -870,37 +924,208 @@ pub fn start_web_server_tunnel(
     source: Arc<dyn TunnelIpSource>,
 ) {
     std::thread::spawn(move || {
-        let mut current_addrs: Vec<String> = Vec::new();
+        // 已打开的 listener：(地址, 停止标志, 线程句柄)。关闭靠 stop 标志，
+        // tiny_http 没有公开 close()；句柄只用来判断线程是否已退出。
+        let mut adopted: Vec<(
+            String,
+            Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )> = Vec::new();
+        let mut warn_keys: std::collections::HashMap<String, Instant> =
+            std::collections::HashMap::new();
         info!("🚀 Web Dashboard manager started (bind=tunnel)");
         loop {
-            let addrs = source.tunnel_addrs(bind_port);
-            if addrs.is_empty() {
-                // 隧道 IP 尚不可用：保持现状（若已在监听则继续监听旧地址）
-            } else if addrs != current_addrs {
-                // 先开新 listener，全部成功后再关旧的
-                let mut new_handles = Vec::new();
-                for a in &addrs {
-                    let auth = auth.clone();
-                    let provider = provider.clone();
-                    let a = a.clone();
-                    new_handles.push(std::thread::spawn(move || {
-                        serve_listener(a, auth, provider);
-                    }));
+            let wanted = source.tunnel_addrs(bind_port);
+
+            // 规格已消失的地址：通知其线程退出以释放端口（对齐 Go 删除
+            // listener）。wanted 为空 = 隧道 IP 尚未就绪，保留现状等下一轮。
+            adopted.retain(|(a, stop, _)| {
+                if wanted.is_empty() || wanted.contains(a) {
+                    true
+                } else {
+                    info!(
+                        "🔀 Web Dashboard listener on {} removed (tunnel address gone)",
+                        a
+                    );
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    false
                 }
-                // 给新 listener 一点时间暴露绑定失败（如地址尚未真正就绪）
-                std::thread::sleep(Duration::from_millis(300));
-                let all_alive = new_handles.iter().all(|h| !h.is_finished());
-                if all_alive {
-                    // listener 线程随进程生命周期服务（tiny_http 无公开
-                    // shutdown）；detach 后由 rebind 循环仅跟踪地址集合
-                    for h in new_handles {
-                        std::mem::forget(h);
-                    }
-                    current_addrs = addrs;
-                    info!("🔀 Dashboard rebound to tunnel addresses");
+            });
+
+            for a in wanted {
+                if adopted.iter().any(|(cur, _, _)| *cur == a) {
+                    continue;
+                }
+                let key = a.clone();
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                let addr = a;
+                let auth = auth.clone();
+                let provider = provider.clone();
+                let stop_task = stop.clone();
+                let handle = std::thread::spawn(move || {
+                    serve_listener(addr, auth, provider, Some(tx), stop_task);
+                });
+                // bind 是同步的，正常情况下立刻有结果。超时时结果未知，
+                // 保守地不采纳：真已绑定就让它继续服务，下一轮会因
+                // EADDRINUSE 再判失败，不会开出重复监听。
+                let bound = rx.recv_timeout(Duration::from_secs(1)).unwrap_or(false);
+                if bound {
+                    adopted.push((key, stop, handle));
+                } else if warn_throttled(&mut warn_keys, &key) {
+                    warn!(
+                        "Web Dashboard bind failed on {} (other listeners still serving, will retry)",
+                        key
+                    );
                 }
             }
+
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    struct StubProvider;
+    impl WebStatsProvider for StubProvider {
+        fn stats_json(&self) -> serde_json::Value {
+            json!({"mode": "test"})
+        }
+        fn metrics_text(&self) -> String {
+            String::new()
+        }
+        fn control(&self, _a: &str, _c: &str, _l: &str, _t: i64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct SwitchSource(Arc<Mutex<Vec<String>>>);
+    impl TunnelIpSource for SwitchSource {
+        fn tunnel_addrs(&self, _port: u16) -> Vec<String> {
+            self.0.lock().clone()
+        }
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    /// 发一个真实 HTTP GET，成功返回响应体
+    fn http_get(addr: &str, path: &str) -> Option<String> {
+        let mut s = std::net::TcpStream::connect(addr).ok()?;
+        let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, addr);
+        s.write_all(req.as_bytes()).ok()?;
+        let mut out = String::new();
+        s.read_to_string(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn wait_http(addr: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < timeout {
+            if http_get(addr, "/api/stats").is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn wait_closed(addr: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < timeout {
+            if std::net::TcpStream::connect(addr).is_err() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    #[test]
+    fn warn_throttled_suppresses_repeats_within_window() {
+        let mut keys: std::collections::HashMap<String, Instant> =
+            std::collections::HashMap::new();
+        assert!(warn_throttled(&mut keys, "127.0.0.1:1"), "首次应上报");
+        assert!(
+            !warn_throttled(&mut keys, "127.0.0.1:1"),
+            "30 秒内重复失败不应重复上报"
+        );
+        // 不同地址互不影响
+        assert!(warn_throttled(&mut keys, "127.0.0.1:2"));
+    }
+
+    /// stop 是 tiny_http 监听端口唯一的关闭途径；不退出循环端口就不会释放
+    #[test]
+    fn serve_listener_stop_releases_the_port() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let stop_task = stop.clone();
+        let addr_task = addr.clone();
+        let handle = std::thread::spawn(move || {
+            serve_listener(addr_task, String::new(), Arc::new(StubProvider), Some(tx), stop_task);
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false),
+            "bind 应成功"
+        );
+        assert!(
+            wait_http(&addr, Duration::from_secs(3)),
+            "监听应能响应请求"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            handle.join().is_ok(),
+            "stop 后线程应正常退出"
+        );
+        // tiny_http 的 drop 到 OS 真正放端口有几百毫秒的窗口，并行跑测试时
+        // 单点检查会撞上去
+        assert!(
+            wait_closed(&addr, Duration::from_secs(3)),
+            "stop 后端口必须已释放"
+        );
+    }
+
+    /// 回归：采纳必须逐个进行。旧实现「全有或全无」会让一个地址绑不上时
+    /// 把已 bind 成功的监听一起丢弃，socket 永远占着自己的端口，下一轮
+    /// 两个地址都 EADDRINUSE（用户报告的 8000 端口被自己占用的现象）。
+    #[test]
+    fn tunnel_manager_adopts_addresses_independently() {
+        let a1 = format!("127.0.0.1:{}", free_port());
+        let a2 = format!("127.0.0.1:{}", free_port());
+        // 占住 a2，模拟隧道 IPv6 地址尚未真正就绪时的绑定失败
+        let blocker = std::net::TcpListener::bind(&a2).unwrap();
+
+        let addrs = Arc::new(Mutex::new(vec![a1.clone(), a2.clone()]));
+        start_web_server_tunnel(
+            0,
+            String::new(),
+            Arc::new(StubProvider),
+            Arc::new(SwitchSource(addrs.clone())),
+        );
+
+        // a1 必须单独被采纳，不能跟着 a2 一起失败
+        assert!(
+            wait_http(&a1, Duration::from_secs(10)),
+            "可绑定的地址必须独立生效"
+        );
+
+        // 地址就绪后 a2 也要跟上来
+        drop(blocker);
+        assert!(wait_http(&a2, Duration::from_secs(10)), "就绪地址应被补齐监听");
+
+        // 地址从规格里消失：旧监听必须关闭并释放端口，而不是永久泄漏
+        *addrs.lock() = vec![a2.clone()];
+        assert!(wait_closed(&a1, Duration::from_secs(10)), "消失的地址应释放端口");
+        assert!(wait_http(&a2, Duration::from_secs(5)), "保留的地址应继续服务");
+    }
 }

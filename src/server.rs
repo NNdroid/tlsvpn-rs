@@ -619,12 +619,29 @@ pub fn start_server(args: &Args) {
         info!("Using in-memory TAP backend (no real device)");
         Arc::new(MemTap)
     } else {
-        let dev = tun_rs::DeviceBuilder::new()
+        // 对齐 Go server.go 的 setTapMac：服务端也尊重配置里的 mac。
+        // 与客户端不同的是这里失败只告警——服务端不向任何人声明自己的 MAC，
+        // 配置错了顶多是自己 TAP 的地址不符合预期，不该因此拒绝启动。
+        let cfg_mac: Option<[u8; 6]> = match crate::utils::parse_config_mac(&args.mac) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Server failed to set tap MAC: {}", e);
+                None
+            }
+        };
+        let builder = tun_rs::DeviceBuilder::new()
             .name(&args.tap)
             .layer(tun_rs::Layer::L2)
-            .mtu(args.mtu)
-            .build_sync()
-            .unwrap();
+            .mtu(args.mtu);
+        let builder = if let Some(m) = cfg_mac {
+            builder.mac_addr(m)
+        } else {
+            builder
+        };
+        let dev = builder.build_sync().unwrap();
+        if cfg_mac.is_some() {
+            info!("Interface {} MAC set to {}", args.tap, args.mac);
+        }
         info!("Configuring Server TAP Interface IP...");
         // 对齐 Go：TAP 配置网关地址（网络基址+1），而非网络号
         Command::new("ip")

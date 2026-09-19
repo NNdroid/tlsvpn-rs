@@ -149,6 +149,19 @@ e2e_reap_all() {
   esac
 }
 
+# Wait until a pattern appears in a log file, or return 1 after the deadline
+# (default 15s). Same idea as e2e_wait_port but for log markers: a suite can
+# bail out as soon as the handshake lands instead of sleeping a fixed 5-8s,
+# which is what made the suites take minutes.
+e2e_wait_log() {
+  local pat="$1" file="$2" deadline=$(( $(date +%s) + ${3:-15} ))
+  while ! grep -q "$pat" "$file" 2>/dev/null; do
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 0.5
+  done
+  return 0
+}
+
 # Wait for a TCP port to accept, or return 1 after the deadline (default 20s).
 e2e_wait_port() {
   local host="$1" port="$2" deadline=$(( $(date +%s) + ${3:-20} ))

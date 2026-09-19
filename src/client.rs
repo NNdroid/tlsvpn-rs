@@ -419,21 +419,40 @@ impl WebStatsProvider for Client {
 
 pub fn start_client(args: &Args) {
     info!("Starting TCP TLS client process...");
+    // mac 必须写入 TAP 设备本体（对齐 Go setTapMac）。只拿它算 client_id 不够：
+    // 握手声明 req.mac=配置值，而帧里的 src MAC 是内核给 TAP 随机分配的那个，
+    // 服务端 src_mac_allowed 会据此丢弃本端自己的帧。
+    let cfg_mac: Option<[u8; 6]> = match crate::utils::parse_config_mac(&args.mac) {
+        Ok(m) => m,
+        Err(e) => {
+            error!("{}", e);
+            return;
+        }
+    };
+    if cfg_mac.is_some() {
+        info!("Interface {} MAC set to {}", args.tap, args.mac);
+    }
+
     let device: Arc<dyn TapDevice> = if args.tap == "mem" {
         info!("Using in-memory TAP backend (no real device)");
         Arc::new(MemTap)
     } else {
-        let dev = tun_rs::DeviceBuilder::new()
+        let builder = tun_rs::DeviceBuilder::new()
             .name(&args.tap)
             .layer(tun_rs::Layer::L2)
-            .mtu(args.mtu)
-            .build_sync()
-            .unwrap();
+            .mtu(args.mtu);
+        // DeviceBuilder 的方法按值消费 self，mac 只能作为链上的另一节
+        let builder = if let Some(m) = cfg_mac {
+            builder.mac_addr(m)
+        } else {
+            builder
+        };
+        let dev = builder.build_sync().unwrap();
         Arc::new(dev)
     };
 
-    // MAC：优先显式指定；否则读真实网卡 MAC（Linux sysfs），仍失败则警告。
-    // 注意 client_id 依赖 MAC，与 Go 一致。
+    // MAC：显式指定时上面的 builder 已写入设备，这里沿用同一个值；否则读
+    // TAP 的真实 MAC（Linux sysfs），仍失败则警告。client_id 依赖 MAC，与 Go 一致。
     let actual_mac = if args.mac.is_empty() {
         let from_sys = std::fs::read_to_string(format!("/sys/class/net/{}/address", args.tap))
             .unwrap_or_else(|_| String::new())

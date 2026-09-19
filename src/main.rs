@@ -245,6 +245,54 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.addr.is_empty() {
         return Err("addr is required".into());
     }
+    // log_level 是闭集（对齐 Go 的 zapcore.Level.UnmarshalText）。之前不校验，
+    // 任意拼错的串都塞进 EnvFilter，只会得到「日志行为莫名变化」这种最难受的
+    // 失败模式。校验假设 Args 已归一化（load_config_file 会给 "info"），
+    // 与 Go Validate 只跑在 applyDefaults 之后的配置上保持一致。
+    match args.loglevel.to_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => {}
+        other => {
+            return Err(format!(
+                "invalid log_level {:?} (want trace, debug, info, warn or error)",
+                other
+            ))
+        }
+    }
+    // mac 格式：只用于算 client_id 时拼错不会报错，静默变成另一台客户端。
+    if !crate::utils::is_valid_mac_string(&args.mac) {
+        return Err(format!(
+            "invalid mac {:?} (want aa:bb:cc:dd:ee:ff)",
+            args.mac
+        ));
+    }
+    // web.bind 闭集；未知值历史上会被当成 "all" 静默处理
+    match args.web_bind.as_str() {
+        "" | "all" | "tunnel" => {}
+        other => {
+            return Err(format!(
+                "invalid web.bind {:?} (want all or tunnel)",
+                other
+            ))
+        }
+    }
+    // web.auth 必须带冒号。check_basic_auth 对非空串一律要求 Basic 头，
+    // 写 "admin" 这种没有冒号的值会让面板对所有人 401。
+    if !args.web_auth.is_empty() && !args.web_auth.contains(':') {
+        return Err(format!(
+            "invalid web.auth {:?} (want user:password)",
+            args.web_auth
+        ));
+    }
+    if args.mode == "server" {
+        // parse_v4_cidr / parse_v6_cidr 遇到不可解析的串会回落到默认网段，
+        // 垃圾 CIDR 必须在这里断掉而不是变成悄悄换地址池（对齐 Go net.ParseCIDR）
+        if !crate::utils::is_valid_cidr(&args.v4cidr, false) {
+            return Err(format!("invalid server.v4_cidr {:?}", args.v4cidr));
+        }
+        if !crate::utils::is_valid_cidr(&args.v6cidr, true) {
+            return Err(format!("invalid server.v6_cidr {:?}", args.v6cidr));
+        }
+    }
     // 配置加载层强校验；set_pad_mode 的 legacy 回落只兜住面板热更路径
     if !crypto::pad_mode_valid(&args.pad_mode) {
         return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
@@ -333,16 +381,21 @@ fn main() {
         }
     };
 
+    // 校验必须先于 init_logging：log_level 本身就是被校验的字段，而
+    // init_logging 拿它建过滤器。拼错的值会被 EnvFilter 当成「只接受名叫该串的
+    // target」的指令，连下面这条报错都会被过滤掉——结果只剩一个无声的非零退出
+    // 码，用户完全不知道哪里错了（e2e 的 cfg badlog 用例就是这样发现的）。
+    if let Err(e) = validate_args(&args) {
+        eprintln!("Invalid configuration: {}", e);
+        std::process::exit(1);
+    }
+
     init_logging(&args.loglevel);
 
     lazy_static::initialize(&PADDING_CACHE);
 
     if args.psk == "quic_secret" {
         tracing::warn!("⚠️  PSK is the default value — change it in the config file!");
-    }
-    if let Err(e) = validate_args(&args) {
-        error!("Invalid configuration: {}", e);
-        std::process::exit(1);
     }
 
     // 填充策略全局生效（发送路径读取），面板可热更。
@@ -540,9 +593,13 @@ mod tests {
             assert!(validate_args(&args).is_ok(), "max_sessions={} 应通过校验", given);
         }
 
+        // Args::default() 未经归一化，这里补齐 load_config_file 会给的默认值
         let mut a = Args::default();
         a.mode = "server".into();
         a.addr = "0.0.0.0:4000".into();
+        a.loglevel = "info".into();
+        a.v4cidr = "10.0.0.0/24".into();
+        a.v6cidr = "fd00::/64".into();
         assert!(validate_args(&a).is_ok(), "flag 默认值应通过校验");
         for bad in [-1i32, (1 << 20) + 1] {
             a.max_sessions = bad;
@@ -600,9 +657,11 @@ mod tests {
 
     #[test]
     fn min_enc_validation_matches_go() {
+        // Args::default() 未经归一化，log_level 显式给默认值
         let mut a = Args::default();
         a.mode = "client".into();
         a.addr = "127.0.0.1:1".into();
+        a.loglevel = "info".into();
         a.conns = 4;
         a.fec_group = 4;
         a.encrypt = true;
@@ -644,6 +703,140 @@ mod tests {
         assert!(
             validate_args(&a).is_ok(),
             "min_enc 空串 + encrypt=false 是旧版行为，必须放行"
+        );
+    }
+
+    /// 回归：这些字段历史上要么完全无效，要么无效值被静默降级。
+    /// 校验必须落在配置加载层，而不是运行时悄悄出错。
+    #[test]
+    fn validate_args_rejects_garbage_in_previously_ignored_fields() {
+        // 合法基线：client 模式不需要地址池，v4/v6 cidr 留空即可。
+        // validate_args 假设 Args 已归一化，所以 log_level 显式给默认值。
+        let mut a = Args::default();
+        a.mode = "client".into();
+        a.addr = "10.0.0.1:4000".into();
+        a.loglevel = "info".into();
+        a.conns = 1;
+        a.fec_group = 4;
+        a.max_sessions = 1024;
+        assert!(validate_args(&a).is_ok(), "基线配置应通过校验");
+
+        // log_level 闭集（大小写不敏感，与 Go 一致地要求非空）
+        for good in ["trace", "Debug", "INFO", "warn", "error"] {
+            a.loglevel = good.into();
+            assert!(
+                validate_args(&a).is_ok(),
+                "log_level {:?} 应通过校验",
+                good
+            );
+        }
+        for bad in ["", "verbose", "information", "tracee", " ", "infox", "off"] {
+            a.loglevel = bad.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("invalid log_level"),
+                "log_level {:?} 应被拒绝，实际: {}",
+                bad,
+                err
+            );
+        }
+
+        // mac：空串合法（未设置），其余必须是 aa:bb:cc:dd:ee:ff
+        a.loglevel = "info".into();
+        for good in ["", "00:1a:2b:3c:4d:5e", "AA:BB:CC:DD:EE:FF"] {
+            a.mac = good.into();
+            assert!(validate_args(&a).is_ok(), "mac {:?} 应通过校验", good);
+        }
+        for bad in ["00:1a:2b:3c:4d:5", "00:1a:2b:3c:4d:5e:6f", "zz:11:22:33:44:55",
+                    "00-1a-2b-3c-4d-5e", "001a2b3c4d5e", "1"] {
+            a.mac = bad.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("invalid mac"),
+                "mac {:?} 应被拒绝，实际: {}",
+                bad,
+                err
+            );
+        }
+        a.mac = String::new();
+
+        // web.auth：非空时必须带冒号，否则面板对所有人 401。
+        // "a:b:c" 和 ":" 与 Go ensureBasicAuthFormat 一致地放行（只看有没有冒号）。
+        for good in ["", "admin:secret", "a:b:c", ":"] {
+            a.web_auth = good.into();
+            assert!(
+                validate_args(&a).is_ok(),
+                "web.auth {:?} 应通过校验",
+                good
+            );
+        }
+        for bad in ["admin", " admin", "secret ", "nopass"] {
+            a.web_auth = bad.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("invalid web.auth"),
+                "web.auth {:?} 应被拒绝，实际: {}",
+                bad,
+                err
+            );
+        }
+        a.web_auth = String::new();
+
+        // web.bind 闭集：未知值历史上会被当成 "all"
+        for good in ["", "all", "tunnel"] {
+            a.web_bind = good.into();
+            assert!(
+                validate_args(&a).is_ok(),
+                "web.bind {:?} 应通过校验",
+                good
+            );
+        }
+        for bad in ["Any", "TUNNEL", "tunnel:", "all ", "tunnels"] {
+            a.web_bind = bad.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("invalid web.bind"),
+                "web.bind {:?} 应被拒绝，实际: {}",
+                bad,
+                err
+            );
+        }
+        a.web_bind = String::new();
+
+        // server 地址池：垃圾 CIDR 历史上被静默回落到默认网段
+        a.mode = "server".into();
+        a.addr = "0.0.0.0:4000".into();
+        for (v4, v6, good) in [
+            ("10.0.0.0/24", "fd00::/64", true),
+            ("192.168.1.1", "::ffff:10.0.0.0/120", true),
+            ("10.0.0.0/32", "fd00::/128", true),
+            ("10.0.0.0/33", "fd00::/64", false),
+            ("not-a-cidr", "fd00::/64", false),
+            ("10.0.0.0/24", "fd00::zzz/64", false),
+            ("10.0.0.0/24", "10.0.0.0/24", false),
+            ("10.0.0.0/24", "fd00::", true),
+        ] {
+            a.v4cidr = v4.into();
+            a.v6cidr = v6.into();
+            if good {
+                assert!(
+                    validate_args(&a).is_ok(),
+                    "v4={v4:?} v6={v6:?} 应通过校验"
+                );
+            } else {
+                let err = validate_args(&a).unwrap_err();
+                assert!(
+                    err.contains("invalid server."),
+                    "v4={v4:?} v6={v6:?} 应被拒绝，实际: {}",
+                    err
+                );
+            }
+        }
+        // client 模式不校验地址池（Go Validate 同样只在 server 分支检查）
+        a.mode = "client".into();
+        assert!(
+            validate_args(&a).is_ok(),
+            "client 模式不校验 v4/v6_cidr"
         );
     }
 

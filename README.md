@@ -115,14 +115,14 @@ All defaults match the Go implementation 1:1; the only Rust-specific field is `w
 | `workers` | `0` | — | **Rust server only**: worker event-loop threads (0 = auto, one per CPU up to 8) |
 | `mtu` | `1500` | — | TAP MTU. Higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
-| `mac` | (empty) | — | Explicit TAP MAC; part of the client identity |
+| `mac` | (empty) | — | Explicit TAP MAC, `aa:bb:cc:dd:ee:ff`, local bit must be clear. Written **into** the TAP device (the server drops frames whose src MAC isn't the identity, so a value that's only used to compute the ClientID would drop your own traffic) and part of the client identity |
 | `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
-| `log_level` | `info` | — | `debug` / `info` / `warn` / `error` (switchable live from the dashboard) |
+| `log_level` | `info` | — | `trace` / `debug` / `info` / `warn` / `error` — validated at startup, anything else is refused (switchable live from the dashboard) |
 | `web.addr` | (empty) | — | Dashboard listen address; off unless set |
-| `web.auth` | (empty) | — | Basic Auth as `user:pass` (constant-time compare). Strongly recommended off loopback |
-| `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear) |
+| `web.auth` | (empty) | — | Basic Auth as `user:pass` (constant-time compare). Must contain a `:` — a bare username would 401 every request. Strongly recommended off loopback |
+| `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving |
 | `web.cert` / `web.key` | (empty) | — | Accepted for Go config compatibility only — the Rust dashboard always serves plain HTTP and ignores them |
-| `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host) |
+| `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
 | `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM) |
 | `server.session_token` | `false` | server | Enable per-session tokens |

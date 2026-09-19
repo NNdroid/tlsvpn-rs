@@ -28,6 +28,29 @@ pub fn u128_to_ip6(val: u128) -> String {
     Ipv6Addr::from(val).to_string()
 }
 
+/// CIDR 形态校验，接受域与 Go 的 net.ParseCIDR 对齐：裸 IP 也算合法（无
+/// 前缀时按主机位全 0 处理）。v4_cidr / v6_cidr 必须在这里断掉垃圾值——
+/// parse_v4_cidr / parse_v6_cidr 遇到不可解析的地址会静默回落到默认网段，
+/// 结果是地址池悄悄变成 10.0.0.0/24 之类的东西。
+pub fn is_valid_cidr(s: &str, v6: bool) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let (ip, bits) = match s.split_once('/') {
+        Some((a, b)) => match b.trim().parse::<u32>() {
+            Ok(bits) => (a.trim(), Some(bits)),
+            Err(_) => return false,
+        },
+        None => (s, None),
+    };
+    if v6 {
+        ip.parse::<Ipv6Addr>().is_ok() && bits.map_or(true, |n| n <= 128)
+    } else {
+        ip.parse::<Ipv4Addr>().is_ok() && bits.map_or(true, |n| n <= 32)
+    }
+}
+
 pub struct FastRand(u64);
 impl FastRand {
     pub fn new() -> Self {
@@ -103,6 +126,31 @@ pub fn is_valid_client_id(id: &str) -> bool {
         }
     }
     true
+}
+
+/// 解析配置里的 `mac`：空串 = 未配置（Ok(None)）。格式非法或本地位被置位
+/// 返回 Err，拒绝条件与 Go net_linux.go setTapMac 一致。
+///
+/// 客户端与服务端都用它，但错误处理不同：客户端要把这个值写进握手声明给
+/// 服务端，值错会让服务端把本端自己的帧当外来帧丢掉（src_mac_allowed），
+/// 所以按硬错误处理；服务端只改自己 TAP 的地址，值错只该告警。
+pub fn parse_config_mac(s: &str) -> Result<Option<[u8; 6]>, String> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let Some(m) = parse_mac_key(s) else {
+        return Err(format!(
+            "无效的 mac 配置值 {:?}（须为 aa:bb:cc:dd:ee:ff）",
+            s
+        ));
+    };
+    if m[0] & 1 != 0 {
+        return Err(format!(
+            "mac 配置值 {:?} 的本地位被置位（组播/广播地址），无法作为 TAP 地址",
+            s
+        ));
+    }
+    Ok(Some(m))
 }
 
 /// 解析 "aa:bb:cc:dd:ee:ff"（大小写不敏感）为二进制 MAC。解析失败返回 None，
@@ -211,5 +259,75 @@ mod tests {
         ] {
             assert!(parse_mac_key(s).is_none(), "parse_mac_key({s:?}) 应失败");
         }
+    }
+
+    #[test]
+    fn parse_config_mac_empty_ok_and_rejects_garbage_or_local_bit() {
+        // 未配置：空串是合法的"没设置"，不能与解析失败混淆
+        assert_eq!(parse_config_mac("").unwrap(), None);
+        // 全 0 合法且必须与 None 区分（否则会被当成"没设置"）
+        assert_eq!(
+            parse_config_mac("00:00:00:00:00:00").unwrap(),
+            Some([0u8; 6])
+        );
+        assert_eq!(
+            parse_config_mac("aa:bb:cc:dd:ee:ff").unwrap(),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        assert!(parse_config_mac("AA:BB:CC:DD:EE:FF").unwrap().is_some());
+
+        for s in [
+            "aa:bb:cc:dd:ee",         // 少一段
+            "aa:bb:cc:dd:ee:ff:00",   // 多一段
+            "zz:11:22:33:44:55",      // 非 hex
+            "aa:bb:cc:dd:ee:ff:",     // 尾随冒号
+            "1", "aa bb", "00:1a:2b:3c:4d",
+        ] {
+            assert!(
+                parse_config_mac(s).is_err(),
+                "parse_config_mac({s:?}) 应返回 Err"
+            );
+        }
+        // 本地位置位 = 组播/广播地址，不能作为 TAP 地址（对齐 Go setTapMac）
+        for s in [
+            "01:00:5e:00:00:01",
+            "ff:ff:ff:ff:ff:ff",
+            "45:aa:bb:cc:dd:ee",
+            "a1:00:00:00:00:00",
+        ] {
+            let err = parse_config_mac(s).unwrap_err();
+            assert!(
+                err.contains("本地位"),
+                "parse_config_mac({s:?}) 应拒绝组播地址，实际: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_cidr_accepts_bare_ips_and_rejects_garbage() {
+        // 与 Go net.ParseCIDR 一致：裸 IP 合法
+        for s in [
+            "10.0.0.0/24", "10.0.0.1", "127.0.0.0/8", "192.168.1.0/32",
+            " fd00::/64 ", "fd00::1", "::ffff:10.0.0.0/120",
+        ] {
+            let v6 = s.trim().contains(':');
+            assert!(is_valid_cidr(s, v6), "合法 CIDR {s:?} 被误拒");
+        }
+        for s in [
+            "", "  ", "10.0.0.0/33", "10.0.0.0/", "/24", "10.0.0.0/24/",
+            "10.0.0.0/-1", "10.0.0.0/abc", "not-a-cidr", "10.0.0.256/24",
+            "256.0.0.0/8", "fd00::zzz/64", "fd00::/129", "::ffff:10.0.0.0/200",
+            "10.0.0.0/128",
+        ] {
+            let v6 = s.trim().contains(':');
+            assert!(!is_valid_cidr(s, v6), "非法 CIDR {s:?} 被误放行");
+        }
+        // 跨族：同一串在两个族下都要给出符合预期的答案
+        assert!(is_valid_cidr("10.0.0.0/24", false));
+        assert!(is_valid_cidr("fd00::/64", true));
+        assert!(!is_valid_cidr("10.0.0.0/24", true));
+        assert!(!is_valid_cidr("fd00::/64", false));
+        // "fd00::/128" 对 v4 来说前缀超界
+        assert!(!is_valid_cidr("fd00::/128", false));
     }
 }

@@ -40,8 +40,9 @@ jobs:
       run: RUSTFLAGS="-C target-cpu=native" cargo test --release bench_protocol_throughput -- --ignored --nocapture
 
   # Cross-language e2e suites (scripts/e2e_test.sh): the 档 A/B/C/D acceptance
-  # matrix, session_token hijack, pad_mode and min_enc policy — 73 cases driven
-  # by the in-memory TAP probes. No CAP_NET_ADMIN and no root required, so these
+  # matrix, session_token hijack, pad_mode, min_enc policy and the cfg suite
+  # (per-field config interop plus config validation) — all driven by the
+  # in-memory TAP probes. No CAP_NET_ADMIN and no root required, so these
   # run for real on hosted runners (net-perf below is the one that self-skips).
   e2e-interop:
     runs-on: ubuntu-latest
@@ -73,7 +74,7 @@ jobs:
         (cd go-impl && bash scripts/build.sh)
         go build -C interop -o probe .
 
-    - name: Cross-language e2e (accept / tok / pad / minenc)
+    - name: Cross-language e2e (accept / tok / pad / minenc / cfg)
       env:
         E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
         E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
