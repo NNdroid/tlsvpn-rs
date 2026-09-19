@@ -196,6 +196,9 @@ pub struct ClientSession {
     pub fec_dec: Option<Arc<FecDecoder>>,
     pub fec_enc_k: i64,
     pub mac: String,
+    // 握手 MAC 的二进制形式（建会话时解析一次）。全零表示未上报/为空，
+    // 归属校验对此放行（见 src_mac_allowed）
+    pub mac_bin: [u8; 6],
     pub ipv4: String,
     pub ipv6: String,
     pub enc_algo: i64,
@@ -222,6 +225,19 @@ struct MioSession {
     send_buf: Vec<u8>,
     ic_rx: Option<Arc<InnerCipher>>,
     write_stalled: Option<Instant>,
+}
+
+/// 源 MAC 归属校验判定（对齐 Go validateSrcMAC）：会话端口只允许声明本会话
+/// 注册的 MAC，防止持密者声明他人 MAC 把受害者表项翻转到自己端口上劫持其
+/// 下行单播流量（学习表翻转攻击）。
+///
+/// `registered` 为 None（本机 TAP 等非会话端口）或全零（未上报 MAC 的会话）
+/// 时无法核对，放行以保持兼容。
+fn src_mac_allowed(registered: Option<&[u8; 6]>, mac: &[u8; 6]) -> bool {
+    match registered {
+        Some(r) if *r != [0u8; 6] => r == mac,
+        _ => true,
+    }
 }
 
 // ======================= 服务端共享状态（面板/控制用） =======================
@@ -451,6 +467,12 @@ impl WebStatsProvider for ServerCore {
                 "gauge",
                 self.banned.len().to_string(),
             );
+            emit(
+                "tlsvpn_spoofed_src_dropped_frames_total",
+                "Frames dropped for declaring another session's src MAC",
+                "counter",
+                self.vswitch.spoof_drops().to_string(),
+            );
         }
         m
     }
@@ -571,6 +593,21 @@ pub fn start_server(args: &Args) {
         v4_mask_bits,
         v6_mask_bits,
     });
+
+    // 源 MAC 归属校验（对齐 Go validateSrcMAC）：会话端口只能声明本会话
+    // 注册的 MAC。捕获 Weak 而非 Arc——ServerCore 持有 VSwitch，捕获 Arc 会
+    // 构成引用环
+    {
+        let weak = Arc::downgrade(&core);
+        let f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync> = Arc::new(
+            move |src_port_id, mac| {
+                let Some(core) = weak.upgrade() else { return true };
+                let sessions = core.sessions.read();
+                src_mac_allowed(sessions.get(src_port_id).map(|s| &s.mac_bin), mac)
+            },
+        );
+        core.vswitch.set_validate_mac(f);
+    }
 
     let device: Arc<dyn TapDevice> = if args.tap == "mem" {
         info!("Using in-memory TAP backend (no real device)");
@@ -1414,6 +1451,8 @@ fn handle_handshake(
             );
 
             let sess = Arc::new(ClientSession {
+                // 握手已保证格式合法（为空则解析失败），这里只解析一次
+                mac_bin: parse_mac_key(&mac).unwrap_or_default(),
                 session_id: gen_session_id(),
                 stat,
                 port,
@@ -1617,5 +1656,31 @@ mod tests {
         let second = p.alloc_v4("");
         assert!(!second.is_empty(), "回收后应能再次分配");
         assert_eq!(p.alloc_v4(""), "", "再次分配后池应重新耗尽");
+    }
+
+    // ---------- 源 MAC 归属校验（档 F） ----------
+
+    #[test]
+    fn src_mac_allowed_matches_go() {
+        let registered = [0xAA, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let other = [0xBB, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+        assert!(
+            src_mac_allowed(Some(&registered), &registered),
+            "本会话注册的 MAC 必须放行"
+        );
+        assert!(
+            !src_mac_allowed(Some(&registered), &other),
+            "他人 MAC 必须拒绝——这就是被堵的劫持路径"
+        );
+        assert!(
+            !src_mac_allowed(Some(&registered), &[0u8; 6]),
+            "空 MAC 帧不得借道"
+        );
+
+        // 未注册端口（本机 TAP）无法核对 → 放行
+        assert!(src_mac_allowed(None, &other));
+        // 未上报 MAC 的会话（注册值为全零）→ 放行保持兼容
+        assert!(src_mac_allowed(Some(&[0u8; 6]), &other));
     }
 }

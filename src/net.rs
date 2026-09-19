@@ -648,6 +648,11 @@ struct MacEntry {
 pub struct VSwitch {
     ports: DashMap<String, Arc<AsyncPort>>,
     mac_table: DashMap<[u8; 6], MacEntry>,
+    // 源 MAC 归属校验（None = 不过滤）：会话端口只允许声明本会话注册的 MAC。
+    // 共享 PSK 的多客户端场景下，恶意客户端可以声明他人的 srcMAC 把受害者的
+    // 表项学习到自己的端口，劫持其下行单播流量（学习表翻转攻击）。
+    validate_mac: RwLock<Option<Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync>>>,
+    spoof_drops: AtomicU64,
 }
 
 impl VSwitch {
@@ -655,6 +660,8 @@ impl VSwitch {
         let vs = Arc::new(Self {
             ports: DashMap::new(),
             mac_table: DashMap::new(),
+            validate_mac: RwLock::new(None),
+            spoof_drops: AtomicU64::new(0),
         });
 
         // 垃圾回收协程
@@ -676,6 +683,29 @@ impl VSwitch {
     pub fn remove_port(&self, id: &str) {
         self.ports.remove(id);
         self.mac_table.retain(|_, entry| entry.port_id != id);
+    }
+
+    /// 注入源 MAC 归属校验回调（对齐 Go validateMAC）。
+    ///
+    /// 注入方应捕获 `Weak<ServerCore>` 而不是 `Arc`——VSwitch 由 ServerCore
+    /// 持有，直接捕获 `Arc` 会构成引用环，进程存活期内两者都无法释放。
+    pub fn set_validate_mac(
+        &self,
+        f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync>,
+    ) {
+        *self.validate_mac.write() = Some(f);
+    }
+
+    /// 冒充他人源 MAC 被整帧丢弃的计数（对齐 Go 的
+    /// tlsvpn_spoofed_src_dropped_frames_total）
+    pub fn spoof_drops(&self) -> u64 {
+        self.spoof_drops.load(Ordering::Relaxed)
+    }
+
+    /// 查询某 MAC 当前的表项归属（测试用：确认冒充帧没有改写受害者表项）
+    #[cfg(test)]
+    fn mac_port(&self, mac: &[u8; 6]) -> Option<String> {
+        self.mac_table.get(mac).map(|e| e.port_id.clone())
     }
 
     /// MAC 表快照（面板展示，对齐 Go MACSnapshot）
@@ -718,6 +748,19 @@ impl VSwitch {
             None => true,
         };
         if need_update {
+            // 源 MAC 归属校验：端口只能声明自己会话注册的 MAC。冒充帧整帧丢弃
+            // （既不学习也不转发——转发等于允许攻击者以受害者身份注入流量）。
+            if let Some(f) = self.validate_mac.read().as_ref() {
+                if !f(src_port_id, &src_mac) {
+                    self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        "VSWITCH drop spoofed srcMAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} from port {}",
+                        src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+                        src_port_id
+                    );
+                    return;
+                }
+            }
             self.mac_table.insert(
                 src_mac,
                 MacEntry {
@@ -752,3 +795,235 @@ impl VSwitch {
 
 // AtomicBool 保留给会话保活标记使用
 pub type SharedFlag = Arc<AtomicBool>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
+    type TestBackend = (
+        Arc<Backend>,
+        crossbeam_channel::Receiver<VPNFrame>,
+    );
+
+    fn make_backend() -> TestBackend {
+        let (tx, rx) = crossbeam_channel::bounded(256);
+        (
+            Arc::new(Backend {
+                ch: tx,
+                rtt_cache: Arc::new(AtomicU32::new(50000)),
+                notify: None,
+            }),
+            rx,
+        )
+    }
+
+    /// 从收帧端取走当前所有帧的载荷末字节（测试断言顺序与内容用）
+    fn drained_last_byte(
+        rx: &crossbeam_channel::Receiver<VPNFrame>,
+    ) -> Vec<u8> {
+        (0..8)
+            .filter_map(|_| rx.try_recv().ok())
+            .map(|f| f.data[f.data.len() - 1])
+            .collect()
+    }
+
+    /// 最小合法以太帧（dst 6 + src 6 + ethertype 2 + 载荷）
+    fn eth_frame(dst: &[u8; 6], src: &[u8; 6], payload: &[u8]) -> Arc<Vec<u8>> {
+        let mut f = Vec::with_capacity(14 + payload.len());
+        f.extend_from_slice(dst);
+        f.extend_from_slice(src);
+        f.extend_from_slice(&0x0800u16.to_be_bytes());
+        f.extend_from_slice(payload);
+        Arc::new(f)
+    }
+
+    /// 与 server.rs 的 src_mac_allowed 同形的回调：注册表里没有条目
+    /// （本机 TAP 等非会话端口）或条目是全零 MAC（未上报）时放行。
+    fn ownership_callback(
+        reg: std::collections::HashMap<String, [u8; 6]>,
+    ) -> Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync> {
+        Arc::new(move |port_id, mac| {
+            match reg.get(port_id) {
+                Some(r) if r != &[0u8; 6] => r == mac,
+                _ => true,
+            }
+        })
+    }
+
+    #[test]
+    fn src_mac_ownership_blocks_impersonation() {
+        let vs = VSwitch::new();
+        let port_a = Arc::new(AsyncPort::new("A".into(), false));
+        let port_b = Arc::new(AsyncPort::new("B".into(), false));
+        let (backend_a, rx_a) = make_backend();
+        let (backend_b, rx_b) = make_backend();
+        port_a.register_backend(backend_a);
+        port_b.register_backend(backend_b);
+        vs.add_port("A".into(), port_a);
+        vs.add_port("B".into(), port_b);
+
+        let mac_a = [0xAA, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mac_b = [0xBB, 0x00, 0x00, 0x00, 0x00, 0x02];
+        vs.set_validate_mac(ownership_callback(std::collections::HashMap::from([
+            ("A".to_string(), mac_a),
+            ("B".to_string(), mac_b),
+        ])));
+
+        // 合法路径：两个端口各自声明自己的 MAC，被学习并正常互达
+        vs.process_frame("A", eth_frame(&[0, 0, 0, 0, 0, 0], &mac_a, &[0x01]));
+        vs.process_frame("B", eth_frame(&[0, 0, 0, 0, 0, 0], &mac_b, &[0x02]));
+        assert_eq!(
+            vs.mac_port(&mac_a),
+            Some("A".to_string()),
+            "A 的 MAC 表项必须指向端口 A"
+        );
+        assert_eq!(vs.mac_port(&mac_b), Some("B".to_string()));
+        assert_eq!(
+            drained_last_byte(&rx_b),
+            vec![0x01],
+            "合法帧必须照常投递"
+        );
+        assert_eq!(
+            drained_last_byte(&rx_a),
+            vec![0x02],
+            "合法帧必须照常投递"
+        );
+        assert_eq!(vs.spoof_drops(), 0);
+
+        // 冒充：B 声明 A 的 MAC 想抢走 A 的表项 —— 整帧丢弃
+        vs.process_frame("B", eth_frame(&[0, 0, 0, 0, 0, 0], &mac_a, &[0xAA]));
+        assert_eq!(
+            vs.spoof_drops(),
+            1,
+            "冒充源 MAC 的帧必须被计数"
+        );
+        assert_eq!(
+            vs.mac_port(&mac_a),
+            Some("A".to_string()),
+            "冒充帧不得改写受害者 MAC 的表项"
+        );
+        assert_eq!(
+            drained_last_byte(&rx_b),
+            Vec::<u8>::new(),
+            "冒充帧被丢在交换机内，不得再洪泛一次"
+        );
+
+        // 表项没被污染：正常单播仍可达 A，攻击者自己的流量不受影响
+        vs.process_frame("B", eth_frame(&mac_a, &mac_b, &[0x03]));
+        assert_eq!(
+            drained_last_byte(&rx_a),
+            vec![0x03],
+            "单播必须继续按受害者表项投递"
+        );
+
+        // 未注册的端口（本机 TAP）声明任意 MAC 放行
+        vs.process_frame("TAP_LOCAL", eth_frame(&mac_a, &[0x42; 6], &[0x04]));
+        assert_eq!(
+            vs.mac_port(&[0x42; 6]),
+            Some("TAP_LOCAL".to_string()),
+            "本机 TAP 端口声明的 MAC 必须放行"
+        );
+        assert_eq!(drained_last_byte(&rx_a), vec![0x04]);
+
+        // 未上报 MAC 的会话（全零注册值）放行，保持与旧客户端兼容
+        let vs2 = VSwitch::new();
+        vs2.set_validate_mac(ownership_callback(std::collections::HashMap::from([
+            ("C".to_string(), [0u8; 6]),
+        ])));
+        vs2.process_frame("C", eth_frame(&[0, 0, 0, 0, 0, 0], &[0x07; 6], &[0x05]));
+        assert_eq!(
+            vs2.mac_port(&[0x07; 6]),
+            Some("C".to_string()),
+            "空 MAC 会话必须放行"
+        );
+    }
+
+    #[test]
+    fn broadcast_from_exempt_port_is_delivered() {
+        // 本机 TAP 端口不在会话注册表里，校验放行：广播照旧洪泛到所有其他端口，
+        // 并按正常路径学习（对齐 Go——TAP 侧本来就是多 MAC）。
+        let vs = VSwitch::new();
+        let (backend_a, rx_a) = make_backend();
+        let (backend_b, rx_b) = make_backend();
+        let port_a = Arc::new(AsyncPort::new("A".into(), false));
+        let port_b = Arc::new(AsyncPort::new("B".into(), false));
+        port_a.register_backend(backend_a);
+        port_b.register_backend(backend_b);
+        vs.add_port("A".into(), port_a);
+        vs.add_port("B".into(), port_b);
+        vs.set_validate_mac(ownership_callback(std::collections::HashMap::from([
+            ("A".to_string(), [0xAA; 6]),
+            ("B".to_string(), [0xBB; 6]),
+        ])));
+
+        vs.process_frame(
+            "TAP_LOCAL",
+            eth_frame(&[0xff; 6], &[0xEE; 6], &[0x01]),
+        );
+        assert_eq!(
+            drained_last_byte(&rx_a),
+            vec![0x01],
+            "广播帧必须投递到所有其他端口"
+        );
+        assert_eq!(
+            drained_last_byte(&rx_b),
+            vec![0x01],
+            "广播帧必须投递到所有其他端口"
+        );
+        assert_eq!(
+            vs.spoof_drops(),
+            0,
+            "豁免端口的广播不得计入冒充丢弃"
+        );
+        assert_eq!(
+            vs.mac_port(&[0xEE; 6]),
+            Some("TAP_LOCAL".to_string()),
+            "豁免端口按正常路径学习"
+        );
+    }
+
+    #[test]
+    fn illegal_src_mac_broadcast_is_also_dropped() {
+        // 校验失败是整帧丢弃，广播也不例外：否则冒充者可以用广播绕过归属校验
+        // 把流量注入所有客户端（对齐 Go needUpdate 内的 return）。
+        let vs = VSwitch::new();
+        let (backend_a, rx_a) = make_backend();
+        let port_a = Arc::new(AsyncPort::new("A".into(), false));
+        port_a.register_backend(backend_a);
+        vs.add_port("A".into(), port_a);
+        vs.set_validate_mac(ownership_callback(std::collections::HashMap::from([
+            ("A".to_string(), [0xAA; 6]),
+        ])));
+
+        vs.process_frame(
+            "A",
+            eth_frame(&[0xff; 6], &[0xDD; 6], &[0x01]),
+        );
+        assert_eq!(vs.spoof_drops(), 1, "冒充广播必须被计数");
+        assert_eq!(
+            drained_last_byte(&rx_a),
+            Vec::<u8>::new(),
+            "冒充广播必须整帧丢弃"
+        );
+        assert_eq!(
+            vs.mac_port(&[0xDD; 6]),
+            None,
+            "冒充广播不得进入学习表"
+        );
+    }
+
+    #[test]
+    fn no_callback_keeps_learning_unrestricted() {
+        // 未注入回调（对齐 Go validateMAC == nil）时保持原行为：任意端口可学习
+        let vs = VSwitch::new();
+        let mac = [0xCD; 6];
+        let empty = [0u8; 6];
+        vs.process_frame("A", eth_frame(&empty, &mac, &[0x01]));
+        assert_eq!(vs.mac_port(&mac), Some("A".to_string()));
+        vs.process_frame("B", eth_frame(&empty, &mac, &[0x02]));
+        assert_eq!(vs.mac_port(&mac), Some("B".to_string()));
+        assert_eq!(vs.spoof_drops(), 0);
+    }
+}
