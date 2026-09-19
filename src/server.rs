@@ -807,12 +807,16 @@ fn worker_loop(
                     t,
                 ))),
             });
+            // 首帧是握手 JSON（<2KB）：认证前用小上限，防 10 字节帧头声明
+            // 131070 长度把扫描缓冲扩到 131KB/连接；认证通过后恢复全量上限
+            let mut scanner = FrameScanner::new();
+            scanner.set_max_data_len(HANDSHAKE_DATA_LENGTH);
             mio_sessions.insert(
                 t,
                 MioSession {
                     socket,
                     tls: ServerConnection::new(tls_config.clone()).unwrap(),
-                    scanner: FrameScanner::new(),
+                    scanner,
                     rx,
                     handshake_done: false,
                     sniffed: false,
@@ -1043,7 +1047,11 @@ fn process_plain_frames(
 
                 if seq == 0 && !sess.handshake_done {
                     match handle_handshake(sess, core, &data, tarpit) {
-                        HandshakeOutcome::Ok => sess.handshake_done = true,
+                        HandshakeOutcome::Ok => {
+                            sess.handshake_done = true;
+                            // 认证已通过：恢复数据帧的线路全量上限（jumbo 帧合法）
+                            sess.scanner.set_max_data_len(MAX_DATA_LENGTH);
+                        }
                         HandshakeOutcome::Close => {
                             *close = true;
                             break;

@@ -66,18 +66,35 @@ pub fn write_stream_frame(buf: &mut Vec<u8>, frame: &[u8]) {
 pub struct FrameScanner {
     buffer: Vec<u8>,
     offset: usize,
+    // 当前允许的帧负载上限：认证前的握手帧用小上限，认证通过后恢复线路
+    // 全量上限（见 set_max_data_len）。默认给全量上限，这样只在握手路径上
+    // 需要显式收紧。
+    max_data_len: usize,
 }
 
 // 与 Go FrameScanner 对齐的常量
-const HEADER_SIZE: usize = 10;
-const MAX_DATA_LENGTH: usize = 65535 * 2;
+pub const HEADER_SIZE: usize = 10;
+pub const MAX_DATA_LENGTH: usize = 65535 * 2;
+/// 认证前首帧上限。合法握手 JSON < 2KB；不设限的话攻击者用 10 字节帧头声明
+/// 131070 长度即可把扫描缓冲扩到 131KB/连接，预认证并发连接无上限，构成
+/// 内存放大。
+pub const HANDSHAKE_DATA_LENGTH: usize = 16 * 1024;
 
 impl FrameScanner {
     pub fn new() -> Self {
+        // 初始 16KB 覆盖典型 MTU 帧的聚合，大帧按需增长。旧值 70KB 对 1.5KB
+        // 帧是 45 倍冗余，多连接下白占内存并放大内存扫描开销。
         Self {
-            buffer: Vec::with_capacity(70 * 1024),
+            buffer: Vec::with_capacity(HANDSHAKE_DATA_LENGTH),
             offset: 0,
+            max_data_len: MAX_DATA_LENGTH,
         }
+    }
+
+    /// 调整帧负载上限，认证前收紧、认证后放开配对使用（对齐 Go 的
+    /// FrameScanner.SetMaxDataLen）。
+    pub fn set_max_data_len(&mut self, n: usize) {
+        self.max_data_len = n;
     }
 
     /// 供服务端"内层首字节嗅探"使用：返回缓冲区下一个待解析字节
@@ -90,7 +107,8 @@ impl FrameScanner {
     }
 
     /// 读取一帧。与 Go 行为一致：
-    /// - dataLen > 65535*2 → InvalidData 错误并清空缓冲；
+    /// - dataLen > max_data_len → InvalidData 错误并清空缓冲（认证前为
+    ///   HANDSHAKE_DATA_LENGTH，认证后为 MAX_DATA_LENGTH）；
     /// - dataLen == 0 的空帧（心跳等）直接跳过，不返回给调用方；
     /// - 无完整帧时返回 Ok(None)。
     pub fn read_frame<R: Read>(&mut self, reader: &mut R) -> io::Result<Option<(Vec<u8>, u32)>> {
@@ -126,7 +144,7 @@ impl FrameScanner {
             let seq = BigEndian::read_u32(&self.buffer[self.offset + 6..self.offset + 10]);
             let total_len = data_len + pad_len;
 
-            if data_len > MAX_DATA_LENGTH {
+            if data_len > self.max_data_len {
                 self.buffer.clear();
                 self.offset = 0;
                 return Err(io::Error::new(
@@ -259,6 +277,86 @@ mod tests {
         );
 
         let _ = crate::crypto::set_pad_mode(&prev);
+    }
+
+    // ---------- 预认证帧长上限（档 E） ----------
+
+    fn append_frame_head(buf: &mut Vec<u8>, data_len: u32, pad_len: u16, seq: u32) {
+        buf.extend_from_slice(&data_len.to_be_bytes());
+        buf.extend_from_slice(&pad_len.to_be_bytes());
+        buf.extend_from_slice(&seq.to_be_bytes());
+    }
+
+    #[test]
+    fn over_limit_header_errors_without_buffer_bloat() {
+        // 攻击面：10 字节帧头声明 16385 字节负载，只送帧头。扫描器必须立刻
+        // 报错，而不能按声明长度把缓冲撑到 16KB 以上——预认证并发无上限，
+        // 放大倍数会直接乘到连接数上。
+        let mut stream = Vec::new();
+        append_frame_head(&mut stream, HANDSHAKE_DATA_LENGTH as u32 + 1, 0, 0);
+        stream.extend_from_slice(&[0u8; 5]);
+
+        let mut s = FrameScanner::new();
+        s.set_max_data_len(HANDSHAKE_DATA_LENGTH);
+        let err = s
+            .read_frame(&mut std::io::Cursor::new(stream))
+            .expect_err("超限帧头必须立刻报错");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            s.buffer.capacity() <= HANDSHAKE_DATA_LENGTH * 2,
+            "扫描缓冲膨胀到 {}，仅凭一个超限帧头就吃掉了远超握手上限的内存",
+            s.buffer.capacity()
+        );
+        // 缓冲被清空：错误路径不能留下半帧残骸影响后续读取
+        assert_eq!(s.buffer.len(), 0);
+        assert_eq!(s.offset, 0);
+    }
+
+    #[test]
+    fn large_frame_reads_after_relaxing_the_limit() {
+        // 认证通过后恢复线路全量上限：jumbo 帧合法，不能因为收紧握手路径
+        // 而把数据面一起卡死。
+        let data = vec![0x5Au8; MAX_DATA_LENGTH];
+        let mut stream = Vec::new();
+        append_frame_head(&mut stream, MAX_DATA_LENGTH as u32, 0, 7);
+        stream.extend_from_slice(&data);
+        assert!(
+            stream.capacity() > HANDSHAKE_DATA_LENGTH,
+            "测试前置条件：完整帧必须超过初始缓冲容量"
+        );
+
+        let mut s = FrameScanner::new();
+        s.set_max_data_len(HANDSHAKE_DATA_LENGTH);
+        assert!(
+            s.read_frame(&mut std::io::Cursor::new(stream.clone()))
+                .is_err(),
+                "收紧状态下同一帧必须被拒绝"
+        );
+        s.set_max_data_len(MAX_DATA_LENGTH);
+        let (got, seq) = s
+            .read_frame(&mut std::io::Cursor::new(stream))
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(got.len(), MAX_DATA_LENGTH);
+        assert!(got.iter().all(|&b| b == 0x5A));
+
+        // 上限是"大于才拒"：恰好等于上限的帧必须通过
+        let mut exact = Vec::new();
+        append_frame_head(&mut exact, MAX_DATA_LENGTH as u32, 0, 0);
+        exact.extend_from_slice(&data);
+        let mut s2 = FrameScanner::new();
+        let (got2, _) = s2.read_frame(&mut std::io::Cursor::new(exact)).unwrap().unwrap();
+        assert_eq!(got2.len(), MAX_DATA_LENGTH);
+
+        // 空帧（心跳）不受上限影响
+        let mut hb = Vec::new();
+        append_frame_head(&mut hb, 0, 0, 42);
+        let mut s3 = FrameScanner::new();
+        s3.set_max_data_len(0);
+        let (got3, seq3) = s3.read_frame(&mut std::io::Cursor::new(hb)).unwrap().unwrap();
+        assert!(got3.is_empty());
+        assert_eq!(seq3, 42);
     }
 
     /// legacy 阈值同样以线路长度为输入：明文 184B → 线路 200B 落在

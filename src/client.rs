@@ -1316,6 +1316,9 @@ fn tls_exchange_resp(
 ) -> Option<HandshakeResp> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut scanner = FrameScanner::new();
+    // 首帧是握手响应（<2KB）：收紧上限防畸形帧头撑大缓冲。本函数只读握手响应，
+    // 数据面用的是主循环里另一个扫描器（默认全量上限）
+    scanner.set_max_data_len(HANDSHAKE_DATA_LENGTH);
     loop {
         // 尽力冲刷请求
         while tls.wants_write() {
