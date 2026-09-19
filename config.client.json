@@ -1,0 +1,34 @@
+{
+  "mode": "client",
+  "psk": "change-me-please",
+  "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
+  "log_level": "info",
+  "encrypt": true,
+  "min_enc": "gcm",
+  "pad_mode": "bucket",
+  "brutal": true,
+  "brutal_up": 100,
+  "brutal_down": 500,
+  "socks5": "",
+  "mtu": 1500,
+  "tap": "tap0",
+  "mac": "",
+  "web": {
+    "addr": ":8080",
+    "auth": "admin:change-me",
+    "bind": "tunnel",
+    "cert": "",
+    "key": ""
+  },
+  "client": {
+    "conns": 4,
+    "fec": true,
+    "fec_group": 4,
+    "sni": "www.cloudflare.com",
+    "insecure": false,
+    "cert_sha256": "",
+    "req_v4": "",
+    "req_v6": "",
+    "fwmark": 0
+  }
+}

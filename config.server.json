@@ -1,0 +1,31 @@
+{
+  "mode": "server",
+  "psk": "change-me-please",
+  "addr": ":4000",
+  "log_level": "info",
+  "encrypt": true,
+  "min_enc": "gcm",
+  "pad_mode": "bucket",
+  "brutal": true,
+  "brutal_up": 100,
+  "brutal_down": 500,
+  "workers": 4,
+  "mtu": 1500,
+  "tap": "tap0",
+  "mac": "",
+  "web": {
+    "addr": ":8080",
+    "auth": "admin:change-me",
+    "bind": "tunnel",
+    "cert": "",
+    "key": ""
+  },
+  "server": {
+    "v4_cidr": "10.0.0.0/24",
+    "v6_cidr": "fd00::/64",
+    "cert": "server.crt",
+    "key": "server.key",
+    "session_token": false,
+    "max_sessions": 1024
+  }
+}

@@ -752,6 +752,31 @@ fn example_config_json() -> String {
     )
 }
 
+    // ---------- 仓库根目录的示例配置 ----------
+
+    #[test]
+    fn example_configs_in_repo_root_load_and_validate() {
+        // config.server.json / config.client.json 是用户克隆后直接 -c 的起点，
+        // 必须原样通过加载（deny_unknown_fields）+ 校验，否则示例即失效。
+        let mut psks = Vec::new();
+        for (file, mode) in [
+            ("config.server.json", "server"),
+            ("config.client.json", "client"),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let args = load_config_file(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{} 加载失败: {}", file, e));
+            validate_args(&args)
+                .unwrap_or_else(|e| panic!("{} 校验失败: {}", file, e));
+            assert_eq!(args.mode, mode, "{} 的 mode 不对", file);
+            assert_eq!(args.pad_mode, "bucket", "{} 的 pad_mode 未按模板", file);
+            assert_eq!(args.mtu, 1500, "{} 的 mtu 未按模板", file);
+            psks.push(args.psk);
+        }
+        // 两份示例的 psk 必须一致，否则开箱即不通
+        assert_eq!(psks[0], psks[1], "server/client 示例的 psk 不一致");
+    }
+
 fn num_cpus_hint() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())

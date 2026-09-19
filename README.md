@@ -61,6 +61,8 @@ sudo ./target/release/tlsvpn -c client.json
 
 Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
 
+Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite, so they never drift from the binary.
+
 ## Configuration
 
 `-c config.json` is the **only** configuration surface — there are no other flags, and the format is identical to the Go build, so binaries can be swapped without touching a config. Unknown fields are rejected. Start from the built-in template:
