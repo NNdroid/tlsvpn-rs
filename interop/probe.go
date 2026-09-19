@@ -1,12 +1,12 @@
 // 互操作探针（e2e 用，独立二进制，不参与主程序编译）
 //
 // 用自包含的协议栈完成一次完整会话：
-//   1. TLS（跳过验证）连到 --addr 指定的服务端
-//   2. 发送 HandshakeReq（含 enc_algo=2 / fec_group 请求）
-//   3. 解析 HandshakeResp，打印协商结果
-//   4. 用协商出的加密器发 N 个加密数据帧
-//   5. 每 500ms 发一个心跳，从服务端收帧（校验帧/数据帧/心跳）并统计
-//   6. 收到 --expect-frames 帧或超时后退出 0；任何一步失败退出非 0
+//  1. TLS（跳过验证）连到 --addr 指定的服务端
+//  2. 发送 HandshakeReq（含 enc_algo=2 / fec_group 请求）
+//  3. 解析 HandshakeResp，打印协商结果
+//  4. 用协商出的加密器发 N 个加密数据帧
+//  5. 每 500ms 发一个心跳，从服务端收帧（校验帧/数据帧/心跳）并统计
+//  6. 收到 --expect-frames 帧或超时后退出 0；任何一步失败退出非 0
 //
 // 由 -tags interop 控制编译：go build -tags interop -o probe.exe ./cmd/probe
 package main
@@ -32,7 +32,8 @@ import (
 
 // ---- 协议常量（与 tlsvpn/frame.go 一致） ----
 const (
-	encAlgoGCM = 2
+	encAlgoGCM   = 2
+	encAlgoGCMV2 = 3
 	encSaltSize  = 8
 	gcmTagSize   = 16
 	fecMagic     = byte(0xFE)
@@ -111,11 +112,18 @@ type interopCipher struct {
 	salt [encSaltSize]byte
 }
 
-func newInteropCipher(psk string, salt []byte) (*interopCipher, error) {
+// newInteropCipher 按协商出的算法值（2 = GCM-v1，3 = GCM-v2）构造内层加密器。
+// 二者仅密钥派生标签不同：v2 用 _enc_key_gcm_v2 实现 GCM/CTR 密钥分离
+// （对齐 Go gcmKeyLabel）。
+func newInteropCipher(psk string, salt []byte, algo int) (*interopCipher, error) {
 	if len(salt) != encSaltSize {
 		return nil, fmt.Errorf("bad salt len %d", len(salt))
 	}
-	keyHash := sha256.Sum256([]byte(psk + "_enc_key"))
+	label := "_enc_key"
+	if algo == encAlgoGCMV2 {
+		label = "_enc_key_gcm_v2"
+	}
+	keyHash := sha256.Sum256([]byte(psk + label))
 	block, err := aes.NewCipher(keyHash[:])
 	if err != nil {
 		return nil, err
@@ -210,7 +218,7 @@ func main() {
 	staySec := flag.Int("stay", 0, "stay connected N seconds receiving frames (2-client test)")
 	bcast := flag.Bool("bcast", false, "send one broadcast ethernet frame before staying")
 	parityTest := flag.Bool("parity-test", false, "send K-1 broadcast frames + data frames so parity frames appear on wire (FEC cross-check)")
-	encAlgo := flag.Int("enc-algo", encAlgoGCM, "inner cipher capability to declare: 0 = legacy CTR, 2 = GCM (min_enc 下限测试用)")
+	encAlgo := flag.Int("enc-algo", encAlgoGCM, "inner cipher capability to declare: 0 = legacy CTR, 2 = GCM-v1, 3 = GCM-v2, 9 = 未知算法（min_enc 下限测试用）")
 	flag.Parse()
 
 	target := *addr
@@ -245,7 +253,11 @@ func main() {
 	tlsConn.SetDeadline(time.Time{})
 
 	idHash := sha256.Sum256([]byte(*mac + *psk))
-	clientID := hex.EncodeToString(idHash[:16]) // 探针用短 ID，格式不要求是 UUID
+	// 服务端把 ClientID 校验为 UUID 形态（8-4-4-4-12），探针派生同样的形状；
+	// 由 mac+psk 确定，保证同一身份重连时 ID 恒定
+	h := hex.EncodeToString(idHash[:16])
+	clientID := fmt.Sprintf(
+		"%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 
 	// 2. 握手请求
 	req := HandshakeReq{
@@ -291,27 +303,33 @@ func main() {
 	}
 	var icTx, icRx *interopCipher
 	if *encrypt {
-		// 精确比较而非 >=：未知算法 ID 不得被当成 GCM（见 encAlgoSupported）
-		if resp.EncAlgo == encAlgoGCM {
+		// 精确比较而非 >=：未知算法 ID 不得被当成 GCM（见 encAlgoSupported）。
+		// 算法 3（GCM-v2）与 2（GCM-v1）都是合格协商结果：服务端按本端声明的
+		// 能力（-enc-algo）精确匹配后回哪个，哪个就是对的。
+		if resp.EncAlgo == encAlgoGCM || resp.EncAlgo == encAlgoGCMV2 {
 			saltTx, e1 := hex.DecodeString(resp.EncSalt)
 			saltRx, e2 := hex.DecodeString(resp.EncSalt2)
 			if e1 != nil || e2 != nil || len(saltTx) != encSaltSize || len(saltRx) != encSaltSize {
 				fmt.Println("FAIL: bad enc salts from server")
 				os.Exit(1)
 			}
-			icTx, err = newInteropCipher(*psk, saltTx)
+			icTx, err = newInteropCipher(*psk, saltTx, resp.EncAlgo)
 			if err != nil {
 				fmt.Println("FAIL:", err)
 				os.Exit(1)
 			}
-			icRx, err = newInteropCipher(*psk, saltRx)
+			icRx, err = newInteropCipher(*psk, saltRx, resp.EncAlgo)
 			if err != nil {
 				fmt.Println("FAIL:", err)
 				os.Exit(1)
 			}
-			fmt.Println("NEGOTIATED: GCM (per-session bidirectional salts)")
+			if resp.EncAlgo == encAlgoGCMV2 {
+				fmt.Println("NEGOTIATED: GCM-v2 (per-session salts, independent key label)")
+			} else {
+				fmt.Println("NEGOTIATED: GCM (per-session bidirectional salts)")
+			}
 		} else {
-			fmt.Println("NEGOTIATED: legacy CTR (server lacks GCM)")
+			fmt.Println("NEGOTIATED: legacy CTR (server lacks GCM or below min_enc)")
 			fmt.Println("FAIL: expected GCM negotiation with modern server")
 			os.Exit(1)
 		}
@@ -332,12 +350,12 @@ func main() {
 	if !*parityTest {
 		go func() {
 			for i := 0; i < *frames; i++ {
-			payload := []byte(fmt.Sprintf("PROBE-DATA-%04d:%s", i, time.Now().Format("15:04:05.000")))
-			fb := appendPaddedFrame(nil, uint32(i+1), payload, icTx)
-			if _, err := tlsConn.Write(fb); err != nil {
-				return
-			}
-			time.Sleep(20 * time.Millisecond)
+				payload := []byte(fmt.Sprintf("PROBE-DATA-%04d:%s", i, time.Now().Format("15:04:05.000")))
+				fb := appendPaddedFrame(nil, uint32(i+1), payload, icTx)
+				if _, err := tlsConn.Write(fb); err != nil {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
 		}()
 	}

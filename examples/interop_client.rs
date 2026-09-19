@@ -100,12 +100,15 @@ struct ProbeCipher {
 }
 
 impl ProbeCipher {
-    fn new(psk: &str, salt: &[u8]) -> Result<Self, String> {
+    /// algo 是握手协商出的算法值（2 = GCM-v1，3 = GCM-v2）。二者仅密钥派生
+    /// 标签不同：v2 用 `_enc_key_gcm_v2` 实现 GCM/CTR 密钥分离（对齐 Go gcmKeyLabel）。
+    fn new(psk: &str, salt: &[u8], algo: i64) -> Result<Self, String> {
         if salt.len() != ENC_SALT_SIZE {
             return Err(format!("bad salt len {}", salt.len()));
         }
+        let label = if algo == 3 { "_enc_key_gcm_v2" } else { "_enc_key" };
         let mut h = Sha256::new();
-        h.update(format!("{}_enc_key", psk).as_bytes());
+        h.update(format!("{}{}", psk, label).as_bytes());
         let key = h.finalize();
         let aead = Aes256Gcm::new((&key).into());
         let mut s = [0u8; ENC_SALT_SIZE];
@@ -407,10 +410,20 @@ fn main() {
     let mut tls = rustls::StreamOwned::new(conn, tcp);
 
     // 3. 握手
+    // 服务端把 ClientID 校验为 UUID 形态（8-4-4-4-12），探针派生同样的形状；
+    // 由 mac+psk 确定，保证同一身份重连时 ID 恒定
     let client_id = {
         let mut h = Sha256::new();
         h.update(format!("{}{}", mac, psk).as_bytes());
-        hex::encode(&h.finalize()[..16])
+        let d = hex::encode(&h.finalize()[..16]);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &d[0..8],
+            &d[8..12],
+            &d[12..16],
+            &d[16..20],
+            &d[20..32]
+        )
     };
     let req = HandshakeReq {
         client_id: client_id.clone(),
@@ -454,16 +467,24 @@ fn main() {
     let mut ic_tx: Option<ProbeCipher> = None;
     let mut ic_rx: Option<ProbeCipher> = None;
     if encrypt {
-        // 精确比较而非 >=：enc_algo 是枚举不是强度量级，
-        // 未知算法 ID 不得被当成 GCM 能力（与 crypto::enc_algo_supported 一致）。
-        // fec_group 那边用 >= 是对的——K 单调递增，K=3 严格强于 K=2。
-        if resp.enc_algo.unwrap_or(0) == 2 {
+        let algo = resp.enc_algo.unwrap_or(0);
+        // 精确比较而非 >=：enc_algo 是枚举不是强度量级，未知算法 ID 不得被
+        // 当成 GCM 能力（与 crypto::enc_algo_supported 一致）。fec_group 那边
+        // 用 >= 是对的——K 单调递增，K=3 严格强于 K=2。
+        // 算法 3（GCM-v2）与 2（GCM-v1）都是合格协商结果：服务端按本端声明的
+        // 能力（--enc-algo）精确匹配后回哪个，哪个就是对的。
+        if algo == 2 || algo == 3 {
             let stx = hex::decode(resp.enc_salt.as_deref().unwrap_or("")).unwrap_or_default();
             let srx = hex::decode(resp.enc_salt2.as_deref().unwrap_or("")).unwrap_or_default();
-            ic_tx = Some(ProbeCipher::new(&psk, &stx).unwrap_or_else(|e| fail(&e)));
-            ic_rx = Some(ProbeCipher::new(&psk, &srx).unwrap_or_else(|e| fail(&e)));
-            println!("NEGOTIATED: GCM (per-session bidirectional salts)");
+            ic_tx = Some(ProbeCipher::new(&psk, &stx, algo).unwrap_or_else(|e| fail(&e)));
+            ic_rx = Some(ProbeCipher::new(&psk, &srx, algo).unwrap_or_else(|e| fail(&e)));
+            if algo == 3 {
+                println!("NEGOTIATED: GCM-v2 (per-session salts, independent key label)");
+            } else {
+                println!("NEGOTIATED: GCM (per-session bidirectional salts)");
+            }
         } else {
+            println!("NEGOTIATED: legacy CTR (server lacks GCM or below min_enc)");
             println!("FAIL: expected GCM negotiation with modern server");
             std::process::exit(1);
         }

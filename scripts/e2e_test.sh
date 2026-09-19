@@ -131,9 +131,10 @@ suite_pad() {
 }
 
 suite_minenc() {
-  # 14 个组合 × 2 个服务端 = 28 组，再加 2 组 Go 探针交叉 = 30 组。
-  # encalgo=3 是两端都不认识的算法 ID：服务端必须按"精确比较"处理，
-  # 不得因为 3 >= 2 就当成满足 gcm 下限（Go 侧历史上正是这么错的）。
+  # 15 个组合 × 2 个服务端 = 30 组，再加 3 组 Go 探针交叉 = 33 组。
+  # 算法 ID 3（GCM-v2）自 aacef6d 起是两端都认识的能力，高于 gcm 下限；
+  # 真正"两端都不认识"的算法 ID 用 9：服务端必须按精确比较判定强度，
+  # 不得因为数值大就当成满足 gcm 下限（Go 侧历史上正是这么错的）。
   local -a combos=(
     ""            0  accept
     ""            2  accept
@@ -143,15 +144,16 @@ suite_minenc() {
     legacy        2  accept
     gcm           2  accept
     gcm           0  reject
-    gcm           3  reject      # 未知算法不算 GCM → 必拒（真正的 >= bug 回归锁）
-    ctr           3  accept      # 未知算法回落 CTR 档，ctr 下限本就该放行
+    gcm           3  accept      # GCM-v2 高于 gcm 下限
+    gcm           9  reject      # 真未知算法归 CTR 档 → 不满足 gcm（>= bug 回归锁）
+    ctr           3  accept      # GCM-v2 高于 ctr 下限，本就该放行
     legacy        3  accept      # 同上；legacy 与 ctr 是同一档下限
     gcm           2  configerr   # ENCRYPT=0
     ctr           2  configerr   # ENCRYPT=0
     bogus         2  configerr
   )
   local i=0 n=0 fails=0 m en mo s port enc
-  echo "  min_enc：14 个组合 × 2 个服务端 + 2 组 Go 探针交叉 = 30 组"
+  echo "  min_enc：15 个组合 × 2 个服务端 + 3 组 Go 探针交叉 = 33 组"
   for s in rs go; do
     for ((i = 0; i < ${#combos[@]}; i += 3)); do
       m="${combos[i]}"; en="${combos[i+1]}"; mo="${combos[i+2]}"
@@ -164,9 +166,10 @@ suite_minenc() {
       n=$((n + 1))
     done
   done
-  # Go 探针交叉：确认判据在服务端，探针语言不影响结果
-  n=28
-  for spec in "gcm 2 accept" "gcm 0 reject"; do
+  # Go 探针交叉：确认判据在服务端，探针语言不影响结果。第三组让 Go 探针
+  # 声明 GCM-v2，跨语言走完 v2 的独立密钥标签路径。
+  n=30
+  for spec in "gcm 2 accept" "gcm 0 reject" "gcm 3 accept"; do
     set -- $spec; m="$1"; en="$2"; mo="$3"
     SRV=rs PROBE=go MODE="$mo" MINENC="$m" ENCALGO="$en" ENCRYPT=1 \
       PORT="$((PORT_BASE_MINENC + n * 10))" LABEL="minenc_go-probe_${m}_${en}_${mo}" \
