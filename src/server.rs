@@ -1273,7 +1273,21 @@ fn handle_handshake(
             let salt_a = new_random_salt();
             let salt_b = new_random_salt();
             let (enc_algo, ic_tx, ic_rx) = if core.encrypt {
-                if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM) {
+                // 算法 3（GCM-v2）优先于 2（GCM-v1）：v2 用独立密钥标签实现
+                // GCM/CTR 密钥分离；仅声明 2 的旧客户端继续用旧派生（对齐 Go）。
+                if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM_V2) {
+                    (
+                        ENC_ALGO_GCM_V2,
+                        Some(Arc::new(
+                            InnerCipher::gcm_algo(&core.psk, &salt_b, ENC_ALGO_GCM_V2)
+                                .expect("GCM init"),
+                        )),
+                        Some(Arc::new(
+                            InnerCipher::gcm_algo(&core.psk, &salt_a, ENC_ALGO_GCM_V2)
+                                .expect("GCM init"),
+                        )),
+                    )
+                } else if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM) {
                     (
                         ENC_ALGO_GCM,
                         Some(Arc::new(
@@ -1315,7 +1329,7 @@ fn handle_handshake(
             ));
             *stat.fec_mode.lock() = fec_mode.clone();
             stat.enc_algo.store(
-                if enc_algo == ENC_ALGO_GCM {
+                if enc_algo == ENC_ALGO_GCM || enc_algo == ENC_ALGO_GCM_V2 {
                     2
                 } else if core.encrypt {
                     1
@@ -1397,7 +1411,7 @@ fn handle_handshake(
         apply_tcp_brutal(&sess.socket, server_tx_rate);
     }
 
-    let (enc_salt, enc_salt2) = if c_sess.enc_algo == ENC_ALGO_GCM {
+    let (enc_salt, enc_salt2) = if c_sess.enc_algo == ENC_ALGO_GCM || c_sess.enc_algo == ENC_ALGO_GCM_V2 {
         (hex::encode(c_sess.salt_a), hex::encode(c_sess.salt_b))
     } else {
         (String::new(), String::new())

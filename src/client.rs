@@ -925,19 +925,22 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut ic_tx: Option<Arc<InnerCipher>> = None;
     let mut ic_rx: Option<Arc<InnerCipher>> = None;
     if cl.encrypt {
-        if enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM) {
+        // resp.enc_algo=3 为 GCM-v2（独立密钥标签），=2 为旧派生，二者语义一致
+        if enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM)
+            || enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM_V2)
+        {
             let salt_tx = hex::decode(&resp.enc_salt).ok();
             let salt_rx = hex::decode(&resp.enc_salt2).ok();
             if let (Some(stx), Some(srx)) = (salt_tx, salt_rx) {
                 if stx.len() == ENC_SALT_SIZE && srx.len() == ENC_SALT_SIZE {
                     match (
-                        InnerCipher::gcm(&cl.psk, &stx),
-                        InnerCipher::gcm(&cl.psk, &srx),
+                        InnerCipher::gcm_algo(&cl.psk, &stx, resp.enc_algo),
+                        InnerCipher::gcm_algo(&cl.psk, &srx, resp.enc_algo),
                     ) {
                         (Ok(tx), Ok(rx)) => {
                             ic_tx = Some(Arc::new(tx));
                             ic_rx = Some(Arc::new(rx));
-                            enc_algo = ENC_ALGO_GCM;
+                            enc_algo = resp.enc_algo;
                         }
                         (e1, e2) => {
                             warn!(
@@ -1030,7 +1033,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
         cl.enc_algo_display.store(
-            if enc_algo == ENC_ALGO_GCM { 2 } else { 1 },
+            if enc_algo == ENC_ALGO_GCM || enc_algo == ENC_ALGO_GCM_V2 {
+                2
+            } else {
+                1
+            },
             Ordering::Relaxed,
         );
 

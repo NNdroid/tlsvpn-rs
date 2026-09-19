@@ -10,12 +10,20 @@ use crate::utils::*;
 // 与 Go 端 crypto.go 对齐的算法常量
 pub const ENC_ALGO_LEGACY_CTR: i64 = 0;
 pub const ENC_ALGO_GCM: i64 = 2;
+/// 协商式 GCM 密钥分离（对齐 Go encAlgoGCMV2）：算法语义与 2 完全一致，仅密钥
+/// 改为独立标签派生，消除"同一 AES 密钥同时充当 GCM 的 GHASH 子密钥与 legacy
+/// CTR 密钥流"的分层混用。必须走协商：直接改 2 的派生会让"新服务端+旧客户端"
+/// 在双方都声明支持 GCM 的情况下静默黑洞（协商成功、标签全败）；改为新算法值
+/// 后旧对端自动回退 CTR。新客户端声明 3，新服务端按 3 用 v2 密钥、按 2 用旧密钥。
+pub const ENC_ALGO_GCM_V2: i64 = 3;
 pub const GCM_TAG_SIZE: usize = 16;
 pub const GCM_NONCE_SIZE: usize = 12;
 pub const ENC_SALT_SIZE: usize = 8;
 
-// 客户端握手请求里声明的本端最高算法支持（对齐 Go clientEncAlgoSupport）
-pub const CLIENT_ENC_ALGO_SUPPORT: i64 = ENC_ALGO_GCM;
+// 客户端握手请求里声明的本端最高算法支持（对齐 Go clientEncAlgoSupport）。
+// 声明 v2(3)：新服务端按 3 协商 v2 密钥；旧服务端精确匹配 2 失败会回退
+// legacy CTR（安全降级，绝不静默黑洞）——两端都升级后 GCM 恢复。
+pub const CLIENT_ENC_ALGO_SUPPORT: i64 = ENC_ALGO_GCM_V2;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -192,9 +200,9 @@ pub const MIN_ENC_LEGACY: &str = "legacy";
 pub const MIN_ENC_GCM: &str = "gcm";
 
 /// 算法强度排序；未知算法视为最弱（CTR 档）。
-/// 0 / 1 / 任何其它值都算 CTR——只有恰好等于 ENC_ALGO_GCM 才算 GCM。
+/// 0 / 1 / 任何其它值都算 CTR——只有恰好等于 ENC_ALGO_GCM/V2 才算 GCM。
 pub fn enc_algo_rank(algo: i64) -> i64 {
-    if algo == ENC_ALGO_GCM {
+    if algo == ENC_ALGO_GCM || algo == ENC_ALGO_GCM_V2 {
         ENC_RANK_GCM
     } else {
         ENC_RANK_CTR
@@ -237,14 +245,30 @@ pub fn get_cipher_context(psk: &str) -> (Vec<u8>, Vec<u8>) {
     (key, iv)
 }
 
-// 生成本端导出的 AES-256 key（legacy CTR 与 GCM 共用）
+// 生成本端导出的 AES-256 key（legacy CTR 与 GCM-v1 共用，历史原因）
 fn derive_key(psk: &str) -> [u8; 32] {
+    derive_key_labeled(psk, "_enc_key")
+}
+
+/// 按标签派生 AES-256 key（对齐 Go gcmKeyLabel：GCM-v2 用独立标签实现
+/// GCM/CTR 密钥分离）
+fn derive_key_labeled(psk: &str, label: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(format!("{}_enc_key", psk).as_bytes());
+    hasher.update(format!("{}{}", psk, label).as_bytes());
     let out = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&out);
     key
+}
+
+/// 各 GCM 算法值的密钥派生标签。算法 2 保留旧标签以兼容既有实现；
+/// 算法 3 用独立标签实现 GCM/CTR 密钥分离（对齐 Go gcmKeyLabel）。
+fn gcm_key_label(algo: i64) -> &'static str {
+    if algo == ENC_ALGO_GCM_V2 {
+        "_enc_key_gcm_v2"
+    } else {
+        "_enc_key"
+    }
 }
 
 /// 每会话随机的方向盐（crypto/rand 等价物，对齐 Go newRandomSalt）
@@ -284,6 +308,14 @@ impl InnerCipher {
     }
 
     pub fn gcm(psk: &str, salt: &[u8]) -> Result<InnerCipher, String> {
+        Self::gcm_algo(psk, salt, ENC_ALGO_GCM)
+    }
+
+    /// 按协商出的算法值构造 GCM 加密器（2 或 3；二者仅密钥派生标签不同）
+    pub fn gcm_algo(psk: &str, salt: &[u8], algo: i64) -> Result<InnerCipher, String> {
+        if algo != ENC_ALGO_GCM && algo != ENC_ALGO_GCM_V2 {
+            return Err(format!("unknown GCM algo {}", algo));
+        }
         if salt.len() != ENC_SALT_SIZE {
             return Err(format!(
                 "encryption salt must be {} bytes, got {}",
@@ -291,7 +323,7 @@ impl InnerCipher {
                 salt.len()
             ));
         }
-        let key = derive_key(psk);
+        let key = derive_key_labeled(psk, gcm_key_label(algo));
         let aead = Aes256Gcm::new((&key).into());
         let mut s = [0u8; ENC_SALT_SIZE];
         s.copy_from_slice(salt);
@@ -743,10 +775,11 @@ mod tests {
 
     #[test]
     fn enc_algo_rank_treats_unknown_as_weakest() {
-        // 回归锁：只有恰好等于 ENC_ALGO_GCM 才算 GCM。未知算法必须落到 CTR 档，
-        // 绝不能因为"数值更大"就算满足 GCM 下限。
+        // 回归锁：只有恰好等于 ENC_ALGO_GCM/GCM_V2 才算 GCM。未知算法必须落到
+        // CTR 档，绝不能因为"数值更大"就算满足 GCM 下限。
         assert_eq!(enc_algo_rank(ENC_ALGO_GCM), ENC_RANK_GCM);
-        for algo in [0i64, 1, 3, 7, 99, -1, i64::MAX] {
+        assert_eq!(enc_algo_rank(ENC_ALGO_GCM_V2), ENC_RANK_GCM);
+        for algo in [0i64, 1, 4, 7, 99, -1, i64::MAX] {
             assert_eq!(
                 enc_algo_rank(algo),
                 ENC_RANK_CTR,
@@ -792,6 +825,38 @@ mod tests {
     }
 
     #[test]
+    fn gcm_v2_roundtrip_and_key_separation() {
+        let salt = new_random_salt();
+        let wire = (16 + GCM_TAG_SIZE) as u32;
+        // 同算法往返成功（region = 明文 16B + 标签空间 16B）
+        let tx = InnerCipher::gcm_algo("v2_psk", &salt, ENC_ALGO_GCM_V2).unwrap();
+        let rx = InnerCipher::gcm_algo("v2_psk", &salt, ENC_ALGO_GCM_V2).unwrap();
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(b"hello gcm v2 pay");
+        tx.seal_in_place(&mut buf, 16, 42, wire);
+        let plain = rx.open_in_place(&mut buf, 42, wire).expect("v2 open");
+        assert_eq!(&plain[..16], b"hello gcm v2 pay");
+
+        // 密钥分离：v1 密文必须不能用 v2 密钥打开——
+        // 这是把 GCM/CTR 密钥混用问题做成分离协商值的全部意义
+        let tx1 = InnerCipher::gcm("sep_psk", &salt).unwrap();
+        let rx2 = InnerCipher::gcm_algo("sep_psk", &salt, ENC_ALGO_GCM_V2).unwrap();
+        let mut buf1 = [0u8; 32];
+        buf1[..16].copy_from_slice(b"cross-label pay!");
+        tx1.seal_in_place(&mut buf1, 16, 7, wire);
+        assert!(
+            rx2.open_in_place(&mut buf1, 7, wire).is_err(),
+            "v1 密文不得被 v2 密钥打开"
+        );
+
+        // 未知算法值拒绝构造
+        assert!(InnerCipher::gcm_algo("x", &salt, 99).is_err());
+
+        // v2 与 v1 同强度档（min_enc=gcm 必须同时接受 2 与 3）
+        assert_eq!(enc_algo_rank(ENC_ALGO_GCM_V2), ENC_RANK_GCM);
+    }
+
+    #[test]
     fn min_enc_floor_matrix() {
         // 无下限：任何算法都放行
         assert!(!server_rejects_min_enc(true, ENC_RANK_NONE, ENC_ALGO_LEGACY_CTR));
@@ -805,11 +870,13 @@ mod tests {
             "GCM 下限必须拒绝 CTR 客户端"
         );
         assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM));
+        // GCM-v2(3) 与 v1 同强度档
+        assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM_V2));
         // encrypt=false 时下限失效（此时本不该配置 min_enc，校验层已拦）
         assert!(!server_rejects_min_enc(false, ENC_RANK_GCM, ENC_ALGO_LEGACY_CTR));
         // 未知算法 ID 必须被 GCM 下限拦下——用 >= 比较会让它漏过去
         assert!(
-            server_rejects_min_enc(true, ENC_RANK_GCM, 3),
+            server_rejects_min_enc(true, ENC_RANK_GCM, 4),
             "未知算法 ID 必须算 CTR 档并被 GCM 下限拒绝"
         );
     }
@@ -825,8 +892,10 @@ mod tests {
             "服务端降级到 CTR 时必须判定握手失败并重连"
         );
         assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM));
+        // GCM-v2(3) 与 v1 同强度档，不得拒
+        assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM_V2));
         assert!(
-            client_rejects_min_enc(ENC_RANK_GCM, 3),
+            client_rejects_min_enc(ENC_RANK_GCM, 4),
             "未知算法 ID 的协商结果不得被当成 GCM"
         );
     }
