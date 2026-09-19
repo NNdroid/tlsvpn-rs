@@ -3,6 +3,7 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use mio;
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +21,10 @@ const H2_403_RESPONSE: &[u8] = &[
     0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01, 0x08, 0x03, b'4', b'0', b'3',
 ];
+
+/// 本机 TAP 在交换机上的端口名（对齐 Go tapPortID）。网关侧端口，可信：
+/// 源 MAC 校验按"未注册端口"放行，洪泛预算豁免
+pub const TAP_PORT_ID: &str = "TAP_LOCAL";
 
 pub fn serve_fallback_http<W: Write>(mut writer: W, is_h2: bool) {
     if is_h2 {
@@ -653,15 +658,38 @@ pub struct VSwitch {
     // 表项学习到自己的端口，劫持其下行单播流量（学习表翻转攻击）。
     validate_mac: RwLock<Option<Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync>>>,
     spoof_drops: AtomicU64,
+
+    // 广播/未知单播洪泛的每端口令牌桶：恶意客户端可以线速广播，洪泛会被
+    // 复制到所有端口放大 N 倍。合法 ARP/mDNS 远低于该预算；超预算的帧直接
+    // 丢弃（单播不受影响）。
+    flood_mu: Mutex<HashMap<String, FloodBudget>>,
+    flood_burst: f64, // 桶容量（突发预算）
+    flood_rate_per_sec: f64, // 每秒补充令牌数
+    flood_drops: AtomicU64,
+    // 豁免洪泛预算的端口（本机 TAP）：网关自己发起的广播不受限
+    trusted_port: String,
+}
+
+/// 每源端口的洪泛预算（对齐 Go floodBudget）：令牌按时间线性回充
+struct FloodBudget {
+    tokens: f64,
+    last: Instant,
 }
 
 impl VSwitch {
-    pub fn new() -> Arc<Self> {
+    fn with_flood_budgets(burst: f64, rate_per_sec: f64) -> Arc<Self> {
         let vs = Arc::new(Self {
             ports: DashMap::new(),
             mac_table: DashMap::new(),
             validate_mac: RwLock::new(None),
             spoof_drops: AtomicU64::new(0),
+            flood_mu: Mutex::new(HashMap::new()),
+            // 默认预算覆盖 ~180 Mbps 的纯洪泛流量（1400B 帧）且从不误伤学习
+            // 后的单播；线速广播攻击（10 万+ fps）仍被削掉 90% 以上。
+            flood_burst: burst,
+            flood_rate_per_sec: rate_per_sec,
+            flood_drops: AtomicU64::new(0),
+            trusted_port: TAP_PORT_ID.to_string(),
         });
 
         // 垃圾回收协程
@@ -676,12 +704,19 @@ impl VSwitch {
         vs
     }
 
+    /// 默认洪泛预算：突发 8192 帧、每秒回充 16384（对齐 Go NewVSwitch）
+    pub fn new() -> Arc<Self> {
+        Self::with_flood_budgets(8192.0, 16384.0)
+    }
+
     pub fn add_port(&self, id: String, port: Arc<AsyncPort>) {
         self.ports.insert(id, port);
     }
 
     pub fn remove_port(&self, id: &str) {
         self.ports.remove(id);
+        // 回收洪泛预算槽位，否则长期运行下 map 会随断开的会话无限增长
+        self.flood_mu.lock().remove(id);
         self.mac_table.retain(|_, entry| entry.port_id != id);
     }
 
@@ -700,6 +735,12 @@ impl VSwitch {
     /// tlsvpn_spoofed_src_dropped_frames_total）
     pub fn spoof_drops(&self) -> u64 {
         self.spoof_drops.load(Ordering::Relaxed)
+    }
+
+    /// 超出每端口洪泛预算被丢弃的广播帧计数（对齐 Go 的
+    /// tlsvpn_broadcast_dropped_frames_total）
+    pub fn flood_drops(&self) -> u64 {
+        self.flood_drops.load(Ordering::Relaxed)
     }
 
     /// 查询某 MAC 当前的表项归属（测试用：确认冒充帧没有改写受害者表项）
@@ -783,11 +824,63 @@ impl VSwitch {
                     port.write_frame(frame);
                 }
             }
-        } else if target_port_id.is_none() {
-            for ref_multi in self.ports.iter() {
-                if *ref_multi.key() != src_port_id {
-                    ref_multi.value().write_frame(frame.clone());
+        } else {
+            self.flood(src_port_id, frame);
+        }
+    }
+
+    /// 洪泛到所有其他端口，但每源端口有独立的广播预算：线速广播会被复制
+    /// 到所有端口放大 N 倍，超预算的帧在这里整帧丢弃（单播不受影响——见
+    /// process_frame 的分支顺序：只有查不到目标才走到这里）。
+    ///
+    /// 豁免端口（本机 TAP）不受预算限制：网关自己发起的 ARP/mDNS 不应被
+    /// 自己削掉。
+    fn flood(&self, exclude_port_id: &str, frame: Arc<Vec<u8>>) {
+        if exclude_port_id != self.trusted_port && !self.allow_flood(exclude_port_id) {
+            self.flood_drops.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "VSWITCH drop flooded frame over budget from port {}",
+                exclude_port_id
+            );
+            return;
+        }
+        for ref_multi in self.ports.iter() {
+            if *ref_multi.key() != exclude_port_id {
+                ref_multi.value().write_frame(frame.clone());
+            }
+        }
+    }
+
+    /// 消耗一个洪泛令牌；令牌按时间线性回充，容量 flood_burst。
+    ///
+    /// 首次为端口建桶时即消耗一枚——桶满意味着"从此刻起还有 burst 枚预算"，
+    /// 若建桶时给满额又直接放行，预算会恒定多出一枚。
+    fn allow_flood(&self, src_port_id: &str) -> bool {
+        let mut budgets = self.flood_mu.lock();
+        let now = Instant::now();
+        match budgets.get_mut(src_port_id) {
+            None => {
+                budgets.insert(
+                    src_port_id.to_string(),
+                    FloodBudget {
+                        tokens: self.flood_burst - 1.0,
+                        last: now,
+                    },
+                );
+                true
+            }
+            Some(b) => {
+                let elapsed = now.duration_since(b.last).as_secs_f64();
+                if elapsed > 0.0 {
+                    b.tokens = (b.tokens + elapsed * self.flood_rate_per_sec)
+                        .min(self.flood_burst);
+                    b.last = now;
                 }
+                if b.tokens < 1.0 {
+                    return false;
+                }
+                b.tokens -= 1.0;
+                true
             }
         }
     }
@@ -823,10 +916,11 @@ mod tests {
     fn drained_last_byte(
         rx: &crossbeam_channel::Receiver<VPNFrame>,
     ) -> Vec<u8> {
-        (0..8)
-            .filter_map(|_| rx.try_recv().ok())
-            .map(|f| f.data[f.data.len() - 1])
-            .collect()
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            out.push(f.data[f.data.len() - 1]);
+        }
+        out
     }
 
     /// 最小合法以太帧（dst 6 + src 6 + ethertype 2 + 载荷）
@@ -919,10 +1013,10 @@ mod tests {
         );
 
         // 未注册的端口（本机 TAP）声明任意 MAC 放行
-        vs.process_frame("TAP_LOCAL", eth_frame(&mac_a, &[0x42; 6], &[0x04]));
+        vs.process_frame(TAP_PORT_ID, eth_frame(&mac_a, &[0x42; 6], &[0x04]));
         assert_eq!(
             vs.mac_port(&[0x42; 6]),
-            Some("TAP_LOCAL".to_string()),
+            Some(TAP_PORT_ID.to_string()),
             "本机 TAP 端口声明的 MAC 必须放行"
         );
         assert_eq!(drained_last_byte(&rx_a), vec![0x04]);
@@ -959,7 +1053,7 @@ mod tests {
         ])));
 
         vs.process_frame(
-            "TAP_LOCAL",
+            TAP_PORT_ID,
             eth_frame(&[0xff; 6], &[0xEE; 6], &[0x01]),
         );
         assert_eq!(
@@ -979,7 +1073,7 @@ mod tests {
         );
         assert_eq!(
             vs.mac_port(&[0xEE; 6]),
-            Some("TAP_LOCAL".to_string()),
+            Some(TAP_PORT_ID.to_string()),
             "豁免端口按正常路径学习"
         );
     }
@@ -1025,5 +1119,132 @@ mod tests {
         vs.process_frame("B", eth_frame(&empty, &mac, &[0x02]));
         assert_eq!(vs.mac_port(&mac), Some("B".to_string()));
         assert_eq!(vs.spoof_drops(), 0);
+    }
+
+    // ---------- 广播/洪泛预算（档 G） ----------
+
+    #[test]
+    fn flood_budget_consumes_a_token_on_bucket_creation() {
+        // 建桶即消耗一枚：满桶意味着"从此刻起还有 burst 枚预算"。若建桶给满额
+        // 又直接放行，预算会恒定多出一枚。
+        let vs = VSwitch::with_flood_budgets(3.0, 0.0);
+        let allowed = (0..6).take_while(|_| vs.allow_flood("A")).count();
+        assert_eq!(allowed, 3, "恰好 burst 枚预算");
+    }
+
+    #[test]
+    fn flood_defaults_match_go() {
+        // 默认值必须有真流量意义：突发 8192 帧按 1400B 帧约 9.1MB 缓冲，
+        // 回充 16384/秒约等于 180 Mbps 纯洪泛流量
+        let vs = VSwitch::new();
+        assert_eq!(vs.flood_burst, 8192.0, "对齐 Go NewVSwitch 的 floodBurst");
+        assert_eq!(
+            vs.flood_rate_per_sec,
+            16384.0,
+            "对齐 Go NewVSwitch 的 floodRatePerSec"
+        );
+        assert_eq!(vs.trusted_port, TAP_PORT_ID, "本机 TAP 豁免洪泛预算");
+
+        // 预算内的满量洪泛一帧都不能丢。回充只会增加预算，所以这条断言不会因
+        // 时钟漂移误报；反方向（何时开始丢）交给小桶测试验证
+        for _ in 0..8192 {
+            vs.process_frame(
+                "A",
+                eth_frame(&[0xff; 6], &[0xDD; 6], &[1]),
+            );
+        }
+        assert_eq!(vs.flood_drops(), 0, "8192 帧洪泛必须全部通过");
+    }
+
+    #[test]
+    fn flood_budget_refills_and_caps_at_burst() {
+        let vs = VSwitch::with_flood_budgets(2.0, 1000.0);
+        for _ in 0..4 {
+            if !vs.allow_flood("A") {
+                break;
+            }
+        }
+        assert!(!vs.allow_flood("A"), "排空后必须拒发");
+
+        // 10ms × 1000 枚/秒 = 10 枚，回充不得越过桶容量
+        std::thread::sleep(Duration::from_millis(10));
+        let allowed = (0..6).take_while(|_| vs.allow_flood("A")).count();
+        assert_eq!(allowed, 2, "回充必须封顶在 burst");
+    }
+
+    #[test]
+    fn over_budget_broadcast_is_dropped_whole() {
+        // 超预算的洪泛帧整帧丢弃：既不学习表项也不投给任何其他端口。
+        // 单播不受预算影响——预算只作用于"查不到目标"的洪泛分支。
+        let vs = VSwitch::with_flood_budgets(2.0, 0.0);
+        let (backend_b, rx_b) = make_backend();
+        let port_a = Arc::new(AsyncPort::new("A".into(), false));
+        let port_b = Arc::new(AsyncPort::new("B".into(), false));
+        port_b.register_backend(backend_b);
+        vs.add_port("A".into(), port_a);
+        vs.add_port("B".into(), port_b);
+
+        // 单播用的 MAC：首字节 bit0 必须为 0，否则会被当成广播走洪泛分支
+        let mac_b = [0xBA, 0x00, 0x00, 0x00, 0x00, 0x01];
+        // B 先学习一个 MAC，好让后面的单播断言有目标
+        vs.process_frame("B", eth_frame(&[0, 0, 0, 0, 0, 0], &mac_b, &[0x00]));
+
+        for i in [1u8, 2] {
+            vs.process_frame("A", eth_frame(&[0xff; 6], &[0xDD; 6], &[i]));
+        }
+        assert_eq!(vs.flood_drops(), 0, "预算内不得丢帧");
+
+        vs.process_frame("A", eth_frame(&[0xff; 6], &[0xDD; 6], &[0xFF]));
+        assert_eq!(vs.flood_drops(), 1, "超预算必须整帧丢弃并计数");
+
+        vs.process_frame("A", eth_frame(&mac_b, &[0xDD; 6], &[0x09]));
+        assert_eq!(
+            drained_last_byte(&rx_b),
+            vec![0x01, 0x02, 0x09],
+            "预算内 2 帧 + 超预算广播丢弃 + 单播不受限"
+        );
+    }
+
+    #[test]
+    fn trusted_port_is_exempt_from_flood_budget() {
+        // 本机 TAP 豁免洪泛预算：网关自己发起的 ARP/mDNS 不应被自己削掉
+        let vs = VSwitch::with_flood_budgets(1.0, 0.0);
+        let (backend_b, rx_b) = make_backend();
+        let port_b = Arc::new(AsyncPort::new("B".into(), false));
+        port_b.register_backend(backend_b);
+        vs.add_port("B".into(), port_b);
+
+        for i in 0..10u8 {
+            vs.process_frame(
+                TAP_PORT_ID,
+                eth_frame(&[0xff; 6], &[0xEE; 6], &[i]),
+            );
+        }
+        assert_eq!(
+            vs.flood_drops(),
+            0,
+            "本机 TAP 的洪泛不得计入预算丢弃"
+        );
+        assert_eq!(
+            drained_last_byte(&rx_b).len(),
+            10,
+            "豁免端口的洪泛必须全部投递"
+        );
+    }
+
+    #[test]
+    fn remove_port_reclaims_flood_budget_slot() {
+        // 端口销毁后必须回收预算槽位：否则 map 随断开会话无限增长，重连的端口
+        // 还会继承上一个会话用尽的预算
+        let vs = VSwitch::with_flood_budgets(1.0, 0.0);
+        assert!(vs.allow_flood("A"), "建桶即消耗唯一一枚");
+        assert!(!vs.allow_flood("A"), "单枚预算必须被耗尽");
+
+        vs.remove_port("A");
+        assert!(
+            vs.allow_flood("A"),
+            "端口移除后预算必须清零重建，而不是继承耗尽状态"
+        );
+        assert!(!vs.allow_flood("A"));
     }
 }

@@ -473,6 +473,12 @@ impl WebStatsProvider for ServerCore {
                 "counter",
                 self.vswitch.spoof_drops().to_string(),
             );
+            emit(
+                "tlsvpn_broadcast_dropped_frames_total",
+                "Broadcast frames dropped over the per-port flood budget",
+                "counter",
+                self.vswitch.flood_drops().to_string(),
+            );
         }
         m
     }
@@ -659,13 +665,13 @@ pub fn start_server(args: &Args) {
     let dev_reader = dev_writer.clone();
 
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
-    let tap_port = Arc::new(AsyncPort::new("TAP_LOCAL".to_string(), false));
+    let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string(), false));
     tap_port.register_backend(Arc::new(Backend {
         ch: tap_tx,
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
     }));
-    vswitch.add_port("TAP_LOCAL".to_string(), tap_port);
+    vswitch.add_port(TAP_PORT_ID.to_string(), tap_port);
     std::thread::spawn(move || {
         while let Ok(f) = tap_rx.recv() {
             if !f.data.is_empty() {
@@ -680,7 +686,7 @@ pub fn start_server(args: &Args) {
         loop {
             if let Ok(n) = dev_reader.recv(&mut buf) {
                 if n > 0 {
-                    vs_for_tap.process_frame("TAP_LOCAL", Arc::new(buf[..n].to_vec()));
+                    vs_for_tap.process_frame(TAP_PORT_ID, Arc::new(buf[..n].to_vec()));
                 }
             }
         }
