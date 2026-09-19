@@ -33,6 +33,23 @@ pub fn hash_psk(psk: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// 常量时间比较（对齐 Go hmac.Equal / subtle.ConstantTimeCompare）。
+///
+/// PSK 哈希与会话复活分支的 MAC 都是对端可控的等长秘密（pskHash 本身就是握手
+/// 凭据）。字符串 `!=` 逐字节短路，响应时延会泄露匹配前缀长度：那是远程时序
+/// 预言机，攻击者可逐字节重建 pskHash 而无需知道 PSK 本身。
+/// 长度不等直接 false——长度本身是公开的（两侧均为 64 位 hex），不是秘密。
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// PSK 派生的 32 字节密钥材料（hash_psk 的二进制形式，对齐 Go pskKey）
 fn psk_key(psk: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -519,6 +536,79 @@ pub fn gen_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 与线上比较对象同形的定长材料（pskHash / 会话令牌均为 64 位 hex）
+    const HASH64: [u8; 64] = *b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn constant_time_eq_correctness() {
+        assert!(constant_time_eq(&HASH64, &HASH64), "相等输入必须通过");
+        assert!(constant_time_eq(b"", b""), "两侧空切片视为相等");
+
+        // 任一位置的错配都必须失败——覆盖"前 N-1 字节相同"的所有 N
+        for at in 0..HASH64.len() {
+            let mut other = HASH64;
+            other[at] ^= 0x01;
+            assert!(
+                !constant_time_eq(&HASH64, &other),
+                "第 {at} 字节错配必须失败"
+            );
+        }
+        // 多字节错配
+        let mut other = HASH64;
+        other[0] ^= 0xFF;
+        other[63] ^= 0xFF;
+        assert!(!constant_time_eq(&HASH64, &other));
+        // 长度不等：长度本身是公开信息，直接判失败
+        assert!(!constant_time_eq(&HASH64, &HASH64[..63]));
+        assert!(!constant_time_eq(&HASH64, &HASH64[1..]));
+        let mut longer = HASH64.to_vec();
+        longer.push(HASH64[0]);
+        assert!(
+            !constant_time_eq(&HASH64, &longer),
+            "前缀全等但更长必须失败（不能退化成 starts_with）"
+        );
+        assert!(!constant_time_eq(&HASH64, &[]));
+    }
+
+    #[test]
+    fn constant_time_eq_timing_does_not_leak_prefix() {
+        // 锁定"不逐字节短路"的语义：错配发生在第 0 字节还是最后一个字节，
+        // 总耗时必须是同量级。真正的保证来自异或折叠，这个测试是防回退的
+        // 绊线——有人换回 == 或 starts_with 时会在这里炸掉。
+        // 用 64KB 放大差距（64 字节上短路差异被常数项淹没，无法区分）。
+        let a = vec![0xABu8; 64 * 1024];
+        let mut early = a.clone();
+        early[0] ^= 0x01;
+        let mut late = a.clone();
+        let last = late.len() - 1;
+        late[last] ^= 0x01;
+
+        const ROUNDS: usize = 16;
+        let measure = |x: &[u8], y: &[u8]| -> std::time::Duration {
+            let t = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                std::hint::black_box(!constant_time_eq(
+                    std::hint::black_box(x),
+                    std::hint::black_box(y),
+                ));
+            }
+            t.elapsed()
+        };
+        let early_dt = measure(&a, &early);
+        let late_dt = measure(&a, &late);
+
+        // 阈值来自实测：异或折叠两侧都 ~19µs（比值 1.0）；== 短路是 100ns vs
+        // 38µs（比值 ~380）。20 倍足够宽以吸收 CI 抖动，仍能挡住短路实现。
+        // 刻意不设绝对下限——短路实现的首字节样本本身就是极小值，任何 ms 级
+        // 下限都会把它放过去（8ms 下限实测漏过 == 短路）。
+        let budget = early_dt.saturating_mul(20);
+        assert!(
+            late_dt <= budget,
+            "末字节错配 ({late_dt:?}) 显著慢于首字节错配 ({early_dt:?})：\
+             比较在短路，前缀长度会通过时延泄露"
+        );
+    }
 
     // 黄金向量由 Go 端 computeSessionToken 直接产出（main_test.go 的算法），
     // 并与 openssl dgst -sha256 -mac HMAC -macopt hexkey:<sha256(psk)> 交叉核对。

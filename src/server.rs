@@ -1197,7 +1197,9 @@ fn handle_handshake(
     };
     debug!("<= 收到客户端握手请求 (HandshakeReq): {:?}", req);
 
-    if req.psk != core.psk_hash {
+    // 常量时间比较：pskHash 本身就是握手凭据，字符串 != 的逐字节短路会把匹配
+    // 前缀长度泄露在响应时延里（远程时序预言机，可逐字节重建 pskHash）。
+    if !constant_time_eq(req.psk.as_bytes(), core.psk_hash.as_bytes()) {
         warn!("PSK 验证失败 (Hash不匹配).");
         return HandshakeOutcome::TarpitClose;
     }
@@ -1235,7 +1237,7 @@ fn handle_handshake(
     let c_sess: Arc<ClientSession> = {
         let mut sessions = core.sessions.write();
         if let Some(existing) = sessions.get(&client_id) {
-            if req.mac != existing.mac {
+            if !constant_time_eq(req.mac.as_bytes(), existing.mac.as_bytes()) {
                 warn!("[{}] 拒绝连接: MAC 不匹配", client_id);
                 *tarpit_flag = true;
                 return HandshakeOutcome::TarpitClose;
