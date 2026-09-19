@@ -23,8 +23,13 @@ echo "🏃 [2/3] 采集 profile：运行协议基准 + 本地 e2e..."
 cargo test --release bench_protocol_throughput -- --ignored --nocapture || true
 
 # 本地 e2e：起 mem-TAP 服务端 + Go/Rust 探针打流量（尽力而为，失败不阻断）
-./target/release/tlsvpn --mode server --psk pgo_secret --tap mem \
-  --addr 127.0.0.1:2999 --cert e2e_cert.pem --key e2e_key.pem --encrypt --loglevel warn &
+# flags 已移除（2026-09-19）：服务端同样走配置文件
+cat > "$PROF_DIR/pgo_srv.json" <<'EOF'
+{"mode": "server", "psk": "pgo_secret", "addr": "127.0.0.1:2999", "tap": "mem",
+ "log_level": "warn", "encrypt": true,
+ "server": {"cert": "e2e_cert.pem", "key": "e2e_key.pem"}}
+EOF
+./target/release/tlsvpn -c "$PROF_DIR/pgo_srv.json" &
 SRV_PID=$!
 sleep 2
 if command -v go >/dev/null 2>&1 && [ -d interop ]; then

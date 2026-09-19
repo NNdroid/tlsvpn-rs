@@ -84,39 +84,16 @@ HAVE_IPERF=$(command -v iperf3 || true)
 HAVE_TRACEROUTE=$(command -v traceroute || true)
 HAVE_PY3=$(command -v python3 || true)
 
-# ---------------------------------------------------------------------------
-# Flag mapping (Go: single-dash; Rust: long double-dash), mirrors e2e_test.sh.
-# ---------------------------------------------------------------------------
-flag_for() {
-  local flavor="$1" verb="$2"
-  if [[ "$flavor" == "rs" ]]; then
-    case "$verb" in
-      mode) echo "--mode";; addr) echo "--addr";; tap) echo "--tap";;
-      cert) echo "--cert";; key) echo "--key";; v4cidr) echo "--v4cidr";;
-      v6cidr) echo "--v6cidr";; encrypt) echo "--encrypt";;
-      loglevel) echo "--loglevel";; certsha) echo "--cert_sha256";;
-      insecure) echo "--insecure";;
-    esac
-  else
-    case "$verb" in
-      mode) echo "-mode";; addr) echo "-addr";; tap) echo "-tap";;
-      cert) echo "-cert";; key) echo "-key";; v4cidr) echo "-v4cidr";;
-      v6cidr) echo "-v6cidr";; encrypt) echo "-encrypt";;
-      loglevel) echo "-loglevel";; certsha) echo "-cert-sha256";;
-      insecure) echo "-insecure";;
-    esac
-  fi
-}
-
 SRV_DIR=""
 PIDS=()
 
-# Generate a Go-side JSON config: the tlsvpn (Go) binary is config-file-only
-# since 2026-09-19 (its command-line flags were removed; launch with -c).
-#   go_config OUT MODE ADDR [json-fragment...]
-# "tap" is preset to $TAP mode by the caller passing it via a fragment — here
-# the real TAP device name is a fragment (unlike the mem-tap e2e helper).
-go_config() {
+# Generate a JSON config for either implementation — both are config-file-only
+# since 2026-09-19 (their command-line flags were removed; launch with -c),
+# and both consume the same top-level key names.
+#   impl_config OUT MODE ADDR [json-fragment...]
+# "tap" is NOT preset here — the real TAP device name is passed as a fragment
+# (unlike the mem-tap e2e helper).
+impl_config() {
   local out="$1" mode="$2" addr="$3"; shift 3
   {
     printf '{\n  "mode": "%s",\n  "addr": "%s"' "$mode" "$addr"
@@ -295,27 +272,14 @@ run_group() {
 
   log "--- group: ${FLAVOR_SRV}_srv <- ${FLAVOR_CLI}_cli (real TAP) ---"
 
-  local m_flag a_flag t_flag c_flag k_flag f4_flag f6_flag e_flag l_flag
-  m_flag=$(flag_for "$FLAVOR_SRV" mode);   a_flag=$(flag_for "$FLAVOR_SRV" addr)
-  t_flag=$(flag_for "$FLAVOR_SRV" tap);    c_flag=$(flag_for "$FLAVOR_SRV" cert)
-  k_flag=$(flag_for "$FLAVOR_SRV" key);    f4_flag=$(flag_for "$FLAVOR_SRV" v4cidr)
-  f6_flag=$(flag_for "$FLAVOR_SRV" v6cidr); e_flag=$(flag_for "$FLAVOR_SRV" encrypt)
-  l_flag=$(flag_for "$FLAVOR_SRV" loglevel)
-  if [[ "$FLAVOR_SRV" == "go" ]]; then
-    # Go 服务端：flags 已移除（2026-09-19），一律走配置文件
-    local scfg="$SRV_DIR/srv.json"
-    go_config "$scfg" server "127.0.0.1:$PORT" \
-      '"encrypt": true' \
-      '"log_level": "debug"' \
-      "\"tap\": \"$TAP_SRV\"" \
-      "\"server\": {\"cert\": \"$SRV_DIR/e2e_cert.pem\", \"key\": \"$SRV_DIR/e2e_key.pem\", \"v4_cidr\": \"$SUBNET_V4\", \"v6_cidr\": \"fd77::/64\"}"
-    "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
-  else
-    "$BIN_SRV" $m_flag server $a_flag "127.0.0.1:$PORT" $t_flag "$TAP_SRV" \
-      $c_flag "$SRV_DIR/e2e_cert.pem" $k_flag "$SRV_DIR/e2e_key.pem" \
-      $f4_flag "$SUBNET_V4" $f6_flag "fd77::/64" $e_flag $l_flag debug \
-      > "$SRV_DIR/srv.log" 2>&1 &
-  fi
+  # 两实现 flags 均已移除（2026-09-19）：键名两边一致，服务端配置共用一份
+  local scfg="$SRV_DIR/srv.json"
+  impl_config "$scfg" server "127.0.0.1:$PORT" \
+    '"encrypt": true' \
+    '"log_level": "debug"' \
+    "\"tap\": \"$TAP_SRV\"" \
+    "\"server\": {\"cert\": \"$SRV_DIR/e2e_cert.pem\", \"key\": \"$SRV_DIR/e2e_key.pem\", \"v4_cidr\": \"$SUBNET_V4\", \"v6_cidr\": \"fd77::/64\"}"
+  "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
   PIDS+=($!)
   wait_for_port 127.0.0.1 "$PORT" 20 || { fail "server did not start"; return 1; }
 
@@ -325,26 +289,24 @@ run_group() {
        | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z')
   log "server cert sha256 pinned: $fp"
 
-  local cm_flag ca_flag ct_flag ce_flag cl_flag cs_flag
-  cm_flag=$(flag_for "$FLAVOR_CLI" mode); ca_flag=$(flag_for "$FLAVOR_CLI" addr)
-  ct_flag=$(flag_for "$FLAVOR_CLI" tap);  ce_flag=$(flag_for "$FLAVOR_CLI" encrypt)
-  cl_flag=$(flag_for "$FLAVOR_CLI" loglevel); cs_flag=$(flag_for "$FLAVOR_CLI" certsha)
   # Go 客户端的 cert_sha256 仅设置 VerifyPeerCertificate，链验证先行失败
   # （自签证书），需配合 insecure 才能真正生效；Rust 客户端的 cert_sha256
   # 走 dangerous() 完整替换验证器，无需也不应叠加 insecure。
+  local ccfg="$SRV_DIR/cli.json"
   if [[ "$FLAVOR_CLI" == "go" ]]; then
-    # Go 客户端：flags 已移除（2026-09-19），一律走配置文件
-    local ccfg="$SRV_DIR/cli.json"
-    go_config "$ccfg" client "127.0.0.1:$PORT" \
+    impl_config "$ccfg" client "127.0.0.1:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"tap\": \"$TAP_CLI\"" \
       "\"client\": {\"cert_sha256\": \"$fp\", \"insecure\": true}"
-    "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
   else
-    "$BIN_CLI" $cm_flag client $ca_flag "127.0.0.1:$PORT" $ct_flag "$TAP_CLI" \
-      $cs_flag "$fp" $ce_flag $cl_flag info > "$SRV_DIR/cli.log" 2>&1 &
+    impl_config "$ccfg" client "127.0.0.1:$PORT" \
+      '"encrypt": true' \
+      '"log_level": "info"' \
+      "\"tap\": \"$TAP_CLI\"" \
+      "\"client\": {\"cert_sha256\": \"$fp\"}"
   fi
+  "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
 
   if ! wait_for_client_ip; then

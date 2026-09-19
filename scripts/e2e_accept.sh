@@ -36,13 +36,17 @@ e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; ex
 CERT="$E2E_CERT"
 KEY="$E2E_KEY"
 
-# run_case LABEL SRV_IMPL CLI_IMPL SRV_EXTRA CLI_EXTRA [SRV_CFG] [EXPECT]
+# run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC SRV_TOKEN CLI_EXTRA [SRV_CFG] [EXPECT]
 # SRV/CLI 取值：rs | go | rsold | goold
-# SRV_CFG 非空 → 服务端用 Go 配置文件启动（-c 覆盖所有 flag）
+# SRV_PAD / SRV_MINENC / SRV_TOKEN 是服务端特性旋钮：非空才写入对应键。
+# 两实现 flags 均已移除（2026-09-19），一律拼 config.json 后 -c 启动；
+# 旋钮为空就省键 —— pre-feature 旧二进制（rsold/goold）的 schema 没有这些键，
+# DisallowUnknownFields 会拒收。需要完整定制时用 go_cfg_now 生成 SRV_CFG 传入。
 # EXPECT=pass(默认)|fail → fail 表示预期不互通（用于 opt-in 破坏旧对端）
 run_case() {
   local label="$1" srv="$2" cli="$3"
-  local srv_extra="$4" cli_extra="$5" srv_cfg="${6:-}" expect="${7:-pass}"
+  local srv_pad="$4" srv_minenc="$5" srv_token="$6"
+  local cli_extra="$7" srv_cfg="${8:-}" expect="${9:-pass}"
   local gobin rsbin probebin
 
   # 归一化到实际的语言实现（rsold/goold 只是版本别名）
@@ -71,33 +75,27 @@ run_case() {
   e2e_kill_port "$port"
 
   # 服务端命令（数组形式，避免 eval 注入与二次引号问题）
+  local cfg
   if [ -n "$srv_cfg" ]; then
-    set -- "$gobin" -c "$srv_cfg"
-  elif [ "$sk" = rs ]; then
-    set -- "$rsbin" --mode server --addr "127.0.0.1:$port" --psk "$PSK" --encrypt \
-      --cert "$CERT" --key "$KEY" --v4cidr 10.77.0.0/24 --v6cidr fd77::/64 \
-      --tap mem --loglevel info
-    for w in $srv_extra; do set -- "$@" "$w"; done
+    cfg="$srv_cfg"   # go_cfg_now 产出的已是 winpath 形态
   else
-    # Go 服务器：flags 已移除（2026-09-19），一律走配置文件。这里只生成
-    # 「长青字段」（JSON 首发即有），对 pre-feature 的 goold 同样可用——
-    # goold 的 schema 还没有 min_enc/pad_mode/session_token，
-    # DisallowUnknownFields 会拒收这些键。需要新特性字段时用 go_cfg_now
-    # 生成 SRV_CFG 传入（P1/P4 的 go 用例正是这么做的）。
-    if [ -n "$srv_extra" ]; then
-      printf '  %sFAIL%s      [%s] go server 的 srv_extra 必须经 SRV_CFG 传入（flags 已移除）: %s\n' \
-        "$E2E_RED" "$E2E_RESET" "$label" "$srv_extra"
-      FAIL_N=$((FAIL_N + 1)); FAILED_CASES+=("$label")
-      return 0
-    fi
-    local gocfg
-    gocfg="$(e2e_winpath "$tmp/srv.json")"
-    e2e_config "$gocfg" server "127.0.0.1:$port" \
+    cfg="$(e2e_winpath "$tmp/srv.json")"
+    local pad_frag="" minenc_frag=""
+    local srvobj="\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\""
+    [ -n "$srv_pad" ] && pad_frag="\"pad_mode\": \"$srv_pad\""
+    [ -n "$srv_minenc" ] && minenc_frag="\"min_enc\": \"$srv_minenc\""
+    [ "$srv_token" = 1 ] && srvobj+=", \"session_token\": true"
+    srvobj+="}"
+    e2e_config "$tmp/srv.json" server "127.0.0.1:$port" \
       "\"psk\": \"$PSK\"" \
       '"encrypt": true' \
       '"log_level": "info"' \
-      "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
-    set -- "$gobin" -c "$gocfg"
+      "$pad_frag" "$minenc_frag" "$srvobj"
+  fi
+  if [ "$sk" = rs ]; then
+    set -- "$rsbin" -c "$cfg"
+  else
+    set -- "$gobin" -c "$cfg"
   fi
   "$@" >"$slog" 2>&1 &
   e2e_wait_port 127.0.0.1 "$port" 15 || {
@@ -185,41 +183,41 @@ echo "=================================================================="
 echo " P1  三项全开：pad_mode=bucket + session_token + min_enc=gcm"
 echo "     探针声明 enc_algo=3(GCM-v2)，满足 min_enc 下限并走完独立密钥标签路径"
 echo "=================================================================="
-run_case "rs->rs 全开"      rs rs "--pad-mode bucket --min-enc gcm --session-token" "--enc-algo 3"
-run_case "rs->go 全开"      rs go "--pad-mode bucket --min-enc gcm --session-token" "--enc-algo 3"
-run_case "go->rs 全开"      go rs "" "--enc-algo 3"
-run_case "go->go 全开"      go go "" "-enc-algo 3"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->rs" go rs "" "--enc-algo 3" "$CFGF"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->go" go go "" "-enc-algo 3" "$CFGF"
+run_case "rs->rs 全开"      rs rs bucket gcm 1 "--enc-algo 3"
+run_case "rs->go 全开"      rs go bucket gcm 1 "--enc-algo 3"
+run_case "go->rs 全开"      go rs "" "" "" "--enc-algo 3"
+run_case "go->go 全开"      go go "" "" "" "-enc-algo 3"
+go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->rs" go rs "" "" "" "--enc-algo 3" "$CFGF"
+go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->go" go go "" "" "" "-enc-algo 3" "$CFGF"
 
 echo ""
 echo "=================================================================="
 echo " P2  三项全关（回退路径）：pad_mode=legacy / 空，无 min_enc，无 session_token"
 echo "=================================================================="
-run_case "rs->rs 全关"  rs rs "--pad-mode legacy" ""
-run_case "rs->go 全关"  rs go "--pad-mode legacy" ""
-run_case "go->rs 全关"  go rs "" ""
-run_case "go->go 全关"  go go "" ""
+run_case "rs->rs 全关"  rs rs legacy "" "" ""
+run_case "rs->go 全关"  rs go legacy "" "" ""
+run_case "go->rs 全关"  go rs "" "" "" ""
+run_case "go->go 全关"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
 echo " P3  新旧混装（fallback 模式 = 特性全关）"
 echo "=================================================================="
 if [ "$HAVE_OLD" = 1 ]; then
-  run_case "rsNEW->goOLD"  rs goold "--pad-mode legacy" ""
-  run_case "rsNEW->goOLD2" rs goold "" ""
-  run_case "goOLD->rsNEW"  goold rs "" ""
-  run_case "rsOLD->goNEW"  rsold go "" ""
-  run_case "goNEW->rsOLD"  go rsold "" ""
-  run_case "rsOLD->goOLD"  rsold goold "" ""
-  run_case "goOLD->rsOLD"  goold rsold "" ""
+  run_case "rsNEW->goOLD"  rs goold legacy "" "" ""
+  run_case "rsNEW->goOLD2" rs goold "" "" "" ""
+  run_case "goOLD->rsNEW"  goold rs "" "" "" ""
+  run_case "rsOLD->goNEW"  rsold go "" "" "" ""
+  run_case "goNEW->rsOLD"  go rsold "" "" "" ""
+  run_case "rsOLD->goOLD"  rsold goold "" "" "" ""
+  run_case "goOLD->rsOLD"  goold rsold "" "" "" ""
 else
   SKIP_N=$((SKIP_N + 7))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 7 组：缺旧版二进制"
   echo "             rs: ${E2E_RS_OLD_BIN:-(未配置)}   go: ${E2E_GO_OLD_BIN:-(未配置)}"
   echo "             设置 E2E_RS_OLD_BIN / E2E_RS_OLD_PROBE / E2E_GO_OLD_BIN 后重跑可启用"
 fi
-run_case "goNEW->goNEW"  go go "" ""
+run_case "goNEW->goNEW"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
@@ -230,18 +228,18 @@ echo "     真实代价只出现在重连路径 —— 旧客户端拿不到令�
 echo "     那一半由 e2e_tok.sh 用真实客户端覆盖（本矩阵的探针不做重连）。"
 echo "=================================================================="
 if [ "$HAVE_OLD" = 1 ]; then
-  run_case "rsNEW(tok)->rsOLD 首次接入" rs rsold "--session-token" ""
+  run_case "rsNEW(tok)->rsOLD 首次接入" rs rsold "" "" 1 ""
 else
   SKIP_N=$((SKIP_N + 1))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：rsNEW(tok)->rsOLD 缺旧版 Rust 二进制"
 fi
 if [ "$HAVE_OLD" = 1 ]; then
-  go_cfg_now 1 true "" ""; run_case "goNEW(tok)->rsOLD 首次接入" go rsold "" "" "$CFGF"
+  go_cfg_now 1 true "" ""; run_case "goNEW(tok)->rsOLD 首次接入" go rsold "" "" "" "" "$CFGF"
 else
   SKIP_N=$((SKIP_N + 1))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：goNEW(tok)->rsOLD 缺旧版 Rust 探针"
 fi
-go_cfg_now 1 true "" ""; run_case "goNEW(tok)->go 首次接入"  go go "" "" "$CFGF"
+go_cfg_now 1 true "" ""; run_case "goNEW(tok)->go 首次接入"  go go "" "" "" "" "$CFGF"
 
 for d in "${TMPDIRS[@]}"; do rm -rf "$d"; done
 e2e_reap_all

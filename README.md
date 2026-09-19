@@ -1,168 +1,157 @@
 # tlsvpn-rs
 
-**tlsvpn-rs** is the Rust implementation of [tlsvpn](https://github.com/NNdroid/tlsvpn) — a high-performance, high-stealth Layer 2 VPN tunnel that transmits Ethernet frames over standard TCP TLS. The Go and Rust binaries are **fully interoperable and interchangeable**: either client works against either server, enforced byte-for-byte by shared protocol golden vectors and cross-implementation end-to-end tests.
+**tlsvpn-rs** is the Rust implementation of [tlsvpn](https://github.com/NNdroid/tlsvpn) — a high-performance, high-stealth Layer 2 VPN that carries Ethernet frames over standard TCP TLS.
 
-Beyond parity, the Rust build adds its own focus: an event-driven I/O core (mio + Waker), multi-worker server sharding, and a protocol-path benchmark of **~3.7 GB/s** (frame scan + inner crypto, single core).
+The Rust and Go binaries are **fully interchangeable**: any client works against any server, locked byte-for-byte by shared protocol golden vectors and cross-implementation e2e tests. Beyond parity, the Rust build adds an event-driven I/O core (mio + Waker), multi-worker server sharding, and a protocol-path benchmark of **~3.7 GB/s** (frame scan + inner crypto, single core).
 
-## 🌟 Core Features
+## Features
 
-* **🛡️ Camouflage**: Standard TLS with ALPN (h2/http1.1) and randomized payload padding. Non-VPN or invalid-PSK connections get an nginx-styled 403 page or a slow-loris tarpit; probe traffic (printable first byte) is detected inside the TLS stream as well.
-* **🔐 Inner Encryption (Optional)**: `--encrypt` adds AES-256-GCM **inside** the TLS tunnel with per-session random salts (one per direction, nonce = seq‖salt, AAD covers wireLen‖seq) — integrity protection, and immunity to keystream reuse across sessions/directions/clients. Older peers transparently fall back to legacy AES-CTR.
-* **⚡ TCP Brutal**: Optional TCP Brutal congestion control (Linux `tcp_brutal` module) holding a fixed rate under loss.
-* **🔗 Multipath**: Parallel TCP connections with MinRTT load balancing, or XOR-parity FEC — every K data frames carry one parity frame (overhead ≈ 1/K) so any single lost frame is transparently reconstructed. Legacy packet-duplication FEC remains as the automatic fallback.
-* **🌐 Multi-IP Failover**: Comma-separated server addresses, round-robin per connection, exponential backoff with jitter and 30s-stable reset.
-* **📦 Layer 2 Tunneling**: TAP device (ARP/DHCP/IPv6 pass-through), MAC learning switch with flooding, session survivorship (120s grace with seamless resume across reconnects/restarts).
-* **📊 Web Dashboard**: Same UI as the Go build — live throughput chart, FEC/loss stats, per-connection details, MAC table, ban/kick management, live log tail & level switching, Prometheus `/metrics`.
-* **🚀 Server Sharding**: `--workers N` spawns N event-loop workers (independent pollers, session tables) behind a shared acceptor — line-rate beyond a single core.
-* **📦 Zero-Copy Data Path**: Frames travel as `Arc`-shared buffers end to end — broadcast/flood/multi-backend dispatch is reference-count only, with AVX2-accelerated FEC parity math and O(1) reorder-gap resolution.
+- **Camouflage** — real TLS with ALPN (`h2`/`http1.1`) and randomized payload padding. Invalid-PSK connections get an nginx-styled 403 page or a slow-loris tarpit; probes (printable first byte) are detected inside the TLS stream as well.
+- **Inner encryption (optional)** — AES-256-GCM *inside* the TLS tunnel, with a random salt per session per direction (nonce = `seq‖salt`, AAD covers `wireLen‖seq`). Integrity, plus immunity to keystream reuse across sessions, directions and clients. Older peers transparently fall back to legacy AES-CTR.
+- **Multipath & FEC** — parallel TCP connections with MinRTT load balancing, or XOR-parity FEC: one parity frame per K data frames (≈1/K overhead) so any single lost frame is reconstructed transparently. Duplication FEC remains the automatic fallback.
+- **Resilience** — comma-separated server addresses with round-robin per connection, exponential backoff with jitter, 30s-stable reset.
+- **Layer 2** — TAP device (ARP/DHCP/IPv6 pass-through), MAC-learning switch with flooding, and session survivorship: 120s grace with seamless resume across reconnects and restarts.
+- **Zero-copy data path** — frames stay `Arc`-shared end to end, so broadcast/flood/multi-backend dispatch is reference-count only, with AVX2-accelerated FEC parity math and O(1) reorder-gap resolution.
+- **Server sharding** — `workers: N` runs N event-loop workers (independent pollers and session tables) behind a shared acceptor; line-rate beyond a single core.
+- **Dashboard** — live throughput chart, FEC/loss stats, per-connection details, MAC table, ban/kick management, log tail with live level switching, Prometheus `/metrics`.
+- **TCP Brutal** — optional `tcp_brutal` congestion control that holds a fixed rate under loss (Linux only).
 
----
+## Quick Start
 
-## 🚀 Quick Start
-
-### 1. Build
+**Server** (Linux, root):
 
 ```bash
-git clone https://github.com/NNdroid/tlsvpn-rs.git
-cd tlsvpn-rs
+git clone https://github.com/NNdroid/tlsvpn-rs.git && cd tlsvpn-rs
 cargo build --release
-# binary: target/release/tlsvpn
+
+# generate a TLS pair once, then pin it on clients via cert_sha256
+openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
+            -days 3650 -nodes -subj "/CN=tlsvpn"
+
+sudo ./target/release/tlsvpn -c server.json
 ```
 
-### 2. Server (Linux, root)
-
-```bash
-# generate a TLS pair once (any method, e.g.):
-openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 3650 -nodes -subj "/CN=tlsvpn"
-
-sudo ./target/release/tlsvpn --mode server --psk "your_secret_key" --addr ":4000" \
-  --cert server.crt --key server.key --encrypt --web ":8080" --web-auth "admin:change-me"
+```json
+{
+  "mode": "server",
+  "psk": "your_secret_key",
+  "addr": ":4000",
+  "encrypt": true,
+  "web": { "addr": ":8080", "auth": "admin:change-me" },
+  "server": { "cert": "server.crt", "key": "server.key" }
+}
 ```
 
-### 3. Client
+**Client**:
 
-```bash
-sudo ./target/release/tlsvpn --mode client --psk "your_secret_key" \
-  --addr "203.0.113.10:4000,[2001:db8::10]:4000" \
-  --conns 4 --fec --encrypt --brutal
+```json
+{
+  "mode": "client",
+  "psk": "your_secret_key",
+  "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
+  "encrypt": true,
+  "brutal": true, "brutal_up": 100, "brutal_down": 500,
+  "client": { "conns": 4, "fec": true, "fec_group": 4 }
+}
 ```
 
-Windows/macOS clients work with `--tap mem` (no kernel TAP); interface addressing and policy routing are Linux features.
+```bash
+sudo ./target/release/tlsvpn -c client.json
+```
 
-### 4. JSON Config File
+Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
 
-`-c config.json` makes the file the **single source of truth** — all other flags are ignored, unknown fields are rejected, and the format is **identical to the Go build** (you can swap binaries without touching the config).
+## Configuration
+
+`-c config.json` is the **only** configuration surface — there are no other flags, and the format is identical to the Go build, so binaries can be swapped without touching a config. Unknown fields are rejected. Start from the built-in template:
 
 ```bash
-# Print the full template from the binary itself
 ./tlsvpn --print-config > config.json
 ```
+
+<details><summary>Full template (matches <code>--print-config</code>)</summary>
 
 ```json
 {
   "mode": "client",
   "psk": "change-me-please",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
+  "log_level": "info",
   "encrypt": true,
-  "brutal": true, "brutal_up": 100, "brutal_down": 500,
+  "min_enc": "gcm",
+  "pad_mode": "bucket",
+  "brutal": true,
+  "brutal_up": 100,
+  "brutal_down": 500,
   "workers": 4,
-  "web": { "addr": ":8080", "auth": "admin:change-me" },
-  "client": { "conns": 4, "fec": true, "fec_group": 4 }
+  "mtu": 1500,
+  "socks5": "",
+  "tap": "tap0",
+  "mac": "",
+  "web": { "addr": ":8080", "auth": "admin:change-me", "bind": "all", "cert": "", "key": "" },
+  "client": { "conns": 4, "fec": true, "fec_group": 4, "sni": "www.cloudflare.com",
+              "insecure": false, "cert_sha256": "", "req_v4": "", "req_v6": "", "fwmark": 0 },
+  "server": { "v4_cidr": "10.0.0.0/24", "v6_cidr": "fd00::/64", "cert": "", "key": "",
+              "session_token": false, "max_sessions": 1024 }
 }
 ```
 
-Server mode uses `"mode": "server"` with a `server` section (`v4_cidr`, `v6_cidr`, `cert`, `key`) instead of `client`. Field-by-field reference below.
+</details>
 
-> Unlike the Go server, the Rust server requires an explicit `--cert`/`--key` (no self-signed generation). Generate a pair once, pin it on clients via `cert_sha256`, and it survives restarts the same way.
+All defaults match the Go implementation 1:1; the only Rust-specific field is `workers`.
 
----
+| Field | Default | Where | Description |
+| --- | --- | --- | --- |
+| `mode` | (required) | — | `server` or `client` |
+| `psk` | `quic_secret` ⚠️ | — | Pre-shared key. The default is accepted only with a loud warning — always set your own |
+| `addr` | server `0.0.0.0:4000` | — | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated targets for multi-IP round-robin |
+| `encrypt` | `false` | — | Inner AES-256-GCM payload encryption with per-session salts (legacy CTR fallback for old peers) |
+| `min_enc` | `""` | — | Minimum inner-cipher strength to accept: `""`/`any` (no floor), `ctr`, `legacy`, `gcm`. Requires `encrypt: true`; connections below the floor are refused |
+| `pad_mode` | `bucket` | — | Payload padding style: `bucket`, `legacy`, `off` (empty = `bucket`). Changeable live from the dashboard |
+| `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
+| `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
+| `workers` | `0` | — | **Rust server only**: worker event-loop threads (0 = auto, one per CPU up to 8) |
+| `mtu` | `1500` | — | TAP MTU. Higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
+| `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
+| `mac` | (empty) | — | Explicit TAP MAC; part of the client identity |
+| `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
+| `log_level` | `info` | — | `debug` / `info` / `warn` / `error` (switchable live from the dashboard) |
+| `web.addr` | (empty) | — | Dashboard listen address; off unless set |
+| `web.auth` | (empty) | — | Basic Auth as `user:pass` (constant-time compare). Strongly recommended off loopback |
+| `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear) |
+| `web.cert` / `web.key` | (empty) | — | Accepted for Go config compatibility only — the Rust dashboard always serves plain HTTP and ignores them |
+| `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host) |
+| `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
+| `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM) |
+| `server.session_token` | `false` | server | Enable per-session tokens |
+| `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
+| `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
+| `client.fec` | `false` | client | FEC over multipath — XOR parity when the server supports it, else duplication |
+| `client.fec_group` | `4` | client | XOR FEC group size K (2–64); parity overhead is 1/K |
+| `client.sni` | `www.cloudflare.com` | client | SNI domain for handshake camouflage |
+| `client.insecure` | `false` | client | Skip server TLS verification (prefer `cert_sha256`) |
+| `client.cert_sha256` | (empty) | client | Pin the server cert by SHA-256 fingerprint (hex, colon-tolerant) |
+| `client.req_v4` / `req_v6` | (empty) | client | Request a specific internal IPv4/IPv6 address |
+| `client.fwmark` | `0` | client | Policy-routing fwmark for traffic splitting (Linux) |
 
-## 🛠️ Configuration Reference (JSON)
+> Unlike the Go server, the Rust server requires explicit `server.cert`/`server.key` — no self-signed generation. Generate a pair once and it survives restarts the same way.
 
-Values and defaults match the Go implementation 1:1; the only Rust-specific field is `workers`.
+## Dashboard
 
-### 🟢 Global
+Off by default; set `web.addr` on **both** sides to enable it. Throughput chart (120s), FEC recovered/lost counters, per-connection RTT/bytes/retries, MAC table, IP-pool usage, ban/kick/kick-all with immediate effect, in-panel log tail (500 lines) with live level switching, and Prometheus `/metrics`. Every control action requires a CSRF header (`X-Requested-With`).
 
-| Field | Default | Description |
-| --- | --- | --- |
-| `mode` | (Required) | `server` or `client` |
-| `psk` | `quic_secret` ⚠️ | Pre-shared key. The default is accepted only with a loud warning — always set your own |
-| `addr` | server `0.0.0.0:4000` / client (Required) | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated target list for multi-IP round-robin |
-| `tap` | `tap0` | TAP device name. `"mem"` uses an in-memory backend (CI/e2e, no kernel device) |
-| `mac` | (Empty) | Manually specify the TAP interface MAC (part of the client identity) |
-| `log_level` | `info` | `debug` / `info` / `warn` / `error` (switchable live from the dashboard) |
-| `encrypt` | `false` | Inner AES-256-GCM payload encryption with per-session salts (legacy CTR fallback for old peers) |
-| `brutal` / `brutal_up` / `brutal_down` | `false` / `100` / `500` | TCP Brutal congestion control and rates (Mbps) |
-| `socks5` | (Empty) | Client: route ALL outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
-| `workers` | `0` | **Rust server only**: worker event-loop threads (0 = auto, one per CPU up to 8) |
-| `mtu` | `1500` | TAP device MTU. Larger values (e.g. 8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (sender's frame size, receiver accepts up to 128 KB by protocol) |
+## Notes
 
-### 🌐 web (Optional — dashboard is off unless `web.addr` is set)
+1. **Kernel module** — Brutal mode needs the Linux `tcp_brutal` module; elsewhere a warning is logged and it continues without it.
+2. **Permissions** — TAP requires `/dev/net/tun` access, typically root.
+3. **Client identity** — the ClientID derives from TAP MAC + PSK. If the real MAC can't be read (e.g. `"tap": "mem"`), an all-zero MAC is used with a warning — set `mac` explicitly when running many such clients, or they'll share one identity and IP.
+4. **Interoperability** — handshake fields `fec_group`, `enc_algo`, `enc_salt`, `enc_salt2` are additive; older peers (Go or Rust) interoperate in fallback mode (duplication FEC / legacy CTR).
 
-| Field | Default | Description |
-| --- | --- | --- |
-| `addr` | (Empty) | Dashboard listen address (e.g. `:8080`) |
-| `auth` | (Empty) | Basic Auth as `user:pass`. Strongly recommended when binding a non-loopback address |
-| `bind` | `all` | `all` listens on every interface; `tunnel` binds only the tunnel IP(s) — server: the pool gateway IPv4+IPv6, client: the assigned tunnel IP (rebinds automatically within 2s as IPs appear/change) |
+## Development
 
-### 🔵 server (Server mode only)
+**Interop is locked by golden vectors.** `tlsvpn/testdata/protocol_golden.json` (generated by the Go repo) covers key derivation, CTR keystream, frame headers and handshake field names; `cargo test --test protocol_conformance` fails on any drift.
 
-| Field | Default | Description |
-| --- | --- | --- |
-| `v4_cidr` | `10.0.0.0/24` | IPv4 address pool for clients (gateway = first host) |
-| `v6_cidr` | `fd00::/64` | IPv6 address pool for clients |
-| `cert` / `key` | (Required in Rust) | TLS certificate pair (PEM) |
-
-### 🟡 client (Client mode only)
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `conns` | `1` | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
-| `fec` | `false` | FEC over multipath (XOR parity when the server supports it, else duplication) |
-| `fec_group` | `4` | XOR FEC group size K (2–64); parity overhead is 1/K |
-| `sni` | `www.cloudflare.com` | SNI domain used during the TLS handshake for camouflage |
-| `insecure` | `false` | Skip server TLS verification (prefer `cert_sha256`) |
-| `cert_sha256` | (Empty) | Pin the server certificate by SHA-256 fingerprint (hex, colon-tolerant) |
-| `req_v4` / `req_v6` | (Empty) | Request a specific internal IPv4/IPv6 address |
-| `fwmark` | `0` | Policy routing fwmark (transparent proxies / traffic splitting, Linux) |
-
----
-
-## 📈 Web Dashboard (Optional)
-
-Off by default; enable with `web.addr` for **both** server and client. Throughput chart (120s), FEC recovered/lost counters, per-connection RTT/bytes/retries, MAC learning table, IP-pool usage, ban/kick/kick-all with immediate effect, in-panel log tail (500 lines) with live level switching, and Prometheus `/metrics`.
-
-Security: `web.auth` (Basic Auth, constant-time compare) and a CSRF header guard (`X-Requested-With`) on every control action.
-
-## ⚠️ Important Notes
-
-1. **Kernel Module**: Brutal mode requires the `tcp_brutal` congestion-control module (Linux only; other platforms log a warning and continue without it).
-2. **Permissions**: `/dev/net/tun` access, typically root.
-3. **Client identity**: the ClientID is derived from the TAP MAC + PSK. If the real MAC cannot be determined (e.g. `--tap mem`), a warning is logged and an all-zero MAC is used — set `mac` explicitly when running many such clients, or they will share one identity/IP.
-4. **Interoperability**: handshake fields `fec_group`, `enc_algo`, `enc_salt`, `enc_salt2` are additive; older peers (Go or Rust) interoperate in fallback mode (duplication FEC / legacy CTR).
-
----
-
-## 🧪 Protocol Interop & Benchmarks
-
-The protocol contract is locked by **golden vectors** (`tlsvpn/testdata/protocol_golden.json`, generated by the Go repo) covering key derivation, CTR keystream, frame headers, and handshake field names — `cargo test --test protocol_conformance` fails on any drift.
-
-Cross-implementation e2e probes (self-contained protocol stacks, no shared code) verify real interop:
-
-```bash
-# Rust probe -> any server (Go or Rust)
-cargo run --release --example interop_client -- --addr 127.0.0.1:4000 --psk secret --encrypt --fec 4
-
-# Go probe -> any server
-go build -C interop -o probe.exe . && ./interop/probe.exe --addr <server> --psk secret --encrypt --fec --fec-group 4
-```
-
-### Cross-language e2e suites
-
-`scripts/e2e_test.sh` is the single entry point. It drives four suites against a
-real Rust build and a real Go build over the in-memory TAP (`--tap mem`), so it
-needs no `CAP_NET_ADMIN` — unlike `net_perf_test.sh`, it runs for real on hosted
-CI:
+**Cross-implementation e2e** — `scripts/e2e_test.sh` drives the four suites below against a real Rust build and a real Go build over the in-memory TAP, so it needs no `CAP_NET_ADMIN` and runs for real on hosted CI:
 
 ```bash
 ./scripts/build.sh native                      # Rust server/client
@@ -173,67 +162,45 @@ go build -C interop -o interop/probe .          # Go probe
 ./scripts/e2e_test.sh accept tok                # selected suites
 ```
 
-| suite  | cases | what it covers |
-|--------|------:|----------------|
-| accept | 21    | 档 A/B/C/D matrix — all features on, all off (fallback path), old↔new mixes, opt-in cost to old peers |
-| tok    | 6     | session_token hijack via two same-MAC clients — 4 reject + 2 takeover control |
-| pad    | 16    | pad_mode off / legacy / bucket × server and client implementation, plus the invalid value |
-| minenc | 30    | min_enc "" / ctr / legacy / gcm floors × declared enc_algo, incl. unknown algo IDs |
+| Suite | Cases | Covers |
+| --- | ---: | --- |
+| `accept` | 21 | Feature matrix: all on, all off (fallback), old↔new mixes, opt-in cost to old peers |
+| `tok` | 6 | `session_token` hijack via two same-MAC clients — 4 rejects + 2 takeover controls |
+| `pad` | 16 | `pad_mode` off / legacy / bucket × server and client side, plus an invalid value |
+| `minenc` | 33 | `min_enc` floors × declared `enc_algo`, including unknown algo IDs |
 
-Each suite is also runnable standalone with its own env knobs (`SRV`, `CLI`,
-`PAD`, `PORT`, … — see the header of each script). Ports are offset per case from
-a `PORT_BASE_*` env var so concurrent runs don't collide. The mixed-version cases
-(`accept` P3/P4) are skipped with a count rather than failing when the
-pre-feature binaries aren't built — point `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`
-and `E2E_GO_OLD_BIN` at them to enable.
+Each suite is also standalone with its own env knobs (`SRV`, `CLI`, `PAD`, `PORT`, …), and ports are offset per case from a `PORT_BASE_*` var so concurrent runs don't collide. Mixed-version cases skip with a count instead of failing when the pre-feature binaries aren't built — point `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE` and `E2E_GO_OLD_BIN` at them to enable. `e2e_cert.pem`/`e2e_key.pem` are gitignored and generated on demand; shared helpers are in `scripts/e2e_lib.sh`.
 
-`e2e_cert.pem` / `e2e_key.pem` are gitignored; when they're absent the suites
-generate a throwaway self-signed pair with `openssl`. Shared helpers live in
-`scripts/e2e_lib.sh`.
-Protocol-path benchmark (frame scan + legacy inner crypto, 1M iterations, single core):
+**Standalone probes** verify real interop against either server:
+
+```bash
+cargo run --release --example interop_client -- \
+  --addr 127.0.0.1:4000 --psk secret --encrypt --fec 4
+```
+
+**Benchmark & build options**
 
 ```bash
 cargo test --release bench_protocol_throughput -- --ignored --nocapture
 # Protocol Throughput: ~3200 MB/s
+
+./scripts/build_pgo.sh   # PGO + native-CPU; needs rustup llvm-tools-preview
 ```
 
-Same-machine deployments can squeeze out further CPU headroom with a PGO + native-CPU build (instrument → run local traffic → recompile):
+`scripts/build.sh` takes `native` (default, host build), `musl` (the three static release targets, via `cross`), `gnu` (x86_64+aarch64 cross) or `all`; artifacts land in `dist/` as `tlsvpn-<target-triple>`.
+
+Real-network tests (ping v4/v6, traceroute, iperf3, optional librespeed) live in `scripts/net_perf_test.sh` and run as the `net-perf` CI job. Hosted runners lack `CAP_NET_ADMIN`, so the job self-skips there — run `sudo bash scripts/net_perf_test.sh` on a Linux box or a privileged self-hosted runner for real results.
+
+## CLI
+
+Two verbs, nothing else:
 
 ```bash
-rustup component add llvm-tools-preview
-./scripts/build_pgo.sh   # requires the e2e cert pair in the repo root; see script
+./tlsvpn -c config.json   # run server or client, per the config's "mode"
+./tlsvpn --print-config   # print the template and exit
 ```
 
-Real-network tests over an actual TAP tunnel (ping v4/v6, traceroute, iperf3
-throughput, optional librespeed) live in `scripts/net_perf_test.sh` and run as
-the `net-perf` CI job. GitHub-hosted runners lack `CAP_NET_ADMIN` so the job
-self-skips there (visible in its log); point `runs-on` at a privileged
-self-hosted runner — or run `sudo bash scripts/net_perf_test.sh` on any Linux
-box — to execute them for real. `scripts/build.sh` supports `native` (default — host
-build for CI/dev), `musl` (the three static targets the release workflow
-ships, via `cross`), `gnu` (x86_64+aarch64 cross via local toolchain) and
-`all`; artifacts land in `dist/` named `tlsvpn-<target-triple>`.
-
----
-
-## 📎 Appendix: Command-Line Flags
-
-All flags still work for quick one-liners; `-c config.json` overrides everything. Flag names map 1:1 to the JSON fields (`--brutal-up` ↔ `brutal_up`, etc.).
-
-```bash
-# Server one-liner
-sudo ./tlsvpn --mode server --psk "your_secret_key" --addr ":4000" --cert server.crt --key server.key \
-  --encrypt --brutal --workers 4 --web ":8080" --web-auth "admin:pass"
-
-# Client one-liner
-sudo ./tlsvpn --mode client --addr "1.1.1.1:4000,[::1]:4000" --psk "your_secret_key" \
-  --conns 4 --fec --fec-group 4 --encrypt --brutal --brutal-down 500
-
-# Shared   : --psk --tap --mac --loglevel --encrypt --brutal --brutal-up --brutal-down --web --web-auth
-# Server   : --v4cidr --v6cidr --cert --key --workers
-# Client   : --conns --fec --fec-group --req-v4 --req-v6 --sni --insecure --cert-sha256 --fwmark --socks5
-# Utility  : --print-config
-```
+`-c` also accepts `--config path` and `--config=path`. Running without `-c` prints this usage and exits.
 
 ---
 

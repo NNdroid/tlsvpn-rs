@@ -60,14 +60,20 @@ trap cleanup EXIT
 
 # --- 服务端 ---
 if [ "$SRV" = rs ]; then
+  # Rust 服务端：flags 已移除（2026-09-19），一律走配置文件。
+  # session_token 语义与 go 分支一致：reject 用例开启（第二台必须被拒），
+  # takeover 对照关闭。
   if [ "$EXPECT" = reject ]; then
-    SRV_ARGS="--session-token"
+    ST='true'
   else
-    SRV_ARGS=""
+    ST='false'
   fi
-  "$SRV_BIN" --mode server --addr "127.0.0.1:$PORT" --psk "$PSK" --encrypt \
-    --cert "$CERT" --key "$KEY" --v4cidr 10.77.0.0/24 --v6cidr fd77::/64 \
-    --tap mem --loglevel info $SRV_ARGS >"$SRV_LOG" 2>&1 &
+  e2e_config "$TMP/srv.json" server "127.0.0.1:$PORT" \
+    "\"psk\": \"$PSK\"" \
+    '"encrypt": true' \
+    '"log_level": "info"' \
+    "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\", \"session_token\": $ST}"
+  "$SRV_BIN" -c "$(e2e_winpath "$TMP/srv.json")" >"$SRV_LOG" 2>&1 &
 else
   # Go 的 session_token 只在配置文件里（无命令行开关）
   if [ "$EXPECT" = reject ]; then
@@ -100,9 +106,16 @@ e2e_wait_port 127.0.0.1 "$PORT" 20 || { echo "FAIL: server did not start"; cat "
 start_cli() {
   local logf="$1" webport="$2"
   if [ "$CLI" = rs ]; then
-    "$CLI_BIN" --mode client --addr "127.0.0.1:$PORT" --psk "$PSK" --encrypt \
-      --insecure --tap mem --conns 1 --loglevel info --mac "$MAC" \
-      --web "127.0.0.1:$webport" >"$logf" 2>&1 &
+    # Rust 客户端：flags 已移除（2026-09-19），一律走配置文件
+    local cfg="$TMP/cli_$webport.json"
+    e2e_config "$cfg" client "127.0.0.1:$PORT" \
+      "\"psk\": \"$PSK\"" \
+      '"encrypt": true' \
+      '"log_level": "info"' \
+      "\"mac\": \"$MAC\"" \
+      "\"web\": {\"addr\": \"127.0.0.1:$webport\"}" \
+      '"client": {"insecure": true, "conns": 1}'
+    "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   else
     # Go 客户端：flags 已移除（2026-09-19），一律走配置文件
     local cfg="$TMP/cli_$webport.json"

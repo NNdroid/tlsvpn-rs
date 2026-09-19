@@ -1,4 +1,3 @@
-use clap::Parser;
 use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
@@ -23,199 +22,43 @@ use crate::buffer::*;
 use crate::client::*;
 use crate::server::*;
 
-/// 命令行参数（与 Go flag 集合对齐；同时支持 JSON 配置文件）
-#[derive(Parser, Debug, Clone, Default)]
-#[command(name = "tlsvpn", about = "Rust Implementation of TLSVPN", long_about = None)]
+/// 运行时配置。config.json 是唯一配置面：本结构不再对接 clap，
+/// 只由 load_config_file 从 ConfigFile 构造，server/client 按字段名消费。
+#[derive(Debug, Clone, Default)]
 pub struct Args {
-    #[arg(long, default_value = "", help = "server or client")]
     pub mode: String,
-    #[arg(long, default_value = "quic_secret", help = "Pre-shared key")]
     pub psk: String,
-    #[arg(long, default_value = "tap0", help = "Name of the TAP device")]
     pub tap: String,
-    #[arg(
-        long,
-        default_value = "",
-        help = "Specify MAC address for TAP device (Client/Server)"
-    )]
     pub mac: String,
-    #[arg(
-        long,
-        default_value = "0.0.0.0:4000",
-        help = "Server: listen address | Client: target addresses (comma-separated)"
-    )]
     pub addr: String,
-    #[arg(
-        long,
-        default_value = "info",
-        help = "Log level (trace, debug, info, warn, error)"
-    )]
     pub loglevel: String,
-    #[arg(
-        long,
-        default_value = "10.0.0.0/24",
-        help = "IPv4 CIDR block (Server only)"
-    )]
     pub v4cidr: String,
-    #[arg(
-        long,
-        default_value = "fd00::/64",
-        help = "IPv6 CIDR block (Server only)"
-    )]
     pub v6cidr: String,
-    #[arg(long, default_value = "", help = "TLS Certificate file (Server only)")]
     pub cert: String,
-    #[arg(long, default_value = "", help = "TLS Key file (Server only)")]
     pub key: String,
-    #[arg(
-        long = "req_v4",
-        alias = "req-v4",
-        default_value = "",
-        help = "Requested IPv4 (Client only)"
-    )]
     pub req_v4: String,
-    #[arg(
-        long = "req_v6",
-        alias = "req-v6",
-        default_value = "",
-        help = "Requested IPv6 (Client only)"
-    )]
     pub req_v6: String,
-    #[arg(
-        long,
-        default_value = "www.cloudflare.com",
-        help = "SNI for TLS (Client only)"
-    )]
     pub sni: String,
-    #[arg(long, default_value_t = false, help = "Skip TLS verify (Client only)")]
     pub insecure: bool,
-    #[arg(
-        long = "cert_sha256",
-        alias = "cert-sha256",
-        default_value = "",
-        help = "Verify server cert SHA256 (Client only)"
-    )]
     pub cert_sha256: String,
-    #[arg(
-        long,
-        default_value_t = 0,
-        help = "Policy routing fwmark (Client only)"
-    )]
     pub fwmark: i32,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable TCP Brutal congestion control"
-    )]
     pub brutal: bool,
-    #[arg(
-        long = "brutal_up",
-        alias = "brutal-up",
-        default_value_t = 100,
-        help = "Brutal upload rate limit in Mbps"
-    )]
     pub brutal_up: u64,
-    #[arg(
-        long = "brutal_down",
-        alias = "brutal-down",
-        default_value_t = 500,
-        help = "Brutal download rate limit in Mbps"
-    )]
     pub brutal_down: u64,
-    #[arg(
-        long,
-        default_value_t = 1,
-        help = "Number of concurrent TCP connections for Load Balancing"
-    )]
     pub conns: i32,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable FEC over Multipath (XOR parity when the server supports it, else packet duplication)"
-    )]
     pub fec: bool,
-    #[arg(
-        long = "fec_group",
-        alias = "fec-group",
-        default_value_t = 4,
-        help = "XOR FEC group size K (2-64); parity overhead is 1/K"
-    )]
     pub fec_group: i64,
-    #[arg(
-        long,
-        default_value = "",
-        help = "Start Web Dashboard on specified address"
-    )]
     pub web: String,
-    #[arg(
-        long = "web_auth",
-        alias = "web-auth",
-        default_value = "",
-        help = "Basic Auth for the Web Dashboard as user:pass"
-    )]
     pub web_auth: String,
-    #[arg(
-        long = "web_bind",
-        alias = "web-bind",
-        default_value = "all",
-        help = "Dashboard listen scope: all (default) or tunnel (tunnel IP only)"
-    )]
     pub web_bind: String,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable inner payload encryption (AES-256-GCM with per-session salts when the peer supports it)"
-    )]
     pub encrypt: bool,
-    #[arg(
-        long,
-        default_value = "",
-        help = "Route ALL outbound sockets through a SOCKS5 proxy (Client only). \
-                Format: [user:pass@]host:port, socks5://host:port or socks5h://host:port"
-    )]
     pub socks5: String,
-    #[arg(
-        long,
-        default_value_t = 0,
-        help = "Server worker threads (0 = auto, one per CPU up to 8)"
-    )]
     pub workers: i32,
-    #[arg(
-        long,
-        default_value_t = 1500,
-        value_parser = clap::value_parser!(u16),
-        help = "TAP device MTU (larger = fewer frames/syscalls; set on BOTH ends)"
-    )]
     pub mtu: u16,
-    #[arg(
-        long = "pad-mode",
-        default_value = "",
-        help = "Confusion padding: legacy | bucket | off (default bucket)"
-    )]
     pub pad_mode: String,
-    #[arg(
-        long = "min-enc",
-        default_value = "",
-        help = "Minimum inner encryption strength: ctr | gcm (reject weaker negotiation)"
-    )]
     pub min_enc: String,
-    #[arg(
-        long = "session-token",
-        default_value_t = false,
-        help = "Server: require the session token issued on the original TLS connection \
-                for re-attaching to a live session"
-    )]
     pub session_token: bool,
-    #[arg(
-        long = "max-sessions",
-        default_value_t = 0,
-        help = "Server: max concurrent client sessions (0 = default 1024); \
-                new handshakes at the limit fail as authentication errors"
-    )]
     pub max_sessions: i32,
-    /// 内部字段：由配置文件加载时跳过 clap 解析
-    #[arg(skip)]
-    pub from_file: bool,
 }
 
 // ======================= JSON 配置文件（对齐 Go config.go） =======================
@@ -383,7 +226,6 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.client.fec_group
         },
-        from_file: true,
     };
     if args.mode == "server" && args.addr.is_empty() {
         args.addr = "0.0.0.0:4000".into();
@@ -392,6 +234,14 @@ fn load_config_file(path: &str) -> Result<Args, String> {
 }
 
 fn validate_args(args: &Args) -> Result<(), String> {
+    // mode 闭集校验，文案与 Go Validate 逐字一致
+    match args.mode.as_str() {
+        "server" | "client" => {}
+        "" => return Err("mode is required (server or client)".into()),
+        other => {
+            return Err(format!("invalid mode {:?} (must be server or client)", other))
+        }
+    }
     if args.addr.is_empty() {
         return Err("addr is required".into());
     }
@@ -438,6 +288,21 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// 从 argv 提取配置文件路径：`-c path`、`--config path`、`--config=path`。
+/// 除 --print-config 外这是唯一被识别的命令行面。
+fn parse_config_arg() -> Option<String> {
+    let argv: Vec<String> = std::env::args().collect();
+    for (i, a) in argv.iter().enumerate() {
+        if let Some(p) = a.strip_prefix("--config=") {
+            return Some(p.to_string());
+        }
+        if a == "-c" || a == "--config" {
+            return argv.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
 fn main() {
     // -print-config：输出示例 JSON 模板并退出（对齐 Go -print-config）
     if std::env::args().any(|a| a == "--print-config") {
@@ -448,27 +313,24 @@ fn main() {
     // rustls 0.23 需要显式选择 crypto provider（ring：无 cmake/NASM 依赖）
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // JSON 配置文件优先（对齐 Go -c 语义；-c <path> 忽略其余 flag）。
-    // 必须先于 Args::parse() 判定：clap 不认识 -c/--config，会直接以
-    // "unexpected argument" 退出，配置文件路径将完全不可用。
-    let argv: Vec<String> = std::env::args().collect();
-    let config_path = argv
-        .iter()
-        .position(|a| a == "-c" || a == "--config")
-        .and_then(|i| argv.get(i + 1))
-        .cloned();
-    let args = match config_path {
-        Some(ref path) => match load_config_file(path) {
-            Ok(a) => {
-                println!("Loaded configuration from {}", path);
-                a
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        },
-        None => Args::parse(),
+    // config.json 是唯一配置面：-c 必填，其余参数一律来自 JSON 字段。
+    let config_path = match parse_config_arg() {
+        Some(p) => p,
+        None => {
+            eprintln!("Usage: tlsvpn -c config.json");
+            eprintln!("       tlsvpn --print-config > config.json   # 生成模板后编辑");
+            std::process::exit(2);
+        }
+    };
+    let args = match load_config_file(&config_path) {
+        Ok(a) => {
+            println!("Loaded configuration from {}", config_path);
+            a
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     };
 
     init_logging(&args.loglevel);
@@ -476,7 +338,7 @@ fn main() {
     lazy_static::initialize(&PADDING_CACHE);
 
     if args.psk == "quic_secret" {
-        tracing::warn!("⚠️  PSK is the default value — change it via -psk or the config file!");
+        tracing::warn!("⚠️  PSK is the default value — change it in the config file!");
     }
     if let Err(e) = validate_args(&args) {
         error!("Invalid configuration: {}", e);
@@ -511,8 +373,10 @@ fn main() {
             on_exit_cleanup();
         }
         other => {
-            eprintln!("Usage: tlsvpn -c config.json   (or --mode server|client with flags)");
-            let _ = other;
+            error!(
+                "Invalid configuration: unknown mode {:?} (want \"server\" or \"client\")",
+                other
+            );
             std::process::exit(1);
         }
     }

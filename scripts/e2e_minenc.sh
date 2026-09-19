@@ -57,12 +57,19 @@ trap cleanup EXIT
 strip() { e2e_strip "$1"; }
 
 start_srv() {
-  local enc=""
-  [ "$ENCRYPT" = 1 ] && enc="--encrypt"
   if [ "$SRV" = rs ]; then
-    "$SRV_BIN" --mode server --addr "127.0.0.1:$PORT" --psk "$PSK" $enc \
-      --cert "$CERT" --key "$KEY" --v4cidr 10.77.0.0/24 --v6cidr fd77::/64 \
-      --tap mem --loglevel info --min-enc "$MINENC" >"$SRV_LOG" 2>&1 &
+    # Rust 服务端：flags 已移除（2026-09-19），一律走配置文件。
+    # min_enc 为空串是合法值（= 不设下限）；configerr 场景依赖
+    # min_enc requires encrypt=true / invalid min_enc 这类启动期校验失败。
+    local cfg="$TMP/srv.json" encjson="false"
+    [ "$ENCRYPT" = 1 ] && encjson="true"
+    e2e_config "$cfg" server "127.0.0.1:$PORT" \
+      "\"psk\": \"$PSK\"" \
+      "\"encrypt\": $encjson" \
+      '"log_level": "info"' \
+      "\"min_enc\": \"$MINENC\"" \
+      "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
+    "$SRV_BIN" -c "$(e2e_winpath "$cfg")" >"$SRV_LOG" 2>&1 &
   else
     # Go 服务端：flags 已移除（2026-09-19），一律走配置文件。
     # min_enc 为空串是合法值（= 不设下限）；configerr 场景依赖

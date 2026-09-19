@@ -243,7 +243,7 @@ fn src_mac_allowed(registered: Option<&[u8; 6]>, mac: &[u8; 6]) -> bool {
 // ======================= 服务端共享状态（面板/控制用） =======================
 
 /// 归一会话上限：0 = 默认 1024（对齐 Go applyDefaults）。配置文件路径在
-/// load_config_file 已归一；这里兜住只传 flag 的启动方式。
+/// load_config_file 已归一；这里兜住绕过它的调用方。
 fn normalize_max_sessions(n: i32) -> i32 {
     if n == 0 { 1024 } else { n }
 }
