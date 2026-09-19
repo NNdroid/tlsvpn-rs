@@ -1228,6 +1228,17 @@ fn handle_handshake(
         warn!("拒绝连接: 缺少 ClientID");
         return HandshakeOutcome::Close;
     }
+    // 格式校验：clientID 与 MAC 会大量进入日志与面板，畸形值既可能是坏客户端，
+    // 也可能被用于换行注入伪造日志行。直接断链，刻意不走焦油坑——这不是探测，
+    // 无需伪装成服务故障。放在封禁检查之前：畸形 ID 不该获得 ban 状态信息。
+    if !is_valid_client_id(&client_id) {
+        warn!("拒绝连接: ClientID 格式非法（须为 UUID），长度 {}", client_id.len());
+        return HandshakeOutcome::Close;
+    }
+    if !is_valid_mac_string(&req.mac) {
+        warn!("[{}] 拒绝连接: MAC 格式非法", client_id);
+        return HandshakeOutcome::Close;
+    }
     if core.banned.is_banned(&client_id) {
         warn!("[{}] 已封禁，拒绝接入", client_id);
         return HandshakeOutcome::TarpitClose;
