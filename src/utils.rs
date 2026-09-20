@@ -225,6 +225,21 @@ pub fn apply_ip_cmds(cmds: &[Vec<&str>]) {
     }
 }
 
+/// 面板监听地址算不算「对外」：非回环地址就算。对齐 Go main.go 的 web.auth 提示判断。
+///
+/// `0.0.0.0` / `[::]` 这种"所有地址"的写法当然也算对外。主机名（"localhost:8080"）
+/// 和格式非法的值解析不出来，Go 那边 SplitHostPort 出错时同样按"不是对外"处理，
+/// 这里保持一致——宁可少提示一次，也别对本来就只在本机监听的配置乱报警。
+pub fn web_addr_is_public(addr: &str) -> bool {
+    use std::net::SocketAddr;
+    matches!(
+        addr.parse::<SocketAddr>(),
+        Ok(sa)
+            if sa.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+                && sa.ip() != std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +414,21 @@ mod tests {
         // "/" 是"未配置"哨兵，对应族不应产生任何命令
         assert_eq!(tap_addr_cmds("tap0", "/", "").len(), 1);
         assert_eq!(tap_addr_cmds("tap0", "10.0.0.1/24", "/").len(), 2);
+    }
+
+    #[test]
+    fn web_addr_is_public_ignores_loopback() {
+        // 回环：不该出 web.auth 提示
+        for a in ["127.0.0.1:8080", "[::1]:8080"] {
+            assert!(!web_addr_is_public(a), "回环 {a} 不应算对外");
+        }
+        // 对外（含"所有地址"写法）：要出提示
+        for a in ["0.0.0.0:8080", "[::]:8080", "10.5.8.2:8080", "[fd99::1]:8000", "192.168.1.5:443"] {
+            assert!(web_addr_is_public(a), "{a} 应算对外");
+        }
+        // 解析不出来：Go SplitHostPort 出错时按"不是对外"处理，这里保持一致
+        for a in ["localhost:8080", "8080", "not-an-addr", ""] {
+            assert!(!web_addr_is_public(a), "解析失败 {a:?} 不应算对外");
+        }
     }
 }

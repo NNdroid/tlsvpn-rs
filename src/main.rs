@@ -443,6 +443,20 @@ fn main() {
         tracing::warn!("⚠️  PSK is the default value — change it in the config file!");
     }
 
+    // 面板安全提示：绑了对外地址、又没开认证、也没上 HTTPS 时明确告警。对齐
+    // Go main.go 的同一条检查——只告警不拒绝，内网测试盒子确实常这么配。
+    // 只告一次、只在启动时：面板地址是启动参数，运行中不会变。
+    if !args.web.is_empty()
+        && args.web_auth.is_empty()
+        && (args.web_cert.is_empty() || args.web_key.is_empty())
+        && crate::utils::web_addr_is_public(&args.web)
+    {
+        warn!(
+            "⚠️  Web dashboard binds a non-loopback address ({}) without auth and without HTTPS. Consider web.auth in the config.",
+            args.web
+        );
+    }
+
     // 填充策略全局生效（发送路径读取），面板可热更。
     // 空串 = 默认 bucket（对齐 Go Config.applyDefaults）。
     let pad_cfg = if args.pad_mode.is_empty() {
