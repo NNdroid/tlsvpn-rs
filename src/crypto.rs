@@ -25,6 +25,21 @@ pub const ENC_SALT_SIZE: usize = 8;
 // legacy CTR（安全降级，绝不静默黑洞）——两端都升级后 GCM 恢复。
 pub const CLIENT_ENC_ALGO_SUPPORT: i64 = ENC_ALGO_GCM_V2;
 
+/// 把协商出的内层算法号归一化成面板固定的三个值：
+/// 0=无内层加密，1=legacy CTR，2=GCM（v1/v2 密钥派生不同，语义一致）。
+///
+/// 不能直接下发原始算法号：ENC_ALGO_LEGACY_CTR 的值是 0，与"未加密"撞号；
+/// 而面板只认识 2，GCM-v2=3 会落进"明文"兜底分支。对齐 Go encAlgoForDisplay。
+pub fn enc_algo_for_display(enc_algo: i64, encrypt: bool) -> i64 {
+    if !encrypt {
+        return 0;
+    }
+    if enc_algo == ENC_ALGO_GCM || enc_algo == ENC_ALGO_GCM_V2 {
+        return 2;
+    }
+    1
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 pub fn hash_psk(psk: &str) -> String {
@@ -908,10 +923,25 @@ mod tests {
     fn enc_algo_supported_is_exact_not_magnitude() {
         assert!(enc_algo_supported(ENC_ALGO_GCM, ENC_ALGO_GCM));
         assert!(!enc_algo_supported(ENC_ALGO_LEGACY_CTR, ENC_ALGO_GCM));
-        // 关键：未来若定义算法 3，旧实现对端不得被当成"支持 GCM"
-        assert!(!enc_algo_supported(3, ENC_ALGO_GCM));
+        // 关键：算法号不相等就一律视为不支持，不能按数值大小推断能力。
+        // GCM-v2=3 语义上确实是 GCM，但只声明 2 的旧对端不得被当成支持 v2。
+        assert!(!enc_algo_supported(ENC_ALGO_GCM_V2, ENC_ALGO_GCM));
         assert!(!enc_algo_supported(99, ENC_ALGO_GCM));
         assert!(!enc_algo_supported(ENC_ALGO_GCM, ENC_ALGO_LEGACY_CTR));
+    }
+
+    #[test]
+    fn enc_algo_for_display_covers_the_ambiguity() {
+        // 0 号歧义：legacy CTR 的算法号就是 0，必须靠 encrypt 区分"未加密"
+        assert_eq!(enc_algo_for_display(ENC_ALGO_LEGACY_CTR, false), 0);
+        assert_eq!(enc_algo_for_display(ENC_ALGO_LEGACY_CTR, true), 1);
+        // GCM v1 与 v2 密钥派生不同，但对面板是同一种内层加密
+        assert_eq!(enc_algo_for_display(ENC_ALGO_GCM, true), 2);
+        assert_eq!(enc_algo_for_display(ENC_ALGO_GCM_V2, true), 2);
+        // 未加密时任何算法号都是 0——否则面板会把明文会话标成 CTR
+        assert_eq!(enc_algo_for_display(ENC_ALGO_GCM_V2, false), 0);
+        // 未知算法号 + encrypt 一律归为 CTR，不产生面板不认识的 3
+        assert_eq!(enc_algo_for_display(99, true), 1);
     }
 
     #[test]

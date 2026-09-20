@@ -218,6 +218,10 @@ pub struct Client {
     pub dedup: Arc<Mutex<DeDuplicator>>,
     pub ic_legacy: Option<Arc<InnerCipher>>,
     pub session: Mutex<SessionState>,
+    // 身份状态文件路径；空串 = 不持久化（进程内测试未从文件加载配置）
+    pub state_path: String,
+    // 内存中的身份状态；多条物理连接的握手会并发落盘，故加锁
+    pub identity: Mutex<crate::client_state::ClientState>,
     pub config: Arc<ClientConfig>,
     pub conn_infos: Vec<Arc<ConnInfo>>,
     pub socks5: Option<Arc<Socks5Proxy>>,
@@ -274,10 +278,8 @@ impl WebStatsProvider for Client {
             .enumerate()
             .map(|(i, c)| c.snapshot(i))
             .collect();
-        let mut enc = self.enc_algo_display.load(Ordering::Relaxed);
-        if enc == 0 && self.encrypt {
-            enc = 1; // legacy CTR 依旧算"已加密"（对齐 Go）
-        }
+        // 发射前已归一化成 0/1/2，这里直接透传
+        let enc = self.enc_algo_display.load(Ordering::Relaxed);
         let fec_status = self.fec_status.lock().clone();
         let local = serde_json::json!({
             "client_id": self.client_id,
@@ -417,21 +419,70 @@ impl WebStatsProvider for Client {
 
 // ======================= 主流程 =======================
 
-pub fn start_client(args: &Args) {
+/// 把服务端下发的会话身份落盘，供进程重启后第一次握手复用既有会话。按
+/// client_id（MAC+PSK 派生）绑定：配置变更后旧令牌自动失效。
+fn persist_session_state(cl: &Client, session_id: &str, token: &str) {
+    if cl.state_path.is_empty() {
+        return;
+    }
+    let mut st = cl.identity.lock().clone();
+    st.client_id = cl.client_id.clone();
+    st.session_id = session_id.to_string();
+    st.session_token = token.to_string();
+    if let Err(e) = crate::client_state::save_client_state(&cl.state_path, &st) {
+        warn!("Client failed to persist session state: {}", e);
+    }
+}
+
+pub fn start_client(args: &Args, config_path: &str) {
     info!("Starting TCP TLS client process...");
+
+    // 进程身份落盘（<config>.state）：MAC 派生 client_id，client_id 决定服务端
+    // 会话与分配的隧道 IP。三者跨进程稳定后，被杀或崩溃重启才能无缝接回原
+    // 会话，而不是等 120 秒僵尸会话过期才自然恢复连通。
+    let state_path = crate::client_state::client_state_path(config_path);
+    let mut identity = crate::client_state::load_client_state(&state_path);
+
     // mac 必须写入 TAP 设备本体（对齐 Go setTapMac）。只拿它算 client_id 不够：
     // 握手声明 req.mac=配置值，而帧里的 src MAC 是内核给 TAP 随机分配的那个，
     // 服务端 src_mac_allowed 会据此丢弃本端自己的帧。
-    let cfg_mac: Option<[u8; 6]> = match crate::utils::parse_config_mac(&args.mac) {
-        Ok(m) => m,
+    // 优先级：配置值 > 落盘值 > 随机生成。tun-rs 每次建 TAP 都发随机 MAC，不
+    // 固定就等于每次重启都是一次全新会话——换新 IP，而旧会话还要占用旧 IP
+    // 满 120 秒。mem 后端没有真实设备，client_id 退化为仅由 PSK 派生，本身
+    // 已跨进程稳定，不生成也不落盘。
+    let apply_mac: Option<[u8; 6]> = match crate::utils::parse_config_mac(&args.mac) {
+        Ok(Some(m)) => {
+            info!("Interface {} MAC set to {}", args.tap, args.mac);
+            Some(m)
+        }
         Err(e) => {
             error!("{}", e);
             return;
         }
+        Ok(None) => {
+            if !identity.mac.is_empty() {
+                match crate::utils::parse_config_mac(&identity.mac) {
+                    Ok(Some(m)) => {
+                        info!("Restored persistent TAP MAC: {}", identity.mac);
+                        Some(m)
+                    }
+                    _ => {
+                        warn!(
+                            "Persisted TAP MAC {:?} is unusable; generating a new one",
+                            identity.mac
+                        );
+                        None
+                    }
+                }
+            } else if args.tap == "mem" {
+                None
+            } else {
+                let gen = crate::client_state::generate_tap_mac();
+                info!("Generated TAP MAC: {}", gen);
+                crate::utils::parse_config_mac(&gen).ok().flatten()
+            }
+        }
     };
-    if cfg_mac.is_some() {
-        info!("Interface {} MAC set to {}", args.tap, args.mac);
-    }
 
     let device: Arc<dyn TapDevice> = if args.tap == "mem" {
         info!("Using in-memory TAP backend (no real device)");
@@ -442,7 +493,7 @@ pub fn start_client(args: &Args) {
             .layer(tun_rs::Layer::L2)
             .mtu(args.mtu);
         // DeviceBuilder 的方法按值消费 self，mac 只能作为链上的另一节
-        let builder = if let Some(m) = cfg_mac {
+        let builder = if let Some(m) = apply_mac {
             builder.mac_addr(m)
         } else {
             builder
@@ -472,6 +523,17 @@ pub fn start_client(args: &Args) {
         args.mac.clone()
     };
 
+    // 未显式配置时把实际生效的 MAC 落盘，下一次进程重启就回到同一个
+    // client_id 与同一条隧道 IP。配置值不动状态文件：改配置就是改身份。
+    if args.mac.is_empty() && identity.mac != actual_mac {
+        identity.mac = actual_mac.clone();
+        if let Err(e) = crate::client_state::save_client_state(&state_path, &identity) {
+            warn!("Client failed to persist TAP MAC: {}", e);
+        } else {
+            info!("Generated and persisted TAP MAC: {}", actual_mac);
+        }
+    }
+
     let ns = uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_URL, b"my_vpn_tunnel");
     let client_id =
         uuid::Uuid::new_v5(&ns, format!("{}{}", actual_mac, args.psk).as_bytes()).to_string();
@@ -485,7 +547,7 @@ pub fn start_client(args: &Args) {
         .filter(|s| !s.is_empty())
         .collect();
     if targets.is_empty() {
-        error!("Client addr 解析结果为空，请检查配置文件中的 addr 字段");
+        error!("Client addr resolved to zero endpoints; check the addr field in the config file");
         return;
     }
 
@@ -576,6 +638,23 @@ pub fn start_client(args: &Args) {
         .map(|i| Arc::new(ConnInfo::new(targets[i % targets.len()].clone())))
         .collect();
 
+    // 冷启动回带：状态文件按 client_id（MAC+PSK 派生）绑定，配置变更后旧令牌
+    // 自动失效；带上令牌的第一次握手就能接回既有会话，不必等 120 秒销毁期。
+    let session = {
+        let mut ss = SessionState::default();
+        if identity.client_id == client_id && !identity.session_id.is_empty() {
+            ss.server_session_id = identity.session_id.clone();
+            if !identity.session_token.is_empty() {
+                ss.session_token = identity.session_token.clone();
+                info!(
+                    "Restored session token for {}; next handshake will rejoin the existing session",
+                    identity.session_id
+                );
+            }
+        }
+        ss
+    };
+
     let client = Client {
         client_id: client_id.clone(),
         psk: args.psk.clone(),
@@ -603,7 +682,9 @@ pub fn start_client(args: &Args) {
         fec_dec: Mutex::new(None),
         dedup: Arc::new(Mutex::new(DeDuplicator::new())),
         ic_legacy,
-        session: Mutex::new(SessionState::default()),
+        session: Mutex::new(session),
+        state_path,
+        identity: Mutex::new(identity),
         config: config.clone(),
         conn_infos,
         socks5: socks5.clone(),
@@ -1057,20 +1138,18 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // 记下服务端下发的会话令牌，供后续重连回带。服务端未开启
         // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
         st.session_token = resp.session_token.clone();
+        // 落盘：进程重启后第一次握手就能回带令牌接回同一会话
+        persist_session_state(cl, &resp.session_id, &resp.session_token);
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
-        cl.enc_algo_display.store(
-            if enc_algo == ENC_ALGO_GCM || enc_algo == ENC_ALGO_GCM_V2 {
-                2
-            } else {
-                1
-            },
-            Ordering::Relaxed,
-        );
+        // 发射前归一化成 0/1/2：原始算法号里 0 同时表示"未加密"和 legacy CTR，
+        // 而 GCM-v2=3 面板不认识会落进"明文"兜底分支。
+        cl.enc_algo_display
+            .store(enc_algo_for_display(enc_algo, cl.encrypt), Ordering::Relaxed);
 
         if is_new_session {
             info!(
-                "[Conn {}] 🔄 检测到服务端重置了会话，正在清理本地旧的接收缓冲池...",
+                "[Conn {}] 🔄 server reset the session; flushing stale local receive buffers...",
                 conn_index
             );
             drop(st);
@@ -1369,7 +1448,7 @@ fn tls_exchange_resp(
                 if let Ok(r) = serde_json::from_slice::<HandshakeResp>(&data) {
                     if r.success {
                         debug!(
-                            "[Conn {}] <= 收到握手响应 (HandshakeResp): {:?}",
+                            "[Conn {}] <= received handshake response (HandshakeResp): {:?}",
                             conn_index, r
                         );
                         return Some(r);

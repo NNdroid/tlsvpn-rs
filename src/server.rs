@@ -287,7 +287,7 @@ impl ServerCore {
         self.vswitch.remove_port(cid);
         self.registry.write().remove(cid);
         self.pool.lock().release(mac, ipv4, ipv6);
-        info!("[{}] 💀 会话超时彻底销毁，释放 IP 及内存资源", cid);
+        info!("[{}] 💀 session timed out and was destroyed, releasing its IPs and memory", cid);
     }
 }
 
@@ -1291,21 +1291,21 @@ fn handle_handshake(
     tarpit_flag: &mut bool,
 ) -> HandshakeOutcome {
     let Ok(req) = serde_json::from_slice::<HandshakeReq>(data) else {
-        warn!("握手数据解析失败. 开启伪装焦油坑.");
+        warn!("Handshake data parse failed; engaging camouflage tar pit.");
         return HandshakeOutcome::TarpitClose;
     };
-    debug!("<= 收到客户端握手请求 (HandshakeReq): {:?}", req);
+    debug!("<= received client handshake request (HandshakeReq): {:?}", req);
 
     // 常量时间比较：pskHash 本身就是握手凭据，字符串 != 的逐字节短路会把匹配
     // 前缀长度泄露在响应时延里（远程时序预言机，可逐字节重建 pskHash）。
     if !constant_time_eq(req.psk.as_bytes(), core.psk_hash.as_bytes()) {
-        warn!("PSK 验证失败 (Hash不匹配).");
+        warn!("PSK verification failed (hash mismatch).");
         return HandshakeOutcome::TarpitClose;
     }
     // 加密配置不匹配 → 焦油坑（对齐 Go）
     if req.encrypt != core.encrypt {
         warn!(
-            "加密配置不匹配 (Client: {}, Server: {})",
+            "Encryption settings mismatch (Client: {}, Server: {})",
             req.encrypt, core.encrypt
         );
         return HandshakeOutcome::TarpitClose;
@@ -1317,29 +1317,29 @@ fn handle_handshake(
         // 此时还没有 client_id（它在下面才算出），algo 是唯一定位线索。
         // mio 的流取对端地址需要消费 socket，不为此改结构体。
         warn!(
-            "拒绝连接: 客户端加密能力 (algo={}) 低于 min_enc 下限 (要求 {})",
+            "connection refused: client cipher capability (algo={}) is below the min_enc floor (requires {})",
             req.enc_algo, core.min_enc
         );
         return HandshakeOutcome::Close;
     }
     let client_id = req.client_id.clone();
     if client_id.is_empty() {
-        warn!("拒绝连接: 缺少 ClientID");
+        warn!("connection refused: ClientID is missing");
         return HandshakeOutcome::Close;
     }
     // 格式校验：clientID 与 MAC 会大量进入日志与面板，畸形值既可能是坏客户端，
     // 也可能被用于换行注入伪造日志行。直接断链，刻意不走焦油坑——这不是探测，
     // 无需伪装成服务故障。放在封禁检查之前：畸形 ID 不该获得 ban 状态信息。
     if !is_valid_client_id(&client_id) {
-        warn!("拒绝连接: ClientID 格式非法（须为 UUID），长度 {}", client_id.len());
+        warn!("connection refused: malformed ClientID (must be a UUID), length {}", client_id.len());
         return HandshakeOutcome::Close;
     }
     if !is_valid_mac_string(&req.mac) {
-        warn!("[{}] 拒绝连接: MAC 格式非法", client_id);
+        warn!("[{}] connection refused: malformed MAC", client_id);
         return HandshakeOutcome::Close;
     }
     if core.banned.is_banned(&client_id) {
-        warn!("[{}] 已封禁，拒绝接入", client_id);
+        warn!("[{}] banned; access denied", client_id);
         return HandshakeOutcome::TarpitClose;
     }
     let mac = req.mac.clone();
@@ -1348,7 +1348,7 @@ fn handle_handshake(
         let mut sessions = core.sessions.write();
         if let Some(existing) = sessions.get(&client_id) {
             if !constant_time_eq(req.mac.as_bytes(), existing.mac.as_bytes()) {
-                warn!("[{}] 拒绝连接: MAC 不匹配", client_id);
+                warn!("[{}] connection refused: MAC mismatch", client_id);
                 *tarpit_flag = true;
                 return HandshakeOutcome::TarpitClose;
             }
@@ -1359,17 +1359,39 @@ fn handle_handshake(
             if core.session_token
                 && !verify_session_token(&core.psk, &existing.session_id, &req.session_token)
             {
-                warn!("[{}] 拒绝重连: 会话令牌无效（疑似冒充在线会话）", client_id);
+                warn!(
+                    "[{}] reconnect refused: invalid session token (possible impersonation of an active session)",
+                    client_id
+                );
                 return HandshakeOutcome::Close;
             }
-            info!("[{}] ⚡ 会话在销毁倒计时内成功复活！(无缝接续)", client_id);
+            info!(
+                "[{}] ⚡ session revived before the destroy countdown expired (seamless handover)",
+                client_id
+            );
+            // 进程级重启：上一代物理连接已全部断开，客户端的 txSeq 计数器重新
+            // 从 1 起。复活会话的旧重排缓冲还停在旧水位，新包全部 diff<0 被判
+            // "太老"丢弃，表现为"下行正常、上行彻底不通"。只有 active_conns==0
+            // 才说明整代连接结束；多连接时后续连接的到达不会走到这里，共享
+            // txPort 的序号也确实在跨连接连续。（对齐 Go）
+            if existing.stat.active_conns.load(Ordering::Relaxed) == 0 {
+                existing.reorder_buf.lock().reset();
+                existing.dedup.lock().reset();
+                if let Some(dec) = &existing.fec_dec {
+                    dec.reset();
+                }
+                info!(
+                    "[{}] 🔄 session revived: prior connection generation ended; reset the upstream reorder buffers",
+                    client_id
+                );
+            }
             existing.clone()
         } else {
             // 会话上限：达到即按认证失败处理，走伪装焦油坑——不向探测者泄露
             // 服务端容量信息。只拦新会话，既有会话的复活分支在上不受影响
             // （对齐 Go）。
             if core.max_sessions > 0 && sessions.len() >= core.max_sessions as usize {
-                warn!("拒绝连接: 会话数已达上限 {}", core.max_sessions);
+                warn!("connection refused: session limit reached ({})", core.max_sessions);
                 return HandshakeOutcome::TarpitClose;
             }
 
@@ -1441,7 +1463,7 @@ fn handle_handshake(
                 // 池耗尽必须拒连：空 IP 会被下游当成合法地址写进应答、注册表与
                 // 统计，产生一个"有会话但无地址"的黑洞。与上限同样走焦油坑。
                 warn!(
-                    "拒绝连接: IPv4 地址池已耗尽 ({})",
+                    "connection refused: IPv4 address pool exhausted ({})",
                     core.ipv4_cidr(&core.gw_v4)
                 );
                 return HandshakeOutcome::TarpitClose;
@@ -1456,16 +1478,7 @@ fn handle_handshake(
                 mac.clone(),
             ));
             *stat.fec_mode.lock() = fec_mode.clone();
-            stat.enc_algo.store(
-                if enc_algo == ENC_ALGO_GCM || enc_algo == ENC_ALGO_GCM_V2 {
-                    2
-                } else if core.encrypt {
-                    1
-                } else {
-                    0
-                },
-                Ordering::Relaxed,
-            );
+            stat.enc_algo.store(enc_algo_for_display(enc_algo, core.encrypt), Ordering::Relaxed);
 
             let port = Arc::new(AsyncPort::new(client_id.clone(), req.fec && fec_enc_k == 0));
             if fec_enc_k > 0 {
@@ -1489,7 +1502,7 @@ fn handle_handshake(
                 .insert(client_id.clone(), stat.clone());
 
             info!(
-                "[{}] 新逻辑 Client 上线 (FEC={} EncAlgo={}), Assigned IPs: {}/{}, {}/{}",
+                "[{}] new logical client online (FEC={} EncAlgo={}), Assigned IPs: {}/{}, {}/{}",
                 client_id, fec_mode, enc_algo, v4ip, core.v4_mask_bits, v6ip, core.v6_mask_bits
             );
 
@@ -1600,7 +1613,7 @@ fn on_conn_closed(
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
             info!(
-                "[{}] ⚠️ 客户端所有物理连接已断开，会话进入 120 秒保留期 (版本: {})...",
+                "[{}] ⚠️ all physical connections are down; entering a 120s session retention period (v={})...",
                 cid, current_version
             );
             let core = core.clone();
@@ -1618,7 +1631,7 @@ fn on_conn_closed(
                     );
                 } else {
                     info!(
-                        "[{}] ⚡ 发现较新的重连事件，取消本次销毁动作",
+                        "[{}] ⚡ a newer reconnect event arrived; cancelling this destroy action",
                         c_sess.stat.client_id
                     );
                 }

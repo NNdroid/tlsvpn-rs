@@ -8,6 +8,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod api;
 pub mod buffer;
 pub mod client;
+pub mod client_state;
 pub mod crypto;
 pub mod fec;
 pub mod frame;
@@ -56,6 +57,9 @@ pub struct Args {
     pub web_cert: String,
     pub web_key: String,
     pub encrypt: bool,
+    // 配置文件里是否显式写了 encrypt。bool 无法自辨"字段缺失"与"显式 false"，
+    // 靠这个标记让 main 能给运维一条明确提示。不参与任何运行时逻辑。
+    pub encrypt_present: bool,
     pub socks5: String,
     pub workers: i32,
     pub mtu: u16,
@@ -139,6 +143,16 @@ struct ClientConfigFile {
 /// 读取 JSON 配置并填充默认值（对齐 Go loadConfigFile + applyDefaults）
 fn load_config_file(path: &str) -> Result<Args, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
+
+    // 唯一例外是 encrypt：bool 无法自辨"字段缺失"与"显式 false"，而这里
+    // 是唯一还能看到原始 JSON 的地方。未写 encrypt 按开启处理——模板一直输出
+    // true，省略字段若仍按零值 false 处理，整条链路会静默跑明文，与模板读起来
+    // 完全相反。要显式关闭必须写 "encrypt": false。
+    let encrypt_present = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("encrypt").and_then(|e| e.as_bool()))
+        .is_some();
+
     let cfg: ConfigFile =
         serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
 
@@ -161,7 +175,8 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.log_level
         },
-        encrypt: cfg.encrypt,
+        encrypt: if encrypt_present { cfg.encrypt } else { true },
+        encrypt_present,
         pad_mode: cfg.pad_mode,
         min_enc: cfg.min_enc,
         socks5: cfg.socks5,
@@ -437,6 +452,12 @@ fn main() {
 
     init_logging(&args.loglevel);
 
+    if !args.encrypt_present {
+        warn!(
+            "Config does not set 'encrypt'; defaulting to enabled. Write \"encrypt\": false to run without inner encryption"
+        );
+    }
+
     lazy_static::initialize(&PADDING_CACHE);
 
     if args.psk == "quic_secret" {
@@ -507,7 +528,7 @@ fn main() {
             start_server(&args);
         }
         "client" => {
-            start_client(&args);
+            start_client(&args, &config_path);
             on_exit_cleanup();
         }
         other => {
@@ -738,6 +759,43 @@ mod tests {
         assert_eq!(args.conns, 4);
         assert_eq!(args.pad_mode, "bucket");
         assert!(args.min_enc.is_empty());
+    }
+
+    #[test]
+    fn encrypt_defaults_to_true_when_absent() {
+        // 未写 encrypt 必须按开启处理：-print-config 模板一直输出 true，省略
+        // 字段若仍按 Go 零值 false 处理，整条链路会静默跑明文，与模板读起来
+        // 完全相反。要显式关闭必须写 "encrypt": false。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tlsvpn-enc-{}.json", std::process::id()));
+        let cases = [
+            (r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1"}"#, false, true),
+            (
+                r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1","encrypt":true}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1","encrypt":false}"#,
+                true,
+                false,
+            ),
+        ];
+        for (json, want_present, want_encrypt) in cases {
+            std::fs::write(&path, json).unwrap();
+            let args = load_config_file(path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                args.encrypt_present, want_present,
+                "encrypt 存在性判断不符: {}",
+                json
+            );
+            assert_eq!(
+                args.encrypt, want_encrypt,
+                "encrypt 归一化结果不符: {}",
+                json
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
