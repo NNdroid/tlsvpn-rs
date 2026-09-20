@@ -18,6 +18,8 @@ const FEC_MAGIC: u8 = 0xFE;
 
 #[derive(serde::Serialize)]
 struct HandshakeReq {
+    protocol_version: i64,
+    client_instance: String,
     client_id: String,
     psk: String,
     mac: String,
@@ -34,6 +36,8 @@ struct HandshakeReq {
 
 #[derive(serde::Deserialize, Debug)]
 struct HandshakeResp {
+    protocol_version: Option<i64>,
+    session_epoch: Option<u64>,
     success: bool,
     #[allow(dead_code)]
     message: String,
@@ -100,15 +104,15 @@ struct ProbeCipher {
 }
 
 impl ProbeCipher {
-    /// algo 是握手协商出的算法值（2 = GCM-v1，3 = GCM-v2）。二者仅密钥派生
-    /// 标签不同：v2 用 `_enc_key_gcm_v2` 实现 GCM/CTR 密钥分离（对齐 Go gcmKeyLabel）。
-    fn new(psk: &str, salt: &[u8], algo: i64) -> Result<Self, String> {
+    /// 密钥标签与 Go `gcmKeyLabel` 逐字一致：sha256(psk ‖ "_enc_key")。
+    /// 内层只有一种算法（GCM），没有按算法编号切换标签的余地。
+    fn new(psk: &str, salt: &[u8]) -> Result<Self, String> {
         if salt.len() != ENC_SALT_SIZE {
             return Err(format!("bad salt len {}", salt.len()));
         }
-        let label = if algo == 3 { "_enc_key_gcm_v2" } else { "_enc_key" };
         let mut h = Sha256::new();
-        h.update(format!("{}{}", psk, label).as_bytes());
+        h.update(psk.as_bytes());
+        h.update(b"_enc_key");
         let key = h.finalize();
         let aead = Aes256Gcm::new((&key).into());
         let mut s = [0u8; ENC_SALT_SIZE];
@@ -412,20 +416,12 @@ fn main() {
     // 3. 握手
     // 服务端把 ClientID 校验为 UUID 形态（8-4-4-4-12），探针派生同样的形状；
     // 由 mac+psk 确定，保证同一身份重连时 ID 恒定
-    let client_id = {
-        let mut h = Sha256::new();
-        h.update(format!("{}{}", mac, psk).as_bytes());
-        let d = hex::encode(&h.finalize()[..16]);
-        format!(
-            "{}-{}-{}-{}-{}",
-            &d[0..8],
-            &d[8..12],
-            &d[12..16],
-            &d[16..20],
-            &d[20..32]
-        )
-    };
+    let ns = uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_URL, b"my_vpn_tunnel");
+    let client_id =
+        uuid::Uuid::new_v5(&ns, format!("{}{}", mac.to_lowercase(), psk).as_bytes()).to_string();
     let req = HandshakeReq {
+        protocol_version: 2,
+        client_instance: "interop-probe-instance-00000001".into(),
         client_id: client_id.clone(),
         psk: hash_psk(&psk),
         mac: mac.clone(),
@@ -453,6 +449,12 @@ fn main() {
     if !resp.success {
         fail(&format!("handshake rejected: {}", resp.message));
     }
+    if resp.protocol_version != Some(2) || resp.session_epoch.unwrap_or(0) == 0 {
+        fail(&format!(
+            "server lacks protocol-v2 key epochs: version={:?} epoch={:?}",
+            resp.protocol_version, resp.session_epoch
+        ));
+    }
     println!(
         "RESP: success={} enc_algo={:?} enc_salt={} enc_salt2={} fec_group={:?} session={:?} ipv4={}",
         resp.success, resp.enc_algo, resp.enc_salt.as_deref().unwrap_or(""), resp.enc_salt2.as_deref().unwrap_or(""),
@@ -471,20 +473,15 @@ fn main() {
         // 精确比较而非 >=：enc_algo 是枚举不是强度量级，未知算法 ID 不得被
         // 当成 GCM 能力（与 crypto::enc_algo_supported 一致）。fec_group 那边
         // 用 >= 是对的——K 单调递增，K=3 严格强于 K=2。
-        // 算法 3（GCM-v2）与 2（GCM-v1）都是合格协商结果：服务端按本端声明的
-        // 能力（--enc-algo）精确匹配后回哪个，哪个就是对的。
-        if algo == 2 || algo == 3 {
+        // 现在唯一合格值是 2：服务端声明不了 GCM 说明不再受支持，直接失败。
+        if algo == 2 {
             let stx = hex::decode(resp.enc_salt.as_deref().unwrap_or("")).unwrap_or_default();
             let srx = hex::decode(resp.enc_salt2.as_deref().unwrap_or("")).unwrap_or_default();
-            ic_tx = Some(ProbeCipher::new(&psk, &stx, algo).unwrap_or_else(|e| fail(&e)));
-            ic_rx = Some(ProbeCipher::new(&psk, &srx, algo).unwrap_or_else(|e| fail(&e)));
-            if algo == 3 {
-                println!("NEGOTIATED: GCM-v2 (per-session salts, independent key label)");
-            } else {
-                println!("NEGOTIATED: GCM (per-session bidirectional salts)");
-            }
+            ic_tx = Some(ProbeCipher::new(&psk, &stx).unwrap_or_else(|e| fail(&e)));
+            ic_rx = Some(ProbeCipher::new(&psk, &srx).unwrap_or_else(|e| fail(&e)));
+            println!("NEGOTIATED: GCM (per-session bidirectional salts)");
         } else {
-            println!("NEGOTIATED: legacy CTR (server lacks GCM or below min_enc)");
+            println!("NEGOTIATED: algo={} (plaintext or unknown)", algo);
             println!("FAIL: expected GCM negotiation with modern server");
             std::process::exit(1);
         }

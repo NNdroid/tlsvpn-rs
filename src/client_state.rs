@@ -12,6 +12,7 @@ pub struct ClientState {
     pub mac: String,
     pub session_id: String,
     pub session_token: String,
+    pub session_epoch: u64,
 }
 
 /// 状态文件紧随配置文件（`<config>.state`）。`config_path` 为空（进程内测试
@@ -62,10 +63,40 @@ pub fn save_client_state(path: &str, st: &ClientState) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).ok();
     }
-    fs::rename(&tmp, path).map_err(|e| {
+    replace_file(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         e.to_string()
     })
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &str, path: &str) -> std::io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &str, path: &str) -> std::io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    let from: Vec<u16> = OsStr::new(tmp).encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// 生成随机 MAC：清掉组播位、置本地管理位，保证是合法单播地址。

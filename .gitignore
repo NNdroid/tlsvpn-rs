@@ -30,3 +30,7 @@ protocol_golden.rust.json
 !/interop/go.mod
 !/interop/go.sum
 dist/
+.zcode/
+# 编译产物（误放仓库根目录的探针二进制，源码在 interop/）
+go_webtls
+rs_webtls

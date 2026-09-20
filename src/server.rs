@@ -9,10 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::*;
 use crate::buffer::*;
@@ -192,7 +192,6 @@ pub struct ClientSession {
     pub port: Arc<AsyncPort>,
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
     pub dedup: Arc<Mutex<DeDuplicator>>,
-    pub fec_dec: Option<Arc<FecDecoder>>,
     pub fec_enc_k: i64,
     pub mac: String,
     // 握手 MAC 的二进制形式（建会话时解析一次）。全零表示未上报/为空，
@@ -200,16 +199,32 @@ pub struct ClientSession {
     pub mac_bin: [u8; 6],
     pub ipv4: String,
     pub ipv6: String,
+    pub epoch_state: RwLock<SessionEpochState>,
+    pub destroy_deadline: Mutex<Option<(Instant, u64)>>,
+    pub created_at: Instant,
+    // 本会话实际生效的 TCP Brutal 整形速率（Mbps），0 = 未启用或被对端压低到 0。
+    // 记录的是协商结果而不是配置值：客户端可以申请更低的预算，面板按实际值显示。
+    pub brutal_tx: AtomicU64,
+    pub brutal_rx: AtomicU64,
+    // 本会话 TCP Brutal 是否真的生效（setsockopt 成功）
+    pub brutal_applied: AtomicBool,
+}
+
+pub struct SessionEpochState {
+    pub instance_id: String,
+    pub epoch: u64,
+    pub resume_token: String,
     pub enc_algo: i64,
-    pub salt_a: [u8; ENC_SALT_SIZE], // c2s 盐（客户端加密/服务端解密）
-    pub salt_b: [u8; ENC_SALT_SIZE], // s2c 盐（服务端加密/客户端解密）
+    pub salt_a: [u8; ENC_SALT_SIZE],
+    pub salt_b: [u8; ENC_SALT_SIZE],
     pub ic_tx: Option<Arc<InnerCipher>>,
     pub ic_rx: Option<Arc<InnerCipher>>,
-    pub created_at: Instant,
+    pub fec_dec: Option<Arc<FecDecoder>>,
 }
 
 struct MioSession {
     socket: MioTcpStream,
+    remote_ip: String,
     tls: ServerConnection,
     scanner: FrameScanner,
     rx: Receiver<VPNFrame>,
@@ -223,6 +238,7 @@ struct MioSession {
     rtt_timer: Instant,
     send_buf: Vec<u8>,
     ic_rx: Option<Arc<InnerCipher>>,
+    session_epoch: u64,
     write_stalled: Option<Instant>,
 }
 
@@ -244,7 +260,11 @@ fn src_mac_allowed(registered: Option<&[u8; 6]>, mac: &[u8; 6]) -> bool {
 /// 归一会话上限：0 = 默认 1024（对齐 Go applyDefaults）。配置文件路径在
 /// load_config_file 已归一；这里兜住绕过它的调用方。
 fn normalize_max_sessions(n: i32) -> i32 {
-    if n == 0 { 1024 } else { n }
+    if n == 0 {
+        1024
+    } else {
+        n
+    }
 }
 
 pub struct ServerCore {
@@ -256,7 +276,6 @@ pub struct ServerCore {
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
-    pub ic_legacy: Option<Arc<InnerCipher>>,
     pub vswitch: Arc<VSwitch>,
     pub sessions: RwLock<HashMap<String, Arc<ClientSession>>>,
     pub pool: Mutex<IpPool>,
@@ -271,6 +290,8 @@ pub struct ServerCore {
     pub min_enc: i64,
     // 并发会话上限（对齐 Go maxSessions；构造时已把 0 归一为 1024）
     pub max_sessions: i32,
+    // 多 worker 共用的会话回收节流，避免每次断线创建一个睡眠 OS 线程。
+    pub last_session_reap_ms: AtomicU64,
 }
 
 impl ServerCore {
@@ -282,12 +303,26 @@ impl ServerCore {
     }
 
     /// 会话销毁：移除注册表/交换机端口/统计/IP（对齐 Go destroyTimer）
-    fn destroy_session(&self, cid: &str, mac: &str, ipv4: &str, ipv6: &str) {
-        self.sessions.write().remove(cid);
+    fn destroy_session(&self, session: &Arc<ClientSession>) {
+        let cid = &session.stat.client_id;
+        let mut sessions = self.sessions.write();
+        let Some(current) = sessions.get(cid) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, session) {
+            return;
+        }
+        sessions.remove(cid);
+        drop(sessions);
         self.vswitch.remove_port(cid);
         self.registry.write().remove(cid);
-        self.pool.lock().release(mac, ipv4, ipv6);
-        info!("[{}] 💀 session timed out and was destroyed, releasing its IPs and memory", cid);
+        self.pool
+            .lock()
+            .release(&session.mac, &session.ipv4, &session.ipv6);
+        info!(
+            "[{}] 💀 session timed out and was destroyed, releasing its IPs and memory",
+            cid
+        );
     }
 }
 
@@ -316,7 +351,8 @@ impl WebStatsProvider for ServerCore {
         let mut lost = 0u64;
         let mut parity = 0u64;
         for (id, s) in sessions.iter() {
-            if let Some(dec) = &s.fec_dec {
+            let epoch = s.epoch_state.read();
+            if let Some(dec) = &epoch.fec_dec {
                 let (r, l) = dec.stats();
                 rec += r;
                 lost += l;
@@ -326,13 +362,21 @@ impl WebStatsProvider for ServerCore {
                 id.clone(),
                 serde_json::json!({
                     "ipv4": s.ipv4, "ipv6": s.ipv6, "mac": s.mac,
+                    "session_id": s.session_id,
+                    "session_epoch": epoch.epoch,
+                    "session_encrypt": epoch.enc_algo == ENC_ALGO_GCM,
                     "active_conns": s.stat.active_conns.load(Ordering::Relaxed),
                     "tx_bytes": s.stat.tx_bytes.load(Ordering::Relaxed),
                     "rx_bytes": s.stat.rx_bytes.load(Ordering::Relaxed),
                     "tx_packets": s.stat.tx_packets.load(Ordering::Relaxed),
                     "rx_packets": s.stat.rx_packets.load(Ordering::Relaxed),
                     "fec": s.stat.fec_mode.lock().clone(),
+                    "fec_group": s.fec_enc_k,
                     "enc_algo": s.stat.enc_algo.load(Ordering::Relaxed),
+                    "brutal_tx": s.brutal_tx.load(Ordering::Relaxed),
+                    "brutal_rx": s.brutal_rx.load(Ordering::Relaxed),
+                    "brutal_applied": s.brutal_applied.load(Ordering::Relaxed),
+                    "online_sec": s.created_at.elapsed().as_secs(),
                     "uptime_sec": s.created_at.elapsed().as_secs(),
                 }),
             );
@@ -345,6 +389,36 @@ impl WebStatsProvider for ServerCore {
             .into_iter()
             .map(|(mac, port, age)| serde_json::json!({"mac": mac, "port": port, "age_sec": age}))
             .collect();
+        // 协商结果：服务端不消费单一会话，这里给"本端配置意图 + 内核实测状态"，
+        // 逐会话的真实取值在 clients 表里（brutal_tx/brutal_rx/enc_algo/fec_group）。
+        let brut = brutal_system_status();
+        // applied 只统计 setsockopt 真的成功过的会话，不是"配置了就算生效"
+        let applied: usize = sessions.values().filter(|s| {
+            s.brutal_applied.load(Ordering::Relaxed)
+        }).count();
+        let negotiate = serde_json::json!({
+            "protocol_version": 2,
+            "fec": true,
+            "fec_group": 4,
+            "enc_algo": if self.encrypt { ENC_ALGO_GCM } else { ENC_ALGO_NONE },
+            "pad_mode": pad_mode_name(),
+            "min_enc": min_enc_label(self.min_enc),
+            "session_token": self.session_token,
+            "max_sessions": self.max_sessions,
+            "brutal": {
+                "enabled": self.brutal,
+                "up_mbps": self.brutal_up,
+                "down_mbps": self.brutal_down,
+                "kernel_supported": brut["supported"].as_bool().unwrap_or(false),
+                "kernel_current": brut["kernel_current"].as_str().unwrap_or(""),
+                "kernel_available": brut["kernel_available"].clone(),
+                "applied_conns": applied,
+                "total_conns": sessions.len(),
+                "per_conn_tx_mbps": self.brutal_up,
+                "per_conn_rx_mbps": self.brutal_down,
+                "error": brut["error"].as_str().unwrap_or(""),
+            }
+        });
         serde_json::json!({
             "mode": "server",
             "version": APP_VERSION,
@@ -361,6 +435,7 @@ impl WebStatsProvider for ServerCore {
             "ip_pool": {"v4_used": v4_used, "v4_total": v4_total, "v6_used": v6_used},
             "banned": banned,
             "mac_table": macs,
+            "negotiate": negotiate,
         })
     }
 
@@ -373,7 +448,8 @@ impl WebStatsProvider for ServerCore {
             rx += s.stat.rx_bytes.load(Ordering::Relaxed);
             pk += s.stat.tx_packets.load(Ordering::Relaxed)
                 + s.stat.rx_packets.load(Ordering::Relaxed);
-            if let Some(dec) = &s.fec_dec {
+            let epoch = s.epoch_state.read();
+            if let Some(dec) = &epoch.fec_dec {
                 let (r, l) = dec.stats();
                 rec += r;
                 lost += l;
@@ -491,8 +567,10 @@ impl WebStatsProvider for ServerCore {
     ) -> Result<(), String> {
         match action {
             "kick" => {
-                if let Some(s) = self.sessions.read().get(client_id) {
+                let session = self.sessions.read().get(client_id).cloned();
+                if let Some(s) = session {
                     s.stat.force_disconnect.store(true, Ordering::Relaxed);
+                    self.destroy_session(&s);
                     info!("[WebUI] Force kicked client: {}", client_id);
                 }
                 Ok(())
@@ -500,8 +578,10 @@ impl WebStatsProvider for ServerCore {
             "ban" => {
                 if self.banned.ban(client_id, ttl_minutes) {
                     info!("[WebUI] Banned client {} (ttl={}m)", client_id, ttl_minutes);
-                    if let Some(s) = self.sessions.read().get(client_id) {
+                    let session = self.sessions.read().get(client_id).cloned();
+                    if let Some(s) = session {
                         s.stat.force_disconnect.store(true, Ordering::Relaxed);
+                        self.destroy_session(&s);
                     }
                 }
                 Ok(())
@@ -512,9 +592,11 @@ impl WebStatsProvider for ServerCore {
                 Ok(())
             }
             "kickall" => {
-                let n = self.sessions.read().len();
-                for s in self.sessions.read().values() {
+                let sessions: Vec<_> = self.sessions.read().values().cloned().collect();
+                let n = sessions.len();
+                for s in sessions {
                     s.stat.force_disconnect.store(true, Ordering::Relaxed);
+                    self.destroy_session(&s);
                 }
                 info!("[WebUI] Kicked all clients ({})", n);
                 Ok(())
@@ -548,8 +630,7 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
                 .into(),
         );
     }
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("server.cert {}: {}", path, e))?;
+    let f = std::fs::File::open(path).map_err(|e| format!("server.cert {}: {}", path, e))?;
     let mut r = std::io::BufReader::new(f);
     rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
@@ -565,8 +646,7 @@ fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Str
         );
     }
     let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path)
-            .map_err(|e| format!("server.key {}: {}", path, e))?,
+        std::fs::File::open(path).map_err(|e| format!("server.key {}: {}", path, e))?,
     );
     rustls_pemfile::private_key(&mut reader)
         .map_err(|e| format!("server.key {}: invalid key PEM: {}", path, e))?
@@ -586,13 +666,8 @@ fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> 
 
 // ======================= 服务端主流程 =======================
 
-pub fn start_server(args: &Args) {
+pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
     info!("Starting TCP TLS server process...");
-    let ic_legacy = if args.encrypt {
-        Some(Arc::new(InnerCipher::legacy(&args.psk)))
-    } else {
-        None
-    };
 
     let (pool, gw_v4, gw_v6) = IpPool::new(&args.v4cidr, &args.v6cidr);
     let v4_mask_bits = pool.v4_mask_bits;
@@ -609,10 +684,10 @@ pub fn start_server(args: &Args) {
         // 0 = 默认 1024：直接跑 --max-sessions 0 也不该变成"无上限"，否则
         // 一个裸参数就能关掉容量保护
         max_sessions: normalize_max_sessions(args.max_sessions),
+        last_session_reap_ms: AtomicU64::new(0),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
-        ic_legacy,
         vswitch: vswitch.clone(),
         sessions: RwLock::new(HashMap::new()),
         pool: Mutex::new(pool),
@@ -630,13 +705,14 @@ pub fn start_server(args: &Args) {
     // 构成引用环
     {
         let weak = Arc::downgrade(&core);
-        let f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync> = Arc::new(
-            move |src_port_id, mac| {
-                let Some(core) = weak.upgrade() else { return true };
+        let f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync> =
+            Arc::new(move |src_port_id, mac| {
+                let Some(core) = weak.upgrade() else {
+                    return true;
+                };
                 let sessions = core.sessions.read();
                 src_mac_allowed(sessions.get(src_port_id).map(|s| &s.mac_bin), mac)
-            },
-        );
+            });
         core.vswitch.set_validate_mac(f);
     }
 
@@ -687,6 +763,7 @@ pub fn start_server(args: &Args) {
                 args.web_cert.clone(),
                 args.web_key.clone(),
                 core.clone(),
+                ctx.clone(),
                 core.clone(),
             ),
             _ => start_web_server(
@@ -695,6 +772,7 @@ pub fn start_server(args: &Args) {
                 args.web_cert.clone(),
                 args.web_key.clone(),
                 core.clone(),
+                ctx.clone(),
             ),
         }
     }
@@ -868,6 +946,19 @@ fn worker_loop(
 
         // ===== 新连接接入（acceptor 分发到本 worker） =====
         while let Ok(mut socket) = accept_rx.try_recv() {
+            let remote_ip = socket
+                .peer_addr()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_default();
+            if mio_sessions.len() >= 32
+                || mio_sessions
+                    .values()
+                    .filter(|s| s.remote_ip == remote_ip)
+                    .count()
+                    >= 4
+            {
+                continue;
+            }
             let t = Token(unique_token);
             unique_token += 1;
             if poll
@@ -895,6 +986,7 @@ fn worker_loop(
                 t,
                 MioSession {
                     socket,
+                    remote_ip,
                     tls: ServerConnection::new(tls_config.clone()).unwrap(),
                     scanner,
                     rx,
@@ -908,12 +1000,43 @@ fn worker_loop(
                     rtt_timer: Instant::now(),
                     send_buf: Vec::with_capacity(70 * 1024),
                     ic_rx: None,
+                    session_epoch: 0,
                     write_stalled: None,
                 },
             );
         }
 
         // ===== 定时器扫描：保活 / 空闲 / RTT / 强踢 / 下行拉帧 =====
+        let now_ms = core.started_at.elapsed().as_millis() as u64;
+        let last_reap = core.last_session_reap_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_reap) >= 1000
+            && core
+                .last_session_reap_ms
+                .compare_exchange(last_reap, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            let expired: Vec<_> = core
+                .sessions
+                .read()
+                .values()
+                .filter(|session| {
+                    if session.stat.active_conns.load(Ordering::Acquire) != 0 {
+                        return false;
+                    }
+                    let version = session.stat.disconnect_version.load(Ordering::Acquire);
+                    matches!(
+                        *session.destroy_deadline.lock(),
+                        Some((deadline, expected_version))
+                            if expected_version == version && Instant::now() >= deadline
+                    )
+                })
+                .cloned()
+                .collect();
+            for session in expired {
+                core.destroy_session(&session);
+            }
+        }
+
         for (token, sess) in mio_sessions.iter_mut() {
             let idle_time = sess.last_rx.elapsed().as_secs();
             if idle_time > 30 {
@@ -946,6 +1069,24 @@ fn worker_loop(
             }
 
             if let Some(c_sess) = &sess.client_session {
+                if c_sess.port.is_sequence_exhausted() {
+                    let mut epoch = c_sess.epoch_state.write();
+                    if !epoch.instance_id.starts_with("exhausted-") {
+                        epoch.instance_id = format!("exhausted-{}", gen_session_id());
+                        epoch.epoch = epoch.epoch.saturating_add(1);
+                        c_sess.stat.active_conns.store(0, Ordering::Release);
+                        warn!(
+                            "[{}] sequence space exhausted; forcing a fresh key epoch",
+                            c_sess.stat.client_id
+                        );
+                    }
+                    closed_tokens.push(*token);
+                    continue;
+                }
+                if c_sess.epoch_state.read().epoch != sess.session_epoch {
+                    closed_tokens.push(*token);
+                    continue;
+                }
                 if c_sess.stat.force_disconnect.load(Ordering::Relaxed) {
                     closed_tokens.push(*token);
                     continue;
@@ -1062,15 +1203,8 @@ fn worker_loop(
                 if close {
                     if let Some(mut s) = mio_sessions.remove(&token) {
                         let _ = poll.registry().deregister(&mut s.socket);
-                        if tarpit {
-                            // 剥离 Mio，把 socket 丢给独立线程执行慢速伪装
-                            let std_sock = into_std_tcp(s.socket);
-                            if let Some(sock) = std_sock {
-                                let _ = sock.set_nonblocking(false);
-                                std::thread::spawn(move || camouflage_probe(sock));
-                            }
-                        }
-                        on_conn_closed(&core, s.client_session, s.tx_backend);
+                        let _ = tarpit; // 认证失败立即释放资源；不再创建无界 tarpit OS 线程。
+                        on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
                     }
                 }
             }
@@ -1082,23 +1216,9 @@ fn worker_loop(
         for t in closed_tokens {
             if let Some(mut s) = mio_sessions.remove(&t) {
                 let _ = poll.registry().deregister(&mut s.socket);
-                on_conn_closed(&core, s.client_session, s.tx_backend);
+                on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
             }
         }
-    }
-}
-
-/// mio TcpStream → 原生 TcpStream（消耗所有权；用于焦油坑线程）
-fn into_std_tcp(s: MioTcpStream) -> Option<std::net::TcpStream> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::{FromRawFd, IntoRawFd};
-        Some(unsafe { std::net::TcpStream::from_raw_fd(s.into_raw_fd()) })
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-        Some(unsafe { std::net::TcpStream::from_raw_socket(s.into_raw_socket()) })
     }
 }
 
@@ -1166,10 +1286,17 @@ fn process_plain_frames(
                         Some(c) => c.clone(),
                         None => continue,
                     };
+                    let epoch = c_sess.epoch_state.read();
+                    if sess.session_epoch != epoch.epoch {
+                        *close = true;
+                        break;
+                    }
+                    let fec_dec = epoch.fec_dec.clone();
+                    drop(epoch);
                     let data = Arc::new(data);
                     // XOR 校验帧 → 会话级 FEC 解码器
                     if seq == 0 {
-                        if let Some(dec) = &c_sess.fec_dec {
+                        if let Some(dec) = &fec_dec {
                             if fec::is_parity_frame(&data) {
                                 let mut sink = make_sink(&c_sess, core);
                                 dec.on_parity(&data, &mut sink);
@@ -1177,7 +1304,7 @@ fn process_plain_frames(
                             }
                         }
                     }
-                    if let Some(dec) = &c_sess.fec_dec {
+                    if let Some(dec) = &fec_dec {
                         let mut sink = make_sink(&c_sess, core);
                         dec.on_data(seq, &data, &mut sink);
                     }
@@ -1226,7 +1353,20 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         drain_tls(sess, close);
         return;
     }
-    let ic_tx = sess.client_session.as_ref().and_then(|s| s.ic_tx.clone());
+    let ic_tx = sess.client_session.as_ref().and_then(|s| {
+        let epoch = s.epoch_state.read();
+        if epoch.epoch != sess.session_epoch {
+            None
+        } else {
+            epoch.ic_tx.clone()
+        }
+    });
+    if let Some(s) = &sess.client_session {
+        if s.epoch_state.read().epoch != sess.session_epoch {
+            *close = true;
+            return;
+        }
+    }
     let mut pulled = 0usize;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
@@ -1284,17 +1424,75 @@ enum HandshakeOutcome {
     TarpitClose,
 }
 
+fn rotate_session_epoch(
+    session: &Arc<ClientSession>,
+    core: &Arc<ServerCore>,
+    instance_id: &str,
+) -> Result<(), String> {
+    let mut epoch = session.epoch_state.write();
+    let salt_a = new_random_salt();
+    let salt_b = new_random_salt();
+    let (ic_tx, ic_rx, fec_tx, fec_rx) = if core.encrypt {
+        (
+            Some(Arc::new(InnerCipher::gcm(&core.psk, &salt_b)?)),
+            Some(Arc::new(InnerCipher::gcm(&core.psk, &salt_a)?)),
+            Some(Arc::new(InnerCipher::gcm_domain(&core.psk, &salt_b, "fec")?)),
+            Some(Arc::new(InnerCipher::gcm_domain(&core.psk, &salt_a, "fec")?)),
+        )
+    } else {
+        (None, None, None, None)
+    };
+    let fec_dec = if session.fec_enc_k > 0 {
+        Some(Arc::new(FecDecoder::new(
+            session.fec_enc_k as usize,
+            fec_rx,
+        )))
+    } else {
+        None
+    };
+    if let Some(old) = &epoch.fec_dec {
+        old.reset();
+    }
+    session.reorder_buf.lock().reset();
+    session.dedup.lock().reset();
+    if session.fec_enc_k > 0 {
+        session.port.reset_epoch(session.fec_enc_k as usize, fec_tx);
+    } else {
+        session.port.reset_epoch(0, None);
+    }
+    epoch.instance_id = instance_id.to_string();
+    epoch.epoch = epoch.epoch.saturating_add(1);
+    epoch.resume_token = new_session_token()?;
+    epoch.salt_a = salt_a;
+    epoch.salt_b = salt_b;
+    epoch.ic_tx = ic_tx;
+    epoch.ic_rx = ic_rx;
+    epoch.fec_dec = fec_dec;
+    session.stat.active_conns.store(0, Ordering::Release);
+    Ok(())
+}
+
 fn handle_handshake(
     sess: &mut MioSession,
     core: &Arc<ServerCore>,
     data: &[u8],
     tarpit_flag: &mut bool,
 ) -> HandshakeOutcome {
-    let Ok(req) = serde_json::from_slice::<HandshakeReq>(data) else {
+    let Ok(mut req) = serde_json::from_slice::<HandshakeReq>(data) else {
         warn!("Handshake data parse failed; engaging camouflage tar pit.");
         return HandshakeOutcome::TarpitClose;
     };
-    debug!("<= received client handshake request (HandshakeReq): {:?}", req);
+    debug!(
+        "<= handshake request client={} proto={} instance={} fec={}/{} enc={}/{} token_present={}",
+        req.client_id,
+        req.protocol_version,
+        req.client_instance,
+        req.fec,
+        req.fec_group,
+        req.encrypt,
+        req.enc_algo,
+        !req.session_token.is_empty()
+    );
 
     // 常量时间比较：pskHash 本身就是握手凭据，字符串 != 的逐字节短路会把匹配
     // 前缀长度泄露在响应时延里（远程时序预言机，可逐字节重建 pskHash）。
@@ -1313,7 +1511,7 @@ fn handle_handshake(
     // 强度下限：运维强制 GCM 时拒绝能力不足的客户端。这里刻意**不**走焦油坑——
     // 这是运维侧的期望结果（客户端版本过旧），需要一条明确可查的失败记录。
     // 位置在会话查找之前：能力不足的客户端连接管既有会话都不该被允许。
-    if core.encrypt && core.min_enc > 0 && enc_algo_rank(req.enc_algo) < core.min_enc {
+    if core.encrypt && core.min_enc > 0 && req.enc_algo != ENC_ALGO_GCM {
         // 此时还没有 client_id（它在下面才算出），algo 是唯一定位线索。
         // mio 的流取对端地址需要消费 socket，不为此改结构体。
         warn!(
@@ -1331,11 +1529,42 @@ fn handle_handshake(
     // 也可能被用于换行注入伪造日志行。直接断链，刻意不走焦油坑——这不是探测，
     // 无需伪装成服务故障。放在封禁检查之前：畸形 ID 不该获得 ban 状态信息。
     if !is_valid_client_id(&client_id) {
-        warn!("connection refused: malformed ClientID (must be a UUID), length {}", client_id.len());
+        warn!(
+            "connection refused: malformed ClientID (must be a UUID), length {}",
+            client_id.len()
+        );
         return HandshakeOutcome::Close;
     }
-    if !is_valid_mac_string(&req.mac) {
-        warn!("[{}] connection refused: malformed MAC", client_id);
+    if !is_valid_session_mac(&req.mac) {
+        warn!(
+            "[{}] connection refused: MAC must be a non-zero unicast address",
+            client_id
+        );
+        return HandshakeOutcome::Close;
+    }
+    if req.protocol_version != 2 {
+        warn!(
+            "[{}] connection refused: unsupported protocol_version={}",
+            client_id, req.protocol_version
+        );
+        return HandshakeOutcome::Close;
+    }
+    if !is_valid_client_instance(&req.client_instance) {
+        warn!(
+            "[{}] connection refused: invalid client_instance",
+            client_id
+        );
+        return HandshakeOutcome::Close;
+    }
+    req.mac = canonical_mac(&req.mac).expect("validated MAC");
+    let ns = uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_URL, b"my_vpn_tunnel");
+    let expected_id =
+        uuid::Uuid::new_v5(&ns, format!("{}{}", req.mac, core.psk).as_bytes()).to_string();
+    if !constant_time_eq(client_id.as_bytes(), expected_id.as_bytes()) {
+        warn!(
+            "[{}] connection refused: client_id is not derived from the authenticated MAC",
+            client_id
+        );
         return HandshakeOutcome::Close;
     }
     if core.banned.is_banned(&client_id) {
@@ -1352,46 +1581,53 @@ fn handle_handshake(
                 *tarpit_flag = true;
                 return HandshakeOutcome::TarpitClose;
             }
-            // 会话令牌：client_id 完全由 (MAC, PSK) 推导，持密者只要知道目标
-            // MAC 就能算出对方 client_id 走"会话复活"分支接管其隧道流量。令牌
-            // 只在原会话自己的 TLS 会话内下发一次，第三方从未见过，无法冒充。
-            // 这里刻意不走焦油坑——被拒是运维/客户端可见的明确结果。
-            if core.session_token
-                && !verify_session_token(&core.psk, &existing.session_id, &req.session_token)
-            {
-                warn!(
-                    "[{}] reconnect refused: invalid session token (possible impersonation of an active session)",
+            let needs_rotation = existing.epoch_state.read().instance_id != req.client_instance;
+            if needs_rotation {
+                let valid_token = {
+                    let epoch = existing.epoch_state.read();
+                    verify_random_session_token(&epoch.resume_token, &req.session_token)
+                };
+                if !valid_token {
+                    warn!(
+                        "[{}] reconnect refused: invalid session token for a new client instance",
+                        client_id
+                    );
+                    return HandshakeOutcome::Close;
+                }
+                if let Err(e) = rotate_session_epoch(existing, core, &req.client_instance) {
+                    warn!("[{}] failed to rotate session key epoch: {}", client_id, e);
+                    return HandshakeOutcome::Close;
+                }
+                info!(
+                    "[{}] rotated session key epoch for a new client process instance",
                     client_id
                 );
-                return HandshakeOutcome::Close;
             }
             info!(
                 "[{}] ⚡ session revived before the destroy countdown expired (seamless handover)",
                 client_id
             );
-            // 进程级重启：上一代物理连接已全部断开，客户端的 txSeq 计数器重新
-            // 从 1 起。复活会话的旧重排缓冲还停在旧水位，新包全部 diff<0 被判
-            // "太老"丢弃，表现为"下行正常、上行彻底不通"。只有 active_conns==0
-            // 才说明整代连接结束；多连接时后续连接的到达不会走到这里，共享
-            // txPort 的序号也确实在跨连接连续。（对齐 Go）
-            if existing.stat.active_conns.load(Ordering::Relaxed) == 0 {
-                existing.reorder_buf.lock().reset();
-                existing.dedup.lock().reset();
-                if let Some(dec) = &existing.fec_dec {
-                    dec.reset();
-                }
-                info!(
-                    "[{}] 🔄 session revived: prior connection generation ended; reset the upstream reorder buffers",
+            *existing.destroy_deadline.lock() = None;
+            if existing.stat.active_conns.load(Ordering::Acquire) >= 16 {
+                warn!(
+                    "[{}] connection refused: per-session physical connection limit reached",
                     client_id
                 );
+                return HandshakeOutcome::Close;
             }
+            // sessions 写锁把“检查 + 占位”串行化；若把 fetch_add 留到锁外，
+            // 多个 worker 可同时看见 15 并把会话冲到上限之外。
+            existing.stat.active_conns.fetch_add(1, Ordering::AcqRel);
             existing.clone()
         } else {
             // 会话上限：达到即按认证失败处理，走伪装焦油坑——不向探测者泄露
             // 服务端容量信息。只拦新会话，既有会话的复活分支在上不受影响
             // （对齐 Go）。
             if core.max_sessions > 0 && sessions.len() >= core.max_sessions as usize {
-                warn!("connection refused: session limit reached ({})", core.max_sessions);
+                warn!(
+                    "connection refused: session limit reached ({})",
+                    core.max_sessions
+                );
                 return HandshakeOutcome::TarpitClose;
             }
 
@@ -1406,48 +1642,42 @@ fn handle_handshake(
             }
 
             // FEC 协商：req.fec && fec_group >= 2 → XOR 模式
-            let fec_enc_k: i64 = if req.fec && req.fec_group >= fec::FEC_MIN_GROUP as i64 {
-                clamp_fec_group(req.fec_group.max(0) as usize) as i64
-            } else {
-                0
-            };
-            // 内层加密协商：双方均声明 GCM 时启用，会话盐随机
+            let fec_enc_k: i64 =
+                if req.fec && req.fec_group >= fec::FEC_MIN_GROUP as i64 {
+                    clamp_fec_group(req.fec_group.max(0) as usize) as i64
+                } else {
+                    0
+                };
+            // 内层加密协商：只有一种算法。双方都声明 GCM 才启用；否则退回
+            // 仅 TLS 一层（对齐 Go：不做弱降级，宁明不给降级）
             let salt_a = new_random_salt();
             let salt_b = new_random_salt();
-            let (enc_algo, ic_tx, ic_rx) = if core.encrypt {
-                // 算法 3（GCM-v2）优先于 2（GCM-v1）：v2 用独立密钥标签实现
-                // GCM/CTR 密钥分离；仅声明 2 的旧客户端继续用旧派生（对齐 Go）。
-                if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM_V2) {
-                    (
-                        ENC_ALGO_GCM_V2,
-                        Some(Arc::new(
-                            InnerCipher::gcm_algo(&core.psk, &salt_b, ENC_ALGO_GCM_V2)
-                                .expect("GCM init"),
-                        )),
-                        Some(Arc::new(
-                            InnerCipher::gcm_algo(&core.psk, &salt_a, ENC_ALGO_GCM_V2)
-                                .expect("GCM init"),
-                        )),
-                    )
-                } else if enc_algo_supported(req.enc_algo, ENC_ALGO_GCM) {
-                    (
-                        ENC_ALGO_GCM,
-                        Some(Arc::new(
-                            InnerCipher::gcm(&core.psk, &salt_b).expect("GCM init"),
-                        )),
-                        Some(Arc::new(
-                            InnerCipher::gcm(&core.psk, &salt_a).expect("GCM init"),
-                        )),
-                    )
-                } else {
-                    (
-                        ENC_ALGO_LEGACY_CTR,
-                        core.ic_legacy.clone(),
-                        core.ic_legacy.clone(),
-                    )
-                }
+            let (enc_algo, ic_tx, ic_rx) = if core.encrypt
+                && enc_algo_supported(req.enc_algo, ENC_ALGO_GCM)
+            {
+                (
+                    ENC_ALGO_GCM,
+                    Some(Arc::new(
+                        InnerCipher::gcm(&core.psk, &salt_b).expect("GCM init"),
+                    )),
+                    Some(Arc::new(
+                        InnerCipher::gcm(&core.psk, &salt_a).expect("GCM init"),
+                    )),
+                )
             } else {
-                (ENC_ALGO_LEGACY_CTR, None, None)
+                (ENC_ALGO_NONE, None, None)
+            };
+            let (fec_tx, fec_rx) = if enc_algo == ENC_ALGO_GCM {
+                (
+                    Some(Arc::new(
+                        InnerCipher::gcm_domain(&core.psk, &salt_b, "fec").expect("FEC GCM init"),
+                    )),
+                    Some(Arc::new(
+                        InnerCipher::gcm_domain(&core.psk, &salt_a, "fec").expect("FEC GCM init"),
+                    )),
+                )
+            } else {
+                (None, None)
             };
 
             let fec_mode = if fec_enc_k > 0 {
@@ -1458,7 +1688,8 @@ fn handle_handshake(
                 "off".to_string()
             };
 
-            let v4ip = core.pool.lock().alloc_v4(&req_v4);
+            let mut pool = core.pool.lock();
+            let v4ip = pool.alloc_v4(&req_v4);
             if v4ip.is_empty() {
                 // 池耗尽必须拒连：空 IP 会被下游当成合法地址写进应答、注册表与
                 // 统计，产生一个"有会话但无地址"的黑洞。与上限同样走焦油坑。
@@ -1468,8 +1699,16 @@ fn handle_handshake(
                 );
                 return HandshakeOutcome::TarpitClose;
             }
-            // v4 成功后才占 v6，否则拒连路径会在池里留下一个孤儿地址
-            let v6ip = core.pool.lock().alloc_v6(&req_v6);
+            let v6ip = pool.alloc_v6(&req_v6);
+            if v6ip.is_empty() {
+                pool.used_v4.remove(&v4ip);
+                warn!(
+                    "connection refused: IPv6 address pool exhausted ({})",
+                    core.ipv6_cidr(&core.gw_v6)
+                );
+                return HandshakeOutcome::TarpitClose;
+            }
+            drop(pool);
 
             let stat = Arc::new(ClientStat::new(
                 client_id.clone(),
@@ -1478,16 +1717,25 @@ fn handle_handshake(
                 mac.clone(),
             ));
             *stat.fec_mode.lock() = fec_mode.clone();
-            stat.enc_algo.store(enc_algo_for_display(enc_algo, core.encrypt), Ordering::Relaxed);
+            stat.enc_algo.store(enc_algo, Ordering::Relaxed);
 
             let port = Arc::new(AsyncPort::new(client_id.clone(), req.fec && fec_enc_k == 0));
             if fec_enc_k > 0 {
-                port.attach_encoder(fec_enc_k as usize, ic_tx.clone());
+                port.attach_encoder(fec_enc_k as usize, fec_tx);
             }
             let fec_dec = if fec_enc_k > 0 {
-                Some(Arc::new(FecDecoder::new(fec_enc_k as usize, ic_rx.clone())))
+                Some(Arc::new(FecDecoder::new(fec_enc_k as usize, fec_rx)))
             } else {
                 None
+            };
+
+            let resume_token = match new_session_token() {
+                Ok(token) => token,
+                Err(e) => {
+                    core.pool.lock().release(&mac, &v4ip, &v6ip);
+                    error!("[{}] failed to generate session token: {}", client_id, e);
+                    return HandshakeOutcome::Close;
+                }
             };
 
             core.vswitch.add_port(client_id.clone(), port.clone());
@@ -1514,25 +1762,50 @@ fn handle_handshake(
                 port,
                 reorder_buf: Arc::new(Mutex::new(ReorderBuffer::new())),
                 dedup: Arc::new(Mutex::new(DeDuplicator::new())),
-                fec_dec,
                 fec_enc_k,
                 mac,
                 ipv4: v4ip,
                 ipv6: v6ip,
-                enc_algo,
-                salt_a,
-                salt_b,
-                ic_tx,
-                ic_rx,
+                epoch_state: RwLock::new(SessionEpochState {
+                    instance_id: req.client_instance.clone(),
+                    epoch: 1,
+                    resume_token,
+                    enc_algo,
+                    salt_a,
+                    salt_b,
+                    ic_tx,
+                    ic_rx,
+                    fec_dec,
+                }),
+                destroy_deadline: Mutex::new(None),
                 created_at: Instant::now(),
+                // 速率在下面的协商段才算出来，这里先留 0
+                brutal_tx: AtomicU64::new(0),
+                brutal_rx: AtomicU64::new(0),
+                brutal_applied: AtomicBool::new(false),
             });
+            sess.stat.active_conns.store(1, Ordering::Release);
             sessions.insert(client_id.clone(), sess.clone());
             sess
         }
     };
 
-    sess.ic_rx = c_sess.ic_rx.clone();
-    c_sess.stat.active_conns.fetch_add(1, Ordering::Relaxed);
+    let epoch_snapshot = c_sess.epoch_state.read();
+    sess.ic_rx = epoch_snapshot.ic_rx.clone();
+    sess.session_epoch = epoch_snapshot.epoch;
+    let response_epoch = epoch_snapshot.epoch;
+    let response_enc_algo = epoch_snapshot.enc_algo;
+    let response_token = epoch_snapshot.resume_token.clone();
+    let (response_enc_salt, response_enc_salt2) =
+        if response_enc_algo == ENC_ALGO_GCM {
+            (
+                hex::encode(epoch_snapshot.salt_a),
+                hex::encode(epoch_snapshot.salt_b),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+    drop(epoch_snapshot);
     if let Some(b) = &sess.tx_backend {
         b.rtt_cache.store(50000, Ordering::Relaxed);
     }
@@ -1550,22 +1823,21 @@ fn handle_handshake(
     if req.brutal_tx > 0 && (core.brutal_down == 0 || req.brutal_tx < core.brutal_down) {
         client_tx_rate = req.brutal_tx;
     }
-    if core.brutal && server_tx_rate > 0 {
-        apply_tcp_brutal(&sess.socket, server_tx_rate);
-    }
+    // 落档协商结果而不是配置值：客户端可以申请更低的预算，未启用时也记 0，
+    // 面板据此区分"没配置"与"配置了但被对端压低"。applied 记 setsockopt 的
+    // 真实返回值——内核没装 brutal 模块时这里必为 false。
+    let brutal_applied = if core.brutal && server_tx_rate > 0 {
+        apply_tcp_brutal(&sess.socket, server_tx_rate)
+    } else {
+        false
+    };
+    c_sess.brutal_tx.store(server_tx_rate, Ordering::Relaxed);
+    c_sess.brutal_rx.store(client_tx_rate, Ordering::Relaxed);
+    c_sess.brutal_applied.store(brutal_applied, Ordering::Relaxed);
 
-    let (enc_salt, enc_salt2) = if c_sess.enc_algo == ENC_ALGO_GCM || c_sess.enc_algo == ENC_ALGO_GCM_V2 {
-        (hex::encode(c_sess.salt_a), hex::encode(c_sess.salt_b))
-    } else {
-        (String::new(), String::new())
-    };
-    // 会话令牌：仅原会话持有者可重连接管（见 handle_handshake 的校验分支）
-    let sess_token = if core.session_token {
-        compute_session_token(&core.psk, &c_sess.session_id)
-    } else {
-        String::new()
-    };
     let resp = HandshakeResp {
+        protocol_version: req.protocol_version,
+        session_epoch: response_epoch,
         success: true,
         message: "OK".into(),
         session_id: c_sess.session_id.clone(),
@@ -1580,10 +1852,10 @@ fn handle_handshake(
         fec: req.fec,
         fec_group: c_sess.fec_enc_k,
         encrypt: core.encrypt,
-        enc_algo: c_sess.enc_algo,
-        enc_salt,
-        enc_salt2,
-        session_token: sess_token,
+        enc_algo: response_enc_algo,
+        enc_salt: response_enc_salt,
+        enc_salt2: response_enc_salt2,
+        session_token: response_token,
     };
     let resp_json = serde_json::to_vec(&resp).unwrap();
     let mut buf = Vec::with_capacity(1024);
@@ -1599,12 +1871,15 @@ fn handle_handshake(
 
 /// 物理连接关闭：注销端口后端；最后一个连接断开时进入 120s 保留期
 fn on_conn_closed(
-    core: &Arc<ServerCore>,
     c_sess: Option<Arc<ClientSession>>,
     backend: Option<Arc<Backend>>,
+    connection_epoch: u64,
 ) {
     if let (Some(c_sess), Some(backend)) = (c_sess, backend) {
         c_sess.port.unregister_backend(&backend.ch);
+        if c_sess.epoch_state.read().epoch != connection_epoch {
+            return;
+        }
         if c_sess.stat.active_conns.fetch_sub(1, Ordering::Relaxed) <= 1 {
             let cid = c_sess.stat.client_id.clone();
             let current_version = c_sess
@@ -1616,26 +1891,8 @@ fn on_conn_closed(
                 "[{}] ⚠️ all physical connections are down; entering a 120s session retention period (v={})...",
                 cid, current_version
             );
-            let core = core.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(120));
-                // 双重校验：连接数归零且版本一致才销毁（对齐 Go destroyTimer）
-                if c_sess.stat.active_conns.load(Ordering::Relaxed) == 0
-                    && c_sess.stat.disconnect_version.load(Ordering::Relaxed) == current_version
-                {
-                    core.destroy_session(
-                        &c_sess.stat.client_id,
-                        &c_sess.mac,
-                        &c_sess.ipv4,
-                        &c_sess.ipv6,
-                    );
-                } else {
-                    info!(
-                        "[{}] ⚡ a newer reconnect event arrived; cancelling this destroy action",
-                        c_sess.stat.client_id
-                    );
-                }
-            });
+            *c_sess.destroy_deadline.lock() =
+                Some((Instant::now() + Duration::from_secs(120), current_version));
         }
     }
 }

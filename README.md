@@ -7,7 +7,7 @@ The Rust and Go binaries are **fully interchangeable**: any client works against
 ## Features
 
 - **Camouflage** — real TLS with ALPN (`h2`/`http1.1`) and randomized payload padding. Invalid-PSK connections get an nginx-styled 403 page or a slow-loris tarpit; probes (printable first byte) are detected inside the TLS stream as well.
-- **Inner encryption (optional)** — AES-256-GCM *inside* the TLS tunnel, with a random salt per session per direction (nonce = `seq‖salt`, AAD covers `wireLen‖seq`). Integrity, plus immunity to keystream reuse across sessions, directions and clients. Older peers transparently fall back to legacy AES-CTR.
+- **Inner encryption (optional)** — AES-256-GCM *inside* TLS, with random per-direction salts, separate data/FEC keys, `nonce = seq‖salt`, and AAD over `wireLen‖seq`. Protocol v2 only.
 - **Multipath & FEC** — parallel TCP connections with MinRTT load balancing, or XOR-parity FEC: one parity frame per K data frames (≈1/K overhead) so any single lost frame is reconstructed transparently. Duplication FEC remains the automatic fallback.
 - **Resilience** — comma-separated server addresses with round-robin per connection, exponential backoff with jitter, 30s-stable reset.
 - **Layer 2** — TAP device (ARP/DHCP/IPv6 pass-through), MAC-learning switch with flooding, and session survivorship: 120s grace with seamless resume across reconnects and restarts.
@@ -34,10 +34,10 @@ sudo ./target/release/tlsvpn -c server.json
 ```json
 {
   "mode": "server",
-  "psk": "your_secret_key",
+  "psk": "GENERATE-A-UNIQUE-RANDOM-SECRET",
   "addr": ":4000",
   "encrypt": true,
-  "web": { "addr": ":8080", "auth": "admin:change-me" },
+  "web": { "addr": ":8080", "auth": "admin:GENERATE-A-UNIQUE-PASSWORD", "bind": "tunnel" },
   "server": { "cert": "server.crt", "key": "server.key" }
 }
 ```
@@ -47,7 +47,7 @@ sudo ./target/release/tlsvpn -c server.json
 ```json
 {
   "mode": "client",
-  "psk": "your_secret_key",
+  "psk": "GENERATE-A-UNIQUE-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "encrypt": true,
   "brutal": true, "brutal_up": 100, "brutal_down": 500,
@@ -76,7 +76,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 ```json
 {
   "mode": "client",
-  "psk": "change-me-please",
+  "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
   "encrypt": true,
@@ -90,11 +90,11 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "socks5": "",
   "tap": "tap0",
   "mac": "",
-  "web": { "addr": ":8080", "auth": "admin:change-me", "bind": "all", "cert": "", "key": "" },
+  "web": { "addr": ":8080", "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD", "bind": "tunnel", "cert": "", "key": "" },
   "client": { "conns": 4, "fec": true, "fec_group": 4, "sni": "www.cloudflare.com",
               "insecure": false, "cert_sha256": "", "req_v4": "", "req_v6": "", "fwmark": 0 },
   "server": { "v4_cidr": "10.0.0.0/24", "v6_cidr": "fd00::/64", "cert": "", "key": "",
-              "session_token": false, "max_sessions": 1024 }
+              "session_token": true, "max_sessions": 1024 }
 }
 ```
 
@@ -105,27 +105,27 @@ All defaults match the Go implementation 1:1. Two fields are Rust extensions (`w
 | Field | Default | Where | Description |
 | --- | --- | --- | --- |
 | `mode` | (required) | — | `server` or `client` |
-| `psk` | `quic_secret` ⚠️ | — | Pre-shared key. The default is accepted only with a loud warning — always set your own |
+| `psk` | (required) | — | High-entropy pre-shared key. Empty and known placeholder values are rejected |
 | `addr` | server `0.0.0.0:4000` | — | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated targets for multi-IP round-robin |
-| `encrypt` | `false` | — | Inner AES-256-GCM payload encryption with per-session salts (legacy CTR fallback for old peers) |
-| `min_enc` | `""` | — | Minimum inner-cipher strength to accept: `""`/`any` (no floor), `ctr`, `legacy`, `gcm`. Requires `encrypt: true`; connections below the floor are refused |
-| `pad_mode` | `bucket` | — | Payload padding style: `bucket`, `legacy`, `off` (empty = `bucket`). Changeable live from the dashboard |
+| `encrypt` | `true` when omitted in JSON | — | Inner AES-256-GCM with per-session salts and separate data/FEC key domains |
+| `min_enc` | `""` | — | Strength floor: `gcm` refuses peers that cannot negotiate GCM, `""`/`any` sets no floor. Requires `encrypt: true`; connections below the floor are refused |
+| `pad_mode` | `bucket` | — | Full-record padding: `bucket` maps every record to a fixed size with positive padding; only `off` permits zero padding |
 | `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
 | `workers` | `0` | — | **Rust-only extension** — Go rejects this key. Worker event-loop threads (0 = auto, one per CPU up to 8) |
 | `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU; higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
-| `mac` | (empty) | — | Explicit TAP MAC, `aa:bb:cc:dd:ee:ff`, local bit must be clear. Written **into** the TAP device (the server drops frames whose src MAC isn't the identity, so a value that's only used to compute the ClientID would drop your own traffic) and part of the client identity |
+| `mac` | (empty) | — | Explicit non-zero unicast TAP MAC. If empty, both real and `mem` clients generate and persist one; the server derives ClientID from canonical MAC + PSK |
 | `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
 | `log_level` | `info` | — | `trace` / `debug` / `info` / `warn` / `error` — validated at startup, anything else is refused (switchable live from the dashboard) |
 | `web.addr` | (empty) | — | Dashboard listen address; off unless set |
-| `web.auth` | (empty) | — | Basic Auth as `user:pass` (constant-time compare). Must contain a `:` — a bare username would 401 every request. Binding a non-loopback `web.addr` with no auth and no TLS prints a startup warning (`Consider web.auth in the config`); it warns and starts anyway, since an internal test box is a legitimate setup |
+| `web.auth` | (required when enabled) | — | Basic Auth as `user:pass`, compared as fixed-length SHA-256 digests. Known example credentials are rejected |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving. On Linux the tunnel addresses are brought `up` first and the v6 address gets `nodad` — without it a v6 address that has no RA to answer for stays tentative forever, and `[fd00::1]:8080` never binds |
-| `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS, as PEM paths. Both set = the panel is served over TLS (the log line then says `https://`); both empty = plain HTTP. Setting only one is a config error, caught at startup rather than by the dashboard thread retrying forever |
+| `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
 | `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
-| `server.session_token` | `false` | server | Enable per-session tokens |
+| `server.session_token` | `false` | server | Compatibility field only — the Rust server always issues a random 256-bit resume token and rotates the key epoch on reconnect, whatever this value is. Retained so a Go config file stays readable (`deny_unknown_fields` would otherwise refuse it) |
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
 | `client.fec` | `false` | client | FEC over multipath — XOR parity when the server supports it, else duplication |
@@ -148,8 +148,8 @@ Off by default; set `web.addr` on **both** sides to enable it. Served over HTTPS
 
 1. **Kernel module** — Brutal mode needs the Linux `tcp_brutal` module; elsewhere a warning is logged and it continues without it.
 2. **Permissions** — TAP requires `/dev/net/tun` access, typically root.
-3. **Client identity** — the ClientID derives from TAP MAC + PSK. If the real MAC can't be read (e.g. `"tap": "mem"`), an all-zero MAC is used with a warning — set `mac` explicitly when running many such clients, or they'll share one identity and IP.
-4. **Interoperability** — handshake fields `fec_group`, `enc_algo`, `enc_salt`, `enc_salt2` are additive; older peers (Go or Rust) interoperate in fallback mode (duplication FEC / legacy CTR).
+3. **Client identity** — the ClientID derives from canonical TAP MAC + PSK. If no MAC is configured or readable, including `"tap": "mem"`, the client generates and persists a random non-zero unicast MAC together with its token and epoch.
+4. **Interoperability** — current Go and Rust builds share strict protocol v2 and byte-for-byte golden vectors, including data/FEC GCM domains. Upgrade both ends together; there is no pre-v2 compatibility mode, so an old binary is refused rather than downgraded.
 
 ## Development
 
@@ -168,13 +168,13 @@ go build -C interop -o interop/probe .          # Go probe
 
 | Suite | Cases | Covers |
 | --- | ---: | --- |
-| `accept` | 21 | Feature matrix: all on, all off (fallback), old↔new mixes, opt-in cost to old peers |
-| `tok` | 6 | `session_token` hijack via two same-MAC clients — 4 rejects + 2 takeover controls |
-| `pad` | 16 | `pad_mode` off / legacy / bucket × server and client side, plus an invalid value |
-| `minenc` | 33 | `min_enc` floors × declared `enc_algo`, including unknown algo IDs |
-| `cfg` | 35 | Config dimensions × 4 rs/go combinations (CIDR pools, `client.conns`, `web.auth`, panel HTTPS, `web.bind=tunnel`, `log_level`), plus 11 startup-rejection cases |
+| `accept` | 21 | Feature matrix: all on, all off (fallback), both-ends-upgraded, plus 5 pre-v2-rejection cases that need old binaries |
+| `tok` | 6 | Resume-token hijack via two same-MAC clients — 4 cross-language rejects + 2 `session_token=false` still-rejected controls |
+| `pad` | 12 | `pad_mode` off / bucket / bogus × rs,go server × rs,go client |
+| `minenc` | 19 | `min_enc` floors × declared `enc_algo`, including an unknown algo ID, plus 3 Go-probe crossings |
+| `cfg` | 38 | 6 config dimensions × 4 rs/go combinations (CIDR pools, `client.conns`, `web.auth`, panel HTTPS, `web.bind=tunnel`, `log_level`) + 7 startup-rejection cases × 2 implementations |
 
-Each suite is also standalone with its own env knobs (`SRV`, `CLI`, `PAD`, `PORT`, …), and ports are offset per case from a `PORT_BASE_*` var so concurrent runs don't collide. Mixed-version cases skip with a count instead of failing when the pre-feature binaries aren't built — point `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE` and `E2E_GO_OLD_BIN` at them to enable. `e2e_cert.pem`/`e2e_key.pem` are gitignored and generated on demand; shared helpers are in `scripts/e2e_lib.sh`.
+Each suite is also standalone with its own env knobs (`SRV`, `CLI`, `PAD`, `PORT`, …), and ports are offset per case from a `PORT_BASE_*` var so concurrent runs don't collide. The 5 pre-v2-rejection cases in `accept` are the only ones that need an old binary — they print a skip count instead of failing when `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE` and `E2E_GO_OLD_BIN` aren't set. `e2e_cert.pem`/`e2e_key.pem` are gitignored and generated on demand; shared helpers are in `scripts/e2e_lib.sh`.
 
 **Standalone probes** verify real interop against either server:
 

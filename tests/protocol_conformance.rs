@@ -11,36 +11,28 @@
 // 若未设置 TLSVPN_GOLDEN，会尝试默认相对路径；找不到则跳过（不算失败），
 // 以免在只有 Rust 仓库的环境里误报。
 
-use aes::Aes256;
-use ctr::cipher::{KeyIvInit, StreamCipher};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-
-type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
 #[derive(Deserialize)]
 struct GoldenVectors {
     #[allow(dead_code)]
     version: u32,
-    cipher_contexts: Vec<CipherContextVec>,
-    xor_vectors: Vec<XorVec>,
     psk_hashes: Vec<PSKHashVec>,
+    gcm_domain_vectors: Vec<GcmDomainVec>,
     frame_headers: Vec<FrameHeaderVec>,
     handshake_req_keys: Vec<String>,
     handshake_resp_keys: Vec<String>,
 }
 
 #[derive(Deserialize)]
-struct CipherContextVec {
+struct GcmDomainVec {
     psk: String,
-    key_hex: String,
-    iv_hex: String,
-}
-
-#[derive(Deserialize)]
-struct XorVec {
-    psk: String,
+    salt_hex: String,
+    domain: String,
     seq: u32,
     plaintext_hex: String,
     ciphertext_hex: String,
@@ -70,27 +62,27 @@ fn hash_psk(psk: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn get_cipher_context(psk: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut kh = Sha256::new();
-    kh.update(format!("{}_enc_key", psk).as_bytes());
-    let key = kh.finalize().to_vec();
-
-    let mut ih = Sha256::new();
-    ih.update(format!("{}_enc_iv", psk).as_bytes());
-    let iv = ih.finalize()[..16].to_vec();
-
-    (key, iv)
-}
-
-fn xor_crypt_in_place(data: &mut [u8], seq: u32, key: &[u8], base_iv: &[u8]) {
-    if data.is_empty() || key.is_empty() {
-        return;
-    }
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(base_iv);
-    iv[12..16].copy_from_slice(&seq.to_be_bytes());
-    let mut c = Aes256Ctr::new_from_slices(key, &iv).unwrap();
-    c.apply_keystream(data);
+fn gcm_domain_seal(v: &GcmDomainVec) -> Vec<u8> {
+    // 数据面用 "_enc_key"，FEC 面再加 "_fec" 后缀——与 Go gcmKeyLabel 逐字一致。
+    let label: &[u8] = if v.domain == "fec" { b"_enc_key_fec" } else { b"_enc_key" };
+    let mut h = Sha256::new();
+    h.update(v.psk.as_bytes());
+    h.update(label);
+    let cipher = Aes256Gcm::new_from_slice(&h.finalize()).unwrap();
+    let salt = hex::decode(&v.salt_hex).unwrap();
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(&v.seq.to_be_bytes());
+    nonce[4..].copy_from_slice(&salt);
+    let mut plaintext = hex::decode(&v.plaintext_hex).unwrap();
+    let wire_len = (plaintext.len() + 16) as u32;
+    let mut aad = [0u8; 8];
+    aad[..4].copy_from_slice(&wire_len.to_be_bytes());
+    aad[4..].copy_from_slice(&v.seq.to_be_bytes());
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext)
+        .unwrap();
+    plaintext.extend_from_slice(&tag);
+    plaintext
 }
 
 fn build_frame_header(data_len: u32, pad_len: u16, seq: u32) -> [u8; 10] {
@@ -154,53 +146,45 @@ fn test_psk_hash_matches_go() {
 }
 
 #[test]
-fn test_cipher_context_matches_go() {
-    let g = golden_or_skip!();
-    for v in &g.cipher_contexts {
-        let (key, iv) = get_cipher_context(&v.psk);
+fn test_gcm_domain_known_answer_vectors() {
+    // 离线固定向量：不依赖黄金文件也能守住密钥派生契约。数值取自 Go 仓库
+    // testdata/protocol_golden.json（数据面与 FEC 面各自独立的密钥标签）。
+    let psk = "cross-language-domain-vector";
+    let salt_hex = "0011223344556677";
+    let seq = 16909060u32;
+    let pt_hex = "65746865726e65742d7061796c6f6164";
+    for (domain, want) in [
+        ("data", "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b"),
+        ("fec", "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56"),
+    ] {
+        let v = GcmDomainVec {
+            psk: psk.into(),
+            salt_hex: salt_hex.into(),
+            domain: domain.into(),
+            seq,
+            plaintext_hex: pt_hex.into(),
+            ciphertext_hex: String::new(),
+        };
         assert_eq!(
-            hex::encode(&key),
-            v.key_hex,
-            "PSK {:?} 派生的 AES key 与 Go 端不一致",
-            v.psk
-        );
-        assert_eq!(
-            hex::encode(&iv),
-            v.iv_hex,
-            "PSK {:?} 派生的 base IV 与 Go 端不一致",
-            v.psk
-        );
-    }
-}
-
-#[test]
-fn test_xor_crypt_matches_go() {
-    let g = golden_or_skip!();
-    for v in &g.xor_vectors {
-        let plain = hex::decode(&v.plaintext_hex).expect("黄金向量明文解码失败");
-        let (key, iv) = get_cipher_context(&v.psk);
-        let mut buf = plain.clone();
-        xor_crypt_in_place(&mut buf, v.seq, &key, &iv);
-        assert_eq!(
-            hex::encode(&buf),
-            v.ciphertext_hex,
-            "PSK {:?} seq={} 的加密结果与 Go 端不一致 —— 数据面无法互通",
-            v.psk,
-            v.seq
+            hex::encode(gcm_domain_seal(&v)),
+            want,
+            "domain={} 的密钥派生或 GCM 参数与 Go 端不一致 —— 数据面无法互通",
+            domain
         );
     }
 }
 
 #[test]
-fn test_xor_is_involutive() {
-    // CTR 模式下加密两次应还原，验证解密路径
-    let (key, iv) = get_cipher_context("roundtrip");
-    let original = b"the quick brown fox".to_vec();
-    let mut buf = original.clone();
-    xor_crypt_in_place(&mut buf, 99, &key, &iv);
-    assert_ne!(buf, original, "加密后不应与原文相同");
-    xor_crypt_in_place(&mut buf, 99, &key, &iv);
-    assert_eq!(buf, original, "二次异或应还原原文");
+fn test_gcm_data_and_fec_domains_match_go() {
+    let g = golden_or_skip!();
+    assert_eq!(g.gcm_domain_vectors.len(), 2);
+    let mut ciphertexts = Vec::new();
+    for v in &g.gcm_domain_vectors {
+        let got = gcm_domain_seal(v);
+        assert_eq!(hex::encode(&got), v.ciphertext_hex, "domain={}", v.domain);
+        ciphertexts.push(got);
+    }
+    assert_ne!(ciphertexts[0], ciphertexts[1]);
 }
 
 #[test]
@@ -233,6 +217,10 @@ fn test_frame_header_is_big_endian() {
 
 #[derive(serde::Serialize, Default)]
 struct HandshakeReqShape {
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    protocol_version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    client_instance: String,
     client_id: String,
     psk: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -261,6 +249,10 @@ struct HandshakeReqShape {
 
 #[derive(serde::Serialize, Default)]
 struct HandshakeRespShape {
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    protocol_version: i64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    session_epoch: u64,
     success: bool,
     message: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -309,6 +301,8 @@ fn test_handshake_req_field_names() {
     let g = golden_or_skip!();
 
     let full = HandshakeReqShape {
+        protocol_version: 2,
+        client_instance: "instance-1".into(),
         client_id: "c".into(),
         psk: "p".into(),
         mac: "m".into(),
@@ -343,6 +337,8 @@ fn test_handshake_req_field_names() {
 fn test_handshake_resp_field_names() {
     // Rust 端 Resp 的完整字段集合（与 Go frame.go 的 HandshakeResp 对齐）
     let full = HandshakeRespShape {
+        protocol_version: 2,
+        session_epoch: 1,
         success: true,
         message: "OK".into(),
         session_id: "s".into(),
@@ -382,6 +378,8 @@ fn test_handshake_resp_field_names() {
         "ipv6",
         "message",
         "padding",
+        "protocol_version",
+        "session_epoch",
         "session_id",
         "session_token",
         "success",
@@ -404,6 +402,8 @@ fn test_golden_handshake_keys_match_rust() {
     let g = golden_or_skip!();
 
     let req_full = HandshakeReqShape {
+        protocol_version: 2,
+        client_instance: "instance-1".into(),
         session_token: "t".into(),
         mac: "m".into(),
         ipv4: "1".into(),
@@ -418,6 +418,8 @@ fn test_golden_handshake_keys_match_rust() {
         ..Default::default()
     };
     let resp_full = HandshakeRespShape {
+        protocol_version: 2,
+        session_epoch: 1,
         success: true,
         message: "OK".into(),
         session_id: "s".into(),
@@ -438,13 +440,20 @@ fn test_golden_handshake_keys_match_rust() {
         session_token: "t".into(),
     };
     for (what, golden, shape) in [
-        ("HandshakeReq", &g.handshake_req_keys, serde_json::to_value(&req_full).unwrap()),
-        ("HandshakeResp", &g.handshake_resp_keys, serde_json::to_value(&resp_full).unwrap()),
+        (
+            "HandshakeReq",
+            &g.handshake_req_keys,
+            serde_json::to_value(&req_full).unwrap(),
+        ),
+        (
+            "HandshakeResp",
+            &g.handshake_resp_keys,
+            serde_json::to_value(&resp_full).unwrap(),
+        ),
     ] {
         let have: std::collections::BTreeSet<String> =
             shape.as_object().unwrap().keys().cloned().collect();
-        let golden_set: std::collections::BTreeSet<String> =
-            golden.iter().cloned().collect();
+        let golden_set: std::collections::BTreeSet<String> = golden.iter().cloned().collect();
         let go_only: Vec<&String> = golden_set.difference(&have).collect();
         let rust_only: Vec<&String> = have.difference(&golden_set).collect();
         assert!(
@@ -469,6 +478,8 @@ fn test_omitempty_semantics() {
     let obj = val.as_object().unwrap();
 
     for k in [
+        "protocol_version",
+        "client_instance",
         "mac",
         "ipv4",
         "ipv6",
@@ -495,36 +506,40 @@ fn test_omitempty_semantics() {
 
 // ---------- 填充长度分支 ----------
 
-fn get_padding_length_bounds(wire_len: usize) -> (usize, usize) {
-    if wire_len == 0 {
-        (100, 300)
-    } else if wire_len < 200 {
-        (300, 499)
-    } else if wire_len < 800 {
-        (100, 299)
-    } else {
-        (0, 99)
+/// 与 Go `padBuckets`/`padBucket` 同构：入参是线路长度（明文 + GCM 标签），
+/// 返回的填充按"完整线路记录 = 10B 头 + 线路长度"对齐到固定桶。
+const GOLDEN_PAD_BUCKETS: [usize; 10] = [128, 256, 384, 512, 768, 1024, 1280, 1600, 2048, 4096];
+
+fn golden_pad_bucket(wire_len: usize) -> (usize, usize) {
+    let record_len = 10usize.saturating_add(wire_len);
+    for &b in GOLDEN_PAD_BUCKETS.iter() {
+        if record_len < b {
+            return (b - record_len, b - record_len);
+        }
     }
+    // 超出最大桶的 jumbo 帧只加小额随机填充
+    (1, 100)
 }
 
 #[test]
-fn test_padding_length_branches_match_go() {
-    // 校验 legacy 分支边界与 Go 端一致（Go padLegacy:
-    // 0->[100,300], <200->[300,499], <800->[100,299], else->[0,99]）。
+fn test_padding_length_bucket_branches_match_go() {
+    // 桶边界两侧必须给出不同的填充量：落在桶内是确定性值，越界则进入随机小额。
     // 入参是线路长度（明文 + GCM 标签），不是明文长度。
     for (wire_len, want) in [
-        (0usize, (100usize, 300usize)),
-        (1, (300, 499)),
-        (199, (300, 499)),
-        (200, (100, 299)),
-        (799, (100, 299)),
-        (800, (0, 99)),
-        (1400, (0, 99)),
+        (0usize, (118usize, 118usize)),  // 10+0=10 < 128
+        (117usize, (1usize, 1usize)),    // 10+117=127 < 128
+        (118, (128, 128)),               // 10+118=128 恰好出桶 → 下一桶 256
+        (245, (1, 1)),                   // 10+245=255 < 256
+        (246, (128, 128)),               // 10+246=256 → 384
+        (4085, (1, 1)),                  // 10+4085=4095 < 4096
+        (4086, (1, 100)),                // 10+4086=4096 越出所有桶 → jumbo 随机
+        (1400, (190, 190)),              // 10+1400=1410 → 1600 桶，常见大帧仍在桶内
+        (5000, (1, 100)),                // 10+5000=5010 越出所有桶 → jumbo 随机
     ] {
         assert_eq!(
-            get_padding_length_bounds(wire_len),
+            golden_pad_bucket(wire_len),
             want,
-            "wire_len={} 的填充范围与 Go 端不一致",
+            "wire_len={} 的填充桶边界与 Go 端不一致",
             wire_len
         );
     }

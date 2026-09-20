@@ -2,10 +2,10 @@
 # e2e_test.sh — 跨语言 e2e 的唯一入口。
 #
 # 跑五个套件：
-#   accept  总验收矩阵（P1 全开 / P2 全关 / P3 新旧混装 / P4 opt-in 代价）
-#   tok     session_token：同 MAC 两台真实客户端互踢，验证接管被拒
-#   pad     pad_mode：off / legacy / bucket 三档 + 非法值
-#   minenc  min_enc："" / ctr / legacy / gcm 下限，含未知算法 ID 回归
+#   accept  总验收矩阵（v2 安全配置 / 可选调优 / 旧版拒绝 / 兼容字段）
+#   tok     protocol v2：同 MAC 两台真实客户端，验证跨实例接管被拒
+#   pad     pad_mode：off / bucket 两档 + 非法值
+#   minenc  min_enc："" / gcm 下限，含未知算法 ID 回归
 #   cfg     配置维度：v4/v6 网段 / client.conns / web.auth / web.cert+web.key
 #           (HTTPS) / web.bind=tunnel / log_level 互通，外加 badlog / badauth /
 #           badv4 / badv6 / badmac / badbind / badwebtls 七个配置校验
@@ -100,17 +100,17 @@ suite_accept() {
 }
 
 suite_tok() {
-  # 4 组 reject（服务端开启 token，第二台必须被拒）+ 2 组 takeover（对照）
+  # 四种跨语言组合都拒绝；另用同语言组合验证兼容字段 false 也不能关闭保护。
   local -a jobs=(
-    "rs rs reject" "rs go reject" "go rs reject" "go go reject"
-    "rs rs takeover" "go go takeover"
+    "rs rs true" "rs go true" "go rs true" "go go true"
+    "rs rs false" "go go false"
   )
-  local i=0 s c e fails=0
-  echo "  session_token：4 组 reject + 2 组 takeover 对照"
+  local i=0 s c token_field fails=0
+  echo "  protocol v2：4 组跨语言拒绝 + 2 组 session_token=false 仍拒绝"
   for spec in "${jobs[@]}"; do
-    set -- $spec; s="$1"; c="$2"; e="$3"
-    SRV="$s" CLI="$c" EXPECT="$e" PORT="$((PORT_BASE_TOK + i * 10))" \
-      WEB_BASE="$((9500 + i * 2))" LABEL="tok_${s}->${c}_${e}" \
+    set -- $spec; s="$1"; c="$2"; token_field="$3"
+    SRV="$s" CLI="$c" TOKEN_FIELD="$token_field" PORT="$((PORT_BASE_TOK + i * 10))" \
+      WEB_BASE="$((9500 + i * 2))" LABEL="tok_${s}->${c}_field-${token_field}" \
       bash "$HERE/e2e_tok.sh" || fails=$((fails + 1))
     i=$((i + 1))
   done
@@ -118,9 +118,9 @@ suite_tok() {
 }
 
 suite_pad() {
-  local -a pads=(off legacy bucket bogus)
+  local -a pads=(off bucket bogus)
   local i=0 p s c fails=0
-  echo "  pad_mode：4 个取值 × 2 服务端 × 2 客户端 = 16 组（bogus 走配置校验）"
+  echo "  pad_mode：3 个取值 × 2 服务端 × 2 客户端 = 12 组（bogus 走配置校验）"
   for p in "${pads[@]}"; do
     for s in rs go; do
       for c in rs go; do
@@ -135,29 +135,21 @@ suite_pad() {
 }
 
 suite_minenc() {
-  # 15 个组合 × 2 个服务端 = 30 组，再加 3 组 Go 探针交叉 = 33 组。
-  # 算法 ID 3（GCM-v2）自 aacef6d 起是两端都认识的能力，高于 gcm 下限；
-  # 真正"两端都不认识"的算法 ID 用 9：服务端必须按精确比较判定强度，
-  # 不得因为数值大就当成满足 gcm 下限（Go 侧历史上正是这么错的）。
+  # 8 个组合 × 2 个服务端 = 16 组，再加 3 组 Go 探针交叉 = 19 组。
+  # 内层只剩 GCM（2），所以探针声明的合格能力只有 2；9 是两端都不认识的算法
+  # ID，用来守住"按数值大小推断能力"这类回归——服务端必须按精确比较判定强度。
   local -a combos=(
-    ""            0  accept
     ""            2  accept
-    ctr           0  accept
-    ctr           2  accept
-    legacy        0  accept
-    legacy        2  accept
+    ""            0  accept
+    ""            9  accept
     gcm           2  accept
-    gcm           0  reject
-    gcm           3  accept      # GCM-v2 高于 gcm 下限
-    gcm           9  reject      # 真未知算法归 CTR 档 → 不满足 gcm（>= bug 回归锁）
-    ctr           3  accept      # GCM-v2 高于 ctr 下限，本就该放行
-    legacy        3  accept      # 同上；legacy 与 ctr 是同一档下限
+    gcm           0  reject      # 声明不了 GCM → 不满足下限
+    gcm           9  reject      # 真未知算法（>= bug 回归锁）
     gcm           2  configerr   # ENCRYPT=0
-    ctr           2  configerr   # ENCRYPT=0
     bogus         2  configerr
   )
   local i=0 n=0 fails=0 m en mo s port enc
-  echo "  min_enc：15 个组合 × 2 个服务端 + 3 组 Go 探针交叉 = 33 组"
+  echo "  min_enc：8 个组合 × 2 个服务端 + 3 组 Go 探针交叉 = 19 组"
   for s in rs go; do
     for ((i = 0; i < ${#combos[@]}; i += 3)); do
       m="${combos[i]}"; en="${combos[i+1]}"; mo="${combos[i+2]}"
@@ -171,9 +163,9 @@ suite_minenc() {
     done
   done
   # Go 探针交叉：确认判据在服务端，探针语言不影响结果。第三组让 Go 探针
-  # 声明 GCM-v2，跨语言走完 v2 的独立密钥标签路径。
-  n=30
-  for spec in "gcm 2 accept" "gcm 0 reject" "gcm 3 accept"; do
+  # 声明两端都不认识的算法 ID，跨语言验证精确比较而不是数值比较。
+  n=16
+  for spec in "gcm 2 accept" "gcm 0 reject" "gcm 9 reject"; do
     set -- $spec; m="$1"; en="$2"; mo="$3"
     SRV=rs PROBE=go MODE="$mo" MINENC="$m" ENCALGO="$en" ENCRYPT=1 \
       PORT="$((PORT_BASE_MINENC + n * 10))" LABEL="minenc_go-probe_${m}_${en}_${mo}" \
@@ -186,8 +178,7 @@ suite_minenc() {
 suite_cfg() {
   # 前 6 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
   # （rs/rs、rs/go、go/rs、go/go），因为「配置生效」必须跨语言成立。
-  # 后 7 个是校验类：进程必须以非零退出并给出对应错误。Go 的 Validate 不检查
-  # mac / web.bind / web 证书配对，那三个只在 Rust 服务端上跑。
+  # 后 7 个是校验类：进程必须以非零退出并给出对应错误，两种实现都覆盖。
   local -a interop=(cidr multi webauth webtls webtunnel logquiet)
   local -a reject=(badlog badauth badv4 badv6)
   local i=0 s c fails=0 case
@@ -203,7 +194,7 @@ suite_cfg() {
     done
   done
   i=24
-  echo "  校验：4 个跨语言用例 × 2 实现 + 3 个仅 Rust 用例 = 11 组"
+  echo "  校验：7 个非法配置 × 2 实现 = 14 组"
   for case in "${reject[@]}"; do
     for s in rs go; do
       SRV="$s" CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
@@ -213,10 +204,12 @@ suite_cfg() {
     done
   done
   for case in badmac badbind badwebtls; do
-    SRV=rs CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
-      WEB_BASE="$((9700 + i))" LABEL="cfg_rs_${case}" \
-      bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))
-    i=$((i + 1))
+    for s in rs go; do
+      SRV="$s" CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
+        WEB_BASE="$((9700 + i))" LABEL="cfg_${s}_${case}" \
+        bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))
+      i=$((i + 1))
+    done
   done
   return $((fails > 0 ? 1 : 0))
 }
@@ -234,7 +227,7 @@ echo "  GO_PROBE $E2E_GO_PROBE"
 if e2e_have E2E_RS_OLD_BIN && e2e_have E2E_RS_OLD_PROBE && e2e_have E2E_GO_OLD_BIN; then
   echo "  OLD      $E2E_RS_OLD_BIN / $E2E_GO_OLD_BIN"
 else
-  echo "  OLD      (缺旧版二进制 → accept 的 P3/P4 混装用例会跳过并计数)"
+  echo "  OLD      (缺旧版二进制 → accept 的 P3 降级拒绝用例会跳过并计数)"
 fi
 echo "  套件     ${SELECTED[*]}"
 

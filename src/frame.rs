@@ -224,14 +224,13 @@ mod tests {
         let ic = InnerCipher::gcm("e2e_secret", &salt).unwrap();
 
         for &(pt_len, want_data_len, want_pad) in
-            &[(112usize, 128usize, 0usize), (113, 129, 127), (0, 0, 0)]
+            &[(112usize, 128usize, 118usize), (113, 129, 117), (0, 0, 118)]
         {
             let data = vec![0xABu8; pt_len];
             let mut buf = Vec::new();
             append_padded_frame(&mut buf, 1, &data, Some(&ic));
 
-            let data_len =
-                u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+            let data_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
             let pad_len = u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
 
             assert_eq!(
@@ -240,19 +239,14 @@ mod tests {
                 "帧总长必须自洽（头部 + 载荷 + 填充）"
             );
             assert_eq!(
-                data_len,
-                want_data_len,
+                data_len, want_data_len,
                 "明文 {}B 加密后线路 dataLen 应为 {}（含 16B 标签）",
-                pt_len,
-                want_data_len
+                pt_len, want_data_len
             );
             assert_eq!(
-                pad_len,
-                want_pad,
+                pad_len, want_pad,
                 "明文 {}B（线路 {}B）应填 {}B",
-                pt_len,
-                want_data_len,
-                want_pad
+                pt_len, want_data_len, want_pad
             );
         }
 
@@ -271,10 +265,7 @@ mod tests {
         let mut buf = Vec::new();
         append_padded_frame(&mut buf, 0, &data, Some(&ic));
         let data_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
-        assert_eq!(
-            data_len, 300,
-            "seq==0 的帧不得附加加密标签"
-        );
+        assert_eq!(data_len, 300, "seq==0 的帧不得附加加密标签");
 
         let _ = crate::crypto::set_pad_mode(&prev);
     }
@@ -330,7 +321,7 @@ mod tests {
         assert!(
             s.read_frame(&mut std::io::Cursor::new(stream.clone()))
                 .is_err(),
-                "收紧状态下同一帧必须被拒绝"
+            "收紧状态下同一帧必须被拒绝"
         );
         s.set_max_data_len(MAX_DATA_LENGTH);
         let (got, seq) = s
@@ -346,7 +337,10 @@ mod tests {
         append_frame_head(&mut exact, MAX_DATA_LENGTH as u32, 0, 0);
         exact.extend_from_slice(&data);
         let mut s2 = FrameScanner::new();
-        let (got2, _) = s2.read_frame(&mut std::io::Cursor::new(exact)).unwrap().unwrap();
+        let (got2, _) = s2
+            .read_frame(&mut std::io::Cursor::new(exact))
+            .unwrap()
+            .unwrap();
         assert_eq!(got2.len(), MAX_DATA_LENGTH);
 
         // 空帧（心跳）不受上限影响
@@ -354,32 +348,35 @@ mod tests {
         append_frame_head(&mut hb, 0, 0, 42);
         let mut s3 = FrameScanner::new();
         s3.set_max_data_len(0);
-        let (got3, seq3) = s3.read_frame(&mut std::io::Cursor::new(hb)).unwrap().unwrap();
+        let (got3, seq3) = s3
+            .read_frame(&mut std::io::Cursor::new(hb))
+            .unwrap()
+            .unwrap();
         assert!(got3.is_empty());
         assert_eq!(seq3, 42);
     }
 
-    /// legacy 阈值同样以线路长度为输入：明文 184B → 线路 200B 落在
-    /// [100,299] 区间，而不是明文 184B 所在的 [300,499] 区间。
+    /// 桶填充同样以线路长度为输入：明文 184B + 16B 标签 = 线路 200B，
+    /// record 210B 落在 256 桶 → pad 恰为 46。若误拿明文 184B 当输入
+    /// （record 194B）会得到 62——两者不同，所以这个等值断言能锁住分桶依据。
     #[test]
-    fn legacy_thresholds_use_wire_length() {
+    fn bucket_padding_uses_wire_length() {
         let _g = crate::crypto::PAD_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = crate::crypto::pad_mode_name();
-        let _ = crate::crypto::set_pad_mode("legacy");
+        let _ = crate::crypto::set_pad_mode("bucket");
 
         let salt: [u8; 8] = [9; 8];
         let ic = InnerCipher::gcm("e2e_secret", &salt).unwrap();
 
-        // 明文 184B：线路 200B → [100,299]；若按明文长度算是 [300,499]
-        for _ in 0..300 {
+        for _ in 0..30 {
             let mut buf = Vec::new();
             append_padded_frame(&mut buf, 3, &[0u8; 184], Some(&ic));
             let pad_len = u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
-            assert!(
-                (100..=299).contains(&pad_len),
-                "明文 184B / 线路 200B 的 legacy 填充应在 [100,299]，实际 {}",
+            assert_eq!(
+                pad_len, 46,
+                "明文 184B / 线路 200B 应填到 256 桶 → pad 46（按明文算会是 62），实际 {}",
                 pad_len
             );
         }

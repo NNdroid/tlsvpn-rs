@@ -26,8 +26,7 @@
 #   校验（进程必须以非零退出并给出对应错误）
 #     badlog badauth badv4 badv6 badmac badbind badwebtls
 #
-# Go 的 Validate 不检查 mac / web.bind / web.cert-key 配对（validate_args 比 Go
-# 严），badmac / badbind / badwebtls 在 SRV=go 时打印跳过并退出 0。
+# Go/Rust 都必须在启动前拒绝非法 mac、web.bind 与不完整的 Web TLS 配置。
 #
 # Env: CASE SRV CLI PORT WEB_BASE MAC LABEL
 set -uo pipefail
@@ -103,11 +102,6 @@ V4PREFIX="10.99.0."
 # ============================ 校验失败类 ============================
 case "$CASE" in
   bad*)
-    if { [ "$CASE" = badmac ] || [ "$CASE" = badbind ] || [ "$CASE" = badwebtls ]; } && [ "$SRV" = go ]; then
-      echo "  SKIP  [$LABEL] $CASE 需要 Rust 服务端（Go 的 Validate 不检查该字段）"
-      exit 0
-    fi
-
     MODE=server
     FRAG=''        # 新键（web / mac）：默认配置里没有，不会撞车
     LOG_FRAG='"log_level": "info"'
@@ -136,14 +130,14 @@ case "$CASE" in
         WANT='invalid mac'
         ;;
       badbind)
-        FRAG='"web": {"bind": "Any"}'
+        FRAG='"web": {"addr": "127.0.0.1:18080", "auth": "e2e:web-test-password", "bind": "Any"}'
         WANT='invalid web.bind'
         ;;
       badwebtls)
         # 只填 web.cert：以前面板线程会在绑定阶段才发现读不到 key，每 2 秒重试
         # 一次、面板一直起不来；现在启动前就该被断掉。给一个真实存在的 cert
         # 路径，才能测到「配对」这一层而不是「文件不存在」那一层。
-        FRAG='"web": {"cert": "'"$CERT"'"}'
+        FRAG='"web": {"addr": "127.0.0.1:18080", "auth": "e2e:web-test-password", "cert": "'"$CERT"'"}'
         WANT='web.key is required when web.cert is set'
         ;;
     esac
@@ -184,7 +178,7 @@ SRV_LOGFRAG='"log_level": "info"'   # 与 SRV_FX 分开：serde_json 拒绝重�
 CLI_LOGFRAG='"log_level": "info"'   # 想覆盖 log_level 必须整段替换而不是追加
 SRV_FX=''        # 服务端额外顶层键
 CLI_FX='"client": {"insecure": true, "conns": 1}'
-WEB_FX=''        # web 对象里的额外键
+WEB_FX='"auth": "e2e:web-test-password"' # Web 启用时认证是强制安全基线
 case "$CASE" in
   cidr)
     # req_v4/req_v6 落在池内 → 必须原样分配，而不是退回池的下一个空位
@@ -202,10 +196,10 @@ case "$CASE" in
   webtls)
     # 同一份 e2e 证书，服务端加载一次、面板 HTTPS 用一次：web.cert / web.key
     # 与 server.cert / server.key 语义一致，都是文件路径。
-    WEB_FX='"cert": "'"$CERT"'", "key": "'"$KEY"'"'
+    WEB_FX='"auth": "e2e:web-test-password", "cert": "'"$CERT"'", "key": "'"$KEY"'"'
     ;;
   webtunnel)
-    WEB_FX='"bind": "tunnel"'
+    WEB_FX='"auth": "e2e:web-test-password", "bind": "tunnel"'
     ;;
   logquiet)
     SRV_LOGFRAG='"log_level": "warn"'
@@ -221,6 +215,7 @@ esac
 WEB_JSON="\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\""
 [ -n "$WEB_FX" ] && WEB_JSON="$WEB_JSON, $WEB_FX"
 WEB_JSON="$WEB_JSON}"
+AUTH_HDR="Authorization: Basic $(printf 'e2e:web-test-password' | base64 -w0)"
 
 e2e_config "$TMP/srv.json" server "127.0.0.1:$PORT" \
   "\"psk\": \"$PSK\"" \
@@ -273,7 +268,7 @@ case "$CASE" in
     ;;
   multi)
     sleep 3
-    BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats '')" || { echo "面板请求失败"; PASS=0; }
+    BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats "$AUTH_HDR")" || { echo "面板请求失败"; PASS=0; }
     if ! echo "$BODY" | grep -qE '"active_conns"[[:space:]]*:[[:space:]]*2'; then
       echo "面板里没有 active_conns=2，client.conns 没生效"
       echo "$BODY" | tail -c 400
@@ -292,7 +287,7 @@ case "$CASE" in
     # 三条断言分别钉住「是 HTTPS」「不是明文」「面板真的在服务」。只填了
     # web.cert 却没真正起 HTTPS 的话，明文那条会返回 200、TLS 那条拿不到响应。
     PLAIN="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats '' | head -1)"
-    TLS_BODY="$(https_get 127.0.0.1 "$WEB_BASE" /api/stats '')"
+    TLS_BODY="$(https_get 127.0.0.1 "$WEB_BASE" /api/stats "$AUTH_HDR")"
     echo "webtls: 明文=[$PLAIN] HTTPS=[$(echo "$TLS_BODY" | grep -m1 -E '^HTTP')"
     echo "$PLAIN" | grep -q " 200" && { echo "配了证书却仍在明文监听"; PASS=0; }
     echo "$TLS_BODY" | grep -q "HTTP/1.1 200" || {
@@ -337,7 +332,7 @@ case "$CASE" in
     e2e_wait_log "新逻辑 Client 上线" "$SRV_LOG" 10 || { echo "bind=tunnel 拖垮了隧道"; PASS=0; }
     ;;
   logquiet)
-    BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats '')" || { echo "面板请求失败"; PASS=0; }
+    BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats "$AUTH_HDR")" || { echo "面板请求失败"; PASS=0; }
     echo "$BODY" | head -1
     echo "$BODY" | grep -q " 200" || { echo "面板应当返回 200"; PASS=0; }
     echo "$BODY" | grep -q "$V4PREFIX" || { echo "客户端未上线或网段未生效（stats 里没有 $V4PREFIX）"; PASS=0; }

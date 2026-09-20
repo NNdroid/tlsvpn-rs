@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # e2e_minenc.sh — 档 D：min_enc 强度下限跨语言互测。
 #
-# 探针用 --enc-algo 声明内层加密能力（0 = legacy CTR，2 = GCM-v1，3 = GCM-v2，
-# 9 = 两端都不认识的算法 ID），服务端按
-# min_enc 下限决定是否放行。判据只看服务端日志，不看探针退出码：探针在
-# 协商到 CTR 时会主动报错退出，那不属于服务端行为。
+# 探针用 --enc-algo 声明内层加密能力。内层只剩一种算法（2 = GCM），所以 2 是
+# 唯一合格值；9 是两端都不认识的算法 ID，用来守住"按数值大小推断能力"这类回归。
+# 服务端按 min_enc 下限决定是否放行。判据只看服务端日志，不看探针退出码：探针在
+# 协商不出 GCM 时会主动报错退出，那不属于服务端行为。
 #
 # Env:
 #   SRV         rs | go   server implementation
 #   PROBE       rs | go   probe implementation
-#   MINENC      "" | ctr | legacy | gcm   default gcm
-#   ENCALGO     0 | 2 | 3 | 9   default 2
+#   MINENC      "" | gcm   default gcm
+#   ENCALGO     2 | 9   default 2
 #   ENCRYPT     1 | 0       default 1
 #   PORT        default 18800
 #   PSK / MAC   同 e2e_tok.sh
@@ -95,7 +95,7 @@ if [ "$MODE" = configerr ]; then
   PASSED=0
   strip "$SRV_LOG" | grep -Ei "min_enc|invalid" >/dev/null && PASSED=1
   strip "$SRV_LOG" | grep -Eqi "panic" && PASSED=0
-  strip "$SRV_LOG" | grep -Eq "低于 min_enc 下限|新逻辑 Client 上线" && PASSED=0
+  strip "$SRV_LOG" | grep -Eq "below the min_enc floor|new logical client online" && PASSED=0
   echo "===== label=$LABEL srv=$SRV min_enc=$MINENC encrypt=$ENCRYPT (configerr) ====="
   strip "$SRV_LOG" | grep -Ei "min_enc|invalid|fatal|panic|error" | head -5
   echo "-------------------------------------"
@@ -114,8 +114,8 @@ else
 fi
 e2e_kill_port "$PORT"
 
-ONLINE="$(strip "$SRV_LOG" | grep -c "新逻辑 Client 上线" || true)"
-DENY="$(strip "$SRV_LOG" | grep -c "低于 min_enc 下限" || true)"
+ONLINE="$(strip "$SRV_LOG" | grep -c "new logical client online" || true)"
+DENY="$(strip "$SRV_LOG" | grep -c "below the min_enc floor" || true)"
 PANIC="$(strip "$SRV_LOG" | grep -Eic "panic|GCM.*(fail|FAIL)|decrypt.*fail|校验失败" || true)"
 
 echo "===== label=$LABEL srv=$SRV probe=$PROBE min_enc=$MINENC enc_algo=$ENCALGO ====="

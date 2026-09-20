@@ -1,5 +1,4 @@
 use crate::Args;
-use aes::Aes256;
 use crossbeam_channel::bounded;
 use crossbeam_queue::ArrayQueue;
 use mio::Interest;
@@ -11,8 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-
-pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
 use crate::api::*;
 use crate::buffer::*;
@@ -99,21 +96,32 @@ impl ServerCertVerifier for CertHashVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        // 证书哈希锁定模式下信任服务器签名（对齐 Go InsecureVerify 语义）
-        Ok(HandshakeSignatureValid::assertion())
+        let provider = rustls::crypto::ring::default_provider();
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        let provider = rustls::crypto::ring::default_provider();
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -133,6 +141,8 @@ pub struct ConnInfo {
     pub rx_bytes: AtomicU64,
     pub retries: AtomicU64,
     pub linked_at: AtomicI64,
+    // 本连接 TCP Brutal 是否真的生效（setsockopt 成功）
+    pub brutal_applied: AtomicBool,
 }
 
 impl ConnInfo {
@@ -147,6 +157,7 @@ impl ConnInfo {
             rx_bytes: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             linked_at: AtomicI64::new(0),
+            brutal_applied: AtomicBool::new(false),
         }
     }
 
@@ -162,6 +173,7 @@ impl ConnInfo {
             "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
             "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
             "retries": self.retries.load(Ordering::Relaxed),
+            "brutal_applied": self.brutal_applied.load(Ordering::Relaxed),
             "age_sec": if linked_at > 0 {
                 (now_unix_ms() / 1000).saturating_sub(linked_at) as u64
             } else {
@@ -186,6 +198,7 @@ pub struct SessionState {
     gw_v6: String,
     // 服务端下发的会话令牌；重连同一 client_id 时必须在握手里回带
     session_token: String,
+    session_epoch: u64,
 }
 
 // ======================= 客户端 =======================
@@ -216,7 +229,6 @@ pub struct Client {
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
     pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,
     pub dedup: Arc<Mutex<DeDuplicator>>,
-    pub ic_legacy: Option<Arc<InnerCipher>>,
     pub session: Mutex<SessionState>,
     // 身份状态文件路径；空串 = 不持久化（进程内测试未从文件加载配置）
     pub state_path: String,
@@ -236,7 +248,9 @@ pub struct Client {
     pub assigned_v6: Mutex<String>,
     pub fec_status: Mutex<String>,
     pub enc_algo_display: AtomicI64,
-    pub force_reconnect: AtomicBool,
+    pub force_generation: AtomicU64,
+    pub instance_id: Mutex<String>,
+    pub sequence_rekeying: AtomicBool,
     pub started_at: Instant,
 }
 
@@ -278,22 +292,83 @@ impl WebStatsProvider for Client {
             .enumerate()
             .map(|(i, c)| c.snapshot(i))
             .collect();
-        // 发射前已归一化成 0/1/2，这里直接透传
+        // 发射前已归一化成 0/2，这里直接透传
         let enc = self.enc_algo_display.load(Ordering::Relaxed);
         let fec_status = self.fec_status.lock().clone();
+        let sess = self.session.lock();
+        let session_token = !sess.session_token.is_empty();
+        let session_epoch = sess.session_epoch;
+        let session_id = sess.server_session_id.clone();
+        drop(sess);
         let local = serde_json::json!({
             "client_id": self.client_id,
             "ipv4": self.assigned_v4.lock().clone(),
             "ipv6": self.assigned_v6.lock().clone(),
             "mac": self.mac,
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "session_token": session_token,
+            "session_encrypt": enc == ENC_ALGO_GCM,
             "active_conns": self.live_conns.load(Ordering::Relaxed),
             "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
             "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
             "tx_packets": self.tx_packets.load(Ordering::Relaxed),
             "rx_packets": self.rx_packets.load(Ordering::Relaxed),
             "fec": fec_status,
+            "fec_group": self.fec_group_req,
             "enc_algo": enc,
         });
+
+        // 协商结果：客户端模式是端到端会话的实际参数（服务端回传的取值），
+        // brutal 段把"配置意图"和"内核实际状态"分开设——非 Linux 或没装 brutal
+        // 模块时 apply 必然失败，混在一起就无法区分"没配置"和"配置了没生效"。
+        let n: u64 = if self.conns_count == 0 { 1 } else { self.conns_count as u64 };
+        let per_up = if self.brutal_up / n == 0 && self.brutal_up > 0 {
+            1
+        } else {
+            self.brutal_up / n
+        };
+        let per_down = if self.brutal_down / n == 0 && self.brutal_down > 0 {
+            1
+        } else {
+            self.brutal_down / n
+        };
+        // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
+        let applied_conns = self
+            .conn_infos
+            .iter()
+            .filter(|c| c.brutal_applied.load(Ordering::Relaxed))
+            .count();
+        let brut = brutal_system_status();
+        let negotiate = serde_json::json!({
+            "protocol_version": 2,
+            "fec": self.fec_mode,
+            "fec_group": self.fec_group_req,
+            "enc_algo": enc,
+            "pad_mode": pad_mode_name(),
+            "min_enc": min_enc_label(self.min_enc),
+            "session_token": session_token,
+            "session_epoch": session_epoch,
+            "tx_rate_mbps": per_up,
+            "rx_rate_mbps": per_down,
+            "socks5": self.socks5.is_some(),
+            "brutal": {
+                "enabled": self.brutal,
+                "up_mbps": self.brutal_up,
+                "down_mbps": self.brutal_down,
+                "kernel_supported": brut["supported"].as_bool().unwrap_or(false),
+                "kernel_current": brut["kernel_current"].as_str().unwrap_or(""),
+                "kernel_available": brut["kernel_available"].clone(),
+                "applied_conns": applied_conns,
+                "total_conns": self.conns_count,
+                "min_up_mbps": per_up,
+                "max_up_mbps": per_up,
+                "min_down_mbps": per_down,
+                "max_down_mbps": per_down,
+                "error": brut["error"].as_str().unwrap_or(""),
+            }
+        });
+
         serde_json::json!({
             "mode": "client",
             "version": APP_VERSION,
@@ -310,6 +385,7 @@ impl WebStatsProvider for Client {
             "conns": conns,
             "fec_mode": fec_status,
             "enc_algo": enc,
+            "negotiate": negotiate,
         })
     }
 
@@ -395,7 +471,7 @@ impl WebStatsProvider for Client {
     ) -> Result<(), String> {
         match action {
             "reconnect" => {
-                self.force_reconnect.store(true, Ordering::Relaxed);
+                self.force_generation.fetch_add(1, Ordering::SeqCst);
                 info!("[WebUI] Forced reconnect triggered");
                 Ok(())
             }
@@ -419,27 +495,37 @@ impl WebStatsProvider for Client {
 
 // ======================= 主流程 =======================
 
+fn random_instance_id() -> String {
+    let mut id = [0u8; 16];
+    getrandom::getrandom(&mut id).expect("generate client instance id");
+    hex::encode(id)
+}
+
 /// 把服务端下发的会话身份落盘，供进程重启后第一次握手复用既有会话。按
 /// client_id（MAC+PSK 派生）绑定：配置变更后旧令牌自动失效。
-fn persist_session_state(cl: &Client, session_id: &str, token: &str) {
+fn persist_session_state(cl: &Client, session_id: &str, token: &str, epoch: u64) {
     if cl.state_path.is_empty() {
         return;
     }
-    let mut st = cl.identity.lock().clone();
+    let mut st = cl.identity.lock();
+    if epoch < st.session_epoch {
+        return;
+    }
     st.client_id = cl.client_id.clone();
     st.session_id = session_id.to_string();
     st.session_token = token.to_string();
+    st.session_epoch = epoch;
     if let Err(e) = crate::client_state::save_client_state(&cl.state_path, &st) {
         warn!("Client failed to persist session state: {}", e);
     }
 }
 
-pub fn start_client(args: &Args, config_path: &str) {
+pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
     info!("Starting TCP TLS client process...");
 
     // 进程身份落盘（<config>.state）：MAC 派生 client_id，client_id 决定服务端
-    // 会话与分配的隧道 IP。三者跨进程稳定后，被杀或崩溃重启才能无缝接回原
-    // 会话，而不是等 120 秒僵尸会话过期才自然恢复连通。
+    // 会话与分配的隧道 IP。三者跨进程稳定后，被杀或崩溃重启才能带着旧令牌
+    // 请求安全的 epoch 轮换，而不是等 120 秒僵尸会话过期。
     let state_path = crate::client_state::client_state_path(config_path);
     let mut identity = crate::client_state::load_client_state(&state_path);
 
@@ -448,8 +534,8 @@ pub fn start_client(args: &Args, config_path: &str) {
     // 服务端 src_mac_allowed 会据此丢弃本端自己的帧。
     // 优先级：配置值 > 落盘值 > 随机生成。tun-rs 每次建 TAP 都发随机 MAC，不
     // 固定就等于每次重启都是一次全新会话——换新 IP，而旧会话还要占用旧 IP
-    // 满 120 秒。mem 后端没有真实设备，client_id 退化为仅由 PSK 派生，本身
-    // 已跨进程稳定，不生成也不落盘。
+    // 满 120 秒。mem 后端同样生成并持久化随机单播 MAC，不能退化成共享 PSK
+    // 下所有客户端都相同的身份。
     let apply_mac: Option<[u8; 6]> = match crate::utils::parse_config_mac(&args.mac) {
         Ok(Some(m)) => {
             info!("Interface {} MAC set to {}", args.tap, args.mac);
@@ -475,7 +561,8 @@ pub fn start_client(args: &Args, config_path: &str) {
                     }
                 }
             } else if args.tap == "mem" {
-                None
+                let gen = crate::client_state::generate_tap_mac();
+                crate::utils::parse_config_mac(&gen).ok().flatten()
             } else {
                 let gen = crate::client_state::generate_tap_mac();
                 info!("Generated TAP MAC: {}", gen);
@@ -505,22 +592,31 @@ pub fn start_client(args: &Args, config_path: &str) {
     // MAC：显式指定时上面的 builder 已写入设备，这里沿用同一个值；否则读
     // TAP 的真实 MAC（Linux sysfs），仍失败则警告。client_id 依赖 MAC，与 Go 一致。
     let actual_mac = if args.mac.is_empty() {
-        let from_sys = std::fs::read_to_string(format!("/sys/class/net/{}/address", args.tap))
-            .unwrap_or_else(|_| String::new())
-            .trim()
-            .to_string();
-        if from_sys.is_empty() {
-            warn!(
-                "Failed to determine real MAC for TAP '{}'; using all-zero MAC \
-                 (client_id will be identical across such hosts!)",
-                args.tap
-            );
-            "00:00:00:00:00:00".to_string()
+        if !identity.mac.is_empty() {
+            identity.mac.to_ascii_lowercase()
+        } else if let Some(m) = apply_mac {
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                m[0], m[1], m[2], m[3], m[4], m[5]
+            )
         } else {
-            from_sys
+            let from_sys = std::fs::read_to_string(format!("/sys/class/net/{}/address", args.tap))
+                .unwrap_or_else(|_| String::new())
+                .trim()
+                .to_string();
+            if from_sys.is_empty() {
+                let generated = crate::client_state::generate_tap_mac();
+                warn!(
+                    "Failed to read TAP MAC for '{}'; generated a persistent identity MAC {}",
+                    args.tap, generated
+                );
+                generated
+            } else {
+                from_sys.to_ascii_lowercase()
+            }
         }
     } else {
-        args.mac.clone()
+        args.mac.to_ascii_lowercase()
     };
 
     // 未显式配置时把实际生效的 MAC 落盘，下一次进程重启就回到同一个
@@ -618,12 +714,6 @@ pub fn start_client(args: &Args, config_path: &str) {
 
     let config = build_tls_config(args);
 
-    let ic_legacy = if args.encrypt {
-        Some(Arc::new(InnerCipher::legacy(&args.psk)))
-    } else {
-        None
-    };
-
     let fec_group_req = if args.fec {
         clamp_fec_group(if args.fec_group == 0 {
             4
@@ -644,6 +734,7 @@ pub fn start_client(args: &Args, config_path: &str) {
         let mut ss = SessionState::default();
         if identity.client_id == client_id && !identity.session_id.is_empty() {
             ss.server_session_id = identity.session_id.clone();
+            ss.session_epoch = identity.session_epoch;
             if !identity.session_token.is_empty() {
                 ss.session_token = identity.session_token.clone();
                 info!(
@@ -681,7 +772,6 @@ pub fn start_client(args: &Args, config_path: &str) {
         reorder_buf: reorder_buf.clone(),
         fec_dec: Mutex::new(None),
         dedup: Arc::new(Mutex::new(DeDuplicator::new())),
-        ic_legacy,
         session: Mutex::new(session),
         state_path,
         identity: Mutex::new(identity),
@@ -698,7 +788,9 @@ pub fn start_client(args: &Args, config_path: &str) {
         assigned_v6: Mutex::new(String::new()),
         fec_status: Mutex::new("off".into()),
         enc_algo_display: AtomicI64::new(0),
-        force_reconnect: AtomicBool::new(false),
+        force_generation: AtomicU64::new(0),
+        instance_id: Mutex::new(random_instance_id()),
+        sequence_rekeying: AtomicBool::new(false),
         started_at: Instant::now(),
     };
     let client = Arc::new(client);
@@ -711,6 +803,7 @@ pub fn start_client(args: &Args, config_path: &str) {
                 args.web_cert.clone(),
                 args.web_key.clone(),
                 client.clone(),
+                ctx.clone(),
                 client.clone(),
             ),
             _ => start_web_server(
@@ -719,6 +812,7 @@ pub fn start_client(args: &Args, config_path: &str) {
                 args.web_cert.clone(),
                 args.web_key.clone(),
                 client.clone(),
+                ctx.clone(),
             ),
         }
     }
@@ -802,11 +896,13 @@ fn build_tls_config(args: &Args) -> Arc<ClientConfig> {
 /// 单条物理连接的完整生命周期（对齐 Go dialAndServe）
 fn conn_loop(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) {
     let mut attempt: u32 = 0;
+    let mut seen_generation = cl.force_generation.load(Ordering::Acquire);
     loop {
         if EXIT.load(Ordering::Relaxed) {
             return;
         }
-        if cl.force_reconnect.swap(false, Ordering::Relaxed) {
+        if cl.force_generation.load(Ordering::Acquire) != seen_generation {
+            seen_generation = cl.force_generation.load(Ordering::Acquire);
             attempt = 0; // 面板触发强制重连：立即重拨
         }
         cl.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -843,7 +939,9 @@ fn conn_loop(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) {
             if EXIT.load(Ordering::Relaxed) {
                 return;
             }
-            if cl.force_reconnect.swap(false, Ordering::Relaxed) {
+            let generation = cl.force_generation.load(Ordering::Acquire);
+            if generation != seen_generation {
+                seen_generation = generation;
                 attempt = 0;
                 break;
             }
@@ -853,18 +951,28 @@ fn conn_loop(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) {
 }
 
 fn dial_target(cl: &Arc<Client>, target: &str) -> std::io::Result<std::net::TcpStream> {
-    if let Some(proxy) = &cl.socks5 {
+    let stream = if let Some(proxy) = &cl.socks5 {
         let (host, port) = split_host_port(target);
-        proxy.connect(&host, port)
+        #[cfg(target_os = "linux")]
+        {
+            let proxy_stream = dial_with_mark(&proxy.host, proxy.port, cl.fwmark)?;
+            proxy.connect_over(proxy_stream, &host, port)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            proxy.connect(&host, port)?
+        }
     } else {
-        // 统一走带 SO_MARK 的拨号器（对齐 Go newBaseDialer：直连与代理两种
-        // 模式下 KeepAlive/mark 都在本层设置）
-        let stream = dial_with_mark_host(target, cl.fwmark)?;
-        stream.set_nodelay(true)?;
-        apply_tcp_keepalive(&stream);
-        apply_socket_buffers(&stream);
-        Ok(stream)
-    }
+        dial_with_mark_host(target, cl.fwmark)?
+    };
+    // SOCKS 握手使用有界阻塞超时；进入隧道数据面前清除它们，再统一安装
+    // 低延迟、保活和 socket buffer 参数。此前代理路径漏掉了整组调优。
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    stream.set_nodelay(true)?;
+    apply_tcp_keepalive(&stream);
+    apply_socket_buffers(&stream);
+    Ok(stream)
 }
 
 #[cfg(target_os = "linux")]
@@ -884,6 +992,7 @@ fn dial_with_mark_host(target: &str, _mark: i32) -> std::io::Result<std::net::Tc
 /// 事件循环（与 Go 双协程等效：poll 超时 5ms 兼顾端口通道的及时拉取，
 /// 可读事件即时唤醒保证下行延迟）。
 fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Duration {
+    let reconnect_generation = cl.force_generation.load(Ordering::Acquire);
     let linked_at = Instant::now();
     let target = cl.targets[conn_index % cl.targets.len()].clone();
 
@@ -920,7 +1029,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         cl.brutal_down / conns
     };
     if cl.brutal && client_tx_rate > 0 && cl.socks5.is_none() {
-        apply_tcp_brutal(&raw, client_tx_rate);
+        // 代理连接不做 shaping（流量不经过本进程），此时 applied 必须是 false
+        ci.brutal_applied.store(apply_tcp_brutal(&raw, client_tx_rate), Ordering::Relaxed);
     }
 
     // 2. TLS 连接与握手（10s 超时对齐 Go SetDeadline）
@@ -990,6 +1100,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
     let session_token = cl.session.lock().session_token.clone();
     let req = HandshakeReq {
+        protocol_version: 2,
+        client_instance: cl.instance_id.lock().clone(),
         client_id: cl.client_id.clone(),
         psk: hash_psk(&cl.psk),
         mac: cl.mac.clone(),
@@ -1027,63 +1139,70 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         Some(r) => r,
         None => return Duration::ZERO,
     };
+    if resp.protocol_version != 2 {
+        *ci.last_error.lock() = format!(
+            "unsupported server protocol version {}",
+            resp.protocol_version
+        );
+        return Duration::ZERO;
+    }
 
     // 4. 内层加密协商（对齐 Go）
-    let mut enc_algo = ENC_ALGO_LEGACY_CTR;
+    if resp.encrypt != cl.encrypt {
+        *ci.last_error.lock() = "server encryption mismatch".into();
+        return Duration::ZERO;
+    }
+
+    // 唯一算法 GCM：会话盐由服务端生成、通过响应下发，服务端重启或会话重建
+    // 即换盐，密钥流不再跨会话重用。旧版 AES-CTR 回退路径已移除——协商不出
+    // GCM 说明对端不再受支持，直接拒连。
+    let mut enc_algo = ENC_ALGO_NONE;
     let mut ic_tx: Option<Arc<InnerCipher>> = None;
     let mut ic_rx: Option<Arc<InnerCipher>> = None;
+    let mut fec_tx: Option<Arc<InnerCipher>> = None;
+    let mut fec_rx: Option<Arc<InnerCipher>> = None;
     if cl.encrypt {
-        // resp.enc_algo=3 为 GCM-v2（独立密钥标签），=2 为旧派生，二者语义一致
-        if enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM)
-            || enc_algo_supported(resp.enc_algo, ENC_ALGO_GCM_V2)
-        {
-            let salt_tx = hex::decode(&resp.enc_salt).ok();
-            let salt_rx = hex::decode(&resp.enc_salt2).ok();
-            if let (Some(stx), Some(srx)) = (salt_tx, salt_rx) {
-                if stx.len() == ENC_SALT_SIZE && srx.len() == ENC_SALT_SIZE {
-                    match (
-                        InnerCipher::gcm_algo(&cl.psk, &stx, resp.enc_algo),
-                        InnerCipher::gcm_algo(&cl.psk, &srx, resp.enc_algo),
-                    ) {
-                        (Ok(tx), Ok(rx)) => {
-                            ic_tx = Some(Arc::new(tx));
-                            ic_rx = Some(Arc::new(rx));
-                            enc_algo = resp.enc_algo;
-                        }
-                        (e1, e2) => {
-                            warn!(
-                                "[Conn {}] GCM cipher init failed, falling back to legacy CTR: {:?}/{:?}",
-                                conn_index,
-                                e1.err(),
-                                e2.err()
-                            );
-                        }
-                    }
-                } else {
-                    warn!(
-                        "[Conn {}] Server sent invalid enc salts, falling back to legacy CTR",
-                        conn_index
-                    );
-                }
-            }
-        } else {
-            info!(
-                "[Conn {}] Server lacks GCM support, using legacy CTR inner encryption",
-                conn_index
+        if resp.enc_algo != ENC_ALGO_GCM {
+            *ci.last_error.lock() = format!(
+                "server negotiated inner cipher {}, GCM ({}) is required",
+                resp.enc_algo, ENC_ALGO_GCM
             );
+            warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
+            return Duration::ZERO;
         }
-        if ic_tx.is_none() {
-            ic_tx = cl.ic_legacy.clone();
-            ic_rx = cl.ic_legacy.clone();
+        let (stx, srx) = match (hex::decode(&resp.enc_salt), hex::decode(&resp.enc_salt2)) {
+            (Ok(a), Ok(b)) if a.len() == ENC_SALT_SIZE && b.len() == ENC_SALT_SIZE => (a, b),
+            _ => {
+                *ci.last_error.lock() = "server sent invalid enc salts".into();
+                warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
+                return Duration::ZERO;
+            }
+        };
+        match (InnerCipher::gcm(&cl.psk, &stx), InnerCipher::gcm(&cl.psk, &srx)) {
+            (Ok(tx), Ok(rx)) => {
+                ic_tx = Some(Arc::new(tx));
+                ic_rx = Some(Arc::new(rx));
+            }
+            (e1, e2) => {
+                *ci.last_error.lock() =
+                    format!("GCM cipher init failed: {:?}/{:?}", e1.err(), e2.err());
+                warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
+                return Duration::ZERO;
+            }
         }
+        fec_tx = InnerCipher::gcm_domain(&cl.psk, &stx, "fec").ok().map(Arc::new);
+        fec_rx = InnerCipher::gcm_domain(&cl.psk, &srx, "fec").ok().map(Arc::new);
+        enc_algo = resp.enc_algo;
     }
 
     // 强度下限：协商结果低于本地要求时拒绝这条连接（服务端可能跑的是旧版，
     // 或中间被降级）。这是运维显式声明的硬要求，不能静默降级。
-    if cl.min_enc > 0 && enc_algo_rank(enc_algo) < cl.min_enc {
+    if cl.min_enc > 0 && enc_algo != ENC_ALGO_GCM {
         *ci.state.lock() = "retrying".into();
-        *ci.last_error.lock() =
-            format!("server negotiated inner cipher {} is below min_enc={}", enc_algo, cl.min_enc);
+        *ci.last_error.lock() = format!(
+            "server negotiated inner cipher {} is below min_enc {:?}",
+            enc_algo, MIN_ENC_GCM
+        );
         warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
         return Duration::ZERO;
     }
@@ -1118,8 +1237,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     old.reset();
                 }
                 let negotiated = st.fec_negotiated as usize;
-                *cl.fec_dec.lock() = Some(Arc::new(FecDecoder::new(negotiated, ic_rx.clone())));
-                cl.tx_port.attach_encoder(negotiated, ic_tx.clone());
+                *cl.fec_dec.lock() = Some(Arc::new(FecDecoder::new(negotiated, fec_rx.clone())));
+                cl.tx_port.reset_epoch(negotiated, fec_tx.clone());
                 st.fec_algo = enc_algo;
                 st.fec_salt_key = resp.enc_salt.clone();
             }
@@ -1129,9 +1248,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             st.ic_tx = ic_tx.clone();
             st.ic_rx = ic_rx.clone();
         }
-        let is_new_session = st.server_session_id != resp.session_id;
+        let is_new_session =
+            st.server_session_id != resp.session_id || st.session_epoch != resp.session_epoch;
         if is_new_session {
             st.server_session_id = resp.session_id.clone();
+            st.session_epoch = resp.session_epoch;
         }
         st.gw_v4 = resp.gw_v4.clone();
         st.gw_v6 = resp.gw_v6.clone();
@@ -1139,15 +1260,22 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
         st.session_token = resp.session_token.clone();
         // 落盘：进程重启后第一次握手就能回带令牌接回同一会话
-        persist_session_state(cl, &resp.session_id, &resp.session_token);
+        persist_session_state(
+            cl,
+            &resp.session_id,
+            &resp.session_token,
+            resp.session_epoch,
+        );
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
-        // 发射前归一化成 0/1/2：原始算法号里 0 同时表示"未加密"和 legacy CTR，
-        // 而 GCM-v2=3 面板不认识会落进"明文"兜底分支。
-        cl.enc_algo_display
-            .store(enc_algo_for_display(enc_algo, cl.encrypt), Ordering::Relaxed);
+        // 只有两种取值：0=明文，2=GCM。面板按此映射即可，无需归一化。
+        cl.enc_algo_display.store(enc_algo, Ordering::Relaxed);
 
         if is_new_session {
+            if !use_xor_fec {
+                cl.tx_port.reset_epoch(0, None);
+            }
+            cl.sequence_rekeying.store(false, Ordering::Release);
             info!(
                 "[Conn {}] 🔄 server reset the session; flushing stale local receive buffers...",
                 conn_index
@@ -1222,6 +1350,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut conn_closed = false;
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
+        if cl.tx_port.is_sequence_exhausted() {
+            if cl
+                .sequence_rekeying
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                *cl.instance_id.lock() = random_instance_id();
+                cl.force_generation.fetch_add(1, Ordering::SeqCst);
+                warn!("client sequence space exhausted; rotating instance and reconnecting with fresh keys");
+            }
+            break;
+        }
+        if cl.force_generation.load(Ordering::Acquire) != reconnect_generation {
+            break;
+        }
         // 阻塞等待：socket 可读或端口 Waker 唤醒；1s 超时兜底保活/空闲检查
         if poll
             .poll(&mut events, Some(Duration::from_secs(1)))
@@ -1448,9 +1591,17 @@ fn tls_exchange_resp(
                 if let Ok(r) = serde_json::from_slice::<HandshakeResp>(&data) {
                     if r.success {
                         debug!(
-                            "[Conn {}] <= received handshake response (HandshakeResp): {:?}",
-                            conn_index, r
-                        );
+							"[Conn {}] <= handshake response session={} proto={} epoch={} fec={}/{} enc={}/{} token_present={}",
+							conn_index,
+							r.session_id,
+							r.protocol_version,
+							r.session_epoch,
+							r.fec,
+							r.fec_group,
+							r.encrypt,
+							r.enc_algo,
+							!r.session_token.is_empty()
+						);
                         return Some(r);
                     }
                     *ci.last_error.lock() = "handshake rejected".into();
@@ -1504,7 +1655,5 @@ use std::process::Command;
 
 #[cfg(target_os = "linux")]
 fn setup_interface(cl: &Arc<Client>, v4cidr: &str, v6cidr: &str) {
-    crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(
-        &cl.tap_name, v4cidr, v6cidr,
-    ));
+    crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(&cl.tap_name, v4cidr, v6cidr));
 }

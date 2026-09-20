@@ -4,12 +4,12 @@
 # 服务端与客户端同时应用同一 pad_mode（填充只由发送方决定，长度走帧头，
 # 所以两侧都用同一模式才能把两条发送路径都跑一遍）。断言：
 #   1. 两个进程都打印 "Confusion padding: <mode>" —— 模式真的生效了
-#   2. 服务端打印 "新逻辑 Client 上线" —— 加密帧带着 pad_len 头成功往返
+#   2. 服务端打印 "new logical client online" —— 加密帧带着 pad_len 头成功往返
 #   3. 两侧日志都没有错误标记
 #
 # Env:
 #   SRV / CLI   rs | go          服务端与客户端实现
-#   PAD         off | legacy | bucket   default bucket
+#   PAD         off | bucket   default bucket
 #   PORT        default 18700
 #   WEB_BASE    client 的 Web 面板端口              default 9502
 #   PSK / MAC   同 e2e_tok.sh
@@ -114,7 +114,7 @@ if [ "$CLI" = rs ]; then
     '"log_level": "info"' \
     "\"pad_mode\": \"$PAD\"" \
     "\"mac\": \"$MAC\"" \
-    "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\"}" \
+    "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\", \"auth\": \"e2e:web-test-password\"}" \
     '"client": {"insecure": true, "conns": 1}'
   "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$CLI_LOG" 2>&1 &
 else
@@ -125,19 +125,19 @@ else
     '"log_level": "info"' \
     "\"pad_mode\": \"$PAD\"" \
     "\"mac\": \"$MAC\"" \
-    "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\"}" \
+    "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\", \"auth\": \"e2e:web-test-password\"}" \
     '"client": {"insecure": true, "conns": 1}'
   "$CLI_BIN" -c "$(e2e_winpath "$local_cfg")" >"$CLI_LOG" 2>&1 &
 fi
 sleep 8
 
-ERRRE="ERROR|panic|panicked|GCM.*(fail|FAIL)|decrypt.*fail|解密失败|校验失败|拒绝连接|fatal"
+ERRRE="ERROR|panic|panicked|GCM.*(fail|FAIL)|decrypt.*fail|verification failed|authentication failed|connection refused|fatal"
 SRV_ERRS="$(strip "$SRV_LOG" | grep -E "$ERRRE" | tail -5 || true)"
 CLI_ERRS="$(strip "$CLI_LOG" | grep -E "$ERRRE" | tail -5 || true)"
 
 SRV_PAD="$(strip "$SRV_LOG" | grep -c "Confusion padding: $PAD" || true)"
 CLI_PAD="$(strip "$CLI_LOG" | grep -c "Confusion padding: $PAD" || true)"
-ONLINE="$(strip "$SRV_LOG" | grep -c "新逻辑 Client 上线" || true)"
+ONLINE="$(strip "$SRV_LOG" | grep -c "new logical client online" || true)"
 
 echo "===== label=$LABEL srv=$SRV cli=$CLI pad=$PAD ====="
 echo "srv pad applied: $SRV_PAD  cli pad applied: $CLI_PAD  client online: $ONLINE"

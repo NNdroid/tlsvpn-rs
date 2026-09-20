@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # e2e_accept.sh — 总验收矩阵：档 A/B/C/D 落地后的跨语言互测。
 #
-#   P1 三项全开   —— pad_mode=bucket + session_token + min_enc=gcm
-#   P2 三项全关   —— 回退路径，回到特性引入前的行为
-#   P3 新旧混装   —— rs-new<->go-old / rs-old<->go-new（特性关闭 = fallback 模式）
-#   P4 opt-in 代价 —— 新特性字段对旧对端的影响
+#   P1 安全配置   —— pad_mode=bucket + min_enc=gcm + protocol v2
+#   P2 可选调优关闭 —— padding=off / 无 min_enc，但 protocol v2 仍强制
+#   P3 新旧混装   —— 默认必须拒绝缺少 protocol v2 的旧对端
+#   P4 兼容字段   —— session_token=false 不得关闭 v2 随机令牌保护
 #
 # 用自包含探针（--tap mem），协议级验证，不需要 CAP_NET_ADMIN。
 # 判据：探针退出 0 + 服务端日志无错误标记（解密失败/panic/校验失败/拒绝连接）。
 #
-# P3 和 P4 依赖特性引入前的旧二进制（E2E_RS_OLD_* / E2E_GO_OLD_BIN）。它们
-# 不在正常构建产物里，缺了就跳过那些用例并打印跳过了几组，而不是整体失败。
+# P3 依赖特性引入前的旧二进制（E2E_RS_OLD_* / E2E_GO_OLD_BIN）。它们
+# 不在正常构建产物里，缺了就跳过拒绝矩阵并打印跳过了几组，而不是整体失败。
 #
 # Env（见 e2e_lib.sh）：PORT_BASE 默认 18200，每例 +10
 set -uo pipefail
@@ -142,7 +142,7 @@ run_case() {
     echo "  --- probe tail ---"; tail -8 "$clog"
     echo "  --- server errors ---"; [ -n "$errs" ] && echo "$errs" || echo "  (无错误标记 → 探针 rc=$rc)"
     echo "  --- server feature lines ---"
-    e2e_strip "$slog" | grep -Ei 'EncAlgo|上线|session|token|拒绝|min_enc|padding|Confusion|bucket|legacy' | tail -6
+    e2e_strip "$slog" | grep -Ei 'EncAlgo|online|session|token|refused|min_enc|padding|Confusion|bucket' | tail -6
   fi
 }
 
@@ -180,37 +180,38 @@ if e2e_have E2E_RS_OLD_BIN && e2e_have E2E_RS_OLD_PROBE && e2e_have E2E_GO_OLD_B
 fi
 
 echo "=================================================================="
-echo " P1  三项全开：pad_mode=bucket + session_token + min_enc=gcm"
-echo "     探针声明 enc_algo=3(GCM-v2)，满足 min_enc 下限并走完独立密钥标签路径"
+echo " P1  安全配置：pad_mode=bucket + min_enc=gcm + protocol v2"
+echo "     探针声明 enc_algo=2(GCM)，满足 min_enc 下限"
 echo "=================================================================="
-run_case "rs->rs 全开"      rs rs bucket gcm 1 "--enc-algo 3"
-run_case "rs->go 全开"      rs go bucket gcm 1 "--enc-algo 3"
-run_case "go->rs 全开"      go rs "" "" "" "--enc-algo 3"
-run_case "go->go 全开"      go go "" "" "" "-enc-algo 3"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->rs" go rs "" "" "" "--enc-algo 3" "$CFGF"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->go" go go "" "" "" "-enc-algo 3" "$CFGF"
+run_case "rs->rs 全开"      rs rs bucket gcm 1 "--enc-algo 2"
+run_case "rs->go 全开"      rs go bucket gcm 1 "--enc-algo 2"
+run_case "go->rs 全开"      go rs "" "" "" "--enc-algo 2"
+run_case "go->go 全开"      go go "" "" "" "-enc-algo 2"
+go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->rs" go rs "" "" "" "--enc-algo 2" "$CFGF"
+go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->go" go go "" "" "" "-enc-algo 2" "$CFGF"
 
 echo ""
 echo "=================================================================="
-echo " P2  三项全关（回退路径）：pad_mode=legacy / 空，无 min_enc，无 session_token"
+echo " P2  可选调优关闭：padding=off / 无 min_enc；protocol v2 与随机令牌仍强制"
 echo "=================================================================="
-run_case "rs->rs 全关"  rs rs legacy "" "" ""
-run_case "rs->go 全关"  rs go legacy "" "" ""
+run_case "rs->rs 全关"  rs rs off "" "" ""
+run_case "rs->go 全关"  rs go off "" "" ""
 run_case "go->rs 全关"  go rs "" "" "" ""
 run_case "go->go 全关"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
-echo " P3  新旧混装（fallback 模式 = 特性全关）"
+echo " P3  新旧混装：默认拒绝缺少 protocol v2 / key epoch 的旧对端"
 echo "=================================================================="
 if [ "$HAVE_OLD" = 1 ]; then
-  run_case "rsNEW->goOLD"  rs goold legacy "" "" ""
-  run_case "rsNEW->goOLD2" rs goold "" "" "" ""
-  run_case "goOLD->rsNEW"  goold rs "" "" "" ""
-  run_case "rsOLD->goNEW"  rsold go "" "" "" ""
-  run_case "goNEW->rsOLD"  go rsold "" "" "" ""
-  run_case "rsOLD->goOLD"  rsold goold "" "" "" ""
-  run_case "goOLD->rsOLD"  goold rsold "" "" "" ""
+  run_case "rsNEW->goOLD 拒绝"  rs goold off "" "" "" "" fail
+  run_case "rsNEW->goOLD2 拒绝" rs goold "" "" "" "" "" fail
+  run_case "goOLD->rsNEW 拒绝"  goold rs "" "" "" "" "" fail
+  run_case "rsOLD->goNEW 拒绝"  rsold go "" "" "" "" "" fail
+  run_case "goNEW->rsOLD 拒绝"  go rsold "" "" "" "" "" fail
+  # 旧↔旧不再属于当前实现的兼容承诺；只验证所有含一端新版的降级均失败。
+  SKIP_N=$((SKIP_N + 2))
+  echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 2 组旧↔旧：不经过当前实现，无安全回归价值"
 else
   SKIP_N=$((SKIP_N + 7))
   echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 7 组：缺旧版二进制"
@@ -221,25 +222,11 @@ run_case "goNEW->goNEW"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
-echo " P4  session_token 开启后的兼容性"
-echo "     HandshakeResp 没有 deny_unknown_fields（只有关配置文件结构体才有），"
-echo "     所以「首次接入」对旧客户端无害：多出的 session_token 字段被直接忽略。"
-echo "     真实代价只出现在重连路径 —— 旧客户端拿不到令牌，重连会被拒。"
-echo "     那一半由 e2e_tok.sh 用真实客户端覆盖（本矩阵的探针不做重连）。"
+echo " P4  session_token 兼容字段：即使写 false，v2 随机令牌也不能被关闭"
+echo "     该字段只为 Go/Rust 配置文件互读保留；安全语义由 protocol v2 固定。"
 echo "=================================================================="
-if [ "$HAVE_OLD" = 1 ]; then
-  run_case "rsNEW(tok)->rsOLD 首次接入" rs rsold "" "" 1 ""
-else
-  SKIP_N=$((SKIP_N + 1))
-  echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：rsNEW(tok)->rsOLD 缺旧版 Rust 二进制"
-fi
-if [ "$HAVE_OLD" = 1 ]; then
-  go_cfg_now 1 true "" ""; run_case "goNEW(tok)->rsOLD 首次接入" go rsold "" "" "" "" "$CFGF"
-else
-  SKIP_N=$((SKIP_N + 1))
-  echo "  ${E2E_YELLOW}SKIP${E2E_RESET} 1 组：goNEW(tok)->rsOLD 缺旧版 Rust 探针"
-fi
-go_cfg_now 1 true "" ""; run_case "goNEW(tok)->go 首次接入"  go go "" "" "" "" "$CFGF"
+go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->rsNEW" go rs "" "" "" "" "$CFGF"
+go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->goNEW" go go "" "" "" "" "$CFGF"
 
 for d in "${TMPDIRS[@]}"; do rm -rf "$d"; done
 e2e_reap_all

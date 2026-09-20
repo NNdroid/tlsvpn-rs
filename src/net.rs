@@ -73,8 +73,10 @@ pub fn camouflage_probe(mut stream: std::net::TcpStream) {
     }
 }
 
+/// 返回是否真的把 shaping 生效到了这条连接上。面板的"已生效"计数只能信这个值，
+/// 配置里写了 brutal 不等于内核接了：模块没装或参数不被接受时 setsockopt 会静默失败。
 #[cfg(target_os = "linux")]
-pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, rate_mbps: u64) {
+pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, rate_mbps: u64) -> bool {
     let fd = stream.as_raw_fd();
     unsafe {
         let algo = b"brutal\0";
@@ -87,32 +89,36 @@ pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, rate_mbps: u64) {
         ) != 0
         {
             warn!("Failed to set TCP_CONGESTION=brutal.");
-            return;
+            return false;
         }
         let rate_bps = rate_mbps * 1000 * 1000 / 8;
         let mut params = [0u8; 12];
         params[0..8].copy_from_slice(&rate_bps.to_le_bytes());
         params[8..12].copy_from_slice(&20u32.to_le_bytes());
 
-        if libc::setsockopt(
+        let ok = libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             23301,
             params.as_ptr() as *const _,
             12,
-        ) == 0
-        {
+        ) == 0;
+        if ok {
             debug!("Applied TCP Brutal limit: {} Mbps", rate_mbps);
+        } else {
+            warn!("Failed to set TCP Brutal rate ({} Mbps).", rate_mbps);
         }
+        ok
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_tcp_brutal<S: AsRawFd>(_stream: &S, rate_mbps: u64) {
+pub fn apply_tcp_brutal<S: AsRawFd>(_stream: &S, rate_mbps: u64) -> bool {
     warn!(
         "TCP Brutal requested ({} Mbps) but only supported on Linux.",
         rate_mbps
     );
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -489,6 +495,7 @@ pub struct AsyncPort {
     backends: RwLock<Vec<Arc<Backend>>>,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
+    sequence_exhausted: AtomicBool,
 }
 
 impl AsyncPort {
@@ -500,12 +507,27 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
+            sequence_exhausted: AtomicBool::new(false),
         }
     }
 
     /// 挂载 XOR FEC 编码器（须在数据流开始前调用一次）
     pub fn attach_encoder(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         *self.encoder.lock() = Some(FecEncoder::new(k, ic));
+    }
+
+    pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
+        self.tx_seq.store(0, Ordering::Release);
+        self.sequence_exhausted.store(false, Ordering::Release);
+        *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
+            Some(FecEncoder::new(k, ic))
+        } else {
+            None
+        };
+    }
+
+    pub fn is_sequence_exhausted(&self) -> bool {
+        self.sequence_exhausted.load(Ordering::Acquire)
     }
 
     pub fn dropped(&self) -> u64 {
@@ -596,7 +618,10 @@ impl AsyncPort {
         if self.encoder.lock().is_some() {
             // XOR FEC：数据帧计入编码器（端口级串行，先分配 seq）；
             // 组满生成校验帧广播，数据帧本身按 MinRTT 单路发送。
-            let seq = self.next_seq();
+            let Some(seq) = self.next_seq() else {
+                self.drop_n(1);
+                return;
+            };
             let parity = {
                 let mut enc = self.encoder.lock();
                 match enc.as_mut().unwrap().add(seq, &frame) {
@@ -620,14 +645,20 @@ impl AsyncPort {
 
         if self.fec_mode {
             // 传统模式：同一帧复制到所有连接（旧版实现互通用）
-            let seq = self.next_seq();
+            let Some(seq) = self.next_seq() else {
+                self.drop_n(1);
+                return;
+            };
             for b in backends.iter() {
                 self.send_frame_to(b, seq, &frame);
             }
             return;
         }
 
-        let seq = self.next_seq();
+        let Some(seq) = self.next_seq() else {
+            self.drop_n(1);
+            return;
+        };
         if let Some(b) = self.pick_backend(&backends) {
             self.send_frame_to(&b, seq, &frame);
         } else {
@@ -635,13 +666,21 @@ impl AsyncPort {
         }
     }
 
-    fn next_seq(&self) -> u32 {
-        let mut seq = self.tx_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        if seq == 0 {
-            // 0 保留给控制/心跳帧
-            seq = self.tx_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    fn next_seq(&self) -> Option<u32> {
+        loop {
+            let current = self.tx_seq.load(Ordering::Acquire);
+            if current == u32::MAX {
+                self.sequence_exhausted.store(true, Ordering::Release);
+                return None;
+            }
+            if self
+                .tx_seq
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(current + 1);
+            }
         }
-        seq
     }
 }
 
@@ -663,7 +702,7 @@ pub struct VSwitch {
     // 复制到所有端口放大 N 倍。合法 ARP/mDNS 远低于该预算；超预算的帧直接
     // 丢弃（单播不受影响）。
     flood_mu: Mutex<HashMap<String, FloodBudget>>,
-    flood_burst: f64, // 桶容量（突发预算）
+    flood_burst: f64,        // 桶容量（突发预算）
     flood_rate_per_sec: f64, // 每秒补充令牌数
     flood_drops: AtomicU64,
     // 豁免洪泛预算的端口（本机 TAP）：网关自己发起的广播不受限
@@ -724,10 +763,7 @@ impl VSwitch {
     ///
     /// 注入方应捕获 `Weak<ServerCore>` 而不是 `Arc`——VSwitch 由 ServerCore
     /// 持有，直接捕获 `Arc` 会构成引用环，进程存活期内两者都无法释放。
-    pub fn set_validate_mac(
-        &self,
-        f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync>,
-    ) {
+    pub fn set_validate_mac(&self, f: Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync>) {
         *self.validate_mac.write() = Some(f);
     }
 
@@ -872,8 +908,7 @@ impl VSwitch {
             Some(b) => {
                 let elapsed = now.duration_since(b.last).as_secs_f64();
                 if elapsed > 0.0 {
-                    b.tokens = (b.tokens + elapsed * self.flood_rate_per_sec)
-                        .min(self.flood_burst);
+                    b.tokens = (b.tokens + elapsed * self.flood_rate_per_sec).min(self.flood_burst);
                     b.last = now;
                 }
                 if b.tokens < 1.0 {
@@ -895,10 +930,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
-    type TestBackend = (
-        Arc<Backend>,
-        crossbeam_channel::Receiver<VPNFrame>,
-    );
+    type TestBackend = (Arc<Backend>, crossbeam_channel::Receiver<VPNFrame>);
 
     fn make_backend() -> TestBackend {
         let (tx, rx) = crossbeam_channel::bounded(256);
@@ -912,10 +944,21 @@ mod tests {
         )
     }
 
+    #[test]
+    fn async_port_sequence_stops_before_wrap() {
+        let port = AsyncPort::new("sequence-test".into(), false);
+        port.tx_seq.store(u32::MAX - 1, Ordering::Release);
+        assert_eq!(port.next_seq(), Some(u32::MAX));
+        assert_eq!(port.next_seq(), None);
+        assert_eq!(port.next_seq(), None);
+        assert!(port.is_sequence_exhausted());
+        port.reset_epoch(0, None);
+        assert_eq!(port.next_seq(), Some(1));
+        assert!(!port.is_sequence_exhausted());
+    }
+
     /// 从收帧端取走当前所有帧的载荷末字节（测试断言顺序与内容用）
-    fn drained_last_byte(
-        rx: &crossbeam_channel::Receiver<VPNFrame>,
-    ) -> Vec<u8> {
+    fn drained_last_byte(rx: &crossbeam_channel::Receiver<VPNFrame>) -> Vec<u8> {
         let mut out = Vec::new();
         while let Ok(f) = rx.try_recv() {
             out.push(f.data[f.data.len() - 1]);
@@ -938,11 +981,9 @@ mod tests {
     fn ownership_callback(
         reg: std::collections::HashMap<String, [u8; 6]>,
     ) -> Arc<dyn Fn(&str, &[u8; 6]) -> bool + Send + Sync> {
-        Arc::new(move |port_id, mac| {
-            match reg.get(port_id) {
-                Some(r) if r != &[0u8; 6] => r == mac,
-                _ => true,
-            }
+        Arc::new(move |port_id, mac| match reg.get(port_id) {
+            Some(r) if r != &[0u8; 6] => r == mac,
+            _ => true,
         })
     }
 
@@ -974,25 +1015,13 @@ mod tests {
             "A 的 MAC 表项必须指向端口 A"
         );
         assert_eq!(vs.mac_port(&mac_b), Some("B".to_string()));
-        assert_eq!(
-            drained_last_byte(&rx_b),
-            vec![0x01],
-            "合法帧必须照常投递"
-        );
-        assert_eq!(
-            drained_last_byte(&rx_a),
-            vec![0x02],
-            "合法帧必须照常投递"
-        );
+        assert_eq!(drained_last_byte(&rx_b), vec![0x01], "合法帧必须照常投递");
+        assert_eq!(drained_last_byte(&rx_a), vec![0x02], "合法帧必须照常投递");
         assert_eq!(vs.spoof_drops(), 0);
 
         // 冒充：B 声明 A 的 MAC 想抢走 A 的表项 —— 整帧丢弃
         vs.process_frame("B", eth_frame(&[0, 0, 0, 0, 0, 0], &mac_a, &[0xAA]));
-        assert_eq!(
-            vs.spoof_drops(),
-            1,
-            "冒充源 MAC 的帧必须被计数"
-        );
+        assert_eq!(vs.spoof_drops(), 1, "冒充源 MAC 的帧必须被计数");
         assert_eq!(
             vs.mac_port(&mac_a),
             Some("A".to_string()),
@@ -1023,9 +1052,10 @@ mod tests {
 
         // 未上报 MAC 的会话（全零注册值）放行，保持与旧客户端兼容
         let vs2 = VSwitch::new();
-        vs2.set_validate_mac(ownership_callback(std::collections::HashMap::from([
-            ("C".to_string(), [0u8; 6]),
-        ])));
+        vs2.set_validate_mac(ownership_callback(std::collections::HashMap::from([(
+            "C".to_string(),
+            [0u8; 6],
+        )])));
         vs2.process_frame("C", eth_frame(&[0, 0, 0, 0, 0, 0], &[0x07; 6], &[0x05]));
         assert_eq!(
             vs2.mac_port(&[0x07; 6]),
@@ -1052,10 +1082,7 @@ mod tests {
             ("B".to_string(), [0xBB; 6]),
         ])));
 
-        vs.process_frame(
-            TAP_PORT_ID,
-            eth_frame(&[0xff; 6], &[0xEE; 6], &[0x01]),
-        );
+        vs.process_frame(TAP_PORT_ID, eth_frame(&[0xff; 6], &[0xEE; 6], &[0x01]));
         assert_eq!(
             drained_last_byte(&rx_a),
             vec![0x01],
@@ -1066,11 +1093,7 @@ mod tests {
             vec![0x01],
             "广播帧必须投递到所有其他端口"
         );
-        assert_eq!(
-            vs.spoof_drops(),
-            0,
-            "豁免端口的广播不得计入冒充丢弃"
-        );
+        assert_eq!(vs.spoof_drops(), 0, "豁免端口的广播不得计入冒充丢弃");
         assert_eq!(
             vs.mac_port(&[0xEE; 6]),
             Some(TAP_PORT_ID.to_string()),
@@ -1087,25 +1110,19 @@ mod tests {
         let port_a = Arc::new(AsyncPort::new("A".into(), false));
         port_a.register_backend(backend_a);
         vs.add_port("A".into(), port_a);
-        vs.set_validate_mac(ownership_callback(std::collections::HashMap::from([
-            ("A".to_string(), [0xAA; 6]),
-        ])));
+        vs.set_validate_mac(ownership_callback(std::collections::HashMap::from([(
+            "A".to_string(),
+            [0xAA; 6],
+        )])));
 
-        vs.process_frame(
-            "A",
-            eth_frame(&[0xff; 6], &[0xDD; 6], &[0x01]),
-        );
+        vs.process_frame("A", eth_frame(&[0xff; 6], &[0xDD; 6], &[0x01]));
         assert_eq!(vs.spoof_drops(), 1, "冒充广播必须被计数");
         assert_eq!(
             drained_last_byte(&rx_a),
             Vec::<u8>::new(),
             "冒充广播必须整帧丢弃"
         );
-        assert_eq!(
-            vs.mac_port(&[0xDD; 6]),
-            None,
-            "冒充广播不得进入学习表"
-        );
+        assert_eq!(vs.mac_port(&[0xDD; 6]), None, "冒充广播不得进入学习表");
     }
 
     #[test]
@@ -1139,8 +1156,7 @@ mod tests {
         let vs = VSwitch::new();
         assert_eq!(vs.flood_burst, 8192.0, "对齐 Go NewVSwitch 的 floodBurst");
         assert_eq!(
-            vs.flood_rate_per_sec,
-            16384.0,
+            vs.flood_rate_per_sec, 16384.0,
             "对齐 Go NewVSwitch 的 floodRatePerSec"
         );
         assert_eq!(vs.trusted_port, TAP_PORT_ID, "本机 TAP 豁免洪泛预算");
@@ -1148,10 +1164,7 @@ mod tests {
         // 预算内的满量洪泛一帧都不能丢。回充只会增加预算，所以这条断言不会因
         // 时钟漂移误报；反方向（何时开始丢）交给小桶测试验证
         for _ in 0..8192 {
-            vs.process_frame(
-                "A",
-                eth_frame(&[0xff; 6], &[0xDD; 6], &[1]),
-            );
+            vs.process_frame("A", eth_frame(&[0xff; 6], &[0xDD; 6], &[1]));
         }
         assert_eq!(vs.flood_drops(), 0, "8192 帧洪泛必须全部通过");
     }
@@ -1215,16 +1228,9 @@ mod tests {
         vs.add_port("B".into(), port_b);
 
         for i in 0..10u8 {
-            vs.process_frame(
-                TAP_PORT_ID,
-                eth_frame(&[0xff; 6], &[0xEE; 6], &[i]),
-            );
+            vs.process_frame(TAP_PORT_ID, eth_frame(&[0xff; 6], &[0xEE; 6], &[i]));
         }
-        assert_eq!(
-            vs.flood_drops(),
-            0,
-            "本机 TAP 的洪泛不得计入预算丢弃"
-        );
+        assert_eq!(vs.flood_drops(), 0, "本机 TAP 的洪泛不得计入预算丢弃");
         assert_eq!(
             drained_last_byte(&rx_b).len(),
             10,

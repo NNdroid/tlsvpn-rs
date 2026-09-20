@@ -1,11 +1,8 @@
-use aes::Aes256;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
-
-pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
 pub fn ip4_to_u32(ip: &str) -> u32 {
     u32::from_be_bytes(
@@ -144,9 +141,9 @@ pub fn parse_config_mac(s: &str) -> Result<Option<[u8; 6]>, String> {
             s
         ));
     };
-    if m[0] & 1 != 0 {
+    if m == [0u8; 6] || m[0] & 1 != 0 {
         return Err(format!(
-            "mac 配置值 {:?} 的本地位被置位（组播/广播地址），无法作为 TAP 地址",
+            "mac 配置值 {:?} 必须是非零单播地址，无法作为 TAP 地址",
             s
         ));
     }
@@ -176,6 +173,23 @@ pub fn parse_mac_key(s: &str) -> Option<[u8; 6]> {
 /// utils.isValidMACString。
 pub fn is_valid_mac_string(s: &str) -> bool {
     s.is_empty() || parse_mac_key(s).is_some()
+}
+
+pub fn is_valid_session_mac(s: &str) -> bool {
+    matches!(parse_mac_key(s), Some(m) if m != [0u8; 6] && m[0] & 1 == 0)
+}
+
+pub fn canonical_mac(s: &str) -> Option<String> {
+    parse_mac_key(s).map(|m| {
+        format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        )
+    })
+}
+
+pub fn is_valid_client_instance(s: &str) -> bool {
+    (16..=64).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
 }
 
 /// 在 tap 上配置隧道地址的 `ip` 子命令序列（不含 `ip` 本身）。
@@ -261,7 +275,7 @@ mod tests {
             "\n",
             "123e4567-e89b-12d3-a456-42661417400", // 少 1 字符
             "123e4567-e89b-12d3-a456-4266141740000", // 多 1 字符
-            "g23e4567-e89b-12d3-a456-42661417400",  // 非 hex 数字
+            "g23e4567-e89b-12d3-a456-42661417400", // 非 hex 数字
             "123e4567_e89b-12d3-a456-426614174000", // 连字符位置错
             "123e4567e89b12d3a4564266141740000",   // 缺连字符
             "bad\nid-with-log-forging-attempt-xxxxxxxxxxxx", // 换行注入
@@ -316,8 +330,15 @@ mod tests {
         assert_eq!(parse_mac_key("00:00:00:00:00:00"), Some([0u8; 6]));
 
         for s in [
-            "", ":", "aa:", ":aa", "aa:bb", "aa:bb:cc:dd:ee:ff:gg", "aa bb",
-            "aa", "zz:11:22:33:44:55",
+            "",
+            ":",
+            "aa:",
+            ":aa",
+            "aa:bb",
+            "aa:bb:cc:dd:ee:ff:gg",
+            "aa bb",
+            "aa",
+            "zz:11:22:33:44:55",
         ] {
             assert!(parse_mac_key(s).is_none(), "parse_mac_key({s:?}) 应失败");
         }
@@ -327,11 +348,7 @@ mod tests {
     fn parse_config_mac_empty_ok_and_rejects_garbage_or_local_bit() {
         // 未配置：空串是合法的"没设置"，不能与解析失败混淆
         assert_eq!(parse_config_mac("").unwrap(), None);
-        // 全 0 合法且必须与 None 区分（否则会被当成"没设置"）
-        assert_eq!(
-            parse_config_mac("00:00:00:00:00:00").unwrap(),
-            Some([0u8; 6])
-        );
+        assert!(parse_config_mac("00:00:00:00:00:00").is_err());
         assert_eq!(
             parse_config_mac("aa:bb:cc:dd:ee:ff").unwrap(),
             Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
@@ -339,11 +356,13 @@ mod tests {
         assert!(parse_config_mac("AA:BB:CC:DD:EE:FF").unwrap().is_some());
 
         for s in [
-            "aa:bb:cc:dd:ee",         // 少一段
-            "aa:bb:cc:dd:ee:ff:00",   // 多一段
-            "zz:11:22:33:44:55",      // 非 hex
-            "aa:bb:cc:dd:ee:ff:",     // 尾随冒号
-            "1", "aa bb", "00:1a:2b:3c:4d",
+            "aa:bb:cc:dd:ee",       // 少一段
+            "aa:bb:cc:dd:ee:ff:00", // 多一段
+            "zz:11:22:33:44:55",    // 非 hex
+            "aa:bb:cc:dd:ee:ff:",   // 尾随冒号
+            "1",
+            "aa bb",
+            "00:1a:2b:3c:4d",
         ] {
             assert!(
                 parse_config_mac(s).is_err(),
@@ -359,26 +378,56 @@ mod tests {
         ] {
             let err = parse_config_mac(s).unwrap_err();
             assert!(
-                err.contains("本地位"),
+                err.contains("非零单播"),
                 "parse_config_mac({s:?}) 应拒绝组播地址，实际: {err}"
             );
         }
     }
 
     #[test]
+    fn client_instance_validation_matches_go() {
+        for s in [
+            "123e4567-e89b-12d3-a456-426614174000",
+            "0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(is_valid_client_instance(s));
+        }
+        for s in ["", "short", "instance\nforged-log-line"] {
+            assert!(!is_valid_client_instance(s));
+        }
+        assert!(!is_valid_client_instance(&"a".repeat(65)));
+    }
+
+    #[test]
     fn is_valid_cidr_accepts_bare_ips_and_rejects_garbage() {
         // 与 Go net.ParseCIDR 一致：裸 IP 合法
         for s in [
-            "10.0.0.0/24", "10.0.0.1", "127.0.0.0/8", "192.168.1.0/32",
-            " fd00::/64 ", "fd00::1", "::ffff:10.0.0.0/120",
+            "10.0.0.0/24",
+            "10.0.0.1",
+            "127.0.0.0/8",
+            "192.168.1.0/32",
+            " fd00::/64 ",
+            "fd00::1",
+            "::ffff:10.0.0.0/120",
         ] {
             let v6 = s.trim().contains(':');
             assert!(is_valid_cidr(s, v6), "合法 CIDR {s:?} 被误拒");
         }
         for s in [
-            "", "  ", "10.0.0.0/33", "10.0.0.0/", "/24", "10.0.0.0/24/",
-            "10.0.0.0/-1", "10.0.0.0/abc", "not-a-cidr", "10.0.0.256/24",
-            "256.0.0.0/8", "fd00::zzz/64", "fd00::/129", "::ffff:10.0.0.0/200",
+            "",
+            "  ",
+            "10.0.0.0/33",
+            "10.0.0.0/",
+            "/24",
+            "10.0.0.0/24/",
+            "10.0.0.0/-1",
+            "10.0.0.0/abc",
+            "not-a-cidr",
+            "10.0.0.256/24",
+            "256.0.0.0/8",
+            "fd00::zzz/64",
+            "fd00::/129",
+            "::ffff:10.0.0.0/200",
             "10.0.0.0/128",
         ] {
             let v6 = s.trim().contains(':');
@@ -401,7 +450,10 @@ mod tests {
         // 第一条必须是 link up：bind 要求 IFF_UP，且 v6 地址在接口 up 的瞬间
         // 会重新触发 DAD，先挂地址再 up 会让 web.bind=tunnel 白等一个探测窗口
         assert_eq!(cmds[0], &["link", "set", "dev", "tap0", "up"][..]);
-        assert_eq!(cmds[1], &["addr", "replace", "10.0.0.1/24", "dev", "tap0"][..]);
+        assert_eq!(
+            cmds[1],
+            &["addr", "replace", "10.0.0.1/24", "dev", "tap0"][..]
+        );
 
         // v6：nodad 让地址挂上即生效（拿不到 RA 时一直 tentative，v6 面板绑定
         // 永久失败）；replace 而不是 add（地址还在时 add 报 File exists）
@@ -423,7 +475,13 @@ mod tests {
             assert!(!web_addr_is_public(a), "回环 {a} 不应算对外");
         }
         // 对外（含"所有地址"写法）：要出提示
-        for a in ["0.0.0.0:8080", "[::]:8080", "10.5.8.2:8080", "[fd99::1]:8000", "192.168.1.5:443"] {
+        for a in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.5.8.2:8080",
+            "[fd99::1]:8000",
+            "192.168.1.5:443",
+        ] {
             assert!(web_addr_is_public(a), "{a} 应算对外");
         }
         // 解析不出来：Go SplitHostPort 出错时按"不是对外"处理，这里保持一致

@@ -9,12 +9,13 @@
 //
 // 运行：
 //   TLSVPN_GOLDEN_OUT=path/to/protocol_golden.json cargo test --test gen_golden -- --ignored --nocapture
+//
+// 注意：字段集合必须与 Go 的 testdata/protocol_golden.json 保持同构，
+// 否则 protocol_conformance.rs 会因缺字段而解析失败、整组静默跳过。
 
-use aes::Aes256;
-use ctr::cipher::{KeyIvInit, StreamCipher};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
-
-type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
 fn hash_psk(psk: &str) -> String {
     let mut h = Sha256::new();
@@ -22,25 +23,39 @@ fn hash_psk(psk: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn get_cipher_context(psk: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut kh = Sha256::new();
-    kh.update(format!("{}_enc_key", psk).as_bytes());
-    let key = kh.finalize().to_vec();
-    let mut ih = Sha256::new();
-    ih.update(format!("{}_enc_iv", psk).as_bytes());
-    let iv = ih.finalize()[..16].to_vec();
-    (key, iv)
+/// 密钥标签与 Go `gcmKeyLabel` 逐字一致：数据面 `sha256(psk ‖ "_enc_key")`，
+/// FEC 面再拼一个 "_fec" 后缀，实现两个域之间的密钥分离。
+fn gcm_key(psk: &str, domain: &str) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(psk.as_bytes());
+    let label: &[u8] = if domain == "fec" { b"_enc_key_fec" } else { b"_enc_key" };
+    h.update(label);
+    h.finalize().to_vec()
 }
 
-fn xor_crypt(data: &mut [u8], seq: u32, key: &[u8], base_iv: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(base_iv);
-    iv[12..16].copy_from_slice(&seq.to_be_bytes());
-    let mut c = Aes256Ctr::new_from_slices(key, &iv).unwrap();
-    c.apply_keystream(data);
+/// 与 src/crypto.rs::InnerCipher::gcm_domain 同构：nonce = seq‖salt，AAD = wireLen‖seq。
+fn gcm_domain_ciphertext(
+    psk: &str,
+    domain: &str,
+    salt_hex: &str,
+    seq: u32,
+    plaintext: &[u8],
+) -> String {
+    let salt = hex::decode(salt_hex).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&gcm_key(psk, domain)).unwrap();
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(&seq.to_be_bytes());
+    nonce[4..].copy_from_slice(&salt);
+    let wire_len = (plaintext.len() + 16) as u32;
+    let mut aad = [0u8; 8];
+    aad[..4].copy_from_slice(&wire_len.to_be_bytes());
+    aad[4..].copy_from_slice(&seq.to_be_bytes());
+    let mut buf = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut buf)
+        .unwrap();
+    buf.extend_from_slice(&tag);
+    hex::encode(buf)
 }
 
 #[test]
@@ -48,55 +63,44 @@ fn xor_crypt(data: &mut [u8], seq: u32, key: &[u8], base_iv: &[u8]) {
 fn generate_golden_vectors() {
     use serde_json::json;
 
-    let psks = [
-        "",
-        "test_psk",
-        "my_super_secret_test_key",
-        "中文密钥🔑",
-        "a",
-    ];
+    let psks = ["", "test_psk", "my_super_secret_test_key", "中文密钥🔑", "a"];
+    let psk_hashes: Vec<_> = psks
+        .iter()
+        .map(|psk| json!({ "psk": psk, "hash": hash_psk(psk) }))
+        .collect();
 
-    let mut cipher_contexts = Vec::new();
-    let mut psk_hashes = Vec::new();
-    for psk in psks {
-        let (key, iv) = get_cipher_context(psk);
-        cipher_contexts.push(json!({
-            "psk": psk,
-            "key_hex": hex::encode(&key),
-            "iv_hex": hex::encode(&iv),
-        }));
-        psk_hashes.push(json!({ "psk": psk, "hash": hash_psk(psk) }));
-    }
-
-    let cases: Vec<(&str, u32, Vec<u8>)> = vec![
-        ("test_psk", 0, b"hello".to_vec()),
-        ("test_psk", 1, b"hello".to_vec()),
+    // 与 Go 侧固定的跨语言向量完全一致（盐、序号、明文都不随机），
+    // 所以两份文件可以直接逐字节比对。
+    let domain_cases: [(&str, &str, &str, u32, &str); 2] = [
         (
-            "test_psk",
-            42,
-            b"The quick brown fox jumps over the lazy dog".to_vec(),
+            "cross-language-domain-vector",
+            "0011223344556677",
+            "data",
+            16909060,
+            "65746865726e65742d7061796c6f6164",
         ),
-        ("test_psk", 4294967295, vec![0x00, 0xFF, 0x7F, 0x80]),
-        ("my_super_secret_test_key", 12345, vec![0xAB; 64]),
         (
-            "中文密钥🔑",
-            7,
-            "多字节 PSK 派生必须一致".as_bytes().to_vec(),
+            "cross-language-domain-vector",
+            "0011223344556677",
+            "fec",
+            16909060,
+            "65746865726e65742d7061796c6f6164",
         ),
     ];
-
-    let mut xor_vectors = Vec::new();
-    for (psk, seq, data) in &cases {
-        let (key, iv) = get_cipher_context(psk);
-        let mut buf = data.clone();
-        xor_crypt(&mut buf, *seq, &key, &iv);
-        xor_vectors.push(json!({
-            "psk": psk,
-            "seq": seq,
-            "plaintext_hex": hex::encode(data),
-            "ciphertext_hex": hex::encode(&buf),
-        }));
-    }
+    let gcm_domain_vectors: Vec<_> = domain_cases
+        .iter()
+        .map(|(psk, salt, domain, seq, pt_hex)| {
+            let pt = hex::decode(pt_hex).unwrap();
+            json!({
+                "psk": psk,
+                "salt_hex": salt,
+                "domain": domain,
+                "seq": seq,
+                "plaintext_hex": pt_hex,
+                "ciphertext_hex": gcm_domain_ciphertext(psk, domain, salt, *seq, &pt),
+            })
+        })
+        .collect();
 
     let headers: [(u32, u16, u32); 4] = [
         (0, 0, 0),
@@ -118,18 +122,17 @@ fn generate_golden_vectors() {
 
     let out = json!({
         "version": 1,
-        "cipher_contexts": cipher_contexts,
-        "xor_vectors": xor_vectors,
         "psk_hashes": psk_hashes,
+        "gcm_domain_vectors": gcm_domain_vectors,
         "frame_headers": frame_headers,
         "handshake_req_keys": [
-            "brutal_rx","brutal_tx","client_id","encrypt","fec",
-            "ipv4","ipv6","mac","padding","psk"
+            "brutal_rx","brutal_tx","client_id","client_instance","enc_algo","encrypt","fec",
+            "fec_group","ipv4","ipv6","mac","padding","protocol_version","psk","session_token"
         ],
         "handshake_resp_keys": [
-            "brutal_rx","brutal_tx","client_id","encrypt","fec",
-            "gw_v4","gw_v6","ipv4","ipv6","message","padding",
-            "session_id","success"
+            "brutal_rx","brutal_tx","client_id","enc_algo","enc_salt","enc_salt2","encrypt","fec",
+            "fec_group","gw_v4","gw_v6","ipv4","ipv6","message","padding","protocol_version",
+            "session_epoch","session_id","session_token","success"
         ],
     });
 

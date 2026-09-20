@@ -177,3 +177,18 @@ impl ReorderBuffer {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_replay_sequence_is_delivered_only_once() {
+        let mut rb = ReorderBuffer::new();
+        let first = rb.insert(42, Arc::new(vec![0x41]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].as_slice(), &[0x41]);
+        let replay = rb.insert(42, Arc::new(vec![0x42]));
+        assert!(replay.is_empty());
+    }
+}

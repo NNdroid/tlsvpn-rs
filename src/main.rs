@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 // mimalloc：每帧多次 malloc/free 的场景下比系统分配器快 10-20%
@@ -18,7 +19,7 @@ pub mod socks5;
 pub mod tap;
 pub mod utils;
 
-use crate::api::init_logging;
+use crate::api::{init_logging, RuntimeCtx};
 use crate::buffer::*;
 use crate::client::*;
 use crate::server::*;
@@ -158,11 +159,7 @@ fn load_config_file(path: &str) -> Result<Args, String> {
 
     let mut args = Args {
         mode: cfg.mode.clone(),
-        psk: if cfg.psk.is_empty() {
-            "quic_secret".into()
-        } else {
-            cfg.psk
-        },
+        psk: cfg.psk,
         tap: if cfg.tap.is_empty() {
             "tap0".into()
         } else {
@@ -178,7 +175,11 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         encrypt: if encrypt_present { cfg.encrypt } else { true },
         encrypt_present,
         pad_mode: cfg.pad_mode,
-        min_enc: cfg.min_enc,
+        min_enc: if (if encrypt_present { cfg.encrypt } else { true }) && cfg.min_enc.is_empty() {
+            "gcm".into()
+        } else {
+            cfg.min_enc
+        },
         socks5: cfg.socks5,
         workers: cfg.workers,
         // Go 的配置文件不含 mtu 字段；缺省必须取 flag 默认值 1500，
@@ -270,11 +271,23 @@ fn validate_args(args: &Args) -> Result<(), String> {
         "server" | "client" => {}
         "" => return Err("mode is required (server or client)".into()),
         other => {
-            return Err(format!("invalid mode {:?} (must be server or client)", other))
+            return Err(format!(
+                "invalid mode {:?} (must be server or client)",
+                other
+            ))
         }
     }
     if args.addr.is_empty() {
         return Err("addr is required".into());
+    }
+    match args.psk.trim().to_ascii_lowercase().as_str() {
+        "" => return Err("psk is required; generate a high-entropy random secret".into()),
+        "quic_secret" | "change-me" | "change-me-please" | "replace-with-a-random-secret" => {
+            return Err(
+                "psk uses a known placeholder; replace it with a high-entropy random secret".into(),
+            )
+        }
+        _ => {}
     }
     // log_level 是闭集（对齐 Go 的 zapcore.Level.UnmarshalText）。之前不校验，
     // 任意拼错的串都塞进 EnvFilter，只会得到「日志行为莫名变化」这种最难受的
@@ -290,21 +303,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
         }
     }
     // mac 格式：只用于算 client_id 时拼错不会报错，静默变成另一台客户端。
-    if !crate::utils::is_valid_mac_string(&args.mac) {
+    if !args.mac.is_empty() && !crate::utils::is_valid_session_mac(&args.mac) {
         return Err(format!(
-            "invalid mac {:?} (want aa:bb:cc:dd:ee:ff)",
+            "invalid mac {:?} (want a non-zero unicast aa:bb:cc:dd:ee:ff address)",
             args.mac
         ));
     }
     // web.bind 闭集；未知值历史上会被当成 "all" 静默处理
     match args.web_bind.as_str() {
         "" | "all" | "tunnel" => {}
-        other => {
-            return Err(format!(
-                "invalid web.bind {:?} (want all or tunnel)",
-                other
-            ))
-        }
+        other => return Err(format!("invalid web.bind {:?} (want all or tunnel)", other)),
     }
     // web.auth 必须带冒号。check_basic_auth 对非空串一律要求 Basic 头，
     // 写 "admin" 这种没有冒号的值会让面板对所有人 401。
@@ -313,6 +321,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
             "invalid web.auth {:?} (want user:password)",
             args.web_auth
         ));
+    }
+    if args.web_auth.eq_ignore_ascii_case("admin:change-me")
+        || args
+            .web_auth
+            .eq_ignore_ascii_case("admin:replace-with-a-random-password")
+    {
+        return Err("web.auth uses a known placeholder; replace it with a unique password".into());
+    }
+    if !args.web.is_empty() && args.web_auth.is_empty() {
+        return Err("web.auth is required whenever the dashboard is enabled".into());
     }
     // web.cert / web.key：都空 = 明文 HTTP，都非空 = HTTPS，只填一个是错的
     // （tiny_http 需要一个成对的 SslConfig）。必须在启动前断掉：否则面板管理
@@ -332,6 +350,15 @@ fn validate_args(args: &Args) -> Result<(), String> {
         if let Err(e) = config_file_readable("web.key", &args.web_key) {
             return Err(e);
         }
+    }
+    if !args.web.is_empty()
+        && args.web_bind == "all"
+        && crate::utils::web_addr_is_public(&args.web)
+        && (!has_cert || !has_key)
+    {
+        return Err(
+            "web.cert and web.key are required for a non-loopback dashboard listener".into(),
+        );
     }
     if args.mode == "server" {
         // parse_v4_cidr / parse_v6_cidr 遇到不可解析的串会回落到默认网段，
@@ -353,21 +380,18 @@ fn validate_args(args: &Args) -> Result<(), String> {
             });
         }
     }
-    // 配置加载层强校验；set_pad_mode 的 legacy 回落只兜住面板热更路径
+    // 配置加载层强校验；set_pad_mode 的 bucket 回落只兜住面板热更路径
     if !crypto::pad_mode_valid(&args.pad_mode) {
         return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
     }
     // min_enc 取大小写敏感的闭集；"any" 与空串等价（都等于不设下限）
     match args.min_enc.as_str() {
-        "" | "any" | "ctr" | "legacy" | "gcm" => {}
+        "" | "any" | "gcm" => {}
         _ => return Err(crypto::min_enc_invalid_error(&args.min_enc)),
     }
     // 关着 encrypt 配 min_enc 是矛盾配置：没有内层加密谈何强度下限
     if !args.min_enc.is_empty() && !args.encrypt {
-        return Err(format!(
-            "min_enc {:?} requires encrypt=true",
-            args.min_enc
-        ));
+        return Err(format!("min_enc {:?} requires encrypt=true", args.min_enc));
     }
     if args.mode == "client" {
         if args.conns < 1 {
@@ -381,9 +405,12 @@ fn validate_args(args: &Args) -> Result<(), String> {
         }
         if !args.cert_sha256.is_empty() {
             let cleaned = args.cert_sha256.replace(':', "").to_lowercase();
-            if cleaned.len() != 64 {
+            if cleaned.len() != 64 || !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("client cert_sha256 must be 64 hex chars (sha256)".into());
             }
+        }
+        if args.insecure && !args.cert_sha256.is_empty() {
+            return Err("client.insecure and client.cert_sha256 cannot be enabled together".into());
         }
     }
     // 上限是拒绝服务阀值：负数无意义，超大值等于关掉保护（对齐 Go Validate）
@@ -498,22 +525,52 @@ fn main() {
     // 默认值」的项提示，默认值说明配置里根本没写，不值得刷一条 warning。
     let mut ignored = Vec::new();
     if args.mode == "server" {
-        if !args.req_v4.is_empty() { ignored.push("client.req_v4"); }
-        if !args.req_v6.is_empty() { ignored.push("client.req_v6"); }
-        if args.sni != "www.cloudflare.com" { ignored.push("client.sni"); }
-        if args.insecure { ignored.push("client.insecure"); }
-        if !args.cert_sha256.is_empty() { ignored.push("client.cert_sha256"); }
-        if args.fwmark != 0 { ignored.push("client.fwmark"); }
-        if args.conns != 1 { ignored.push("client.conns"); }
-        if args.fec { ignored.push("client.fec"); }
-        if args.fec_group != 4 { ignored.push("client.fec_group"); }
+        if !args.req_v4.is_empty() {
+            ignored.push("client.req_v4");
+        }
+        if !args.req_v6.is_empty() {
+            ignored.push("client.req_v6");
+        }
+        if args.sni != "www.cloudflare.com" {
+            ignored.push("client.sni");
+        }
+        if args.insecure {
+            ignored.push("client.insecure");
+        }
+        if !args.cert_sha256.is_empty() {
+            ignored.push("client.cert_sha256");
+        }
+        if args.fwmark != 0 {
+            ignored.push("client.fwmark");
+        }
+        if args.conns != 1 {
+            ignored.push("client.conns");
+        }
+        if args.fec {
+            ignored.push("client.fec");
+        }
+        if args.fec_group != 4 {
+            ignored.push("client.fec_group");
+        }
     } else if args.mode == "client" {
-        if args.v4cidr != "10.0.0.0/24" { ignored.push("server.v4_cidr"); }
-        if args.v6cidr != "fd00::/64" { ignored.push("server.v6_cidr"); }
-        if !args.cert.is_empty() { ignored.push("server.cert"); }
-        if !args.key.is_empty() { ignored.push("server.key"); }
-        if args.session_token { ignored.push("server.session_token"); }
-        if args.max_sessions != 1024 { ignored.push("server.max_sessions"); }
+        if args.v4cidr != "10.0.0.0/24" {
+            ignored.push("server.v4_cidr");
+        }
+        if args.v6cidr != "fd00::/64" {
+            ignored.push("server.v6_cidr");
+        }
+        if !args.cert.is_empty() {
+            ignored.push("server.cert");
+        }
+        if !args.key.is_empty() {
+            ignored.push("server.key");
+        }
+        if args.session_token {
+            ignored.push("server.session_token");
+        }
+        if args.max_sessions != 1024 {
+            ignored.push("server.max_sessions");
+        }
     }
     if !ignored.is_empty() {
         warn!(
@@ -525,10 +582,14 @@ fn main() {
 
     match args.mode.as_str() {
         "server" => {
-            start_server(&args);
+            start_server(&args, Arc::new(RuntimeCtx::from_args(&args, &config_path)));
         }
         "client" => {
-            start_client(&args, &config_path);
+            start_client(
+                &args,
+                &config_path,
+                Arc::new(RuntimeCtx::from_args(&args, &config_path)),
+            );
             on_exit_cleanup();
         }
         other => {
@@ -555,10 +616,9 @@ fn install_signal_handler() {
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::*;
     use crate::crypto::*;
     use crate::frame::*;
-    use crate::{Args, ConfigFile, example_config_json, load_config_file, validate_args};
+    use crate::{example_config_json, load_config_file, validate_args, Args, ConfigFile};
     use std::io::Read;
     use std::time::Instant;
 
@@ -567,7 +627,7 @@ mod tests {
     // Go 仓库 config.server.json 的原样内容
     const GO_SERVER_CONFIG: &str = r#"{
   "mode": "server",
-  "psk": "change-me-please",
+  "psk": "test-only-high-entropy-secret-4e390397818f",
   "addr": ":4000",
   "log_level": "info",
   "encrypt": true,
@@ -580,7 +640,7 @@ mod tests {
   "web": {
     "addr": ":8080",
     "bind": "tunnel",
-    "auth": "admin:change-me",
+    "auth": "admin:test-only-password-9b9f5d25",
     "cert": "",
     "key": ""
   },
@@ -589,7 +649,7 @@ mod tests {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": false,
+    "session_token": true,
     "max_sessions": 1024
   }
 }
@@ -598,7 +658,7 @@ mod tests {
     // Go 仓库 config.client.json 的原样内容
     const GO_CLIENT_CONFIG: &str = r#"{
   "mode": "client",
-  "psk": "change-me-please",
+  "psk": "test-only-high-entropy-secret-4e390397818f",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
   "encrypt": true,
@@ -612,7 +672,7 @@ mod tests {
   "web": {
     "addr": ":8080",
     "bind": "tunnel",
-    "auth": "admin:change-me",
+    "auth": "admin:test-only-password-9b9f5d25",
     "cert": "",
     "key": ""
   },
@@ -639,7 +699,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Go {} 配置解析失败: {}", name, e));
             assert_eq!(cfg.mode, name);
             assert_eq!(cfg.pad_mode, "bucket", "{} 配置的 pad_mode 未读入", name);
-            assert!(!cfg.server.session_token, "{} 配置的 session_token 未读入", name);
+            assert!(
+                cfg.server.session_token == (name == "server"),
+                "{} 配置的 session_token 未按预期读入",
+                name
+            );
             // Go 配置不含 workers / mtu / min_enc，缺省值必须与 flag 默认一致
             assert_eq!(cfg.workers, 0);
             assert_eq!(cfg.mtu, 0, "mtu 缺省应由 load_config_file 归一到 1500");
@@ -676,8 +740,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Go {} 配置去字段后解析失败: {}", name, e));
             assert!(cfg.pad_mode.is_empty(), "{}: pad_mode 缺省应为空串", name);
             assert!(cfg.min_enc.is_empty(), "{}: min_enc 缺省应为空串", name);
-            assert!(!cfg.server.session_token, "{}: session_token 缺省应为 false", name);
-            assert_eq!(cfg.server.max_sessions, 0, "{}: max_sessions 缺省应为 0", name);
+            assert!(
+                !cfg.server.session_token,
+                "{}: session_token 缺省应为 false",
+                name
+            );
+            assert_eq!(
+                cfg.server.max_sessions, 0,
+                "{}: max_sessions 缺省应为 0",
+                name
+            );
         }
     }
 
@@ -695,13 +767,22 @@ mod tests {
             let args = load_config_file(path.to_str().unwrap()).unwrap();
             let _ = std::fs::remove_file(&path);
             let want = if given == 0 { 1024 } else { given };
-            assert_eq!(args.max_sessions, want, "max_sessions={} 应归一为 {}", given, want);
-            assert!(validate_args(&args).is_ok(), "max_sessions={} 应通过校验", given);
+            assert_eq!(
+                args.max_sessions, want,
+                "max_sessions={} 应归一为 {}",
+                given, want
+            );
+            assert!(
+                validate_args(&args).is_ok(),
+                "max_sessions={} 应通过校验",
+                given
+            );
         }
 
         // Args::default() 未经归一化，这里补齐 load_config_file 会给的默认值
         let mut a = Args::default();
         a.mode = "server".into();
+        a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "0.0.0.0:4000".into();
         a.loglevel = "info".into();
         a.v4cidr = "10.0.0.0/24".into();
@@ -743,7 +824,7 @@ mod tests {
         assert_eq!(cfg.mode, "client");
         assert_eq!(cfg.min_enc, "gcm");
         assert_eq!(cfg.pad_mode, "bucket");
-        assert!(!cfg.server.session_token);
+        assert!(cfg.server.session_token);
     }
 
     #[test]
@@ -758,7 +839,7 @@ mod tests {
         assert_eq!(args.workers, 0);
         assert_eq!(args.conns, 4);
         assert_eq!(args.pad_mode, "bucket");
-        assert!(args.min_enc.is_empty());
+        assert_eq!(args.min_enc, "gcm");
     }
 
     #[test]
@@ -769,7 +850,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("tlsvpn-enc-{}.json", std::process::id()));
         let cases = [
-            (r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1"}"#, false, true),
+            (
+                r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1"}"#,
+                false,
+                true,
+            ),
             (
                 r#"{"mode":"client","psk":"x","addr":"1.2.3.4:1","encrypt":true}"#,
                 true,
@@ -803,6 +888,7 @@ mod tests {
         // Args::default() 未经归一化，log_level 显式给默认值
         let mut a = Args::default();
         a.mode = "client".into();
+        a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "127.0.0.1:1".into();
         a.loglevel = "info".into();
         a.conns = 4;
@@ -810,12 +896,24 @@ mod tests {
         a.encrypt = true;
 
         // 闭集取值全部放行
-        for v in ["", "any", "ctr", "legacy", "gcm"] {
+        for v in ["", "any", "gcm"] {
             a.min_enc = v.into();
             assert!(
                 validate_args(&a).is_ok(),
                 "min_enc {:?} + encrypt=true 应放行",
                 v
+            );
+        }
+
+        // 随旧协议兼容一并移除的档位：现在必须被拒绝，不能被静默接受成"无下限"
+        for v in ["ctr", "legacy"] {
+            a.min_enc = v.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("invalid min_enc"),
+                "min_enc {:?} 已随旧算法移除，必须被拒绝，实际: {}",
+                v,
+                err
             );
         }
 
@@ -857,6 +955,7 @@ mod tests {
         // validate_args 假设 Args 已归一化，所以 log_level 显式给默认值。
         let mut a = Args::default();
         a.mode = "client".into();
+        a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "10.0.0.1:4000".into();
         a.loglevel = "info".into();
         a.conns = 1;
@@ -867,11 +966,7 @@ mod tests {
         // log_level 闭集（大小写不敏感，与 Go 一致地要求非空）
         for good in ["trace", "Debug", "INFO", "warn", "error"] {
             a.loglevel = good.into();
-            assert!(
-                validate_args(&a).is_ok(),
-                "log_level {:?} 应通过校验",
-                good
-            );
+            assert!(validate_args(&a).is_ok(), "log_level {:?} 应通过校验", good);
         }
         for bad in ["", "verbose", "information", "tracee", " ", "infox", "off"] {
             a.loglevel = bad.into();
@@ -890,8 +985,14 @@ mod tests {
             a.mac = good.into();
             assert!(validate_args(&a).is_ok(), "mac {:?} 应通过校验", good);
         }
-        for bad in ["00:1a:2b:3c:4d:5", "00:1a:2b:3c:4d:5e:6f", "zz:11:22:33:44:55",
-                    "00-1a-2b-3c-4d-5e", "001a2b3c4d5e", "1"] {
+        for bad in [
+            "00:1a:2b:3c:4d:5",
+            "00:1a:2b:3c:4d:5e:6f",
+            "zz:11:22:33:44:55",
+            "00-1a-2b-3c-4d-5e",
+            "001a2b3c4d5e",
+            "1",
+        ] {
             a.mac = bad.into();
             let err = validate_args(&a).unwrap_err();
             assert!(
@@ -907,11 +1008,7 @@ mod tests {
         // "a:b:c" 和 ":" 与 Go ensureBasicAuthFormat 一致地放行（只看有没有冒号）。
         for good in ["", "admin:secret", "a:b:c", ":"] {
             a.web_auth = good.into();
-            assert!(
-                validate_args(&a).is_ok(),
-                "web.auth {:?} 应通过校验",
-                good
-            );
+            assert!(validate_args(&a).is_ok(), "web.auth {:?} 应通过校验", good);
         }
         for bad in ["admin", " admin", "secret ", "nopass"] {
             a.web_auth = bad.into();
@@ -928,11 +1025,7 @@ mod tests {
         // web.bind 闭集：未知值历史上会被当成 "all"
         for good in ["", "all", "tunnel"] {
             a.web_bind = good.into();
-            assert!(
-                validate_args(&a).is_ok(),
-                "web.bind {:?} 应通过校验",
-                good
-            );
+            assert!(validate_args(&a).is_ok(), "web.bind {:?} 应通过校验", good);
         }
         for bad in ["Any", "TUNNEL", "tunnel:", "all ", "tunnels"] {
             a.web_bind = bad.into();
@@ -962,10 +1055,7 @@ mod tests {
             a.v4cidr = v4.into();
             a.v6cidr = v6.into();
             if good {
-                assert!(
-                    validate_args(&a).is_ok(),
-                    "v4={v4:?} v6={v6:?} 应通过校验"
-                );
+                assert!(validate_args(&a).is_ok(), "v4={v4:?} v6={v6:?} 应通过校验");
             } else {
                 let err = validate_args(&a).unwrap_err();
                 assert!(
@@ -977,10 +1067,7 @@ mod tests {
         }
         // client 模式不校验地址池（Go Validate 同样只在 server 分支检查）
         a.mode = "client".into();
-        assert!(
-            validate_args(&a).is_ok(),
-            "client 模式不校验 v4/v6_cidr"
-        );
+        assert!(validate_args(&a).is_ok(), "client 模式不校验 v4/v6_cidr");
 
         // web.cert / web.key 只填一个是错的：tiny_http 需要一个成对的 SslConfig，
         // 拆开填只会让面板监听永远起不来
@@ -1050,7 +1137,8 @@ mod tests {
     #[test]
     #[ignore = "benchmark: long-running (1M iterations); run with `cargo test -- --ignored`"]
     fn bench_protocol_throughput() {
-        let ic = InnerCipher::legacy("benchmark_secret_key");
+        let ic = InnerCipher::gcm("benchmark_secret_key", &[7u8; ENC_SALT_SIZE])
+            .expect("gcm init");
         let payload = vec![0u8; 1400];
 
         let mut frame_buf = Vec::new();
@@ -1085,7 +1173,7 @@ mod tests {
 fn example_config_json() -> &'static str {
     r#"{
   "mode": "client",
-  "psk": "change-me-please",
+  "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
   "encrypt": true,
@@ -1099,8 +1187,8 @@ fn example_config_json() -> &'static str {
   "mac": "",
   "web": {
     "addr": ":8080",
-    "auth": "admin:change-me",
-    "bind": "all",
+    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
+    "bind": "tunnel",
     "cert": "",
     "key": ""
   },
@@ -1120,39 +1208,44 @@ fn example_config_json() -> &'static str {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": false,
+    "session_token": true,
     "max_sessions": 1024
   }
 }"#
 }
 
-    // ---------- 仓库根目录的示例配置 ----------
+// ---------- 仓库根目录的示例配置 ----------
 
-    #[test]
-    fn example_configs_in_repo_root_load_and_validate() {
-        // config.server.json / config.client.json 是用户克隆后直接 -c 的起点，
-        // 必须原样通过加载（deny_unknown_fields）+ 校验，否则示例即失效。
-        let mut psks = Vec::new();
-        for (file, mode) in [
-            ("config.server.json", "server"),
-            ("config.client.json", "client"),
-        ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-            let args = load_config_file(path.to_str().unwrap())
-                .unwrap_or_else(|e| panic!("{} 加载失败: {}", file, e));
-            validate_args(&args)
-                .unwrap_or_else(|e| panic!("{} 校验失败: {}", file, e));
-            assert_eq!(args.mode, mode, "{} 的 mode 不对", file);
-            assert_eq!(args.pad_mode, "bucket", "{} 的 pad_mode 未按模板", file);
-            assert_eq!(args.mtu, 1500, "{} 未声明 mtu，应取默认 1500", file);
-            assert_eq!(
-                args.workers, 0,
-                "{} 未声明 workers，应取默认（自动按 CPU 核数）",
-                file
-            );
-            psks.push(args.psk);
-        }
-        // 两份示例的 psk 必须一致，否则开箱即不通
-        assert_eq!(psks[0], psks[1], "server/client 示例的 psk 不一致");
+#[test]
+fn example_configs_in_repo_root_load_and_validate() {
+    // config.server.json / config.client.json 是用户克隆后直接 -c 的起点，
+    // 必须原样通过加载（deny_unknown_fields）+ 校验，否则示例即失效。
+    let mut psks = Vec::new();
+    for (file, mode) in [
+        ("config.server.json", "server"),
+        ("config.client.json", "client"),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let mut args = load_config_file(path.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("{} 加载失败: {}", file, e));
+        assert!(
+            validate_args(&args).is_err(),
+            "{} 的占位凭据必须阻止直接启动",
+            file
+        );
+        args.psk = "test-only-high-entropy-secret-4e390397818f".into();
+        args.web_auth = "admin:test-only-password-9b9f5d25".into();
+        validate_args(&args).unwrap_or_else(|e| panic!("{} 校验失败: {}", file, e));
+        assert_eq!(args.mode, mode, "{} 的 mode 不对", file);
+        assert_eq!(args.pad_mode, "bucket", "{} 的 pad_mode 未按模板", file);
+        assert_eq!(args.mtu, 1500, "{} 未声明 mtu，应取默认 1500", file);
+        assert_eq!(
+            args.workers, 0,
+            "{} 未声明 workers，应取默认（自动按 CPU 核数）",
+            file
+        );
+        psks.push(args.psk);
     }
-
+    // 两份示例的 psk 必须一致，否则开箱即不通
+    assert_eq!(psks[0], psks[1], "server/client 示例的 psk 不一致");
+}

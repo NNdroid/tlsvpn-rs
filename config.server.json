@@ -1,6 +1,6 @@
 {
   "mode": "server",
-  "psk": "change-me-please",
+  "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": ":4000",
   "log_level": "info",
   "encrypt": true,
@@ -13,7 +13,7 @@
   "mac": "",
   "web": {
     "addr": ":8080",
-    "auth": "admin:change-me",
+    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "bind": "tunnel",
     "cert": "",
     "key": ""
@@ -23,7 +23,7 @@
     "v6_cidr": "fd00::/64",
     "cert": "server.crt",
     "key": "server.key",
-    "session_token": false,
+    "session_token": true,
     "max_sessions": 1024
   }
 }

@@ -60,7 +60,7 @@ e2e_drvpath() {
 E2E_RS_BIN="${E2E_RS_BIN:-$E2E_REPO/target/debug/tlsvpn$E2E_EXE}"
 E2E_GO_BIN="${E2E_GO_BIN:-$E2E_GO_DIR/bin/tlsvpn$E2E_EXE}"
 E2E_RS_PROBE="${E2E_RS_PROBE:-$E2E_REPO/target/debug/examples/interop_client$E2E_EXE}"
-E2E_GO_PROBE="${E2E_GO_PROBE:-$E2E_REPO/interop/probe$E2E_EXE}"
+E2E_GO_PROBE="${E2E_GO_PROBE:-$E2E_GO_DIR/interop/probe$E2E_EXE}"
 
 E2E_RS_OLD_BIN="${E2E_RS_OLD_BIN:-}"
 E2E_RS_OLD_PROBE="${E2E_RS_OLD_PROBE:-}"

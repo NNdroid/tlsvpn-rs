@@ -1,6 +1,6 @@
 {
   "mode": "client",
-  "psk": "change-me-please",
+  "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
   "encrypt": true,
@@ -14,7 +14,7 @@
   "mac": "",
   "web": {
     "addr": ":8080",
-    "auth": "admin:change-me",
+    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "bind": "tunnel",
     "cert": "",
     "key": ""

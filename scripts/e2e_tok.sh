@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# e2e_tok.sh — 档 B (session_token) e2e：两台同 MAC 客户端互踢，验证接管被拒。
+# e2e_tok.sh — protocol v2 e2e：两台同 MAC 客户端，验证跨实例接管被拒。
 #
 # 威胁模型：client_id 完全由 (MAC, PSK) 推导，持密者只要知道目标 MAC 就能算出
-# 对方 client_id，走"会话复活"分支接管既有隧道。开启 session_token 后，令牌
-# 只在原会话自己的 TLS 连接里下发过一次，第三方从未见过 → 接管必须被拒。
+# 对方 client_id，走"会话复活"分支接管既有隧道。v2 随机令牌只在原会话的
+# TLS 连接里下发，第三方从未见过；client_instance 也不同，因此接管必须被拒。
 #
 # 与 e2e_accept.sh 的探针不同：这里用真实客户端，因为只有完整客户端才会
 # 重连并回带上次拿到的令牌 —— 探针只做一次会话，覆盖不到重连路径。
@@ -15,9 +15,8 @@
 #   WEB_BASE     client A 的 Web 面板端口，B 用 +1   default 9500
 #   PSK          default e2e_secret
 #   MAC          default aa:bb:cc:dd:ee:01
-#   EXPECT       reject | takeover   default reject
-#     reject   = 服务端开启 session_token，第二台必须被拒
-#     takeover = 服务端关闭 session_token（对照），第二台必须接管成功
+#   TOKEN_FIELD  true | false   default true
+#     session_token 是配置兼容字段；false 也不得关闭 protocol v2 的令牌保护。
 #   LABEL
 set -uo pipefail
 
@@ -30,7 +29,7 @@ PORT="${PORT:-18500}"
 WEB_BASE="${WEB_BASE:-9500}"
 PSK="$E2E_PSK"
 MAC="${MAC:-aa:bb:cc:dd:ee:01}"
-EXPECT="${EXPECT:-reject}"
+TOKEN_FIELD="${TOKEN_FIELD:-true}"
 LABEL="${LABEL:-}"
 
 SRV_BIN="$E2E_RS_BIN"; [ "$SRV" = go ] && SRV_BIN="$E2E_GO_BIN"
@@ -61,13 +60,7 @@ trap cleanup EXIT
 # --- 服务端 ---
 if [ "$SRV" = rs ]; then
   # Rust 服务端：flags 已移除（2026-09-19），一律走配置文件。
-  # session_token 语义与 go 分支一致：reject 用例开启（第二台必须被拒），
-  # takeover 对照关闭。
-  if [ "$EXPECT" = reject ]; then
-    ST='true'
-  else
-    ST='false'
-  fi
+  ST="$TOKEN_FIELD"
   e2e_config "$TMP/srv.json" server "127.0.0.1:$PORT" \
     "\"psk\": \"$PSK\"" \
     '"encrypt": true' \
@@ -75,12 +68,8 @@ if [ "$SRV" = rs ]; then
     "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\", \"session_token\": $ST}"
   "$SRV_BIN" -c "$(e2e_winpath "$TMP/srv.json")" >"$SRV_LOG" 2>&1 &
 else
-  # Go 的 session_token 只在配置文件里（无命令行开关）
-  if [ "$EXPECT" = reject ]; then
-    ST='true'
-  else
-    ST='false'
-  fi
+  # Go/Rust 都保留该字段用于配置互读，但 v2 安全语义不受其值影响。
+  ST="$TOKEN_FIELD"
   cat >"$TMP/srv.json" <<EOF
 {
   "mode": "server",
@@ -113,7 +102,7 @@ start_cli() {
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"mac\": \"$MAC\"" \
-      "\"web\": {\"addr\": \"127.0.0.1:$webport\"}" \
+      "\"web\": {\"addr\": \"127.0.0.1:$webport\", \"auth\": \"e2e:web-test-password\"}" \
       '"client": {"insecure": true, "conns": 1}'
     "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   else
@@ -124,7 +113,7 @@ start_cli() {
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"mac\": \"$MAC\"" \
-      "\"web\": {\"addr\": \"127.0.0.1:$webport\"}" \
+      "\"web\": {\"addr\": \"127.0.0.1:$webport\", \"auth\": \"e2e:web-test-password\"}" \
       '"client": {"insecure": true, "conns": 1}'
     "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   fi
@@ -134,7 +123,7 @@ sleep 5
 start_cli "$B_LOG" "$((WEB_BASE + 1))"
 sleep 6
 
-echo "===== label=$LABEL srv=$SRV cli=$CLI expect=$EXPECT ====="
+echo "===== label=$LABEL srv=$SRV cli=$CLI token_field=$TOKEN_FIELD ====="
 echo "----- server log (handshake decisions) -----"
 e2e_strip "$SRV_LOG" | grep -Ei "上线|复活|令牌|拒绝|session|token" | tail -15
 echo "----- client A log (tail 8) -----"
@@ -149,15 +138,9 @@ DENY=$(grep -c "会话令牌无效" "$SRV_LOG" || true)
 echo "server: 上线=$UP 复活=$REVIVE 令牌拒绝=$DENY"
 
 PASS=0
-if [ "$EXPECT" = reject ]; then
-  # A 上线一次；B 被令牌校验拦下；不得出现"接管成功"
-  [ "$UP" -eq 1 ] && PASS=1
-  [ "$DENY" -ge 1 ] && PASS=1
-  [ "$REVIVE" -eq 0 ] || PASS=0
-  [ "$UP" -eq 1 ] || PASS=0
-else
-  # 对照：关闭 session_token 时 B 走"会话复活"接管既有会话
-  [ "$REVIVE" -ge 1 ] && PASS=1
+# A 上线一次；B 被令牌/实例校验拦下；配置字段 false 也不得允许接管。
+if [ "$UP" -eq 1 ] && [ "$DENY" -ge 1 ] && [ "$REVIVE" -eq 0 ]; then
+  PASS=1
 fi
-e2e_result "$PASS" "${LABEL:-$SRV->$CLI expect=$EXPECT}"
+e2e_result "$PASS" "${LABEL:-$SRV->$CLI token_field=$TOKEN_FIELD}"
 exit $((1 - PASS))

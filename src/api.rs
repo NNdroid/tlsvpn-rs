@@ -1,6 +1,8 @@
 use base64ct::{Base64, Encoding};
 use parking_lot::Mutex;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +25,10 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct HandshakeReq {
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub protocol_version: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_instance: String,
     pub client_id: String,
     pub psk: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -53,6 +59,10 @@ pub struct HandshakeReq {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct HandshakeResp {
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub protocol_version: i64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub session_epoch: u64,
     pub success: bool,
     pub message: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -405,7 +415,154 @@ pub fn rss_mb() -> f64 {
     }
 }
 
-// ======================= 面板（与 Go dashboardHTML 逐字一致） =======================
+// ======================= 面板"运行状态"页的数据源 =======================
+
+/// 生效配置与宿主信息的扁平快照。main 在启动时构建一次：Rust 版没有配置热更，
+/// 配置只在启动时读一遍，所以这里不需要锁。每次 /api/stats 都并入同一份拷贝，
+/// 让面板的"状态"页能直接展示当前实际生效的开关，而不是让运维去翻配置文件。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeCtx {
+    pub cfg: serde_json::Value,
+    pub system: serde_json::Value,
+}
+
+impl RuntimeCtx {
+    /// 从最终生效的 Args 拍快照。只放"开关现在是开还是关"这类信息，
+    /// PSK 等凭据不进入面板：浏览器缓存一份可保存的凭据没有意义还多一个泄露面。
+    pub fn from_args(args: &crate::Args, cfg_path: &str) -> Self {
+        let pad_actual = crate::crypto::pad_mode_name();
+        let web_https = !args.web_cert.is_empty() && !args.web_key.is_empty();
+        Self {
+            cfg: serde_json::json!({
+                "mode": args.mode,
+                "encrypt": args.encrypt,
+                "min_enc": args.min_enc,
+                "pad_mode": pad_actual,
+                "brutal": args.brutal,
+                "brutal_up": args.brutal_up,
+                "brutal_down": args.brutal_down,
+                "socks5": !args.socks5.is_empty(),
+                "fec": args.fec,
+                "fec_group": args.fec_group,
+                "log_level": args.loglevel,
+                "conns": args.conns,
+                "workers": args.workers,
+                "mtu": args.mtu,
+                "tap": args.tap,
+                "mac": args.mac,
+                "addr": args.addr,
+                "web_addr": args.web,
+                "web_auth": !args.web_auth.is_empty(),
+                "web_bind": args.web_bind,
+                "web_https": web_https,
+                "encrypt_psk": true,
+                "session_token": args.session_token,
+                "max_sessions": args.max_sessions,
+                "v4_cidr": args.v4cidr,
+                "v6_cidr": args.v6cidr,
+                "req_v4": args.req_v4,
+                "req_v6": args.req_v6,
+                "sni": args.sni,
+                "insecure": args.insecure,
+                "cert_sha256": args.cert_sha256,
+                "fwmark": args.fwmark,
+                "encrypt_present": args.encrypt_present,
+            }),
+            system: system_info(cfg_path),
+        }
+    }
+}
+
+fn read_proc_trim(path: &str) -> String {
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 宿主平台与进程信息。Hostname 失败时留空（容器场景常见）。
+pub fn system_info(cfg_path: &str) -> serde_json::Value {
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "num_cpu": cpu,
+        "host": host_name(),
+        "cfg_path": cfg_path.to_string(),
+    })
+}
+
+/// TCP Brutal 的内核侧状态。
+///
+/// 主机名。Windows 上没有 HOSTNAME，只有 COMPUTERNAME；两个环境变量都没设时再读
+/// /etc/hostname 兜底。面板的"系统与进程"页靠它区分同一台机器上跑的多个进程，读不到
+/// 就留空让前端显示 "-"，而不是让运维以为是另一台机器。
+fn host_name() -> String {
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(h) = std::env::var(var) {
+            if !h.is_empty() {
+                return h;
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// 支持性按"可用拥塞控制列表里有没有 brutal"判定，而不是按当前值：当前是
+/// cubic 并不代表模块没装，把两者混在一起就无法区分"没装模块"与"装了没启用"。
+/// 非 Linux（或 /proc 缺失）返回 supported=false 加明确原因。
+pub fn brutal_system_status() -> serde_json::Value {
+    let current = {
+        let s = read_proc_trim("/proc/sys/net/ipv4/tcp_congestion_control");
+        if s.is_empty() {
+            read_proc_trim("/proc/sys/net/ipv4/congestion_control")
+        } else {
+            s
+        }
+    };
+    let avail_raw = read_proc_trim("/proc/sys/net/ipv4/congestion_control");
+    let available: Vec<String> = if avail_raw.is_empty() {
+        Vec::new()
+    } else {
+        avail_raw
+            .split('|')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let supported = available.iter().any(|s| s == "brutal");
+    let mut error = String::new();
+    if current.is_empty() && avail_raw.is_empty() {
+        error = "not Linux: TCP Brutal needs a Linux kernel with tcp pacing".to_string();
+    } else if !supported {
+        error = format!(
+            "kernel exposes no 'brutal' congestion controller (current={}, available={})",
+            if current.is_empty() { "-" } else { &current },
+            if avail_raw.is_empty() { "-" } else { &avail_raw }
+        );
+    }
+    serde_json::json!({
+        "supported": supported,
+        "kernel_current": current,
+        "kernel_available": available,
+        "error": error,
+    })
+}
+
+/// 把内层加密强度下限的运行时取值（rank）翻译成配置页显示用的字符串。
+/// 只有一种算法（GCM），所以 rank>0 一律是 "gcm"，0 是未设下限。
+pub fn min_enc_label(rank: i64) -> &'static str {
+    if rank > 0 { "gcm" } else { "" }
+}
+
+// ======================= 面板（与 Go dashboardHTML 同源） =======================
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -414,53 +571,85 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tlsvpn Dashboard</title>
 <style>
-body { font-family:'Segoe UI',Tahoma,sans-serif; background:#121212; color:#e0e0e0; margin:0; padding:20px; }
-.wrap { max-width:1200px; margin:0 auto; }
+/* 深色为默认；浅色由 data-theme="light" 覆盖。JS 只负责切这一个属性，
+   画布里的网格/曲线颜色再读 CSS 变量，避免两处各存一份色值 */
+:root{--bg:#121212;--panel:#1e1e1e;--panel2:#242424;--border:#333;--text:#e0e0e0;
+--muted:#999;--accent:#bb86fc;--up:#03dac6;--warn:#e1c94e;--err:#ff7597;
+--code-bg:#0d0d0d;--ok-bg:#1b3a2f;--ok-fg:#4ee1a0;--dup-bg:#3a341b;--dup-fg:#e1c94e;
+--off-bg:#333;--off-fg:#888;--field:#2a2a2a;--field-bd:#444;--field-fg:#ddd}
+:root[data-theme="light"]{--bg:#f4f6f9;--panel:#ffffff;--panel2:#eef1f5;--border:#dde1e7;
+--text:#1c1e21;--muted:#5f6469;--accent:#7c4dff;--up:#00897b;--warn:#9a6a00;--err:#c62839;
+--code-bg:#f0f2f5;--ok-bg:#e2f5eb;--ok-fg:#157347;--dup-bg:#fcf3d0;--dup-fg:#8a6100;
+--off-bg:#e3e6ea;--off-fg:#5f6469;--field:#ffffff;--field-bd:#c9ced6;--field-fg:#1c1e21}
+body { font-family:'Segoe UI',Tahoma,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px; transition:background .2s,color .2s; }
+.wrap { max-width:1320px; margin:0 auto; }
 .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }
-.card { background:#1e1e1e; border-radius:8px; padding:14px 18px; box-shadow:0 4px 6px rgba(0,0,0,.3); margin-bottom:14px; }
+.card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px 18px; box-shadow:0 4px 6px rgba(0,0,0,.12); margin-bottom:14px; }
 .card.wide { grid-column:1/-1; }
-h1 { color:#bb86fc; margin:0 0 12px; font-size:1.35em; }
-h1 small { color:#888; font-weight:normal; font-size:.55em; margin-left:8px; }
-h2 { margin:0 0 10px; color:#bb86fc; font-size:1.02em; }
-.kpi { font-size:1.5em; font-weight:bold; color:#03dac6; }
-.sub { color:#999; font-size:.84em; margin-top:3px; }
+.errbar { background:var(--panel2); border:1px solid var(--err); border-left:4px solid var(--err); border-radius:8px; padding:9px 13px; margin-bottom:14px; color:var(--err); font-family:ui-monospace,Consolas,monospace; font-size:12.5px; line-height:1.6; word-break:break-all; }
+.errbar small { color:var(--muted); display:block; font-family:'Segoe UI',Tahoma,sans-serif; font-size:.85em; }
+h1 { color:var(--accent); margin:0 0 12px; font-size:1.35em; }
+h1 small { color:var(--muted); font-weight:normal; font-size:.55em; margin-left:8px; }
+h2 { margin:0 0 10px; color:var(--accent); font-size:1.02em; }
+.topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
+.theme-ctl { display:flex; align-items:center; gap:6px; font-size:.84em; color:var(--muted); padding-top:6px; }
+.theme-ctl select { background:var(--field); color:var(--field-fg); border:1px solid var(--field-bd); border-radius:4px; padding:4px 8px; font-size:1em; }
+.kpi { font-size:1.5em; font-weight:bold; color:var(--up); }
+.sub { color:var(--muted); font-size:.84em; margin-top:3px; }
 table { width:100%; border-collapse:collapse; margin-top:8px; }
-th,td { padding:7px 9px; text-align:left; border-bottom:1px solid #333; font-size:.88em; white-space:nowrap; }
-th { background:#2c2c2c; color:#bbb; }
-.speed { color:#03dac6; font-weight:bold; }
+th,td { padding:7px 9px; text-align:left; border-bottom:1px solid var(--border); font-size:.88em; white-space:nowrap; }
+th { background:var(--panel2); color:var(--muted); }
+table.kv { margin-top:4px; }
+table.kv td { border-bottom:1px solid var(--border); white-space:normal; }
+table.kv td.k { color:var(--muted); width:42%; font-size:.84em; }
+table.kv td.v { font-size:.86em; overflow-wrap:anywhere; }
+.speed { color:var(--up); font-weight:bold; }
 .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:.78em; font-weight:600; }
-.b-on { background:#1b3a2f; color:#4ee1a0; } .b-dup { background:#3a341b; color:#e1c94e; } .b-off { background:#333; color:#888; }
+.b-on { background:var(--ok-bg); color:var(--ok-fg); } .b-dup { background:var(--dup-bg); color:var(--dup-fg); } .b-off { background:var(--off-bg); color:var(--off-fg); }
 .btn { padding:3px 10px; background:#cf6679; color:white; border:none; border-radius:4px; cursor:pointer; font-size:.82em; margin-right:4px; }
 .btn:hover { background:#ff7597; }
 .btn.blue { background:#3d5a80; } .btn.blue:hover { background:#5b84b1; }
-.btn.gray { background:#444; } .btn.gray:hover { background:#666; }
+.btn.gray { background:var(--off-bg); color:var(--text); } .btn.gray:hover { background:var(--field-bd); }
 #chart { width:100%; height:170px; display:block; }
-.legend { font-size:.8em; color:#999; margin-top:6px; }
+.legend { font-size:.8em; color:var(--muted); margin-top:6px; }
 .legend span { margin-right:14px; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:4px; }
-#logbox { background:#0d0d0d; border-radius:6px; padding:10px; height:220px; overflow-y:auto; font:12px/1.5 Consolas,monospace; }
-#logbox .lv-WARN { color:#e1c94e; } #logbox .lv-ERROR,#logbox .lv-PANIC { color:#ff7597; } #logbox .lv-DEBUG { color:#666; }
+.note { font-size:.8em; color:var(--muted); margin-top:8px; }
+.note.bad { color:var(--warn); }
+#logbox { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:10px; height:220px; overflow-y:auto; font:12px/1.5 Consolas,monospace; }
+#logbox .lv-WARN { color:var(--warn); } #logbox .lv-ERROR,#logbox .lv-PANIC { color:var(--err); } #logbox .lv-DEBUG { color:var(--muted); }
 .logbar { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
-.logbar select,.logbar input { background:#2a2a2a; color:#ddd; border:1px solid #444; border-radius:4px; padding:4px 8px; font-size:.85em; }
+.logbar select,.logbar input { background:var(--field); color:var(--field-fg); border:1px solid var(--field-bd); border-radius:4px; padding:4px 8px; font-size:.85em; }
 .logbar input { width:110px; }
 .tabs { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
-.tabs button { background:#2a2a2a; color:#bbb; border:none; border-radius:4px 4px 0 0; padding:6px 14px; cursor:pointer; font-size:.88em; }
-.tabs button.on { background:#bb86fc; color:#121212; font-weight:600; }
+.tabs button { background:var(--field); color:var(--muted); border:none; border-radius:4px 4px 0 0; padding:6px 14px; cursor:pointer; font-size:.88em; }
+.tabs button.on { background:var(--accent); color:var(--bg); font-weight:600; }
 .pane { display:none; } .pane.on { display:block; }
-footer { text-align:center; color:#666; font-size:.78em; margin-top:16px; }
+footer { text-align:center; color:var(--muted); font-size:.78em; margin-top:16px; }
 @media (max-width:640px){ th,td{padding:5px;} .hide-sm{display:none;} }
 </style>
 </head>
 <body>
 <div class="wrap">
+<div class="topbar">
 <h1>🚀 tlsvpn <span id="mode">…</span><small id="meta"></small></h1>
+<label class="theme-ctl">主题
+<select id="theme">
+  <option value="system">跟随系统</option>
+  <option value="light">浅色</option>
+  <option value="dark">深色</option>
+</select>
+</label>
+</div>
+<div class="errbar" id="errbar" style="display:none"><span id="errbar-msg"></span>
+<small>下一轮成功会自动消失；若反复出现，刷新页面（Ctrl+F5）重试，服务端重启后带凭据的旧地址栏也要重新输入一次</small></div>
 <div class="grid">
   <div class="card"><div class="sub">活跃客户端/设备</div><div class="kpi" id="active-clients">0</div><div class="sub" id="conns-sub">TCP 连接: -</div></div>
   <div class="card"><div class="sub">总发送</div><div class="kpi" id="total-tx">0 B</div><div class="sub">↑ <span id="total-tx-speed" class="speed">0 B/s</span></div></div>
   <div class="card"><div class="sub">总接收</div><div class="kpi" id="total-rx">0 B</div><div class="sub">↓ <span id="total-rx-speed" class="speed">0 B/s</span></div></div>
   <div class="card"><div class="sub">运行时长</div><div class="kpi" id="uptime">-</div><div class="sub">版本 <span id="ver">-</span> · GC <a href="#" onclick="doAction('gc');return false;" style="color:#5b84b1">立即回收</a></div></div>
   <div class="card"><div class="sub">FEC 恢复 / 确认丢失</div><div class="kpi" id="fec-kpi">-</div><div class="sub">校验帧 <span id="parity">-</span> · 丢帧(队列) <span id="dropped">-</span></div></div>
-  <div class="card"><div class="sub">内存 / 协程</div><div class="kpi" id="mem">-</div><div class="sub">Goroutines: <span id="goroutines">-</span></div></div>
+  <div class="card"><div class="sub">进程内存</div><div class="kpi" id="mem">-</div><div class="sub">线程数: <span id="goroutines">-</span></div></div>
   <div class="card" id="ippool-card" style="display:none"><div class="sub">IPv4 地址池</div><div class="kpi" id="ippool-kpi">-</div><div class="sub">IPv6 已分配: <span id="v6used">-</span></div></div>
 </div>
 <div class="card wide"><h2>吞吐趋势 <span style="font-size:.7em;color:#888">(近 120 秒)</span></h2>
@@ -469,28 +658,41 @@ footer { text-align:center; color:#666; font-size:.78em; margin-top:16px; }
 
 <div class="card wide">
   <div class="tabs">
-    <button class="on" data-pane="clients" onclick="showPane(this)">客户端</button>
+    <button class="on" data-pane="status" onclick="showPane(this)">运行状态</button>
+    <button data-pane="clients" onclick="showPane(this)">客户端</button>
     <button data-pane="conns" onclick="showPane(this)">连接明细</button>
     <button data-pane="macs" id="macs-tab" onclick="showPane(this)">MAC 表</button>
     <button data-pane="bans" id="bans-tab" onclick="showPane(this)">封禁</button>
     <button data-pane="logs" onclick="showPane(this)">日志</button>
   </div>
 
-  <div class="pane on" id="pane-clients">
+  <div class="pane on" id="pane-status">
+    <div class="grid">
+      <div class="card"><h2>会话协商结果</h2><table class="kv"><tbody id="st-neg"></tbody></table></div>
+      <div class="card"><h2>TCP Brutal</h2><table class="kv"><tbody id="st-brut"></tbody></table>
+        <div id="st-brut-note" class="note"></div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><h2>生效配置</h2><div style="overflow-x:auto"><table class="kv"><tbody id="st-cfg"></tbody></table></div></div>
+      <div class="card"><h2>系统与进程</h2><table class="kv"><tbody id="st-sys"></tbody></table></div>
+    </div>
+  </div>
+
+  <div class="pane" id="pane-clients">
     <div style="overflow-x:auto"><table>
-      <thead><tr><th>ID</th><th>IPv4</th><th class="hide-sm">IPv6</th><th class="hide-sm">MAC</th><th>TCP</th><th>TX (发)</th><th>RX (收)</th><th>↑ 速率</th><th>↓ 速率</th><th class="hide-sm">FEC</th><th class="hide-sm">加密</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>IPv4</th><th class="hide-sm">IPv6</th><th class="hide-sm">MAC</th><th>TCP</th><th>TX (发)</th><th>RX (收)</th><th>↑ 速率</th><th>↓ 速率</th><th class="hide-sm">FEC</th><th class="hide-sm">FEC 分组</th><th class="hide-sm">加密</th><th class="hide-sm">会话</th><th class="hide-sm">代际</th><th class="hide-sm">Brutal 上/下</th><th class="hide-sm">在线</th><th>操作</th></tr></thead>
       <tbody id="clients-body"></tbody>
     </table></div>
   </div>
 
   <div class="pane" id="pane-conns"><div style="overflow-x:auto"><table>
-    <thead><tr><th>#</th><th>目标</th><th>对端</th><th>状态</th><th>RTT</th><th>TX</th><th>RX</th><th class="hide-sm">重试</th><th class="hide-sm">在线</th><th class="hide-sm">最近错误</th><th>操作</th></tr></thead>
-    <tbody id="conns-body"><tr><td colspan="11" style="color:#777">仅客户端模式提供</td></tr></tbody>
+    <thead><tr><th>#</th><th>目标</th><th>对端</th><th>状态</th><th>RTT</th><th>TX</th><th>RX</th><th class="hide-sm">重试</th><th class="hide-sm">在线</th><th class="hide-sm">FEC</th><th class="hide-sm">加密</th><th class="hide-sm">Brutal</th><th class="hide-sm">最近错误</th><th>操作</th></tr></thead>
+    <tbody id="conns-body"><tr><td colspan="14" style="color:var(--muted)">仅客户端模式提供</td></tr></tbody>
   </table></div></div>
 
   <div class="pane" id="pane-macs"><div style="overflow-x:auto"><table>
     <thead><tr><th>MAC</th><th>端口</th><th>最近活跃</th></tr></thead>
-    <tbody id="macs-body"><tr><td colspan="3" style="color:#777">仅服务端模式提供</td></tr></tbody>
+    <tbody id="macs-body"><tr><td colspan="3" style="color:var(--muted)">仅服务端模式提供</td></tr></tbody>
   </table></div></div>
 
   <div class="pane" id="pane-bans">
@@ -498,27 +700,20 @@ footer { text-align:center; color:#666; font-size:.78em; margin-top:16px; }
     <button class="btn blue" onclick="addBan()">封禁</button><button class="btn gray" onclick="loadBans()">刷新</button></div>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>ClientID</th><th>剩余</th><th>操作</th></tr></thead>
-      <tbody id="bans-body"><tr><td colspan="3" style="color:#777">仅服务端模式提供</td></tr></tbody>
+      <tbody id="bans-body"><tr><td colspan="3" style="color:var(--muted)">仅服务端模式提供</td></tr></tbody>
     </table></div>
   </div>
 
   <div class="pane" id="pane-logs">
     <div id="logbox"></div>
     <div class="logbar">
-      <label style="font-size:.85em;color:#999">级别
+      <label style="font-size:.85em;color:var(--muted)">级别
         <select id="loglevel" onchange="setLogLevel(this.value)">
           <option value="debug">debug</option><option value="info">info</option>
           <option value="warn">warn</option><option value="error">error</option>
         </select>
       </label>
-      <label style="font-size:.85em;color:#999">填充
-        <select id="padmode" onchange="setPadMode(this.value)">
-          <option value="legacy">legacy</option>
-          <option value="bucket">bucket</option>
-          <option value="off">off</option>
-        </select>
-      </label>
-      <label style="font-size:.85em;color:#999"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+      <label style="font-size:.85em;color:var(--muted)"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
       <button class="btn gray" onclick="logSeq=0;document.getElementById('logbox').innerHTML=''">清屏</button>
     </div>
   </div>
@@ -526,8 +721,48 @@ footer { text-align:center; color:#666; font-size:.78em; margin-top:16px; }
 <footer>tlsvpn dashboard · 数据每 2 秒刷新 · <span id="tls-flag"></span></footer>
 </div>
 <script>
+// ---------- 错误可见化（必须最先注册：脚本自身出错也要能写进面板） ----------
+// 之前 fetch 抛错只进 console，面板永远停在"…"骨架上，只看到一片空白，
+// 分不清是网络不通、认证失败还是脚本自己挂了。现在把最后一次失败显示在顶部，
+// 下一轮成功自动消失；累计超过 300 次就静默，别让面板变成报错日志。
+let errCount=0;
+function showErr(scope,msg){
+  const box=document.getElementById('errbar');if(!box)return;
+  const n=++errCount,t=document.getElementById('errbar-msg');
+  if(t)t.textContent='⚠ 第 '+n+' 次失败 · '+scope+'：'+(msg||'未知错误');
+  box.style.display=n>300?'none':'';
+}
+function clearErr(){const box=document.getElementById('errbar');if(box)box.style.display='none';}
+window.addEventListener('error',ev=>showErr('脚本',ev.message||ev.reason||(ev.error&&ev.error.message)));
+window.addEventListener('unhandledrejection',ev=>showErr('异步',ev.reason&&ev.reason.message||String(ev.reason)));
+
 const MAXPTS=60;let prev={},lastT=0;const txHist=[],rxHist=[];
 let logSeq=0,logTimer=null;
+
+// ---------- 主题 ----------
+// 深色是 CSS 默认；'system' 跟随操作系统的 prefers-color-scheme，切系统主题时
+// 面板跟着切，不必手动选。选择持久化到 localStorage。
+const THEME_KEY='tlsvpn_theme';
+const themeSel=document.getElementById('theme');
+const savedTheme=localStorage.getItem(THEME_KEY)||'system';
+if(!Array.from(themeSel.options).some(o=>o.value===savedTheme))themeSel.value='system';else themeSel.value=savedTheme;
+function isDarkSystem(){return window.matchMedia('(prefers-color-scheme: dark)').matches;}
+function applyTheme(){
+  const v=themeSel.value;
+  const dark=v==='dark'||(v==='system'&&isDarkSystem());
+  document.documentElement.dataset.theme=dark?'':'light';
+  drawChart();
+}
+themeSel.addEventListener('change',()=>{localStorage.setItem(THEME_KEY,themeSel.value);applyTheme();});
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{
+  if(themeSel.value==='system')applyTheme();
+});
+// 首屏就套上主题，避免第一次轮询画图表前闪一下默认深色
+applyTheme();
+function cssv(name,fallback){
+  const v=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v||fallback;
+}
 
 function fmtBytes(b,s=false){
   if(!isFinite(b)||b<=0)return '0 '+(s?'B/s':'B');
@@ -538,8 +773,13 @@ function fmtDur(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86
   if(d>0)return d+'天'+h+'时';if(h>0)return h+'时'+m+'分';if(m>0)return m+'分'+(s%60)+'秒';return s+'秒';}
 function badge(f){if(!f||f==='off')return '<span class="badge b-off">关闭</span>';
   if(f==='dup')return '<span class="badge b-dup">复制</span>';return '<span class="badge b-on">'+f+'</span>';}
+// 内层只有一种算法（GCM），没有按算法编号切换的余地；0 = 明文
 function encBadge(a){if(a===2)return '<span class="badge b-on">GCM</span>';
-  if(a===1)return '<span class="badge b-dup">CTR</span>';return '<span class="badge b-off">明文</span>';}
+  return '<span class="badge b-off">明文</span>';}
+function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
+// 空值不占行：面板上留一堆空行只会让人误以为字段缺失是故障
+function kvRows(pairs){return pairs.filter(p=>p&&p[1]!==undefined&&p[1]!==null&&p[1]!==''&&p[1]!==false)
+  .map(p=>'<tr><td class="k">'+p[0]+'</td><td class="v">'+p[1]+'</td></tr>').join('');}
 function showPane(btn){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
   btn.classList.add('on');document.getElementById('pane-'+btn.dataset.pane).classList.add('on');
@@ -547,30 +787,41 @@ function showPane(btn){document.querySelectorAll('.tabs button').forEach(b=>b.cl
 
 function drawChart(){
   const c=document.getElementById('chart'),ctx=c.getContext('2d'),W=c.width,H=c.height;
-  ctx.clearRect(0,0,W,H);ctx.strokeStyle='#2a2a2a';
+  ctx.clearRect(0,0,W,H);ctx.strokeStyle=cssv('--border','#2a2a2a');
   for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo(0,H*i/4);ctx.lineTo(W,H*i/4);ctx.stroke();}
   if(txHist.length<2)return;
   const max=Math.max(...txHist,...rxHist,1);
   const plot=(h,col)=>{ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();
     h.forEach((v,i)=>{const x=i/(MAXPTS-1)*W,y=H-6-(v/max)*(H-20);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();};
-  plot(txHist,'#03dac6');plot(rxHist,'#bb86fc');
-  ctx.fillStyle='#888';ctx.font='11px sans-serif';ctx.fillText(fmtBytes(max),4,12);
+  plot(txHist,cssv('--up','#03dac6'));plot(rxHist,cssv('--accent','#bb86fc'));
+  ctx.fillStyle=cssv('--muted','#888');ctx.font='11px sans-serif';ctx.fillText(fmtBytes(max),4,12);
 }
 
-async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-Requested-With':'tlsvpn'},opts.headers||{});return fetch(path,opts);}
+// 用带凭据的地址（http://admin:xx@host/ 打开面板）时，Chrome 拒绝构造任何 fetch——
+// "Request cannot be constructed from a URL that includes credentials"——于是每一轮轮询都抛
+// 同一条 TypeError，面板永远停在初始骨架上，日志里只剩一行重复报错，完全看不出是地址栏
+// 里的凭据引起的。换成 Authorization 头 + 去掉 userinfo 的 URL 即可；同域请求带这个头
+// 不触发预检，所以不影响未启用认证的情况。
+const AUTH_HDR=(location.username||location.password)
+  ?{Authorization:'Basic '+btoa(unescape(encodeURIComponent(location.username+':'+location.password)))}
+  :{};
+// location.origin 按规范不含 userinfo，是构造不带凭据 URL 的可靠基址
+function url(path){return location.origin+path;}
+
+async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-Requested-With':'tlsvpn'},AUTH_HDR,opts.headers||{});return fetch(url(path),opts);}
 
 async function fetchStats(){
   try{
-    const res=await fetch('/api/stats');
+    const res=await fetch(url('/api/stats'),AUTH_HDR);
     if(res.status===401){document.body.innerHTML='<div class="card"><h2>401</h2><p>需要认证：请用 <code>-web-auth user:pass</code> 配置的凭据登录。</p></div>';return;}
     const data=await res.json();
+    clearErr();
     const now=performance.now();const dt=lastT?(now-lastT)/1000:2;lastT=now;
 
     document.getElementById('mode').innerText=data.mode.toUpperCase();
     document.getElementById('ver').innerText=data.version||'-';
     document.getElementById('uptime').innerText=fmtDur(data.uptime_sec||0);
     document.getElementById('loglevel').value=data.log_level||'info';
-    document.getElementById('padmode').value=data.pad_mode||'legacy';
     document.getElementById('tls-flag').innerText=location.protocol==='https:'?'HTTPS':'HTTP（建议 -web-cert 启用 HTTPS）';
 
     let tbody='',tTx=0,tRx=0,tTxS=0,tRxS=0,cur={},tConns=0;
@@ -580,11 +831,17 @@ async function fetchStats(){
       if(prev[id]){sx=Math.max(0,(c.tx_bytes-prev[id].tx_bytes)/dt);sr=Math.max(0,(c.rx_bytes-prev[id].rx_bytes)/dt);}
       cur[id]={tx_bytes:c.tx_bytes,rx_bytes:c.rx_bytes};tTxS+=sx;tRxS+=sr;
       const sid=id.length>10?id.slice(0,10)+'…':id;
+      const bid=c.session_id?(c.session_id.length>10?c.session_id.slice(0,10)+'…':c.session_id):'-';
+      const brut=c.brutal_tx||c.brutal_rx?((c.brutal_tx||0)+' / '+(c.brutal_rx||0)):'-';
       tbody+='<tr><td title="'+id+'">'+sid+'</td><td>'+(c.ipv4||'-')+'</td><td class="hide-sm">'+(c.ipv6||'-')+'</td>'+
         '<td class="hide-sm">'+(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
         '<td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
         '<td class="speed">'+fmtBytes(sx,true)+'</td><td class="speed">'+fmtBytes(sr,true)+'</td>'+
-        '<td class="hide-sm">'+badge(c.fec)+'</td><td class="hide-sm">'+encBadge(c.enc_algo)+'</td>'+
+        '<td class="hide-sm">'+badge(c.fec)+'</td><td class="hide-sm">'+(c.fec_group||'-')+'</td>'+
+        '<td class="hide-sm">'+encBadge(c.enc_algo)+'</td><td class="hide-sm" title="'+bid+'">'+bid+'</td>'+
+        '<td class="hide-sm">'+(c.session_epoch||'-')+'</td>'+
+        '<td class="hide-sm" title="服务端下发方向 / 客户端上行方向 (Mbps)">'+brut+'</td>'+
+        '<td class="hide-sm">'+(c.online_sec?fmtDur(c.online_sec):'-')+'</td>'+
         '<td>'+(data.mode==='server'?'<button class="btn" onclick="kickClient(\''+id+'\')">踢出</button>'+
           '<button class="btn blue" onclick="banClient(\''+id+'\',0)">封禁</button>':'-')+'</td></tr>';
     };
@@ -600,54 +857,161 @@ async function fetchStats(){
     document.getElementById('total-rx').innerText=fmtBytes(tRx);
     document.getElementById('total-tx-speed').innerText=fmtBytes(tTxS,true);
     document.getElementById('total-rx-speed').innerText=fmtBytes(tRxS,true);
-    document.getElementById('clients-body').innerHTML=tbody||'<tr><td colspan="12" style="color:#777">暂无客户端</td></tr>';
+    document.getElementById('clients-body').innerHTML=tbody||'<tr><td colspan="17" style="color:var(--muted)">暂无客户端</td></tr>';
 
     const f=data.fec||{};
-    document.getElementById('fec-kpi').innerHTML=(f.recovered||0)+' <small style="font-size:.6em;color:#888">/</small> '+(f.lost||0);
+    document.getElementById('fec-kpi').innerHTML=(f.recovered||0)+' <small style="font-size:.6em;color:var(--muted)">/</small> '+(f.lost||0);
     document.getElementById('parity').innerText=f.parity_tx||0;
     document.getElementById('dropped').innerText=data.dropped_frames||0;
     const m=data.mem||{};
-    document.getElementById('mem').innerHTML=(m.heap_alloc_mb||0).toFixed(1)+'<small style="font-size:.55em;color:#888"> MB</small>';
-    document.getElementById('goroutines').innerText=m.num_goroutine||0;
+    // 取不到时后端给 0。直接显示 "0.0 MB / 0" 会让运维以为进程几乎不占内存，
+    // 真相是没有统计到——留空比给个假的零诚实。
+    const rss=m.heap_alloc_mb||0,thr=m.num_goroutine||0;
+    document.getElementById('mem').innerHTML=rss>0?(m.heap_alloc_mb).toFixed(1)+'<small style="font-size:.55em;color:var(--muted)"> MB</small>':'—';
+    document.getElementById('goroutines').innerText=thr>0?thr:'—';
 
     if(data.ip_pool){document.getElementById('ippool-card').style.display='';
-      document.getElementById('ippool-kpi').innerHTML=data.ip_pool.v4_used+'<small style="font-size:.55em;color:#888"> / '+data.ip_pool.v4_total+'</small>';
+      document.getElementById('ippool-kpi').innerHTML=data.ip_pool.v4_used+'<small style="font-size:.55em;color:var(--muted)"> / '+data.ip_pool.v4_total+'</small>';
       document.getElementById('v6used').innerText=data.ip_pool.v6_used;}
 
-    const meta=[];if(data.enc_algo===2)meta.push('GCM 加密');else if(data.enc_algo===1)meta.push('CTR 加密(旧)');
+    const meta=[];if(data.enc_algo===2)meta.push('GCM 加密');
     if(data.fec_mode&&data.fec_mode!=='off')meta.push('FEC '+data.fec_mode);
+    const neg0=data.negotiate||{};if(neg0.protocol_version)meta.push('协议 v'+neg0.protocol_version);
     document.getElementById('meta').innerText=meta.join(' · ');
 
-    renderConns(data);renderMacs(data);renderBans(data);
-  }catch(e){console.error('获取统计数据失败',e);}
+    renderStatus(data);renderConns(data);renderMacs(data);renderBans(data);
+  }catch(e){console.error('获取统计数据失败',e);showErr('统计数据',e&&e.message||e);}
+}
+
+function renderStatus(data){
+  const s=data.system||{},c=data.cfg||{},g=data.negotiate||{},b=g.brutal||{},bs=data.brutal_system||{},mem=data.mem||{};
+  // 内核态（模块在不在、当前 cc、可用列表）来自 brutal_system：它每轮都算，不依赖有没有会话。
+  // 协商对象里的同名字段只在 brutal_system 缺时才兜底，免得一台没有任何客户端的机器
+  // 只显示一堆 '-'，看不出 Brutal 到底能不能用。
+  const ker={
+    kernel_supported:bs.supported!==undefined?bs.supported:b.kernel_supported,
+    kernel_current:bs.kernel_current||b.kernel_current,
+    kernel_available:(bs.kernel_available&&bs.kernel_available.length)?bs.kernel_available:b.kernel_available,
+    error:b.error||bs.error
+  };
+
+  document.getElementById('st-sys').innerHTML=kvRows([
+    ['运行模式',c.mode||data.mode||'-'],
+    ['操作系统',s.os||'-'],
+    ['架构',s.arch||'-'],
+    ['CPU 核数',s.num_cpu||'-'],
+    ['主机名',s.host||'-'],
+    ['配置文件',s.cfg_path||'（默认配置）'],
+    ['版本',data.version||'-'],
+    ['运行时长',fmtDur(data.uptime_sec||0)],
+    ['服务端 / 对端地址',c.addr||'-'],
+    ['面板地址',c.web_addr||'未启用'],
+    ['面板认证',c.web_auth?'已启用':'未启用（建议配置）'],
+    ['面板传输',c.web_addr?(c.web_https?'HTTPS':'HTTP'):'-'],
+    ['面板绑定方式',c.web_bind||'all'],
+    ['日志级别',data.log_level||c.log_level||'-'],
+    ['内存 / 线程',(mem.heap_alloc_mb>0?mem.heap_alloc_mb.toFixed(1)+' MB':'-')+' / '+(mem.num_goroutine>0?mem.num_goroutine:'-')],
+  ]);
+
+  document.getElementById('st-cfg').innerHTML=kvRows([
+    ['内层加密 encrypt',c.encrypt?'开启':'关闭'],
+    ['加密下限 min_enc',c.min_enc||'不限'],
+    ['混淆填充 pad_mode',c.pad_mode||'-'],
+    ['TCP Brutal',c.brutal?'开启':'关闭'],
+    ['Brutal 上行 (Mbps)',c.brutal_up||'-'],
+    ['Brutal 下行 (Mbps)',c.brutal_down||'-'],
+    ['FEC',c.fec?'开启':'关闭'],
+    ['FEC 分组',c.fec_group||'-'],
+    ['物理连接数 conns',c.conns||'-'],
+    ['工作线程 workers',c.workers||'-'],
+    ['MTU',c.mtu||'-'],
+    ['TAP 接口',c.tap||'-'],
+    ['MAC 地址',c.mac||'-'],
+    ['SOCKS5 代理',c.socks5?'开启':'关闭'],
+    ['会话令牌 session_token',c.session_token?'开启':'关闭'],
+    ['会话上限 max_sessions',c.max_sessions||'-'],
+    ['IPv4 网段 v4_cidr',c.v4_cidr||'-'],
+    ['IPv6 网段 v6_cidr',c.v6_cidr||'-'],
+    ['请求 IPv4 req_v4',c.req_v4||'-'],
+    ['请求 IPv6 req_v6',c.req_v6||'-'],
+    ['SNI 伪装',c.sni||'-'],
+    ['服务端证书校验',c.insecure?'已跳过':'开启'],
+    ['证书指纹 cert_sha256',c.cert_sha256||'-'],
+    ['FWMark',c.fwmark||'-'],
+    ['encrypt 字段是否显式写入',c.encrypt_present===false?'未写（按开启处理）':'已写入'],
+  ]);
+
+  document.getElementById('st-neg').innerHTML=kvRows([
+    ['协议版本','v'+(g.protocol_version||'-')],
+    ['内层加密算法',g.enc_algo===2?'AES-256-GCM':(g.enc_algo?'未知('+g.enc_algo+')':'明文（未启用）')],
+    ['加密下限 min_enc',g.min_enc||'不限'],
+    ['混淆填充 pad_mode',g.pad_mode||'-'],
+    ['FEC',g.fec?'开启':'关闭'],
+    ['FEC 分组',g.fec_group||'-'],
+    ['会话令牌',g.session_token?'已下发':'未启用'],
+    ['会话代际 epoch',g.session_epoch||'-'],
+    ['每连接上行预算 (Mbps)',g.tx_rate_mbps||'-'],
+    ['每连接下行预算 (Mbps)',g.rx_rate_mbps||'-'],
+    ['会话上限',g.max_sessions||'-'],
+    ['SOCKS5 代理',g.socks5?'开启（本端不整形）':'-'],
+  ]);
+
+  document.getElementById('st-brut').innerHTML=kvRows([
+    ['配置状态',b.enabled?'开启':'关闭'],
+    ['内核支持',ker.kernel_supported===true?'支持':(ker.kernel_supported===false?'不支持':'未知')],
+    ['内核当前拥塞控制',ker.kernel_current||'-'],
+    ['内核可用拥塞控制',(ker.kernel_available&&ker.kernel_available.length)?ker.kernel_available.join(', '):'-'],
+    ['内核原因',ker.error],
+    ['配置上行 (Mbps)',b.up_mbps||'-'],
+    ['配置下行 (Mbps)',b.down_mbps||'-'],
+    ['每连接下行预算 (Mbps)',b.max_down_mbps||b.per_conn_rx_mbps||'-'],
+    ['每连接上行 (Mbps)',b.max_up_mbps||b.per_conn_tx_mbps||'-'],
+    ['已生效连接',b.total_conns?(b.applied_conns+'/'+b.total_conns):'-'],
+  ]);
+
+  const note=document.getElementById('st-brut-note');
+  let txt='',bad=false;
+  if(!b.enabled){txt=ker.kernel_supported===true
+      ?'未启用：内核支持 Brutal，配置开启即生效；当前未做任何 TCP 整形。'
+      :'未启用：内核未做任何 TCP 整形。';}
+  else if(ker.kernel_supported!==true){txt=ker.error||'内核不可用：TCP Brutal 无法生效。';bad=true;}
+  else if(b.total_conns>0&&b.applied_conns<b.total_conns){
+    txt='内核支持，但仅 '+b.applied_conns+'/'+b.total_conns+' 条连接真正生效。'+(b.socks5?'（走 SOCKS5 代理的连接不整形）':'');bad=true;}
+  else{txt='内核支持且所有连接均已生效。';}
+  note.className=bad?'note bad':'note';
+  note.textContent=txt;
 }
 
 function renderConns(data){
   const list=data.conns||[];
-  if(data.mode!=='client'){document.getElementById('conns-body').innerHTML='<tr><td colspan="11" style="color:#777">仅客户端模式提供</td></tr>';return;}
+  if(data.mode!=='client'){document.getElementById('conns-body').innerHTML='<tr><td colspan="14" style="color:var(--muted)">仅客户端模式提供</td></tr>';return;}
+  const neg=data.negotiate||{},b=neg.brutal||{};
+  const brutCell=b.enabled?(b.total_conns?b.applied_conns+'/'+b.total_conns+' 已生效':'未生效'):'关闭';
   document.getElementById('conns-body').innerHTML=list.map(c=>'<tr><td>'+c.index+'</td><td>'+c.target+'</td><td>'+(c.remote||'-')+'</td>'+
     '<td>'+(c.state==='up'?'<span class="badge b-on">up</span>':c.state==='connecting'?'<span class="badge b-dup">connecting</span>':'<span class="badge b-off">'+c.state+'</span>')+'</td>'+
     '<td>'+(c.rtt_ms>=100000?'-':c.rtt_ms+' ms')+'</td><td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
     '<td class="hide-sm">'+c.retries+'</td><td class="hide-sm">'+(c.age_sec?fmtDur(c.age_sec):'-')+'</td>'+
-    '<td class="hide-sm" style="color:#c66" title="'+(c.last_error||'')+'">'+((c.last_error||'').slice(0,40))+'</td>'+
+    '<td class="hide-sm">'+badge(data.fec_mode||'off')+'</td><td class="hide-sm">'+encBadge(neg.enc_algo||0)+'</td>'+
+    '<td class="hide-sm">'+(c.brutal_applied?'<span class="badge b-on">已生效</span>':(b.enabled?'<span class="badge b-dup">未生效</span>':'<span class="badge b-off">未启用</span>'))+'</td>'+
+    '<td class="hide-sm" style="color:var(--err)" title="'+(c.last_error||'')+'">'+((c.last_error||'').slice(0,40))+'</td>'+
     '<td><button class="btn gray" onclick="doAction(\'reconnect\')">重连</button></td></tr>').join('')||
-    '<tr><td colspan="11" style="color:#777">无连接</td></tr>';
+    '<tr><td colspan="14" style="color:var(--muted)">无连接</td></tr>';
 }
 function renderMacs(data){
   const t=document.getElementById('macs-body');
-  if(data.mode!=='server'){t.innerHTML='<tr><td colspan="3" style="color:#777">仅服务端模式提供</td></tr>';return;}
+  if(data.mode!=='server'){t.innerHTML='<tr><td colspan="3" style="color:var(--muted)">仅服务端模式提供</td></tr>';return;}
   const list=data.mac_table||[];
   t.innerHTML=list.map(e=>'<tr><td>'+e.mac+'</td><td>'+e.port+'</td><td>'+e.age_sec+' 秒前</td></tr>').join('')||
-    '<tr><td colspan="3" style="color:#777">尚未学习到 MAC</td></tr>';
+    '<tr><td colspan="3" style="color:var(--muted)">尚未学习到 MAC</td></tr>';
 }
 function renderBans(data){
   const t=document.getElementById('bans-body');
-  if(data.mode!=='server'){t.innerHTML='<tr><td colspan="3" style="color:#777">仅服务端模式提供</td></tr>';return;}
+  if(data.mode!=='server'){t.innerHTML='<tr><td colspan="3" style="color:var(--muted)">仅服务端模式提供</td></tr>';return;}
   const bans=data.banned||{};
   t.innerHTML=Object.entries(bans).map(([id,left])=>'<tr><td title="'+id+'">'+(id.length>18?id.slice(0,18)+'…':id)+'</td>'+
     '<td>'+(left===0?'<span class="badge b-dup">永久</span>':fmtDur(left))+'</td>'+
     '<td><button class="btn gray" onclick="unban(\''+id+'\')">解封</button></td></tr>').join('')||
-    '<tr><td colspan="3" style="color:#777">无封禁记录</td></tr>';
+    '<tr><td colspan="3" style="color:var(--muted)">无封禁记录</td></tr>';
 }
 
 async function kickClient(id){if(!confirm('确定要强制断开该客户端吗？'))return;await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'kick',client_id:id})});fetchStats();}
@@ -658,7 +1022,6 @@ async function addBan(){const id=document.getElementById('ban-id').value.trim();
 async function unban(id){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'unban',client_id:id})});fetchStats();}
 async function doAction(action,extra){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:action},extra||{}))});fetchStats();}
 async function setLogLevel(v){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'loglevel',level:v})});}
-async function setPadMode(v){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pad_mode',level:v})});}
 
 function startLogPoll(){
   stopLogPoll();pollLogs();logTimer=setInterval(pollLogs,2000);
@@ -666,7 +1029,7 @@ function startLogPoll(){
 function stopLogPoll(){if(logTimer){clearInterval(logTimer);logTimer=null;}}
 async function pollLogs(){
   try{
-    const res=await fetch('/api/logs?after='+logSeq);
+    const res=await fetch(url('/api/logs?after='+logSeq),AUTH_HDR);
     if(!res.ok)return;
     const lines=await res.json();
     if(!lines.length)return;
@@ -674,7 +1037,7 @@ async function pollLogs(){
     box.innerHTML+=lines.map(l=>'<div class="lv-'+l.level+'">['+l.time+'] '+l.level+' '+l.msg.replace(/</g,'&lt;')+'</div>').join('');
     logSeq=lines[lines.length-1].seq;
     if(document.getElementById('autoscroll').checked)box.scrollTop=box.scrollHeight;
-  }catch(e){}
+  }catch(e){showErr('日志',e&&e.message||e);}
 }
 
 setInterval(fetchStats,2000);fetchStats();
@@ -714,12 +1077,10 @@ fn respond_json(req: tiny_http::Request, body: String, status: u16) {
 
 /// 常量时间比较，避免时序侧信道
 fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
+    let ah = Sha256::digest(a.as_bytes());
+    let bh = Sha256::digest(b.as_bytes());
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in ah.iter().zip(bh.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -771,6 +1132,7 @@ fn serve_listener(
     cert: String,
     key: String,
     provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
     ready: Option<std::sync::mpsc::Sender<bool>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -844,12 +1206,23 @@ fn serve_listener(
 
         match (request.method(), url.as_str()) {
             (&Method::Get, "/") => {
+                // no-store：面板 HTML 是编译进二进制的，版本变了旧页面不会自己变。
+                // 不换地址栏就看不到新代码，排查时会被误判成"改了没生效"。
                 let response = Response::from_string(DASHBOARD_HTML)
-                    .with_header(http_header("Content-Type", "text/html; charset=utf-8"));
+                    .with_header(http_header("Content-Type", "text/html; charset=utf-8"))
+                    .with_header(http_header("Cache-Control", "no-store"));
                 let _ = request.respond(response);
             }
             (&Method::Get, "/api/stats") => {
-                respond_json(request, provider.stats_json().to_string(), 200);
+                // provider 出的是运行时数据；cfg/system 是启动时固定的上下文，
+                // 在这里并入，避免把静态字段重复写进 server/client 两处实现。
+                let mut stats = provider.stats_json();
+                if let Some(obj) = stats.as_object_mut() {
+                    obj.insert("cfg".to_string(), ctx.cfg.clone());
+                    obj.insert("system".to_string(), ctx.system.clone());
+                    obj.insert("brutal_system".to_string(), brutal_system_status());
+                }
+                respond_json(request, stats.to_string(), 200);
             }
             (&Method::Get, "/api/logs") => {
                 let after: u64 = request
@@ -880,12 +1253,29 @@ fn serve_listener(
                     );
                     continue;
                 }
+                const MAX_CONTROL_BODY: usize = 64 * 1024;
+                if request.body_length().map_or(true, |n| n > MAX_CONTROL_BODY) {
+                    respond_json(
+                        request,
+                        json!({"error": "body length required and must not exceed 65536 bytes"})
+                            .to_string(),
+                        413,
+                    );
+                    continue;
+                }
                 let mut content = String::new();
-                if std::io::Read::read_to_string(request.as_reader(), &mut content).is_err() {
+                if std::io::Read::read_to_string(
+                    &mut request.as_reader().take((MAX_CONTROL_BODY + 1) as u64),
+                    &mut content,
+                )
+                .is_err()
+                    || content.len() > MAX_CONTROL_BODY
+                {
                     respond_json(request, json!({"error": "invalid body"}).to_string(), 400);
                     continue;
                 }
                 #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
                 struct ControlReq {
                     action: String,
                     #[serde(default)]
@@ -935,9 +1325,12 @@ pub fn start_web_server(
     cert: String,
     key: String,
     provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
 ) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || serve_listener(addr, auth, cert, key, provider, None, stop));
+    std::thread::spawn(move || {
+        serve_listener(addr, auth, cert, key, provider, ctx, None, stop)
+    });
 }
 
 /// 同一地址 30 秒内只上报一次绑定失败，避免隧道 IP 未就绪时每 2 秒刷一条
@@ -966,6 +1359,7 @@ pub fn start_web_server_tunnel(
     cert: String,
     key: String,
     provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
     source: Arc<dyn TunnelIpSource>,
 ) {
     std::thread::spawn(move || {
@@ -1009,6 +1403,7 @@ pub fn start_web_server_tunnel(
                 let listener_cert = cert.clone();
                 let listener_key = key.clone();
                 let provider = provider.clone();
+                let listener_ctx = ctx.clone();
                 let stop_task = stop.clone();
                 let handle = std::thread::spawn(move || {
                     serve_listener(
@@ -1017,6 +1412,7 @@ pub fn start_web_server_tunnel(
                         listener_cert,
                         listener_key,
                         provider,
+                        listener_ctx,
                         Some(tx),
                         stop_task,
                     );
@@ -1075,11 +1471,23 @@ mod tests {
     /// 发一个真实 HTTP GET，成功返回响应体
     fn http_get(addr: &str, path: &str) -> Option<String> {
         let mut s = std::net::TcpStream::connect(addr).ok()?;
-        let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, addr);
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            path, addr
+        );
         s.write_all(req.as_bytes()).ok()?;
         let mut out = String::new();
         s.read_to_string(&mut out).ok()?;
         Some(out)
+    }
+
+    fn http_raw(addr: &str, request: &str) -> String {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
     }
 
     fn wait_http(addr: &str, timeout: Duration) -> bool {
@@ -1107,8 +1515,8 @@ mod tests {
     /// web.cert / web.key 缺失时必须带标签报错，否则面板线程只会反复重试
     #[test]
     fn load_web_ssl_reports_which_file_is_unreadable() {
-        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/no_such_cert.pem");
+        let missing =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/no_such_cert.pem");
         let cert_err = load_web_ssl(missing.to_str().unwrap(), "somekey").unwrap_err();
         assert!(
             cert_err.starts_with("web.cert"),
@@ -1136,8 +1544,7 @@ mod tests {
 
     #[test]
     fn warn_throttled_suppresses_repeats_within_window() {
-        let mut keys: std::collections::HashMap<String, Instant> =
-            std::collections::HashMap::new();
+        let mut keys: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
         assert!(warn_throttled(&mut keys, "127.0.0.1:1"), "首次应上报");
         assert!(
             !warn_throttled(&mut keys, "127.0.0.1:1"),
@@ -1145,6 +1552,76 @@ mod tests {
         );
         // 不同地址互不影响
         assert!(warn_throttled(&mut keys, "127.0.0.1:2"));
+    }
+
+    #[test]
+    fn web_auth_and_control_body_limits_are_enforced() {
+        assert!(ct_eq("admin:secret", "admin:secret"));
+        assert!(!ct_eq("admin:secret", "admin:secret-longer"));
+
+        let addr = format!("127.0.0.1:{}", free_port());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let stop_task = stop.clone();
+        let addr_task = addr.clone();
+        let handle = std::thread::spawn(move || {
+            serve_listener(
+                addr_task,
+                "admin:secret".into(),
+                String::new(),
+                String::new(),
+                Arc::new(StubProvider),
+                Arc::new(RuntimeCtx::default()),
+                Some(tx),
+                stop_task,
+            );
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false));
+
+        let unauthorized = http_raw(
+            &addr,
+            &format!(
+                "GET /api/stats HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                addr
+            ),
+        );
+        assert!(unauthorized.contains(" 401 "));
+
+        let auth = "Authorization: Basic YWRtaW46c2VjcmV0\r\n";
+        let missing_len = http_raw(
+            &addr,
+            &format!(
+                "POST /api/control HTTP/1.1\r\nHost: {}\r\n{}X-Requested-With: tlsvpn\r\nConnection: close\r\n\r\n",
+                addr, auth
+            ),
+        );
+        assert!(missing_len.contains(" 413 "));
+
+        let bad = r#"{"action":"gc","unexpected":true}"#;
+        let unknown = http_raw(
+            &addr,
+            &format!(
+                "POST /api/control HTTP/1.1\r\nHost: {}\r\n{}X-Requested-With: tlsvpn\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                addr,
+                auth,
+                bad.len(),
+                bad
+            ),
+        );
+        assert!(unknown.contains(" 400 "));
+
+        let oversized = http_raw(
+            &addr,
+            &format!(
+                "POST /api/control HTTP/1.1\r\nHost: {}\r\n{}X-Requested-With: tlsvpn\r\nContent-Length: 65537\r\nConnection: close\r\n\r\n",
+                addr, auth
+            ),
+        );
+        assert!(oversized.contains(" 413 "));
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = http_get(&addr, "/api/stats");
+        assert!(handle.join().is_ok());
     }
 
     /// stop 是 tiny_http 监听端口唯一的关闭途径；不退出循环端口就不会释放
@@ -1162,6 +1639,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 Arc::new(StubProvider),
+                Arc::new(RuntimeCtx::default()),
                 Some(tx),
                 stop_task,
             );
@@ -1170,16 +1648,10 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false),
             "bind 应成功"
         );
-        assert!(
-            wait_http(&addr, Duration::from_secs(3)),
-            "监听应能响应请求"
-        );
+        assert!(wait_http(&addr, Duration::from_secs(3)), "监听应能响应请求");
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            handle.join().is_ok(),
-            "stop 后线程应正常退出"
-        );
+        assert!(handle.join().is_ok(), "stop 后线程应正常退出");
         // tiny_http 的 drop 到 OS 真正放端口有几百毫秒的窗口，并行跑测试时
         // 单点检查会撞上去
         assert!(
@@ -1205,6 +1677,7 @@ mod tests {
             String::new(),
             String::new(),
             Arc::new(StubProvider),
+            Arc::new(RuntimeCtx::default()),
             Arc::new(SwitchSource(addrs.clone())),
         );
 
@@ -1216,11 +1689,20 @@ mod tests {
 
         // 地址就绪后 a2 也要跟上来
         drop(blocker);
-        assert!(wait_http(&a2, Duration::from_secs(10)), "就绪地址应被补齐监听");
+        assert!(
+            wait_http(&a2, Duration::from_secs(10)),
+            "就绪地址应被补齐监听"
+        );
 
         // 地址从规格里消失：旧监听必须关闭并释放端口，而不是永久泄漏
         *addrs.lock() = vec![a2.clone()];
-        assert!(wait_closed(&a1, Duration::from_secs(10)), "消失的地址应释放端口");
-        assert!(wait_http(&a2, Duration::from_secs(5)), "保留的地址应继续服务");
+        assert!(
+            wait_closed(&a1, Duration::from_secs(10)),
+            "消失的地址应释放端口"
+        );
+        assert!(
+            wait_http(&a2, Duration::from_secs(5)),
+            "保留的地址应继续服务"
+        );
     }
 }

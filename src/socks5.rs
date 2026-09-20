@@ -66,7 +66,19 @@ impl Socks5Proxy {
     /// Establish a TCP connection to `(target_host, target_port)` *through* this
     /// proxy. DNS for the target is resolved by the proxy (ATYP=3 domain).
     pub fn connect(&self, target_host: &str, target_port: u16) -> std::io::Result<TcpStream> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        let stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        self.connect_over(stream, target_host, target_port)
+    }
+
+    /// Run the SOCKS5 handshake over an already-connected proxy socket.  The
+    /// client uses this entry point on Linux so SO_MARK is installed before
+    /// connecting to the proxy, just like direct connections.
+    pub fn connect_over(
+        &self,
+        mut stream: TcpStream,
+        target_host: &str,
+        target_port: u16,
+    ) -> std::io::Result<TcpStream> {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
