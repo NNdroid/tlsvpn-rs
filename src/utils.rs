@@ -178,6 +178,53 @@ pub fn is_valid_mac_string(s: &str) -> bool {
     s.is_empty() || parse_mac_key(s).is_some()
 }
 
+/// 在 tap 上配置隧道地址的 `ip` 子命令序列（不含 `ip` 本身）。
+///
+/// 顺序本身就是行为要求，动它等于把用户实际撞上的问题再造一遍：
+///   * bind 要求接口处于 IFF_UP，所以必须先 up 再挂地址；
+///   * v6 地址在接口 up 的瞬间会重新触发一次 DAD——先挂地址再 up，
+///     web.bind=tunnel 的第一轮绑定就白等一整个探测窗口；
+///   * v6 地址由对端显式分配（或配置指定为网关），没有需要探测的重复地址，
+///     所以加 `nodad` 让地址挂上即生效。不加的话，拿不到 RA 时地址会一直停在
+///     tentative，面板的 `[fd00::1]:8080` 就永久 bind 不上；
+///   * 用 `replace` 而不是 `add`：地址还在（进程重启、会话重建）时 `add` 报
+///     "File exists" 而配不上。
+pub fn tap_addr_cmds<'a>(tap: &'a str, v4cidr: &'a str, v6cidr: &'a str) -> Vec<Vec<&'a str>> {
+    let mut out = vec![vec!["link", "set", "dev", tap, "up"]];
+    if v4cidr != "/" && !v4cidr.is_empty() {
+        out.push(vec!["addr", "replace", v4cidr, "dev", tap]);
+    }
+    if v6cidr != "/" && !v6cidr.is_empty() {
+        out.push(vec!["-6", "addr", "replace", "nodad", v6cidr, "dev", tap]);
+    }
+    out
+}
+
+/// 逐条执行上面的命令并报告失败。
+///
+/// 地址配不上时隧道网关不可达，web.bind=tunnel 会对着一个不存在的地址反复
+/// bind 失败。以前静默丢弃退出码，表现只能是"面板连不上"，看不到原因。
+#[cfg(target_os = "linux")]
+pub fn apply_ip_cmds(cmds: &[Vec<&str>]) {
+    use std::process::Command;
+    for cmd in cmds {
+        let what = cmd.join(" ");
+        match Command::new("ip").args(cmd).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let detail = if err.is_empty() {
+                    format!("exit {}", o.status)
+                } else {
+                    err
+                };
+                tracing::warn!("ip {what} failed: {detail}");
+            }
+            Err(e) => tracing::warn!("ip {what} failed: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +375,29 @@ mod tests {
         assert!(!is_valid_cidr("10.0.0.0/24", true));
         assert!(!is_valid_cidr("fd00::/64", false));
         // "fd00::/128" 对 v4 来说前缀超界
-        assert!(!is_valid_cidr("fd00::/128", false));
+        assert!(!is_valid_cidr("10.0.0.0/128", false));
+    }
+
+    #[test]
+    fn tap_addr_cmds_brings_the_link_up_first_and_marks_v6_nodad() {
+        let cmds = tap_addr_cmds("tap0", "10.0.0.1/24", "fd00::1/64");
+        assert_eq!(cmds.len(), 3);
+
+        // 第一条必须是 link up：bind 要求 IFF_UP，且 v6 地址在接口 up 的瞬间
+        // 会重新触发 DAD，先挂地址再 up 会让 web.bind=tunnel 白等一个探测窗口
+        assert_eq!(cmds[0], &["link", "set", "dev", "tap0", "up"][..]);
+        assert_eq!(cmds[1], &["addr", "replace", "10.0.0.1/24", "dev", "tap0"][..]);
+
+        // v6：nodad 让地址挂上即生效（拿不到 RA 时一直 tentative，v6 面板绑定
+        // 永久失败）；replace 而不是 add（地址还在时 add 报 File exists）
+        let v6 = &cmds[2];
+        assert!(v6.contains(&"nodad"), "v6 必须带 nodad: {v6:?}");
+        assert!(v6.contains(&"replace"), "必须用 replace: {v6:?}");
+        assert!(!v6.contains(&"add"), "不能是 add: {v6:?}");
+        assert!(!cmds[1].contains(&"add"), "v4 也不能是 add: {cmds:?}");
+
+        // "/" 是"未配置"哨兵，对应族不应产生任何命令
+        assert_eq!(tap_addr_cmds("tap0", "/", "").len(), 1);
+        assert_eq!(tap_addr_cmds("tap0", "10.0.0.1/24", "/").len(), 2);
     }
 }

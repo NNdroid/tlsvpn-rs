@@ -8,7 +8,6 @@ use rustls::{ServerConfig, ServerConnection};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -669,26 +668,14 @@ pub fn start_server(args: &Args) {
             info!("Interface {} MAC set to {}", args.tap, args.mac);
         }
         info!("Configuring Server TAP Interface IP...");
-        // 对齐 Go：TAP 配置网关地址（网络基址+1），而非网络号
-        Command::new("ip")
-            .args(["addr", "add", &core.ipv4_cidr(&gw_v4), "dev", &args.tap])
-            .output()
-            .ok();
-        Command::new("ip")
-            .args([
-                "-6",
-                "addr",
-                "add",
-                &core.ipv6_cidr(&gw_v6),
-                "dev",
-                &args.tap,
-            ])
-            .output()
-            .ok();
-        Command::new("ip")
-            .args(["link", "set", "dev", &args.tap, "up"])
-            .output()
-            .ok();
+        // 对齐 Go：TAP 挂网关地址（网络基址+1），而不是网络号。先 up 再挂
+        // 地址、v6 加 nodad，否则 web.bind=tunnel 的面板绑定不上 v6 网关。
+        #[cfg(target_os = "linux")]
+        crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(
+            &args.tap,
+            &core.ipv4_cidr(&gw_v4),
+            &core.ipv6_cidr(&gw_v6),
+        ));
         Arc::new(dev)
     };
 

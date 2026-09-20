@@ -1418,26 +1418,14 @@ fn tls_exchange_resp(
     }
 }
 
-// Linux 下用 ip 命令配置接口地址（对齐 Go setupInterface 的 AddrReplace 语义）
+// Linux 下用 ip 命令配置接口地址；命令序列（顺序、nodad、replace）见
+// utils::tap_addr_cmds，那是 web.bind=tunnel 能绑上 v6 隧道 IP 的前提。
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
 fn setup_interface(cl: &Arc<Client>, v4cidr: &str, v6cidr: &str) {
-    if v4cidr != "/" && !v4cidr.is_empty() {
-        Command::new("ip")
-            .args(["addr", "replace", v4cidr, "dev", &cl.tap_name])
-            .output()
-            .ok();
-    }
-    if v6cidr != "/" && !v6cidr.is_empty() {
-        Command::new("ip")
-            .args(["-6", "addr", "replace", v6cidr, "dev", &cl.tap_name])
-            .output()
-            .ok();
-    }
-    Command::new("ip")
-        .args(["link", "set", "dev", &cl.tap_name, "up"])
-        .output()
-        .ok();
+    crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(
+        &cl.tap_name, v4cidr, v6cidr,
+    ));
 }
