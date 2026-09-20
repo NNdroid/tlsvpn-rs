@@ -61,7 +61,7 @@ sudo ./target/release/tlsvpn -c client.json
 
 Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
 
-Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite, so they never drift from the binary.
+Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite, so they never drift from the binary. They deliberately omit the two Rust-only keys (`workers`, `mtu`) so the Go binary can read them too: Go decodes with `DisallowUnknownFields` and refuses the whole file over an unknown key.
 
 ## Configuration
 
@@ -100,7 +100,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 
 </details>
 
-All defaults match the Go implementation 1:1; the only Rust-specific field is `workers`.
+All defaults match the Go implementation 1:1. Two fields are Rust extensions (`workers`, `mtu`) — Go has no such keys and refuses a config file containing them, so they only belong in Rust-only files.
 
 | Field | Default | Where | Description |
 | --- | --- | --- | --- |
@@ -112,8 +112,8 @@ All defaults match the Go implementation 1:1; the only Rust-specific field is `w
 | `pad_mode` | `bucket` | — | Payload padding style: `bucket`, `legacy`, `off` (empty = `bucket`). Changeable live from the dashboard |
 | `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
-| `workers` | `0` | — | **Rust server only**: worker event-loop threads (0 = auto, one per CPU up to 8) |
-| `mtu` | `1500` | — | TAP MTU. Higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
+| `workers` | `0` | — | **Rust-only extension** — Go rejects this key. Worker event-loop threads (0 = auto, one per CPU up to 8) |
+| `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU; higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
 | `mac` | (empty) | — | Explicit TAP MAC, `aa:bb:cc:dd:ee:ff`, local bit must be clear. Written **into** the TAP device (the server drops frames whose src MAC isn't the identity, so a value that's only used to compute the ClientID would drop your own traffic) and part of the client identity |
 | `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
@@ -121,10 +121,10 @@ All defaults match the Go implementation 1:1; the only Rust-specific field is `w
 | `web.addr` | (empty) | — | Dashboard listen address; off unless set |
 | `web.auth` | (empty) | — | Basic Auth as `user:pass` (constant-time compare). Must contain a `:` — a bare username would 401 every request. Strongly recommended off loopback |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving |
-| `web.cert` / `web.key` | (empty) | — | Accepted for Go config compatibility only — the Rust dashboard always serves plain HTTP and ignores them |
+| `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS, as PEM paths. Both set = the panel is served over TLS (the log line then says `https://`); both empty = plain HTTP. Setting only one is a config error, caught at startup rather than by the dashboard thread retrying forever |
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
-| `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM) |
+| `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
 | `server.session_token` | `false` | server | Enable per-session tokens |
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
@@ -136,11 +136,13 @@ All defaults match the Go implementation 1:1; the only Rust-specific field is `w
 | `client.req_v4` / `req_v6` | (empty) | client | Request a specific internal IPv4/IPv6 address |
 | `client.fwmark` | `0` | client | Policy-routing fwmark for traffic splitting (Linux) |
 
+Keys that belong to the other mode are accepted but have no effect (a server ignores `client.*`, a client ignores `server.*`). Every non-default one is called out on startup — `ignored (mode=server has no effect on them): server.v4_cidr, server.v6_cidr, server.cert` — so a value pasted into the wrong block can't fail silently. Defaults are not listed, since they just mean the key wasn't written.
+
 > Unlike the Go server, the Rust server requires explicit `server.cert`/`server.key` — no self-signed generation. Generate a pair once and it survives restarts the same way.
 
 ## Dashboard
 
-Off by default; set `web.addr` on **both** sides to enable it. Throughput chart (120s), FEC recovered/lost counters, per-connection RTT/bytes/retries, MAC table, IP-pool usage, ban/kick/kick-all with immediate effect, in-panel log tail (500 lines) with live level switching, and Prometheus `/metrics`. Every control action requires a CSRF header (`X-Requested-With`).
+Off by default; set `web.addr` on **both** sides to enable it. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Throughput chart (120s), FEC recovered/lost counters, per-connection RTT/bytes/retries, MAC table, IP-pool usage, ban/kick/kick-all with immediate effect, in-panel log tail (500 lines) with live level switching, and Prometheus `/metrics`. Every control action requires a CSRF header (`X-Requested-With`).
 
 ## Notes
 
@@ -170,6 +172,7 @@ go build -C interop -o interop/probe .          # Go probe
 | `tok` | 6 | `session_token` hijack via two same-MAC clients — 4 rejects + 2 takeover controls |
 | `pad` | 16 | `pad_mode` off / legacy / bucket × server and client side, plus an invalid value |
 | `minenc` | 33 | `min_enc` floors × declared `enc_algo`, including unknown algo IDs |
+| `cfg` | 35 | Config dimensions × 4 rs/go combinations (CIDR pools, `client.conns`, `web.auth`, panel HTTPS, `web.bind=tunnel`, `log_level`), plus 11 startup-rejection cases |
 
 Each suite is also standalone with its own env knobs (`SRV`, `CLI`, `PAD`, `PORT`, …), and ports are offset per case from a `PORT_BASE_*` var so concurrent runs don't collide. Mixed-version cases skip with a count instead of failing when the pre-feature binaries aren't built — point `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE` and `E2E_GO_OLD_BIN` at them to enable. `e2e_cert.pem`/`e2e_key.pem` are gitignored and generated on demand; shared helpers are in `scripts/e2e_lib.sh`.
 

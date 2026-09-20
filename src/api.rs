@@ -747,6 +747,19 @@ fn check_basic_auth(auth_spec: &str, req: &tiny_http::Request) -> bool {
     ct_eq(&cred, auth_spec)
 }
 
+/// 读 web.cert / web.key 组装 HTTPS 凭据。
+///
+/// 这里只负责读文件：路径是否可读、cert/key 是否配对由 validate_args 先挡，
+/// PEM 内容是否合法由 tiny_http 在建 listener 时报错。
+fn load_web_ssl(cert: &str, key: &str) -> Result<tiny_http::SslConfig, String> {
+    let certificate = std::fs::read(cert).map_err(|e| format!("web.cert {}: {}", cert, e))?;
+    let private_key = std::fs::read(key).map_err(|e| format!("web.key {}: {}", key, e))?;
+    Ok(tiny_http::SslConfig {
+        certificate,
+        private_key,
+    })
+}
+
 /// 单个 listener 的服务循环：bind `addr` 并处理请求直到线程被放弃。
 ///
 /// `ready` 若在 bind 前给出，bind 结果会在进入 accept 循环前回报
@@ -755,11 +768,31 @@ fn check_basic_auth(auth_spec: &str, req: &tiny_http::Request) -> bool {
 fn serve_listener(
     addr: String,
     auth: String,
+    cert: String,
+    key: String,
     provider: Arc<dyn WebStatsProvider>,
     ready: Option<std::sync::mpsc::Sender<bool>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let server = match HttpServer::http(&addr) {
+    // web.cert + web.key 同时非空 = 面板走 HTTPS（对齐 Go loadWebTLS：只判
+    // 非空，不要求配对之外的额外条件）。两者都是路径，PEM 内容的合法性由
+    // tiny_http 在建 listener 时校验，失败会走下面 bind 失败的同一条分支。
+    let (server, tls) = if cert.is_empty() || key.is_empty() {
+        (HttpServer::http(&addr), false)
+    } else {
+        match load_web_ssl(&cert, &key) {
+            Ok(cfg) => (HttpServer::https(&addr, cfg), true),
+            Err(e) => {
+                if let Some(tx) = ready {
+                    let _ = tx.send(false);
+                } else {
+                    tracing::error!("Web Dashboard TLS: {}", e);
+                }
+                return;
+            }
+        }
+    };
+    let server = match server {
         Ok(s) => {
             if let Some(tx) = ready {
                 let _ = tx.send(true);
@@ -775,7 +808,11 @@ fn serve_listener(
             return;
         }
     };
-    info!("🚀 Web Dashboard listening at http://{}", addr);
+    info!(
+        "🚀 Web Dashboard listening at {}://{}",
+        if tls { "https" } else { "http" },
+        addr
+    );
     // 用 recv_timeout 轮询而不是 incoming_requests()：tiny_http 没有公开的
     // close()，监听端口只在线程退出这个循环、Server 被 drop 时才释放。
     // stop 是关闭监听的唯一途径——rebind 回收旧地址、进程退出都靠它。
@@ -892,9 +929,15 @@ pub fn web_port(addr: &str) -> u16 {
 }
 
 /// web.bind=all：直接启动单个 listener（默认行为，不变）。stop 永不置位。
-pub fn start_web_server(addr: String, auth: String, provider: Arc<dyn WebStatsProvider>) {
+pub fn start_web_server(
+    addr: String,
+    auth: String,
+    cert: String,
+    key: String,
+    provider: Arc<dyn WebStatsProvider>,
+) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || serve_listener(addr, auth, provider, None, stop));
+    std::thread::spawn(move || serve_listener(addr, auth, cert, key, provider, None, stop));
 }
 
 /// 同一地址 30 秒内只上报一次绑定失败，避免隧道 IP 未就绪时每 2 秒刷一条
@@ -920,6 +963,8 @@ fn warn_throttled(keys: &mut std::collections::HashMap<String, Instant>, key: &s
 pub fn start_web_server_tunnel(
     bind_port: u16,
     auth: String,
+    cert: String,
+    key: String,
     provider: Arc<dyn WebStatsProvider>,
     source: Arc<dyn TunnelIpSource>,
 ) {
@@ -956,26 +1001,36 @@ pub fn start_web_server_tunnel(
                 if adopted.iter().any(|(cur, _, _)| *cur == a) {
                     continue;
                 }
-                let key = a.clone();
+                let addr_key = a.clone();
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (tx, rx) = std::sync::mpsc::channel::<bool>();
                 let addr = a;
                 let auth = auth.clone();
+                let listener_cert = cert.clone();
+                let listener_key = key.clone();
                 let provider = provider.clone();
                 let stop_task = stop.clone();
                 let handle = std::thread::spawn(move || {
-                    serve_listener(addr, auth, provider, Some(tx), stop_task);
+                    serve_listener(
+                        addr,
+                        auth,
+                        listener_cert,
+                        listener_key,
+                        provider,
+                        Some(tx),
+                        stop_task,
+                    );
                 });
                 // bind 是同步的，正常情况下立刻有结果。超时时结果未知，
                 // 保守地不采纳：真已绑定就让它继续服务，下一轮会因
                 // EADDRINUSE 再判失败，不会开出重复监听。
                 let bound = rx.recv_timeout(Duration::from_secs(1)).unwrap_or(false);
                 if bound {
-                    adopted.push((key, stop, handle));
-                } else if warn_throttled(&mut warn_keys, &key) {
+                    adopted.push((addr_key, stop, handle));
+                } else if warn_throttled(&mut warn_keys, &addr_key) {
                     warn!(
                         "Web Dashboard bind failed on {} (other listeners still serving, will retry)",
-                        key
+                        addr_key
                     );
                 }
             }
@@ -1049,6 +1104,36 @@ mod tests {
         false
     }
 
+    /// web.cert / web.key 缺失时必须带标签报错，否则面板线程只会反复重试
+    #[test]
+    fn load_web_ssl_reports_which_file_is_unreadable() {
+        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/no_such_cert.pem");
+        let cert_err = load_web_ssl(missing.to_str().unwrap(), "somekey").unwrap_err();
+        assert!(
+            cert_err.starts_with("web.cert"),
+            "缺 cert 应指认 web.cert，实际: {}",
+            cert_err
+        );
+        // cert 存在但 key 缺失：要报 web.key 而不是 web.cert
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("tlsvpn-wss-{}-c.pem", std::process::id()));
+        std::fs::write(&cert_path, b"not a real pem\n").unwrap();
+        let key_err = load_web_ssl(
+            cert_path.to_str().unwrap(),
+            dir.join(format!("tlsvpn-wss-{}-k.pem", std::process::id()))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            key_err.starts_with("web.key"),
+            "缺 key 应指认 web.key，实际: {}",
+            key_err
+        );
+        let _ = std::fs::remove_file(&cert_path);
+    }
+
     #[test]
     fn warn_throttled_suppresses_repeats_within_window() {
         let mut keys: std::collections::HashMap<String, Instant> =
@@ -1071,7 +1156,15 @@ mod tests {
         let stop_task = stop.clone();
         let addr_task = addr.clone();
         let handle = std::thread::spawn(move || {
-            serve_listener(addr_task, String::new(), Arc::new(StubProvider), Some(tx), stop_task);
+            serve_listener(
+                addr_task,
+                String::new(),
+                String::new(),
+                String::new(),
+                Arc::new(StubProvider),
+                Some(tx),
+                stop_task,
+            );
         });
         assert!(
             rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false),
@@ -1108,6 +1201,8 @@ mod tests {
         let addrs = Arc::new(Mutex::new(vec![a1.clone(), a2.clone()]));
         start_web_server_tunnel(
             0,
+            String::new(),
+            String::new(),
             String::new(),
             Arc::new(StubProvider),
             Arc::new(SwitchSource(addrs.clone())),

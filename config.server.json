@@ -9,8 +9,6 @@
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
-  "workers": 4,
-  "mtu": 1500,
   "tap": "tap0",
   "mac": "",
   "web": {

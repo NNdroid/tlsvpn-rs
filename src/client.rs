@@ -627,10 +627,18 @@ pub fn start_client(args: &Args) {
             "tunnel" => start_web_server_tunnel(
                 web_port(&args.web),
                 args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
                 client.clone(),
                 client.clone(),
             ),
-            _ => start_web_server(args.web.clone(), args.web_auth.clone(), client.clone()),
+            _ => start_web_server(
+                args.web.clone(),
+                args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
+                client.clone(),
+            ),
         }
     }
 

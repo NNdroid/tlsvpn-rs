@@ -51,6 +51,10 @@ pub struct Args {
     pub web: String,
     pub web_auth: String,
     pub web_bind: String,
+    // 面板 HTTPS 凭据：两者都非空时面板走 https，否则明文 http。
+    // 只填一个视为配置错误（validate_args 挡下）。
+    pub web_cert: String,
+    pub web_key: String,
     pub encrypt: bool,
     pub socks5: String,
     pub workers: i32,
@@ -96,12 +100,9 @@ struct WebConfigFile {
     addr: String,
     auth: String,
     bind: String,
-    // Go 版把面板 HTTPS 证书放在这里（web.cert / web.key）。Rust 版面板目前
-    // 只走明文 HTTP，无法消费这两个值，但必须能解析——Go 的示例配置里恒有
-    // 它们，留空即代表"不启用面板 HTTPS"，丢弃不改变任何行为。
-    #[allow(dead_code)]
+    // 面板 HTTPS：两者都非空即启用（tiny_http ssl-rustls），只填一个报配置
+    // 错误。留空 = 明文 HTTP，Go 的示例配置里恒有这两项所以必须能解析。
     cert: String,
-    #[allow(dead_code)]
     key: String,
 }
 
@@ -186,6 +187,8 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.web.bind
         },
+        web_cert: cfg.web.cert,
+        web_key: cfg.web.key,
         v4cidr: if cfg.server.v4_cidr.is_empty() {
             "10.0.0.0/24".into()
         } else {
@@ -231,6 +234,19 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         args.addr = "0.0.0.0:4000".into();
     }
     Ok(args)
+}
+
+/// 配置里给的路径必须是存在的普通文件。
+///
+/// 这类值（server.cert/key、web.cert/key）以前都是启动阶段才碰，坏值的表现
+/// 是一个 panic（`Cannot open cert ...`）或者面板线程每 2 秒重试一次，
+/// 都不如启动前一条说清楚哪个键、哪个文件、为什么的报错。
+fn config_file_readable(label: &str, path: &str) -> Result<(), String> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Ok(()),
+        Ok(_) => Err(format!("{} is not a regular file: {}", label, path)),
+        Err(e) => Err(format!("{} {} unreadable: {}", label, path, e)),
+    }
 }
 
 fn validate_args(args: &Args) -> Result<(), String> {
@@ -283,6 +299,25 @@ fn validate_args(args: &Args) -> Result<(), String> {
             args.web_auth
         ));
     }
+    // web.cert / web.key：都空 = 明文 HTTP，都非空 = HTTPS，只填一个是错的
+    // （tiny_http 需要一个成对的 SslConfig）。必须在启动前断掉：否则面板管理
+    // 线程会在绑定阶段才发现读不到文件，每轮重试一次，面板一直起不来。
+    let (has_cert, has_key) = (!args.web_cert.is_empty(), !args.web_key.is_empty());
+    if has_cert != has_key {
+        return Err(if has_cert {
+            "web.key is required when web.cert is set".into()
+        } else {
+            "web.cert is required when web.key is set".into()
+        });
+    }
+    if has_cert {
+        if let Err(e) = config_file_readable("web.cert", &args.web_cert) {
+            return Err(e);
+        }
+        if let Err(e) = config_file_readable("web.key", &args.web_key) {
+            return Err(e);
+        }
+    }
     if args.mode == "server" {
         // parse_v4_cidr / parse_v6_cidr 遇到不可解析的串会回落到默认网段，
         // 垃圾 CIDR 必须在这里断掉而不是变成悄悄换地址池（对齐 Go net.ParseCIDR）
@@ -291,6 +326,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
         }
         if !crate::utils::is_valid_cidr(&args.v6cidr, true) {
             return Err(format!("invalid server.v6_cidr {:?}", args.v6cidr));
+        }
+        // 服务端 TLS 证书只校验配对：这个构建不会像 Go 那样留空自动生成自签
+        // 证书，但示例配置里写的 server.crt/server.key 本来就是要用户先生成
+        // 的，所以「文件存在性」留到实际加载时判，那里给的是可操作的报错。
+        if args.cert.is_empty() != args.key.is_empty() {
+            return Err(if args.cert.is_empty() {
+                "server.key is set but server.cert is empty".into()
+            } else {
+                "server.cert is set but server.key is empty".into()
+            });
         }
     }
     // 配置加载层强校验；set_pad_mode 的 legacy 回落只兜住面板热更路径
@@ -414,11 +459,37 @@ fn main() {
 
     install_signal_handler();
 
+    // 填在错的模式里就等于白填：不会报错，只是静默不起作用。只对「填了且非
+    // 默认值」的项提示，默认值说明配置里根本没写，不值得刷一条 warning。
+    let mut ignored = Vec::new();
+    if args.mode == "server" {
+        if !args.req_v4.is_empty() { ignored.push("client.req_v4"); }
+        if !args.req_v6.is_empty() { ignored.push("client.req_v6"); }
+        if args.sni != "www.cloudflare.com" { ignored.push("client.sni"); }
+        if args.insecure { ignored.push("client.insecure"); }
+        if !args.cert_sha256.is_empty() { ignored.push("client.cert_sha256"); }
+        if args.fwmark != 0 { ignored.push("client.fwmark"); }
+        if args.conns != 1 { ignored.push("client.conns"); }
+        if args.fec { ignored.push("client.fec"); }
+        if args.fec_group != 4 { ignored.push("client.fec_group"); }
+    } else if args.mode == "client" {
+        if args.v4cidr != "10.0.0.0/24" { ignored.push("server.v4_cidr"); }
+        if args.v6cidr != "fd00::/64" { ignored.push("server.v6_cidr"); }
+        if !args.cert.is_empty() { ignored.push("server.cert"); }
+        if !args.key.is_empty() { ignored.push("server.key"); }
+        if args.session_token { ignored.push("server.session_token"); }
+        if args.max_sessions != 1024 { ignored.push("server.max_sessions"); }
+    }
+    if !ignored.is_empty() {
+        warn!(
+            "ignored (mode={} has no effect on them): {}",
+            args.mode,
+            ignored.join(", ")
+        );
+    }
+
     match args.mode.as_str() {
         "server" => {
-            if args.fec {
-                tracing::warn!("client FEC settings are ignored in server mode");
-            }
             start_server(&args);
         }
         "client" => {
@@ -838,6 +909,46 @@ mod tests {
             validate_args(&a).is_ok(),
             "client 模式不校验 v4/v6_cidr"
         );
+
+        // web.cert / web.key 只填一个是错的：tiny_http 需要一个成对的 SslConfig，
+        // 拆开填只会让面板监听永远起不来
+        for (c, k) in [("only.crt", ""), ("", "only.key")] {
+            a.web_cert = c.into();
+            a.web_key = k.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("required when"),
+                "web 证书/私钥只填一个应被拒绝（cert={c:?} key={k:?}），实际: {err}"
+            );
+            a.web_cert = String::new();
+            a.web_key = String::new();
+        }
+        // 示例配置里这两个键恒为空串 = 明文 HTTP，必须放行
+        assert!(
+            validate_args(&a).is_ok(),
+            "web 证书都空应放行（面板走 HTTP）"
+        );
+
+        // server.cert / server.key 同样只校验配对：示例配置里的 server.crt /
+        // server.key 本来就是要用户先 openssl 生成的，所以「文件存在性」留给
+        // 加载期判，那里给的是能告诉用户怎么办的一条报错而不是 panic。
+        a.mode = "server".into();
+        a.addr = "0.0.0.0:4000".into();
+        for (c, k) in [("only.crt", ""), ("", "only.key")] {
+            a.cert = c.into();
+            a.key = k.into();
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.starts_with("server.") && err.contains("empty"),
+                "server 证书/私钥只填一个应被拒绝（cert={c:?} key={k:?}），实际: {err}"
+            );
+            a.cert = String::new();
+            a.key = String::new();
+        }
+        assert!(
+            validate_args(&a).is_ok(),
+            "server 证书都空应放行（加载期再报缺证书）"
+        );
     }
 
     struct InfiniteReader {
@@ -896,9 +1007,11 @@ mod tests {
 }
 
 /// 与 Go 端 exampleConfigJSON 逐字段一致的模板（两端配置文件可互换）
-fn example_config_json() -> String {
-    format!(
-        r#"{{
+/// -print-config 模板。刻意只放 Go/Rust 都能解析的字段：workers 和 mtu 是
+/// Rust 专属配置项，Go 用 json.Decoder.DisallowUnknownFields，模板里出现
+/// 它们就等于 --print-config 的输出在 Go 版上直接解析失败。要调就自己加。
+fn example_config_json() -> &'static str {
+    r#"{
   "mode": "client",
   "psk": "change-me-please",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
@@ -909,19 +1022,17 @@ fn example_config_json() -> String {
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
-  "workers": {},
-  "mtu": 1500,
   "socks5": "",
   "tap": "tap0",
   "mac": "",
-  "web": {{
+  "web": {
     "addr": ":8080",
     "auth": "admin:change-me",
     "bind": "all",
     "cert": "",
     "key": ""
-  }},
-  "client": {{
+  },
+  "client": {
     "conns": 4,
     "fec": true,
     "fec_group": 4,
@@ -931,18 +1042,16 @@ fn example_config_json() -> String {
     "req_v4": "",
     "req_v6": "",
     "fwmark": 0
-  }},
-  "server": {{
+  },
+  "server": {
     "v4_cidr": "10.0.0.0/24",
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
     "session_token": false,
     "max_sessions": 1024
-  }}
-}}"#,
-        num_cpus_hint()
-    )
+  }
+}"#
 }
 
     // ---------- 仓库根目录的示例配置 ----------
@@ -963,15 +1072,15 @@ fn example_config_json() -> String {
                 .unwrap_or_else(|e| panic!("{} 校验失败: {}", file, e));
             assert_eq!(args.mode, mode, "{} 的 mode 不对", file);
             assert_eq!(args.pad_mode, "bucket", "{} 的 pad_mode 未按模板", file);
-            assert_eq!(args.mtu, 1500, "{} 的 mtu 未按模板", file);
+            assert_eq!(args.mtu, 1500, "{} 未声明 mtu，应取默认 1500", file);
+            assert_eq!(
+                args.workers, 0,
+                "{} 未声明 workers，应取默认（自动按 CPU 核数）",
+                file
+            );
             psks.push(args.psk);
         }
         // 两份示例的 psk 必须一致，否则开箱即不通
         assert_eq!(psks[0], psks[1], "server/client 示例的 psk 不一致");
     }
 
-fn num_cpus_hint() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-}

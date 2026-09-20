@@ -541,22 +541,48 @@ impl WebStatsProvider for ServerCore {
 
 // ======================= TLS 材料 =======================
 
-fn load_certs(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
-    let f =
-        std::fs::File::open(path).unwrap_or_else(|e| panic!("Cannot open cert {}: {}", path, e));
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    if path.is_empty() {
+        return Err(
+            "server.cert is empty: this build does not auto-generate a self-signed cert \
+             (see README for the openssl one-liner)"
+                .into(),
+        );
+    }
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("server.cert {}: {}", path, e))?;
     let mut r = std::io::BufReader::new(f);
     rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
-        .expect("invalid cert PEM")
+        .map_err(|e| format!("server.cert {}: invalid cert PEM: {}", path, e))
 }
 
-fn load_key(path: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
+fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    if path.is_empty() {
+        return Err(
+            "server.key is empty: this build does not auto-generate a self-signed cert \
+             (see README for the openssl one-liner)"
+                .into(),
+        );
+    }
     let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).unwrap_or_else(|e| panic!("Cannot open key {}: {}", path, e)),
+        std::fs::File::open(path)
+            .map_err(|e| format!("server.key {}: {}", path, e))?,
     );
     rustls_pemfile::private_key(&mut reader)
-        .expect("invalid key PEM")
-        .expect("no private key found")
+        .map_err(|e| format!("server.key {}: invalid key PEM: {}", path, e))?
+        .ok_or_else(|| format!("server.key {}: no private key found", path))
+}
+
+/// 服务端 TLS 配置。历史上这一步的每个失败点都是 panic（unwrap / expect），
+/// 报的是 "Invalid TLS cert/key" 这种看不出哪份文件出问题的话。
+fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(load_certs(cert)?, load_key(key)?)
+        .map_err(|e| format!("server.cert and server.key do not match: {}", e))?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
 }
 
 // ======================= 服务端主流程 =======================
@@ -671,10 +697,18 @@ pub fn start_server(args: &Args) {
             "tunnel" => start_web_server_tunnel(
                 web_port(&args.web),
                 args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
                 core.clone(),
                 core.clone(),
             ),
-            _ => start_web_server(args.web.clone(), args.web_auth.clone(), core.clone()),
+            _ => start_web_server(
+                args.web.clone(),
+                args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
+                core.clone(),
+            ),
         }
     }
 
@@ -709,14 +743,13 @@ pub fn start_server(args: &Args) {
         }
     });
 
-    let certs = load_certs(&args.cert);
-    let key = load_key(&args.key);
-    let mut tls_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("Invalid TLS cert/key");
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let tls_config = Arc::new(tls_config);
+    let tls_config = match build_server_tls(&args.cert, &args.key) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Invalid configuration: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let n_workers = if args.workers > 0 {
         args.workers.max(1) as usize

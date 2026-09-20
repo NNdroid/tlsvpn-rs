@@ -6,9 +6,9 @@
 #   tok     session_token：同 MAC 两台真实客户端互踢，验证接管被拒
 #   pad     pad_mode：off / legacy / bucket 三档 + 非法值
 #   minenc  min_enc："" / ctr / legacy / gcm 下限，含未知算法 ID 回归
-#   cfg     配置维度：v4/v6 网段 / client.conns / web.auth / web.bind=tunnel /
-#           log_level 互通，外加 badlog / badauth / badv4 / badv6 / badmac /
-#           badbind 六个配置校验
+#   cfg     配置维度：v4/v6 网段 / client.conns / web.auth / web.cert+web.key
+#           (HTTPS) / web.bind=tunnel / log_level 互通，外加 badlog / badauth /
+#           badv4 / badv6 / badmac / badbind / badwebtls 七个配置校验
 #
 # 全部用 --tap mem 的自包含探针，不需要 CAP_NET_ADMIN，托管 CI 上也能真跑
 # （net_perf_test.sh 那套需要真实 TAP，只能在有权限的 runner 上执行）。
@@ -184,14 +184,14 @@ suite_minenc() {
 }
 
 suite_cfg() {
-  # 前 5 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
+  # 前 6 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
   # （rs/rs、rs/go、go/rs、go/go），因为「配置生效」必须跨语言成立。
-  # 后 6 个是校验类：进程必须以非零退出并给出对应错误。Go 的 Validate 不检查
-  # mac 和 web.bind，那两个只在 Rust 服务端上跑。
-  local -a interop=(cidr multi webauth webtunnel logquiet)
+  # 后 7 个是校验类：进程必须以非零退出并给出对应错误。Go 的 Validate 不检查
+  # mac / web.bind / web 证书配对，那三个只在 Rust 服务端上跑。
+  local -a interop=(cidr multi webauth webtls webtunnel logquiet)
   local -a reject=(badlog badauth badv4 badv6)
   local i=0 s c fails=0 case
-  echo "  互通：5 个配置维度 × 4 种实现组合 = 20 组"
+  echo "  互通：6 个配置维度 × 4 种实现组合 = 24 组"
   for case in "${interop[@]}"; do
     for s in rs go; do
       for c in rs go; do
@@ -202,8 +202,8 @@ suite_cfg() {
       done
     done
   done
-  i=20
-  echo "  校验：4 个跨语言用例 × 2 实现 + 2 个仅 Rust 用例 = 10 组"
+  i=24
+  echo "  校验：4 个跨语言用例 × 2 实现 + 3 个仅 Rust 用例 = 11 组"
   for case in "${reject[@]}"; do
     for s in rs go; do
       SRV="$s" CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
@@ -212,7 +212,7 @@ suite_cfg() {
       i=$((i + 1))
     done
   done
-  for case in badmac badbind; do
+  for case in badmac badbind badwebtls; do
     SRV=rs CASE="$case" PORT="$((PORT_BASE_CFG + i * 10))" \
       WEB_BASE="$((9700 + i))" LABEL="cfg_rs_${case}" \
       bash "$HERE/e2e_cfg.sh" || fails=$((fails + 1))

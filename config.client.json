@@ -10,7 +10,6 @@
   "brutal_up": 100,
   "brutal_down": 500,
   "socks5": "",
-  "mtu": 1500,
   "tap": "tap0",
   "mac": "",
   "web": {

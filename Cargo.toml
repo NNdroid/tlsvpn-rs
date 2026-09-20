@@ -27,7 +27,10 @@ ctr = "0.9"
 aes-gcm = "0.10"
 getrandom = "0.2"
 mimalloc = { version = "0.1", default-features = false }
-tiny_http = "0.12"
+# ssl-rustls：面板 HTTPS（web.cert / web.key）。不启用该 feature 时
+# HttpServer::https 根本不存在，那两个配置值只能被解析后丢掉。
+# tiny_http 内部用 rustls 0.20，与本项目的 0.23 各编一份，互不影响。
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 base64ct = { version = "1.6", features = ["alloc"] }
 ctrlc = "3"
 dashmap = "5.5"

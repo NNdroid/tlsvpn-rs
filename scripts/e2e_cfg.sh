@@ -8,6 +8,8 @@
 #   * server.v4_cidr 写错被 parse_v4_cidr 静默降级成默认网段；
 #   * log_level 拼错只让日志行为莫名变化；
 #   * web.auth 写成不带冒号的值让面板对所有请求返回 401；
+#   * web.cert / web.key 被解析后直接丢掉（面板只有明文 HTTP），配了证书也
+#     毫无效果，还留着 #[allow(dead_code)] 掩盖这件事；
 #   * web.bind=tunnel 里 IPv6 网关没就绪时整批绑定被放弃，已成功的监听被自己
 #     占住，两个地址都再绑不上（用户实际遇到的 8000 端口被自己占用）。
 #
@@ -16,14 +18,16 @@
 #     cidr       自定义网段 + req_v4/req_v6 → 分配必须落在池内
 #     multi      client.conns=2 → 面板 /api/stats 里该客户端 active_conns 必须是 2
 #     webauth    web.auth → 无凭证 401、带凭证 200
+#     webtls     web.cert + web.key → 面板真走 HTTPS（明文拿不到 200，
+#                openssl s_client 拿到 200），而不是被解析后丢掉继续明文
 #     webtunnel  web.bind=tunnel：mem 后端没有网关 IP 可绑，必须逐个地址告警并
 #                限流（每地址 30s 一次），且不得拖垮隧道本身
 #     logquiet   两端 log_level=warn → 日志里没有 INFO/DEBUG/TRACE，面板照常服务
 #   校验（进程必须以非零退出并给出对应错误）
-#     badlog badauth badv4 badv6 badmac badbind
+#     badlog badauth badv4 badv6 badmac badbind badwebtls
 #
-# Go 的 Validate 不检查 mac 和 web.bind（validate_args 比 Go 严），badmac /
-# badbind 在 SRV=go 时打印跳过并退出 0。
+# Go 的 Validate 不检查 mac / web.bind / web.cert-key 配对（validate_args 比 Go
+# 严），badmac / badbind / badwebtls 在 SRV=go 时打印跳过并退出 0。
 #
 # Env: CASE SRV CLI PORT WEB_BASE MAC LABEL
 set -uo pipefail
@@ -43,7 +47,7 @@ LABEL="${LABEL:-}"
 SRV_BIN="$E2E_RS_BIN"; [ "$SRV" = go ] && SRV_BIN="$E2E_GO_BIN"
 CLI_BIN="$E2E_RS_BIN"; [ "$CLI" = go ] && CLI_BIN="$E2E_GO_BIN"
 
-[ -n "$CASE" ] || { echo "e2e_cfg: CASE 必填 (cidr|multi|webauth|webtunnel|logquiet|bad*)"; exit 2; }
+[ -n "$CASE" ] || { echo "e2e_cfg: CASE 必填 (cidr|multi|webauth|webtls|webtunnel|logquiet|bad*)"; exit 2; }
 e2e_require RS_BIN "$SRV_BIN" "先构建：scripts/build.sh native" || exit 2
 e2e_ensure_cert || { echo "e2e_cfg: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
@@ -76,6 +80,20 @@ http_get() {
   exec 3>&-
 }
 
+# HTTPS 版。/dev/tcp 拿到的是 TLS 记录，往里发明文 GET 只会读回一条告警字节，
+# 所以验证 HTTPS 必须真的做 TLS 握手。openssl 是这套套件本来就要求的（生成
+# e2e 证书），直接拿它当客户端。不指定 -alpn：客户端不发 ALPN，服务端就不会
+# 协商 h2，请求走 HTTP/1.1。
+https_get() {
+  local host="$1" port="$2" path="$3" hdr="$4"
+  {
+    printf 'GET %s HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n' \
+      "$path" "$host" "$port"
+    [ -n "$hdr" ] && printf '%s\r\n' "$hdr"
+    printf '\r\n'
+  } | timeout 10 openssl s_client -quiet -connect "$host:$port" 2>/dev/null
+}
+
 # 故意避开默认网段（10.0.0.0/24、fd00::/64）：这样「配置没生效」和
 # 「静默回落到默认网段」都骗不过断言。
 V4CIDR="10.99.0.0/24"
@@ -85,7 +103,7 @@ V4PREFIX="10.99.0."
 # ============================ 校验失败类 ============================
 case "$CASE" in
   bad*)
-    if { [ "$CASE" = badmac ] || [ "$CASE" = badbind ]; } && [ "$SRV" = go ]; then
+    if { [ "$CASE" = badmac ] || [ "$CASE" = badbind ] || [ "$CASE" = badwebtls ]; } && [ "$SRV" = go ]; then
       echo "  SKIP  [$LABEL] $CASE 需要 Rust 服务端（Go 的 Validate 不检查该字段）"
       exit 0
     fi
@@ -120,6 +138,13 @@ case "$CASE" in
       badbind)
         FRAG='"web": {"bind": "Any"}'
         WANT='invalid web.bind'
+        ;;
+      badwebtls)
+        # 只填 web.cert：以前面板线程会在绑定阶段才发现读不到 key，每 2 秒重试
+        # 一次、面板一直起不来；现在启动前就该被断掉。给一个真实存在的 cert
+        # 路径，才能测到「配对」这一层而不是「文件不存在」那一层。
+        FRAG='"web": {"cert": "'"$CERT"'"}'
+        WANT='web.key is required when web.cert is set'
         ;;
     esac
 
@@ -173,6 +198,11 @@ case "$CASE" in
     ;;
   webauth)
     WEB_FX='"auth": "admin:s3cret"'
+    ;;
+  webtls)
+    # 同一份 e2e 证书，服务端加载一次、面板 HTTPS 用一次：web.cert / web.key
+    # 与 server.cert / server.key 语义一致，都是文件路径。
+    WEB_FX='"cert": "'"$CERT"'", "key": "'"$KEY"'"'
     ;;
   webtunnel)
     WEB_FX='"bind": "tunnel"'
@@ -258,6 +288,28 @@ case "$CASE" in
     echo "$CODE_NO"  | grep -q " 401" || { echo "未带凭证应当 401"; PASS=0; }
     echo "$CODE_YES" | grep -q " 200" || { echo "带凭证应当 200"; PASS=0; }
     ;;
+  webtls)
+    # 三条断言分别钉住「是 HTTPS」「不是明文」「面板真的在服务」。只填了
+    # web.cert 却没真正起 HTTPS 的话，明文那条会返回 200、TLS 那条拿不到响应。
+    PLAIN="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats '' | head -1)"
+    TLS_BODY="$(https_get 127.0.0.1 "$WEB_BASE" /api/stats '')"
+    echo "webtls: 明文=[$PLAIN] HTTPS=[$(echo "$TLS_BODY" | grep -m1 -E '^HTTP')"
+    echo "$PLAIN" | grep -q " 200" && { echo "配了证书却仍在明文监听"; PASS=0; }
+    echo "$TLS_BODY" | grep -q "HTTP/1.1 200" || {
+      echo "HTTPS /api/stats 未返回 200"
+      echo "$TLS_BODY" | tail -c 400
+      PASS=0
+    }
+    echo "$TLS_BODY" | grep -q "$V4PREFIX" || {
+      echo "HTTPS 面板里没有 $V4PREFIX，客户端未上线或网段未生效"
+      PASS=0
+    }
+    # 两端文案不同（Rust: https://<addr>，Go: tls=true），子串任取其一
+    if ! e2e_strip "$SRV_LOG" | grep -Eq "https://127.0.0.1:$WEB_BASE|tls=true"; then
+      echo "日志里没有 https:// 或 tls=true，确认不了面板走的是 TLS"
+      PASS=0
+    fi
+    ;;
   webtunnel)
     # mem 后端没有任何接口挂着网关 IP，两个地址都必须绑定失败；限流意味着
     # 10 秒里每个地址只告警一次。grep 的是 "will retry"——两端文案不同
@@ -296,7 +348,7 @@ CLI_ERRS="$(e2e_strip "$CLI_LOG" | grep -E "$ERRRE" | tail -5 || true)"
 [ -z "$CLI_ERRS" ] || { echo "cli errors: $CLI_ERRS"; PASS=0; }
 
 echo "===== label=$LABEL case=$CASE srv=$SRV cli=$CLI ====="
-e2e_strip "$SRV_LOG" | grep -E "上线|will retry|Dashboard|Web Server" | tail -6
+e2e_strip "$SRV_LOG" | grep -E "上线|will retry|Dashboard|Web Server|tls=true" | tail -6
 echo "-------------------------------------"
 e2e_result "$PASS" "${LABEL:-$SRV->$CLI $CASE}"
 exit "$((1 - PASS))"
