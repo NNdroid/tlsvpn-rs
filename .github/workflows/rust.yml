@@ -64,6 +64,20 @@ jobs:
         repository: NNdroid/tlsvpn
         path: go-impl
 
+    - name: Record the Go commit this run builds
+      run: |
+        # Both repos are checked out at their tips on purpose: the cross-language
+        # matrix is what catches protocol divergence between the two
+        # implementations. Do NOT pin a ref here — a pin would hide real
+        # divergence behind whichever Go commit it points at.
+        git -C go-impl log -1 --format='go-impl @ %h (%s)'
+        cat <<'EOF'
+        If the Go build below fails on tlsvpn source, the break is in NNdroid/tlsvpn,
+        not in Rust, and no change to this repo can make this job green. Check the
+        Go repo's CI for the SHA printed above: its TestCrossCompileLinuxMatrix
+        covers every release target and normally catches these before push.
+        EOF
+
     - name: Build Rust binary and probe
       run: |
         bash scripts/build.sh native
@@ -106,6 +120,20 @@ jobs:
       with:
         repository: NNdroid/tlsvpn
         path: go-impl
+
+    - name: Record the Go commit this run builds
+      run: |
+        # Both repos are checked out at their tips on purpose: the cross-language
+        # matrix is what catches protocol divergence between the two
+        # implementations. Do NOT pin a ref here — a pin would hide real
+        # divergence behind whichever Go commit it points at.
+        git -C go-impl log -1 --format='go-impl @ %h (%s)'
+        cat <<'EOF'
+        If the Go build below fails on tlsvpn source, the break is in NNdroid/tlsvpn,
+        not in Rust, and no change to this repo can make this job green. Check the
+        Go repo's CI for the SHA printed above: its TestCrossCompileLinuxMatrix
+        covers every release target and normally catches these before push.
+        EOF
 
     - name: Build Rust binary (scripts/build.sh native)
       run: bash scripts/build.sh native
