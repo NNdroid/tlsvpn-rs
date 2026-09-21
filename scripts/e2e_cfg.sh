@@ -138,7 +138,11 @@ case "$CASE" in
         # 一次、面板一直起不来；现在启动前就该被断掉。给一个真实存在的 cert
         # 路径，才能测到「配对」这一层而不是「文件不存在」那一层。
         FRAG='"web": {"addr": "127.0.0.1:18080", "auth": "e2e:web-test-password", "cert": "'"$CERT"'"}'
-        WANT='web.key is required when web.cert is set'
+        # 两端文案不同，按服务端语言取（同 badauth 的处理）：Rust 说
+        # "web.key is required when web.cert is set"，Go 说
+        # "web.cert and web.key must be provided together"。
+        if [ "$SRV" = go ]; then WANT='web.cert and web.key must be provided together'
+        else WANT='web.key is required when web.cert is set'; fi
         ;;
     esac
 
@@ -249,7 +253,7 @@ if [ "$CASE" = logquiet ]; then
   e2e_wait_port 127.0.0.1 "$WEB_BASE" 20 || { echo "面板端口未监听"; PASS=0; }
   sleep 6
 else
-  if ! e2e_wait_log "新逻辑 Client 上线" "$SRV_LOG" 30; then
+  if ! e2e_wait_log "new logical client online" "$SRV_LOG" 30; then
     echo "服务端没有报出客户端上线"
     echo "--- server ---"
     e2e_strip "$SRV_LOG" | tail -20
@@ -329,7 +333,7 @@ case "$CASE" in
       echo "  (跳过限流断言：Go 的 onceWarn 尚未发布到 NNdroid/tlsvpn，实际 ${RETRY:-0} 条)"
     fi
     # 隧道本身不能被拖垮：客户端照样要上线
-    e2e_wait_log "新逻辑 Client 上线" "$SRV_LOG" 10 || { echo "bind=tunnel 拖垮了隧道"; PASS=0; }
+    e2e_wait_log "new logical client online" "$SRV_LOG" 10 || { echo "bind=tunnel 拖垮了隧道"; PASS=0; }
     ;;
   logquiet)
     BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats "$AUTH_HDR")" || { echo "面板请求失败"; PASS=0; }
@@ -350,7 +354,7 @@ CLI_ERRS="$(e2e_strip "$CLI_LOG" | grep -E "$ERRRE" | tail -5 || true)"
 [ -z "$CLI_ERRS" ] || { echo "cli errors: $CLI_ERRS"; PASS=0; }
 
 echo "===== label=$LABEL case=$CASE srv=$SRV cli=$CLI ====="
-e2e_strip "$SRV_LOG" | grep -E "上线|will retry|Dashboard|Web Server|tls=true" | tail -6
+e2e_strip "$SRV_LOG" | grep -E "online|will retry|Dashboard|Web Server|tls=true" | tail -6
 echo "-------------------------------------"
 e2e_result "$PASS" "${LABEL:-$SRV->$CLI $CASE}"
 exit "$((1 - PASS))"

@@ -38,7 +38,7 @@ need() {
 need E2E_RS_BIN   "$E2E_RS_BIN"   "先构建：scripts/build.sh native"
 need E2E_GO_BIN   "$E2E_GO_BIN"   "先构建：(cd <go 仓库> && scripts/build.sh)"
 need E2E_RS_PROBE "$E2E_RS_PROBE" "先构建：cargo build --examples"
-need E2E_GO_PROBE "$E2E_GO_PROBE" "先构建：go build -C interop -o probe ."
+need E2E_GO_PROBE "$E2E_GO_PROBE" "先构建：(cd <go 仓库> && go build -C interop -o probe .)"
 if [ -n "$MISSING" ]; then
   echo "e2e: 缺少依赖，无法运行："
   echo "$MISSING"
@@ -138,10 +138,13 @@ suite_minenc() {
   # 8 个组合 × 2 个服务端 = 16 组，再加 3 组 Go 探针交叉 = 19 组。
   # 内层只剩 GCM（2），所以探针声明的合格能力只有 2；9 是两端都不认识的算法
   # ID，用来守住"按数值大小推断能力"这类回归——服务端必须按精确比较判定强度。
+  # min_enc 留空已经不是"不设下限"：两端都在 encrypt=true 且 min_enc 为空时把它
+  # 默认成 gcm（Rust src/main.rs、Go config.go），所以 "" + algo≠2 一律拒连；
+  # 想表达"不设下限"得显式写 "any"。
   local -a combos=(
     ""            2  accept
-    ""            0  accept
-    ""            9  accept
+    ""            0  reject
+    ""            9  reject
     gcm           2  accept
     gcm           0  reject      # 声明不了 GCM → 不满足下限
     gcm           9  reject      # 真未知算法（>= bug 回归锁）

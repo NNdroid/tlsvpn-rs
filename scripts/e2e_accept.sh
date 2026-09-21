@@ -119,7 +119,7 @@ run_case() {
   e2e_kill_port "$port"
 
   local errs ok verdict
-  errs="$(e2e_strip "$slog" | grep -E 'ERROR|panic|panicked|GCM.*(fail|FAIL)|decrypt.*fail|解密失败|校验失败|拒绝连接' | tail -5 || true)"
+  errs="$(e2e_strip "$slog" | grep -E 'ERROR|panic|panicked|GCM.*(fail|FAIL)|decrypt.*fail|verification failed|authentication failed|connection refused|fatal' | tail -5 || true)"
   ok=1
   [ $rc -eq 0 ] || ok=0
   [ -z "$errs" ] || ok=0

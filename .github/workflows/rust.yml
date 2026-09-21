@@ -86,11 +86,18 @@ jobs:
     - name: Build Go binary and probe
       run: |
         (cd go-impl && bash scripts/build.sh)
-        go build -C interop -o probe .
+        # The probe is tracked in the Go repo (tlsvpn/interop/probe.go), which is
+        # where E2E_GO_PROBE looks; this repo's own interop/ copy is vestigial.
+        (cd go-impl && go build -C interop -o probe .)
 
     - name: Cross-language e2e (accept / tok / pad / minenc / cfg)
       env:
         E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
+        # E2E_GO_DIR is what E2E_GO_PROBE's default is built from. Left unset it
+        # falls back to <repo>/../tlsvpn, which does not exist on a runner — the
+        # Go checkout lives at go-impl — so every cross-language case aborted with
+        # "缺少依赖: E2E_GO_PROBE".
+        E2E_GO_DIR: ${{ github.workspace }}/go-impl
         E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
       run: bash scripts/e2e_test.sh
 

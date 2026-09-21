@@ -125,16 +125,20 @@ sleep 6
 
 echo "===== label=$LABEL srv=$SRV cli=$CLI token_field=$TOKEN_FIELD ====="
 echo "----- server log (handshake decisions) -----"
-e2e_strip "$SRV_LOG" | grep -Ei "上线|复活|令牌|拒绝|session|token" | tail -15
+e2e_strip "$SRV_LOG" | grep -Ei "online|revive|reconnect refused|session|token" | tail -15
 echo "----- client A log (tail 8) -----"
 tail -8 "$A_LOG"
 echo "----- client B log (tail 8) -----"
 tail -8 "$B_LOG"
 echo "---------------------------------------------"
 
-UP=$(grep -c "新逻辑 Client 上线" "$SRV_LOG" || true)
-REVIVE=$(grep -Ec "成功复活|已有会话增加新物理连接" "$SRV_LOG" || true)
-DENY=$(grep -c "会话令牌无效" "$SRV_LOG" || true)
+# 两实现的日志都已是英文，这里取两端都有的公共前缀：上线文案逐字一致；复活有两条
+# 路径（倒计时内复活 / 既有会话多挂一条物理连接），Rust 两条都含 "session revived"，
+# Go 的第二条是 "existing session gained a new physical connection"，故保留后半段；
+# 令牌拒绝两端后半句不同，公共前缀到 invalid session token 为止。
+UP=$(grep -c "new logical client online" "$SRV_LOG" || true)
+REVIVE=$(grep -Ec "session revived|new physical connection" "$SRV_LOG" || true)
+DENY=$(grep -c "reconnect refused: invalid session token" "$SRV_LOG" || true)
 echo "server: 上线=$UP 复活=$REVIVE 令牌拒绝=$DENY"
 
 PASS=0

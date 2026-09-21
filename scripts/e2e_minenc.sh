@@ -116,12 +116,12 @@ e2e_kill_port "$PORT"
 
 ONLINE="$(strip "$SRV_LOG" | grep -c "new logical client online" || true)"
 DENY="$(strip "$SRV_LOG" | grep -c "below the min_enc floor" || true)"
-PANIC="$(strip "$SRV_LOG" | grep -Eic "panic|GCM.*(fail|FAIL)|decrypt.*fail|校验失败" || true)"
+PANIC="$(strip "$SRV_LOG" | grep -Eic "panic|GCM.*(fail|FAIL)|decrypt.*fail|verification failed|authentication failed" || true)"
 
 echo "===== label=$LABEL srv=$SRV probe=$PROBE min_enc=$MINENC enc_algo=$ENCALGO ====="
 echo "server: 上线=$ONLINE min_enc拒绝=$DENY 异常=$PANIC"
 echo "----- server 相关日志 -----"
-strip "$SRV_LOG" | grep -Ei "min_enc|上线|拒绝|加密能力" | tail -4
+strip "$SRV_LOG" | grep -Ei "min_enc|online|refused|cipher capability" | tail -4
 echo "----- probe 输出 (tail 6) -----"
 tail -6 "$CLI_LOG"
 echo "-------------------------------------"
