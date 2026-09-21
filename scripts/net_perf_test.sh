@@ -21,6 +21,7 @@
 #   BIN_SRV / BIN_CLI       server/client binary paths (required)
 #   FLAVOR_SRV / FLAVOR_CLI "rs" | "go" (default rs)
 #   PORT                    tunnel TCP port (default 18600)
+#   PSK                     tunnel secret (default: openssl rand -hex 16)
 #   IPERF_MIN_MBPS          throughput assert threshold (default 100)
 #   LIBRESPEED_CLI          path to librespeed-cli (optional)
 #   LIBRESPEED_SRV_BIN      librespeed backend binary (optional;
@@ -88,6 +89,12 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 0
 fi
 
+# 放在上面的 openssl 门之后：openssl 缺失时这里会生成空串，而两实现的配置
+# 校验都会以 "psk is required" 拒绝空串。两实现只拒空串加 4 个占位符
+# (quic_secret / change-me / change-me-please / replace-with-a-random-secret)，
+# 十六进制随机串必然通过。
+PSK="${PSK:-$(openssl rand -hex 16)}"
+
 # Best-effort optional tools (root can apt-install; ignore failures).
 if ! command -v iperf3 >/dev/null 2>&1 || ! command -v traceroute >/dev/null 2>&1; then
   apt-get update -qq >/dev/null 2>&1 || true
@@ -110,7 +117,11 @@ PIDS=()
 impl_config() {
   local out="$1" mode="$2" addr="$3"; shift 3
   {
-    printf '{\n  "mode": "%s",\n  "addr": "%s"' "$mode" "$addr"
+    # mode / addr / psk 是两实现都必需的顶层键，在这里预置而不是让每个
+    # 调用点自己记得带。psk 曾就是这样被漏掉的：三处调用都没写，脚本自
+    # 2026-09-19 改为 -c 配置启动起就没真正跑通过，托管 runner 上一直被
+    # TAP 能力门拦成 SKIP，所以没人发现。
+    printf '{\n  "mode": "%s",\n  "addr": "%s",\n  "psk": "%s"' "$mode" "$addr" "$PSK"
     local frag
     for frag in "$@"; do
       [ -n "$frag" ] && printf ',\n  %s' "$frag"
