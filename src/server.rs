@@ -1814,13 +1814,16 @@ fn handle_handshake(
         .register_backend(sess.tx_backend.as_ref().unwrap().clone());
     sess.client_session = Some(c_sess.clone());
 
-    // Brutal 速率协商（对齐 Go）
-    let mut server_tx_rate = core.brutal_up;
-    let mut client_tx_rate = core.brutal_down;
-    if req.brutal_rx > 0 && (core.brutal_up == 0 || req.brutal_rx < core.brutal_up) {
+    // Brutal 速率协商（对齐 Go）。两个方向的预算不能混：server_tx_rate 是
+    // 服务端→客户端（下行），由本端 socket 整形，受本端下行预算约束；
+    // client_tx_rate 是客户端→服务端（上行），客户端自己整形，本端只把它
+    // 裁进自己的上行预算内。曾写反导致客户端面板"上行 125 配 30 上行总量"。
+    let mut server_tx_rate = core.brutal_down;
+    let mut client_tx_rate = core.brutal_up;
+    if req.brutal_rx > 0 && (core.brutal_down == 0 || req.brutal_rx < core.brutal_down) {
         server_tx_rate = req.brutal_rx;
     }
-    if req.brutal_tx > 0 && (core.brutal_down == 0 || req.brutal_tx < core.brutal_down) {
+    if req.brutal_tx > 0 && (core.brutal_up == 0 || req.brutal_tx < core.brutal_up) {
         client_tx_rate = req.brutal_tx;
     }
     // 落档协商结果而不是配置值：客户端可以申请更低的预算，未启用时也记 0，
@@ -1847,8 +1850,11 @@ fn handle_handshake(
         gw_v4: core.gw_v4.clone(),
         gw_v6: core.gw_v6.clone(),
         padding: generate_padding(100, 500),
-        brutal_tx: server_tx_rate,
-        brutal_rx: client_tx_rate,
+        // 客户端视角的上行/下行：brutal_tx 是客户端自己整形的上行速率，
+        // brutal_rx 是本端整形的下行速率（即客户端的 rx）。本端自己的 tx 是
+        // 下行、不是上行，传反会让两端视角整个对调。
+        brutal_tx: client_tx_rate,
+        brutal_rx: server_tx_rate,
         fec: req.fec,
         fec_group: c_sess.fec_enc_k,
         encrypt: core.encrypt,
