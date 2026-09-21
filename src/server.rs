@@ -1202,6 +1202,7 @@ fn worker_loop(
 
                 if close {
                     if let Some(mut s) = mio_sessions.remove(&token) {
+                        close_session_tls(&mut s);
                         let _ = poll.registry().deregister(&mut s.socket);
                         let _ = tarpit; // 认证失败立即释放资源；不再创建无界 tarpit OS 线程。
                         on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
@@ -1215,6 +1216,10 @@ fn worker_loop(
         closed_tokens.dedup();
         for t in closed_tokens {
             if let Some(mut s) = mio_sessions.remove(&t) {
+                // 定时器发现的关闭：空闲超时、序号耗尽、epoch 不匹配、强踢、
+                // 写卡死、下行冲刷失败。握手拒绝等即时关闭走上面的 close 分支，
+                // 两处都补发 close_notify。
+                close_session_tls(&mut s);
                 let _ = poll.registry().deregister(&mut s.socket);
                 on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
             }
@@ -1415,6 +1420,24 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
     }
     if !sess.tls.wants_write() {
         sess.write_stalled = None;
+    }
+}
+
+// 干净断开：补发 TLS close_notify 并冲刷完记录缓冲。
+// rustls 在 Drop 时不发 close_notify，而 Go 的 tls.Conn.Close() 会自动发。
+// 不补发的话，被拒绝握手的探测端读到的是
+// "peer closed connection without sending TLS close_notify"，而不是 EOF，
+// 看起来像服务端异常崩溃而不是按预期拒绝。
+// send_close_notify 在已发过致命告警时是空操作——那类连接对端已经拿到了
+// 明确的错误通知，不需要再补。对端已断开时 write_tls 会直接失败，此时
+// 静默放弃即可：连接反正已经没了。
+fn close_session_tls(s: &mut MioSession) {
+    s.tls.send_close_notify();
+    while s.tls.wants_write() {
+        match s.tls.write_tls(&mut s.socket) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
     }
 }
 

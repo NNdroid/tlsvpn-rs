@@ -227,14 +227,21 @@ e2e_ensure_cert() {
     return 0
   fi
   command -v openssl >/dev/null 2>&1 || return 1
-  local d; d="$(mktemp -d)" || return 1
+  local d dw
+  d="$(mktemp -d)" || return 1
+  # mktemp 给的是 POSIX 路径（/tmp/...），而 openssl 是 Windows 程序，写
+  # 不进去（"Can't open .../key.pem for writing"）。此前在干净 checkout 上
+  # Windows 本机只能靠仓库根目录残留的 pem 才能跑通——生成路径其实是坏的。
+  # 交给 openssl 前转成盘符形式；$d 保留 POSIX 形态供 rm -rf 使用。
+  dw="$(e2e_winpath "$d")"
   if ! openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-      -keyout "$d/key.pem" -out "$d/cert.pem" -subj "/CN=tlsvpn-e2e" >/dev/null 2>&1; then
+      -keyout "$dw/key.pem" -out "$dw/cert.pem" -subj "/CN=tlsvpn-e2e" >/dev/null 2>&1; then
     rm -rf "$d"
     return 1
   fi
-  E2E_CERT="$d/cert.pem"
-  E2E_KEY="$d/key.pem"
+  # 调用方会把这两个值写进 Go 配置 JSON，所以用带斜杠的盘符形式。
+  E2E_CERT="$(e2e_drvpath "$d/cert.pem")"
+  E2E_KEY="$(e2e_drvpath "$d/key.pem")"
   return 0
 }
 

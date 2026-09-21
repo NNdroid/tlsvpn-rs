@@ -1533,6 +1533,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
     }
 
+    // 干净断开：补发 TLS close_notify 并冲刷记录缓冲。rustls 在 Drop 时不发，
+    // 而 Go 的 tls.Conn.Close() 会自动发。缺了它，服务端读到的是 UnexpectedEof
+    // 而不是正常 EOF，客户端主动断开（强踢、退避重拨、退出）看起来像链路中断。
+    // send_close_notify 在已发过致命告警时是空操作。非阻塞 socket 上写不出去
+    // （对端已消失或缓冲满）时立即放弃——连接反正已经没了，不能因为补发一次
+    // 告警而拖住重连。
+    tls.send_close_notify();
+    while tls.wants_write() {
+        match tls.write_tls(&mut sock) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+
     rtt_stop.store(true, Ordering::Relaxed);
     cl.tx_port.unregister_backend(&tx);
     cl.live_conns.fetch_sub(1, Ordering::Relaxed);
