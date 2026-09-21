@@ -6,12 +6,16 @@
 #   * throughput  (iperf3 up/down if installed; librespeed if
 #                  LIBRESPEED_CLI + a backend binary are available)
 #
-# Requirements: root + CAP_NET_ADMIN (a real TAP device). GitHub-hosted
-# runners cannot create one, so the script prints SKIP and exits 0 there,
-# keeping CI green — point the workflow job at a privileged self-hosted
-# runner to execute for real. Both endpoints run on the same machine, so
-# the measured throughput reflects the tunnel stack itself (TLS + inner
-# crypto + vswitch), not the physical network.
+# Requirements: root + the full RTNL path over a real TAP device — create,
+# bring the link up, and assign addresses. Anything short of that prints
+# SKIP with the precise missing step and exits 0, keeping CI green.
+#
+# Note the gate is deliberately stricter than "can I create a TAP?": that
+# alone passes on ubuntu-latest, where TUNSETIFF is allowed but RTNL is not,
+# so the job would proceed and the server would die before binding its port,
+# which looked like "server did not start". Both endpoints run on the same
+# machine, so the measured throughput reflects the tunnel stack itself
+# (TLS + inner crypto + vswitch), not the physical network.
 #
 # Env:
 #   BIN_SRV / BIN_CLI       server/client binary paths (required)
@@ -45,8 +49,14 @@ fail() { echo "[netperf] ❌ $*"; FAIL=$((FAIL+1)); }
 skip() { echo "[netperf] ⏭️  $*"; SKIPPED=$((SKIPPED+1)); }
 
 # ---------------------------------------------------------------------------
-# Capability gate: real TAP needs root + CAP_NET_ADMIN. Hosted runners exit
-# here with SKIP so the CI job stays green.
+# Capability gate: a real tunnel needs root + the whole RTNL path, not just
+# TAP creation. The gate used to test only `ip tuntap add`, which passes on
+# ubuntu-latest — the device is created but `ip link set ... up` / `ip addr
+# replace` are the steps that decide whether a tunnel can actually run. A
+# partial grant here made the gate report "capable" and then let the server
+# die before it ever bound its port, surfacing only as "server did not start".
+# Test the create+up+address sequence instead, so an environment that cannot
+# run a tunnel SKIPs instead of failing inside the server.
 # ---------------------------------------------------------------------------
 skip_reason=""
 if [[ $EUID -ne 0 ]]; then
@@ -56,9 +66,12 @@ elif [[ ! -c /dev/net/tun ]]; then
 else
   if ! ip tuntap add dev tap_capchk mode tap 2>/dev/null; then
     skip_reason="cannot create TAP (no CAP_NET_ADMIN, e.g. GitHub-hosted runner)"
-  else
-    ip link del tap_capchk 2>/dev/null || true
+  elif ! ip link set dev tap_capchk up 2>/dev/null; then
+    skip_reason="TAP created but cannot bring the link up (TUNSETIFF allowed, RTNL refused)"
+  elif ! ip addr replace 10.77.99.1/24 dev tap_capchk 2>/dev/null; then
+    skip_reason="TAP created but cannot assign an address (RTNL refused)"
   fi
+  ip link del tap_capchk 2>/dev/null || true
 fi
 if [[ -n "$skip_reason" ]]; then
   log "SKIP: $skip_reason"
@@ -266,9 +279,6 @@ JSONEOF
 # ---------------------------------------------------------------------------
 run_group() {
   SRV_DIR=$(mktemp -d)
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$SRV_DIR/e2e_key.pem" -out "$SRV_DIR/e2e_cert.pem" \
-    -days 2 -subj "/CN=tlsvpn-netperf" >/dev/null 2>&1
 
   log "--- group: ${FLAVOR_SRV}_srv <- ${FLAVOR_CLI}_cli (real TAP) ---"
 
@@ -279,9 +289,28 @@ run_group() {
     '"log_level": "debug"' \
     "\"tap\": \"$TAP_SRV\"" \
     "\"server\": {\"cert\": \"$SRV_DIR/e2e_cert.pem\", \"key\": \"$SRV_DIR/e2e_key.pem\", \"v4_cidr\": \"$SUBNET_V4\", \"v6_cidr\": \"fd77::/64\"}"
+
+  # 证书生成失败以前是被 >/dev/null 吞掉的：服务端随后在 build_server_tls
+  # 退出（"Invalid configuration: ..."），表象只有 "server did not start"，
+  # 看不出是证书没生成还是别的原因。这里直接断掉。
+  if ! openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout "$SRV_DIR/e2e_key.pem" -out "$SRV_DIR/e2e_cert.pem" \
+      -days 2 -subj "/CN=tlsvpn-netperf" >/dev/null 2>&1 \
+     || { [ ! -s "$SRV_DIR/e2e_key.pem" ] || [ ! -s "$SRV_DIR/e2e_cert.pem" ]; }; then
+    fail "TLS cert generation failed ($SRV_DIR) — openssl is $(openssl version 2>/dev/null || echo 'missing')"
+    return 1
+  fi
+
   "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
-  PIDS+=($!)
-  wait_for_port 127.0.0.1 "$PORT" 20 || { fail "server did not start"; return 1; }
+  local srv_pid=$!
+  PIDS+=($srv_pid)
+  if ! wait_for_port 127.0.0.1 "$PORT" 20; then
+    fail "server did not start (127.0.0.1:$PORT never opened within 20s)"
+    log "server process: $(kill -0 "$srv_pid" 2>/dev/null && echo 'still alive (hangs before binding)' || echo 'already exited (see log)')"
+    log "--- server log ---"; sed 's/^/[netperf]     /' "$SRV_DIR/srv.log" | tail -25 || true
+    log "--- server config ---"; sed 's/^/[netperf]     /' "$scfg" || true
+    return 1
+  fi
 
   # 自签证书：客户端必须 pin 指纹（或 insecure），否则 TLS 校验失败
   local fp

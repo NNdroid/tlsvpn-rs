@@ -105,10 +105,14 @@ jobs:
   # traceroute (v4/v6 through the tunnel), iperf3 up/down throughput and an
   # optional librespeed run (scripts/net_perf_test.sh).
   #
-  # The script is capability-gated: GitHub-hosted runners have no
-  # CAP_NET_ADMIN, so there it reports SKIP and exits 0 (job stays green,
-  # the reason is visible in the job log). Point runs-on at a privileged
-  # self-hosted runner to execute the checks for real.
+  # The script is capability-gated and reports SKIP + exits 0 on an
+  # environment that cannot run a tunnel (job stays green, and the precise
+  # missing step is in the job log). The gate tests the whole RTNL path,
+  # not just TAP creation: ubuntu-latest passes TUNSETIFF while refusing
+  # RTNL, so "can I create a TAP?" alone reports capability the runner does
+  # not actually have — the server then died before binding its port and the
+  # job failed with an unexplained "server did not start". Point runs-on at
+  # a privileged self-hosted runner to execute the checks for real.
   net-perf:
     runs-on: ubuntu-latest
     steps:
