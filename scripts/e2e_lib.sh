@@ -126,6 +126,39 @@ e2e_kill_port() {
 # Remove ANSI colour escapes from a log.
 e2e_strip() { sed -e 's/\x1b\[[0-9;]*m//g' "$1"; }
 
+# e2e_cli_errs CLIENT_LOG FLAVOR [FILTERED_FILE]
+#   → echo the ERROR-class lines from a client log that still matter, and write
+#     the exempted ones to FILTERED_FILE so the caller can print them.
+#
+# The Go client has no in-memory TAP backend, and netlinkTunnelSupported() is
+# `return true` unconditionally on Linux — a build-tag platform check, not a
+# "does my tap exist" check. So every Go client tries to hand the assigned
+# tunnel address to a link literally named "mem" and gets
+# "tap mem not found: Link not found", every time. The tunnel itself is fine:
+# the server still sees the client come online; only the local "apply the
+# address" step fails, and mem-TAP can never provide it.
+#
+# Go used to discard setupInterface's return value, which made that failure
+# silent; once it was surfaced as Errorf (NNdroid/tlsvpn f0580e2) the blanket
+# "client log must be error-free" assertion failed every cross-language case in
+# pad and cfg. Exempt only this one known line — panics, crypto failures and
+# refused connections still fail the case.
+#
+# The exempted lines go to a file, not to a variable: callers capture this
+# function's stdout with $(...), so a variable set here would die with the
+# subshell and the caller could never report what it had filtered.
+e2e_cli_errs() {
+  local log="$1" flavor="$2" out_file="${3:-}"
+  local re='tunnel interface configuration failed.*tap mem not found'
+  local errs
+  errs="$(e2e_strip "$log" | grep -E "$ERRRE" | sed '/^[[:space:]]*$/d' || true)"
+  if [ "$flavor" = go ]; then
+    [ -n "$out_file" ] && printf '%s\n' "$errs" | grep -E "$re" >"$out_file" || true
+    errs="$(printf '%s\n' "$errs" | grep -Ev "$re" || true)"
+  fi
+  printf '%s\n' "$errs" | sed '/^[[:space:]]*$/d' | tail -5
+}
+
 # Last-resort sweep: kill every tlsvpn/probe process left over by a suite.
 # Per-case cleanup reaps by port, but a client whose Web panel failed to bind
 # listens on nothing and would survive it — and a leaked client from one suite

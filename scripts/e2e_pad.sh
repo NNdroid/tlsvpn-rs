@@ -133,7 +133,8 @@ sleep 8
 
 ERRRE="ERROR|panic|panicked|GCM.*(fail|FAIL)|decrypt.*fail|verification failed|authentication failed|connection refused|fatal"
 SRV_ERRS="$(strip "$SRV_LOG" | grep -E "$ERRRE" | tail -5 || true)"
-CLI_ERRS="$(strip "$CLI_LOG" | grep -E "$ERRRE" | tail -5 || true)"
+# Go 客户端没有 mem-TAP 后端，必然报 "tap mem not found"：见 e2e_cli_errs 的说明
+CLI_ERRS="$(e2e_cli_errs "$CLI_LOG" "$CLI" "$TMP/cli_filt.txt")"
 
 SRV_PAD="$(strip "$SRV_LOG" | grep -c "Confusion padding: $PAD" || true)"
 CLI_PAD="$(strip "$CLI_LOG" | grep -c "Confusion padding: $PAD" || true)"
@@ -143,6 +144,10 @@ echo "===== label=$LABEL srv=$SRV cli=$CLI pad=$PAD ====="
 echo "srv pad applied: $SRV_PAD  cli pad applied: $CLI_PAD  client online: $ONLINE"
 if [ -n "$SRV_ERRS" ]; then echo "srv errors: $SRV_ERRS"; fi
 if [ -n "$CLI_ERRS" ]; then echo "cli errors: $CLI_ERRS"; fi
+# 放行不等于看不见：仍把被过滤掉的那行打出来，免得这个用例静默变窄
+if [ -s "$TMP/cli_filt.txt" ]; then
+  echo "cli errors 已放行（Go+mem-TAP 已知，判据见 e2e_lib.sh）: $(tr '\n' ' ' <"$TMP/cli_filt.txt" | cut -c1-150)"
+fi
 echo "-------------------------------------"
 
 RC=0

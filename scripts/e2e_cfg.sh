@@ -349,9 +349,14 @@ case "$CASE" in
 esac
 
 SRV_ERRS="$(e2e_strip "$SRV_LOG" | grep -E "$ERRRE" | grep -v "will retry" | tail -5 || true)"
-CLI_ERRS="$(e2e_strip "$CLI_LOG" | grep -E "$ERRRE" | tail -5 || true)"
+# Go 客户端没有 mem-TAP 后端，必然报 "tap mem not found"：见 e2e_cli_errs 的说明
+CLI_ERRS="$(e2e_cli_errs "$CLI_LOG" "$CLI" "$TMP/cli_filt.txt")"
 [ -z "$SRV_ERRS" ] || { echo "srv errors: $SRV_ERRS"; PASS=0; }
 [ -z "$CLI_ERRS" ] || { echo "cli errors: $CLI_ERRS"; PASS=0; }
+# 放行不等于看不见：仍把被过滤掉的那行打出来，免得这个用例静默变窄
+if [ -s "$TMP/cli_filt.txt" ]; then
+  echo "cli errors 已放行（Go+mem-TAP 已知，判据见 e2e_lib.sh）: $(tr '\n' ' ' <"$TMP/cli_filt.txt" | cut -c1-150)"
+fi
 
 echo "===== label=$LABEL case=$CASE srv=$SRV cli=$CLI ====="
 e2e_strip "$SRV_LOG" | grep -E "online|will retry|Dashboard|Web Server|tls=true" | tail -6
