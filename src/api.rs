@@ -832,7 +832,9 @@ async function fetchStats(){
       cur[id]={tx_bytes:c.tx_bytes,rx_bytes:c.rx_bytes};tTxS+=sx;tRxS+=sr;
       const sid=id.length>10?id.slice(0,10)+'…':id;
       const bid=c.session_id?(c.session_id.length>10?c.session_id.slice(0,10)+'…':c.session_id):'-';
-      const brut=c.brutal_tx||c.brutal_rx?((c.brutal_tx||0)+' / '+(c.brutal_rx||0)):'-';
+      // 上=客户端上行（会话里的 brutal_rx），下=服务端下发（会话里的 brutal_tx）。
+      // 曾写成 brutal_tx / brutal_rx 却配「上/下」表头，两个方向整个对调。
+      const brut=c.brutal_rx||c.brutal_tx?((c.brutal_rx||0)+'↑/'+(c.brutal_tx||0)+'↓'):'-';
       tbody+='<tr><td title="'+id+'">'+sid+'</td><td>'+(c.ipv4||'-')+'</td><td class="hide-sm">'+(c.ipv6||'-')+'</td>'+
         '<td class="hide-sm">'+(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
         '<td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
@@ -840,7 +842,7 @@ async function fetchStats(){
         '<td class="hide-sm">'+badge(c.fec)+'</td><td class="hide-sm">'+(c.fec_group||'-')+'</td>'+
         '<td class="hide-sm">'+encBadge(c.enc_algo)+'</td><td class="hide-sm" title="'+bid+'">'+bid+'</td>'+
         '<td class="hide-sm">'+(c.session_epoch||'-')+'</td>'+
-        '<td class="hide-sm" title="服务端下发方向 / 客户端上行方向 (Mbps)">'+brut+'</td>'+
+        '<td class="hide-sm" title="客户端→服务端（上行）/ 服务端→客户端（下行）(Mbps)">'+brut+'</td>'+
         '<td class="hide-sm">'+(c.online_sec?fmtDur(c.online_sec):'-')+'</td>'+
         '<td>'+(data.mode==='server'?'<button class="btn" onclick="kickClient(\''+id+'\')">踢出</button>'+
           '<button class="btn blue" onclick="banClient(\''+id+'\',0)">封禁</button>':'-')+'</td></tr>';
