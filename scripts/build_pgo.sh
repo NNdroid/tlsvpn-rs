@@ -32,10 +32,13 @@ EOF
 ./target/release/tlsvpn -c "$PROF_DIR/pgo_srv.json" &
 SRV_PID=$!
 sleep 2
-if command -v go >/dev/null 2>&1 && [ -d interop ]; then
-  (cd interop && go build -o probe_pgo . && \
-    ./probe_pgo --addr 127.0.0.1:2999 --psk pgo_secret --encrypt --send 200 --timeout 8 || true; \
-    rm -f probe_pgo)
+# Go 探针源码在 Go 仓库（../tlsvpn/interop）——本仓库曾 vendored 一份超集副本，
+# 没有任何脚本用到那些多出来的 flag，已删。产物写进 PROF_DIR，不污染 Go 仓库。
+# 注意该探针没有 --encrypt（恒加密），只认 addr/psk/mac/send/timeout/enc-algo。
+if command -v go >/dev/null 2>&1 && [ -d ../tlsvpn/interop ]; then
+  (cd ../tlsvpn/interop && go build -o "$PROF_DIR/probe_pgo" . && \
+    "$PROF_DIR/probe_pgo" --addr 127.0.0.1:2999 --psk pgo_secret --send 200 --timeout 8 || true; \
+    rm -f "$PROF_DIR/probe_pgo")
 fi
 ./target/release/examples/interop_client --addr 127.0.0.1:2999 --psk pgo_secret \
   --encrypt --send 200 --timeout 8 || true

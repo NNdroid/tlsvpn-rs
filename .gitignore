@@ -24,13 +24,8 @@ target
 # Rust-generated golden vector bootstrap artifact (Go repo is source of truth)
 protocol_golden.rust.json
 *.pem
-# interop/ 放 Go 探针（README 有引用）：只放行源码，构建产物 probe* 继续忽略
-/interop/*
-!/interop/probe.go
-!/interop/go.mod
-!/interop/go.sum
 dist/
 .zcode/
-# 编译产物（误放仓库根目录的探针二进制，源码在 interop/）
+# 编译产物（误放仓库根目录的探针二进制；Go 探针源码在 ../tlsvpn/interop/）
 go_webtls
 rs_webtls

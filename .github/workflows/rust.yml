@@ -87,7 +87,9 @@ jobs:
       run: |
         (cd go-impl && bash scripts/build.sh)
         # The probe is tracked in the Go repo (tlsvpn/interop/probe.go), which is
-        # where E2E_GO_PROBE looks; this repo's own interop/ copy is vestigial.
+        # where E2E_GO_PROBE looks. An earlier vendored interop/ copy lived here as
+        # a superset (22 flags vs 7); no script ever used any of the extra flags, so
+        # it was deleted. The Go repo is the only probe source now.
         (cd go-impl && go build -C interop -o probe .)
 
     - name: Cross-language e2e (accept / tok / pad / minenc / cfg)

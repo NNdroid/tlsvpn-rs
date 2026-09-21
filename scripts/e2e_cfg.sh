@@ -311,26 +311,23 @@ case "$CASE" in
     ;;
   webtunnel)
     # mem 后端没有任何接口挂着网关 IP，两个地址都必须绑定失败。
-    # 限流只对 Rust 服务端断言：grep 的 "will retry" 两端文案都有
-    # （Rust: "bind failed on ... will retry"，Go: "[Web] ... will retry"），
-    # 但 Go 侧的限流（web.go onceWarn）还没发布到 NNdroid/tlsvpn——CI 从 GitHub
-    # 拉 Go 源码编译，拿到的是每 2 秒一条、10 秒里 5 条的旧实现，断言它会把
-    # cfg_go->*_webtunnel 判挂。本地因为用改过的源码编的二进制，所以两边都过。
-    # Go 改动合进 NNdroid/tlsvpn 后，把下面 [ "$SRV" = rs ] 去掉即恢复跨语言覆盖。
+    # 失败文案两端都有 "will retry"（Rust: "bind failed on ... will retry"，
+    # Go: "[Web] ... will retry"），所以限流断言对两种服务端通用，不按 SRV 分叉。
+    # 两端上限都是 2：Rust 用 per-address 的 warn_throttled（api.rs），两个地址各 1 条；
+    # Go 的 onceWarn 已发布到 NNdroid/tlsvpn（60ef233，2026-09-20），key 是
+    # "listen|" + 本轮全部失败地址，两个地址恒同时失败 → key 恒定 → 10 秒里只 1 条。
+    # 此前 onceWarn 只在本地未推送的源码里，CI 拿到每 2 秒一条的旧实现，
+    # 断言才会把 cfg_go->*_webtunnel 判挂；发布后守卫已移除，跨语言覆盖恢复。
     sleep 10
     RETRY="$(e2e_strip "$SRV_LOG" | grep -c "will retry" || true)"
     if ! e2e_strip "$SRV_LOG" | grep -q "Dashboard manager started"; then
       echo "bind=tunnel 的管理器没启动"
       PASS=0
     fi
-    if [ "$SRV" = rs ]; then
-      # 限流意味着 10 秒里每个地址只告警一次，两个地址上限是 2
-      if [ "${RETRY:-0}" -gt 2 ]; then
-        echo "绑定失败告警 ${RETRY} 条，超过每地址一次的上限（没有限流）"
-        PASS=0
-      fi
-    else
-      echo "  (跳过限流断言：Go 的 onceWarn 尚未发布到 NNdroid/tlsvpn，实际 ${RETRY:-0} 条)"
+    # 限流意味着 10 秒里每个地址只告警一次，两个地址上限是 2
+    if [ "${RETRY:-0}" -gt 2 ]; then
+      echo "绑定失败告警 ${RETRY} 条，超过每地址一次的上限（没有限流）"
+      PASS=0
     fi
     # 隧道本身不能被拖垮：客户端照样要上线
     e2e_wait_log "new logical client online" "$SRV_LOG" 10 || { echo "bind=tunnel 拖垮了隧道"; PASS=0; }

@@ -161,7 +161,7 @@ Off by default; set `web.addr` on **both** sides to enable it. Served over HTTPS
 ./scripts/build.sh native                      # Rust server/client
 cargo build --examples                          # Rust probe
 (cd ../tlsvpn && ./scripts/build.sh)            # Go server/client
-go build -C interop -o interop/probe .          # Go probe
+(cd ../tlsvpn && go build -C interop -o interop/probe .)  # Go probe
 ./scripts/e2e_test.sh                           # all suites
 ./scripts/e2e_test.sh accept tok                # selected suites
 ```

@@ -96,6 +96,7 @@ fi
 HAVE_IPERF=$(command -v iperf3 || true)
 HAVE_TRACEROUTE=$(command -v traceroute || true)
 HAVE_PY3=$(command -v python3 || true)
+HAVE_AWK=$(command -v awk || true)
 
 SRV_DIR=""
 PIDS=()
@@ -211,6 +212,10 @@ d=json.load(sys.stdin)
 end=d.get("end",{})
 s=end.get("sum_received") or end.get("sum_sent") or {}
 print(f"{s.get(\"bits_per_second\",0)/1e6:.1f}")' 2>/dev/null || echo "?")
+    # python3 存在但解析不出数字时 mbps 是空串：Windows Store 的占位程序会
+    # 静默以 0 退出而不打印任何内容。空串必须当成"没解析出来"，否则下一步会
+    # 拿 0 去比阈值，把一个跑通的传输判成未达标。
+    [[ "$mbps" =~ ^[0-9]+([.][0-9]+)?$ ]] || mbps="?"
   else
     mbps="?"
   fi
@@ -218,7 +223,14 @@ print(f"{s.get(\"bits_per_second\",0)/1e6:.1f}")' 2>/dev/null || echo "?")
     ok "iperf3 $label: transfer ok (install python3 for Mbps parsing)"
     return 0
   fi
-  if (( $(echo "$mbps >= $IPERF_MIN_MBPS" | bc -l 2>/dev/null || echo 1) )); then
+  # awk 做浮点比较：POSIX 且每个 runner 都有。此前用 bc，而 bc 缺失时
+  # `… | bc -l 2>/dev/null || echo 1` 把失败的比较替换成字面量 1，
+  # `(( 1 ))` 为真 —— 吞吐断言静默通过，等于没断言。
+  if [[ -z "$HAVE_AWK" ]]; then
+    ok "iperf3 $label: transfer ok (no awk — Mbps assertion skipped)"
+    return 0
+  fi
+  if "$HAVE_AWK" -v a="$mbps" -v b="$IPERF_MIN_MBPS" 'BEGIN { exit !(a + 0 >= b + 0) }'; then
     ok "iperf3 $label: ${mbps} Mbps (>= ${IPERF_MIN_MBPS})"
   else
     fail "iperf3 $label: ${mbps} Mbps < ${IPERF_MIN_MBPS} threshold"
