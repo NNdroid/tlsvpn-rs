@@ -30,8 +30,13 @@ struct HandshakeReq {
     fec_group: i64,
     encrypt: bool,
     enc_algo: i64,
-    brutal_tx: u64,
-    brutal_rx: u64,
+    // 声明 group 语义后服务端按连接数裁剪总量，才能拿到整形速率
+    #[serde(skip_serializing_if = "is_false")]
+    brutal_groups: bool,
+    brutal_total_tx: u64,
+    brutal_total_rx: u64,
+    brutal_conns: i64,
+    brutal_conn_index: i64,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -430,8 +435,11 @@ fn main() {
         fec_group,
         encrypt,
         enc_algo,
-        brutal_tx: 100,
-        brutal_rx: 500,
+        brutal_groups: true,
+        brutal_total_tx: 100,
+        brutal_total_rx: 500,
+        brutal_conns: 1,
+        brutal_conn_index: 0,
     };
     let req_json = serde_json::to_vec(&req).unwrap();
     let mut out = Vec::new();
@@ -493,7 +501,7 @@ fn main() {
             println!("FAIL: expected XOR FEC negotiation");
             std::process::exit(1);
         } else {
-            println!("NEGOTIATED: dup fallback");
+            println!("NEGOTIATED: FEC off (server fec_group={})", resp.fec_group.unwrap_or(0));
         }
     }
 

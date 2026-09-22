@@ -27,6 +27,25 @@ pub fn clamp_fec_group(k: usize) -> usize {
     k.clamp(FEC_MIN_GROUP, FEC_MAX_GROUP)
 }
 
+/// 归一服务端 FEC 分组策略区间：任一端点为 0 表示"不额外限制"，取协议边界
+/// （min → FEC_MIN_GROUP，max → FEC_MAX_GROUP）。负数保持原样，交给配置校验报错。
+/// 对齐 Go applyDefaults 的 0 哨兵语义；配置路径与绕过它的调用方（测试、嵌入）
+/// 都必须给出同一个结论。
+pub fn normalize_fec_group_bounds(min: i64, max: i64) -> (i64, i64) {
+    (
+        if min == 0 {
+            FEC_MIN_GROUP as i64
+        } else {
+            min
+        },
+        if max == 0 {
+            FEC_MAX_GROUP as i64
+        } else {
+            max
+        },
+    )
+}
+
 /// acc[i] ^= data[i]。x86 上运行时检测 AVX2（32 字节/步，逐字节约 8-16 倍），
 /// 其他平台或无 AVX2 时回退 u64 分块。
 #[inline]

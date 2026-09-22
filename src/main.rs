@@ -44,6 +44,12 @@ pub struct Args {
     pub insecure: bool,
     pub cert_sha256: String,
     pub fwmark: i32,
+    // 策略路由规则优先级（0 = 交给内核自动分配），与 extra_routes 一起描述
+    // 客户端侧 fwmark 表的内容。
+    pub fwmark_priority: i64,
+    pub extra_routes: Vec<String>,
+    // 按源地址前缀的规则，用于转发流量的回程路由（NPT 网关场景）
+    pub source_rules: Vec<crate::net::SourceRule>,
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
@@ -68,6 +74,10 @@ pub struct Args {
     pub min_enc: String,
     pub session_token: bool,
     pub max_sessions: i32,
+    // 服务端接受的对端 FEC 分组大小 K 的区间（默认 = 协议边界，不额外限制）。
+    // 越界的 FEC 请求按请求形态错误拒连，不夹取：见 server::handle_handshake。
+    pub fec_group_min: i64,
+    pub fec_group_max: i64,
 }
 
 // ======================= JSON 配置文件（对齐 Go config.go） =======================
@@ -125,6 +135,13 @@ struct ServerConfigFile {
     // deny_unknown_fields 会让 -c 指向 Go 的 config.server.json 直接解析失败。
     #[serde(default)]
     max_sessions: i32,
+    // 服务端接受的对端 FEC 分组大小 K 的区间（0 = 协议边界 [2,64]）。
+    // 与 max_sessions 一样必须声明：Go 的示例配置恒含这两项，不声明的话
+    // deny_unknown_fields 会让 -c 指向 Go 的 config.server.json 直接解析失败。
+    #[serde(default)]
+    fec_group_min: i64,
+    #[serde(default)]
+    fec_group_max: i64,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -136,6 +153,15 @@ struct ClientConfigFile {
     insecure: bool,
     cert_sha256: String,
     fwmark: i32,
+    // 策略路由规则优先级，0 = 交给内核自动分配。它和 extra_routes 都必须
+    // 声明：Go 的示例配置恒含这两项，deny_unknown_fields 会让 -c 指向 Go 的
+    // config.client.json 直接解析失败。
+    #[serde(default)]
+    fwmark_priority: i64,
+    #[serde(default)]
+    extra_routes: Vec<String>,
+    #[serde(default)]
+    source_rules: Vec<crate::net::SourceRule>,
     conns: i32,
     fec: bool,
     fec_group: i64,
@@ -154,9 +180,20 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         .and_then(|v| v.get("encrypt").and_then(|e| e.as_bool()))
         .is_some();
 
-    let cfg: ConfigFile =
+    let mut cfg: ConfigFile =
         serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
 
+    // source_rules 的 from 要就地补全成带掩码的形式，安装逻辑才不用自己推断地址族；
+    // 表号没有可推导的默认值，漏写必须在启动前报出来。放在这里而不是 validate_args
+    // —— 校验要写回规范化结果，而 validate_args 只拿到 &Args。
+    if cfg.mode == "client" {
+        crate::net::validate_source_rules(&mut cfg.client.source_rules)
+            .map_err(|e| format!("parse config {}: {}", path, e))?;
+    }
+
+    // 区间默认取协议边界，即未配置时不额外限制
+    let (fec_group_min, fec_group_max) =
+        crate::fec::normalize_fec_group_bounds(cfg.server.fec_group_min, cfg.server.fec_group_max);
     let mut args = Args {
         mode: cfg.mode.clone(),
         psk: cfg.psk,
@@ -224,6 +261,8 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.server.max_sessions
         },
+        fec_group_min,
+        fec_group_max,
         req_v4: cfg.client.req_v4,
         req_v6: cfg.client.req_v6,
         sni: if cfg.client.sni.is_empty() {
@@ -234,6 +273,10 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         insecure: cfg.client.insecure,
         cert_sha256: cfg.client.cert_sha256,
         fwmark: cfg.client.fwmark,
+        // 0 是"交给内核分配"的保留值，不做默认填充（对齐 Go applyDefaults）
+        fwmark_priority: cfg.client.fwmark_priority,
+        extra_routes: cfg.client.extra_routes,
+        source_rules: cfg.client.source_rules,
         conns: if cfg.client.conns == 0 {
             1
         } else {
@@ -266,6 +309,17 @@ fn config_file_readable(label: &str, path: &str) -> Result<(), String> {
 }
 
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.brutal_up > crate::net::MAX_BRUTAL_RATE_MBPS
+        || args.brutal_down > crate::net::MAX_BRUTAL_RATE_MBPS
+    {
+        return Err(format!(
+            "brutal_up/brutal_down must not exceed {} Mbps",
+            crate::net::MAX_BRUTAL_RATE_MBPS
+        ));
+    }
+    if args.mode == "client" && args.conns > 65536 {
+        return Err("client.conns must not exceed 65536".into());
+    }
     // mode 闭集校验，文案与 Go Validate 逐字一致
     match args.mode.as_str() {
         "server" | "client" => {}
@@ -403,6 +457,20 @@ fn validate_args(args: &Args) -> Result<(), String> {
         if args.fwmark < 0 {
             return Err("client fwmark must be >= 0".into());
         }
+        // 0 是"交给内核分配"的保留值。上界写常量而不写字面量：对齐 Go 的
+        // 32 位 int 溢出问题，字面量 4294967295 在某些平台直接编不过。
+        if args.fwmark_priority < 0 || args.fwmark_priority > u32::MAX as i64 {
+            return Err(format!(
+                "client.fwmark_priority {} must be a uint32 in [0, 4294967295]",
+                args.fwmark_priority
+            ));
+        }
+        // 路由串在配置加载期就拦下来，而不是等隧道握手后才报 parse 失败。
+        // source_rules 同理，但它的校验要写回规范化结果，所以在 load_config_file
+        // 里做（validate_args 只有 &Args）。
+        if let Err(e) = crate::net::validate_extra_routes(&args.extra_routes) {
+            return Err(e);
+        }
         if !args.cert_sha256.is_empty() {
             let cleaned = args.cert_sha256.replace(':', "").to_lowercase();
             if cleaned.len() != 64 || !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -420,8 +488,38 @@ fn validate_args(args: &Args) -> Result<(), String> {
             args.max_sessions
         ));
     }
+    // FEC 分组策略区间：两端都必须落在协议允许范围内，且 min <= max
+    // （错误文案与 Go Validate 逐字一致）。校验跑在归一化之后：Args::default()
+    // 与绕过 load_config_file 的调用方都不会自己填默认值。
+    if args.mode == "server" {
+        let (lo, hi) = (
+            crate::fec::FEC_MIN_GROUP as i64,
+            crate::fec::FEC_MAX_GROUP as i64,
+        );
+        let (fec_group_min, fec_group_max) =
+            crate::fec::normalize_fec_group_bounds(args.fec_group_min, args.fec_group_max);
+        if fec_group_min < lo || fec_group_min > hi {
+            return Err(format!(
+                "server.fec_group_min {} must be in [{}, {}]",
+                fec_group_min, lo, hi
+            ));
+        }
+        if fec_group_max < lo || fec_group_max > hi {
+            return Err(format!(
+                "server.fec_group_max {} must be in [{}, {}]",
+                fec_group_max, lo, hi
+            ));
+        }
+        if fec_group_min > fec_group_max {
+            return Err(format!(
+                "server.fec_group_min {} must be <= fec_group_max {}",
+                fec_group_min, fec_group_max
+            ));
+        }
+    }
     Ok(())
 }
+
 
 /// 从 argv 提取配置文件路径：`-c path`、`--config path`、`--config=path`。
 /// 除 --print-config 外这是唯一被识别的命令行面。
@@ -543,6 +641,15 @@ fn main() {
         if args.fwmark != 0 {
             ignored.push("client.fwmark");
         }
+        if args.fwmark_priority != 0 {
+            ignored.push("client.fwmark_priority");
+        }
+        if !args.extra_routes.is_empty() {
+            ignored.push("client.extra_routes");
+        }
+        if !args.source_rules.is_empty() {
+            ignored.push("client.source_rules");
+        }
         if args.conns != 1 {
             ignored.push("client.conns");
         }
@@ -570,6 +677,12 @@ fn main() {
         }
         if args.max_sessions != 1024 {
             ignored.push("server.max_sessions");
+        }
+        if args.fec_group_min != crate::fec::FEC_MIN_GROUP as i64 {
+            ignored.push("server.fec_group_min");
+        }
+        if args.fec_group_max != crate::fec::FEC_MAX_GROUP as i64 {
+            ignored.push("server.fec_group_max");
         }
     }
     if !ignored.is_empty() {
@@ -685,7 +798,10 @@ mod tests {
     "cert_sha256": "",
     "req_v4": "",
     "req_v6": "",
-    "fwmark": 0
+    "fwmark": 0,
+    "fwmark_priority": 0,
+    "extra_routes": [],
+    "source_rules": []
   }
 }
 "#;
@@ -800,6 +916,88 @@ mod tests {
         a.fec_group = 4;
         a.max_sessions = -1;
         assert!(validate_args(&a).is_ok(), "client 模式不校验 max_sessions");
+    }
+
+    #[test]
+    fn fec_group_policy_default_and_validation_match_go() {
+        // Go 配置样例里没写这两个键：解析必须通过并落到协议边界。
+        // 这也是 deny_unknown_fields 的镜像要求——新增键若未声明，Go 的配置
+        // 文件会被整个拒掉。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tlsvpn-fec-absent-{}.json", std::process::id()));
+        std::fs::write(&path, GO_SERVER_CONFIG).unwrap();
+        let args = load_config_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            (args.fec_group_min, args.fec_group_max),
+            (2, 64),
+            "缺省应为协议边界，即未配置时不额外限制"
+        );
+        assert!(validate_args(&args).is_ok(), "缺省区间应通过校验");
+
+        for (min, max) in [(0i32, 0), (4, 8), (2, 64), (32, 32)] {
+            let path = dir.join(format!(
+                "tlsvpn-fec-{}-{}-{}.json",
+                std::process::id(),
+                min,
+                max
+            ));
+            let raw = GO_SERVER_CONFIG.replace(
+                "\"max_sessions\": 1024",
+                &format!(
+                    "\"max_sessions\": 1024,\n    \"fec_group_min\": {},\n    \"fec_group_max\": {}",
+                    min, max
+                ),
+            );
+            std::fs::write(&path, &raw).unwrap();
+            let args = load_config_file(path.to_str().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let want: (i64, i64) = (
+                if min == 0 { 2 } else { min as i64 },
+                if max == 0 { 64 } else { max as i64 },
+            );
+            assert_eq!(
+                (args.fec_group_min, args.fec_group_max),
+                want,
+                "[{} {}] 应归一为 {:?}",
+                min, max, want
+            );
+            assert!(
+                validate_args(&args).is_ok(),
+                "fec_group {:?} 应通过校验",
+                want
+            );
+        }
+
+        // Args::default() 未经归一化，两个端点都是 0；validate_args 内部自行归一，
+        // 因此 flag 默认路径不需要调用方先填边界。
+        let mut a = Args::default();
+        a.mode = "server".into();
+        a.psk = "test-only-high-entropy-secret-4e390397818f".into();
+        a.addr = "0.0.0.0:4000".into();
+        a.loglevel = "info".into();
+        a.v4cidr = "10.0.0.0/24".into();
+        a.v6cidr = "fd00::/64".into();
+        assert!(validate_args(&a).is_ok(), "flag 默认值应通过校验");
+        for (min, max) in [(-1i64, 8), (1, 8), (4, 65), (9, 4), (4, -1)] {
+            a.fec_group_min = min;
+            a.fec_group_max = max;
+            let err = validate_args(&a).unwrap_err();
+            assert!(
+                err.contains("fec_group"),
+                "fec_group [{} {}] 的报错应指名该字段，实际: {}",
+                min,
+                max,
+                err
+            );
+        }
+        // 客户端模式下这是服务端策略，不参与校验
+        a.mode = "client".into();
+        a.conns = 4;
+        a.fec_group = 4;
+        a.fec_group_min = -1;
+        a.fec_group_max = 65;
+        assert!(validate_args(&a).is_ok(), "client 模式不校验 fec 策略区间");
     }
 
     #[test]
@@ -1110,6 +1308,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_args_rejects_brutal_kernel_and_connection_overflow() {
+        let mut args = Args::default();
+        args.mode = "client".into();
+        args.psk = "test-only-high-entropy-secret-4e390397818f".into();
+        args.addr = "10.0.0.1:4000".into();
+        args.loglevel = "info".into();
+        args.conns = 1;
+        args.fec_group = 4;
+        args.max_sessions = 1024;
+        args.brutal_up = crate::net::MAX_BRUTAL_RATE_MBPS + 1;
+        assert!(validate_args(&args).unwrap_err().contains("brutal_up/brutal_down"));
+
+        args.brutal_up = 100;
+        args.conns = 65537;
+        assert!(validate_args(&args).unwrap_err().contains("client.conns"));
+    }
+
     struct InfiniteReader {
         data: Vec<u8>,
         pos: usize,
@@ -1201,7 +1417,10 @@ fn example_config_json() -> &'static str {
     "cert_sha256": "",
     "req_v4": "",
     "req_v6": "",
-    "fwmark": 0
+    "fwmark": 0,
+    "fwmark_priority": 0,
+    "extra_routes": [],
+    "source_rules": []
   },
   "server": {
     "v4_cidr": "10.0.0.0/24",

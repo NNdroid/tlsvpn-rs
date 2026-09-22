@@ -126,11 +126,13 @@ fn generate_golden_vectors() {
         "gcm_domain_vectors": gcm_domain_vectors,
         "frame_headers": frame_headers,
         "handshake_req_keys": [
-            "brutal_rx","brutal_tx","client_id","client_instance","enc_algo","encrypt","fec",
+            "brutal_conn_index","brutal_conns","brutal_groups","brutal_total_rx","brutal_total_tx",
+            "client_id","client_instance","enc_algo","encrypt","fec",
             "fec_group","ipv4","ipv6","mac","padding","protocol_version","psk","session_token"
         ],
         "handshake_resp_keys": [
-            "brutal_rx","brutal_tx","client_id","enc_algo","enc_salt","enc_salt2","encrypt","fec",
+            "brutal_groups","brutal_total_rx","brutal_total_tx","client_id","enc_algo",
+            "enc_salt","enc_salt2","encrypt","fec",
             "fec_group","gw_v4","gw_v6","ipv4","ipv6","message","padding","protocol_version",
             "session_epoch","session_id","session_token","success"
         ],

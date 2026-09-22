@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::api::*;
 use crate::buffer::*;
 use crate::crypto::*;
-use crate::fec::{self, clamp_fec_group, FecDecoder};
+use crate::fec::{self, FecDecoder};
 use crate::frame::*;
 use crate::net::*;
 use crate::tap::{MemTap, TapDevice};
@@ -206,8 +206,9 @@ pub struct ClientSession {
     // 记录的是协商结果而不是配置值：客户端可以申请更低的预算，面板按实际值显示。
     pub brutal_tx: AtomicU64,
     pub brutal_rx: AtomicU64,
-    // 本会话 TCP Brutal 是否真的生效（setsockopt 成功）
-    pub brutal_applied: AtomicBool,
+    // 物理连接级计数；不能让后建立的一条失败连接覆盖此前成功连接的状态。
+    pub brutal_applied_conns: AtomicU64,
+    pub brutal_error: Mutex<String>,
 }
 
 pub struct SessionEpochState {
@@ -240,6 +241,7 @@ struct MioSession {
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
     write_stalled: Option<Instant>,
+    brutal_applied: bool,
 }
 
 /// 源 MAC 归属校验判定（对齐 Go validateSrcMAC）：会话端口只允许声明本会话
@@ -290,6 +292,11 @@ pub struct ServerCore {
     pub min_enc: i64,
     // 并发会话上限（对齐 Go maxSessions；构造时已把 0 归一为 1024）
     pub max_sessions: i32,
+    // 服务端接受的对端 FEC 分组大小 K 的区间（默认协议边界 [2,64]，不额外限制）。
+    // 越界的 FEC 请求拒连，不夹取：对端要的是自己的编码参数，静默改成别的 K
+    // 会让它多付 N/K 冗余开销而不自知（见 handle_handshake 的拒连闸）。
+    pub fec_group_min: i64,
+    pub fec_group_max: i64,
     // 多 worker 共用的会话回收节流，避免每次断线创建一个睡眠 OS 线程。
     pub last_session_reap_ms: AtomicU64,
 }
@@ -375,7 +382,9 @@ impl WebStatsProvider for ServerCore {
                     "enc_algo": s.stat.enc_algo.load(Ordering::Relaxed),
                     "brutal_tx": s.brutal_tx.load(Ordering::Relaxed),
                     "brutal_rx": s.brutal_rx.load(Ordering::Relaxed),
-                    "brutal_applied": s.brutal_applied.load(Ordering::Relaxed),
+                    "brutal_applied": s.brutal_applied_conns.load(Ordering::Relaxed) > 0,
+                    "brutal_applied_conns": s.brutal_applied_conns.load(Ordering::Relaxed),
+                    "brutal_error": s.brutal_error.lock().clone(),
                     "online_sec": s.created_at.elapsed().as_secs(),
                     "uptime_sec": s.created_at.elapsed().as_secs(),
                 }),
@@ -393,9 +402,26 @@ impl WebStatsProvider for ServerCore {
         // 逐会话的真实取值在 clients 表里（brutal_tx/brutal_rx/enc_algo/fec_group）。
         let brut = brutal_system_status();
         // applied 只统计 setsockopt 真的成功过的会话，不是"配置了就算生效"
-        let applied: usize = sessions.values().filter(|s| {
-            s.brutal_applied.load(Ordering::Relaxed)
-        }).count();
+        let applied: usize = sessions.values()
+            .map(|s| s.brutal_applied_conns.load(Ordering::Relaxed) as usize)
+            .sum();
+        let total_conns: usize = sessions.values()
+            .map(|s| s.stat.active_conns.load(Ordering::Relaxed).max(0) as usize)
+            .sum();
+        let mut min_up = u64::MAX;
+        let mut max_up = 0u64;
+        let mut min_down = u64::MAX;
+        let mut max_down = 0u64;
+        for s in sessions.values() {
+            let n = s.stat.active_conns.load(Ordering::Relaxed).max(1) as usize;
+            let up = s.brutal_rx.load(Ordering::Relaxed);
+            let down = s.brutal_tx.load(Ordering::Relaxed);
+            min_up = min_up.min(split_legacy_brutal_rate(up, n, n - 1));
+            max_up = max_up.max(split_legacy_brutal_rate(up, n, 0));
+            min_down = min_down.min(split_legacy_brutal_rate(down, n, n - 1));
+            max_down = max_down.max(split_legacy_brutal_rate(down, n, 0));
+        }
+        if sessions.is_empty() { min_up = 0; min_down = 0; }
         let negotiate = serde_json::json!({
             "protocol_version": 2,
             "fec": true,
@@ -405,6 +431,7 @@ impl WebStatsProvider for ServerCore {
             "min_enc": min_enc_label(self.min_enc),
             "session_token": self.session_token,
             "max_sessions": self.max_sessions,
+
             "brutal": {
                 "enabled": self.brutal,
                 "up_mbps": self.brutal_up,
@@ -413,9 +440,11 @@ impl WebStatsProvider for ServerCore {
                 "kernel_current": brut["kernel_current"].as_str().unwrap_or(""),
                 "kernel_available": brut["kernel_available"].clone(),
                 "applied_conns": applied,
-                "total_conns": sessions.len(),
-                "per_conn_tx_mbps": self.brutal_up,
-                "per_conn_rx_mbps": self.brutal_down,
+                "total_conns": total_conns,
+                "min_up_mbps": min_up,
+                "max_up_mbps": max_up,
+                "min_down_mbps": min_down,
+                "max_down_mbps": max_down,
                 "error": brut["error"].as_str().unwrap_or(""),
             }
         });
@@ -674,6 +703,9 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
     let v6_mask_bits = pool.v6_mask_bits;
 
     let vswitch = VSwitch::new();
+    // 0 = 协议边界 [2,64]：未配置时不额外限制
+    let (fec_group_min, fec_group_max) =
+        crate::fec::normalize_fec_group_bounds(args.fec_group_min, args.fec_group_max);
     let core = Arc::new(ServerCore {
         psk: args.psk.clone(),
         psk_hash: hash_psk(&args.psk),
@@ -684,6 +716,8 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
         // 0 = 默认 1024：直接跑 --max-sessions 0 也不该变成"无上限"，否则
         // 一个裸参数就能关掉容量保护
         max_sessions: normalize_max_sessions(args.max_sessions),
+        fec_group_min,
+        fec_group_max,
         last_session_reap_ms: AtomicU64::new(0),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
@@ -781,7 +815,7 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
     let dev_reader = dev_writer.clone();
 
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
-    let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string(), false));
+    let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
     tap_port.register_backend(Arc::new(Backend {
         ch: tap_tx,
         rtt_cache: Arc::new(AtomicU32::new(0)),
@@ -1002,6 +1036,7 @@ fn worker_loop(
                     ic_rx: None,
                     session_epoch: 0,
                     write_stalled: None,
+                    brutal_applied: false,
                 },
             );
         }
@@ -1205,7 +1240,7 @@ fn worker_loop(
                         close_session_tls(&mut s);
                         let _ = poll.registry().deregister(&mut s.socket);
                         let _ = tarpit; // 认证失败立即释放资源；不再创建无界 tarpit OS 线程。
-                        on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
+                        on_conn_closed(s.client_session, s.tx_backend, s.session_epoch, s.brutal_applied);
                     }
                 }
             }
@@ -1221,7 +1256,7 @@ fn worker_loop(
                 // 两处都补发 close_notify。
                 close_session_tls(&mut s);
                 let _ = poll.registry().deregister(&mut s.socket);
-                on_conn_closed(s.client_session, s.tx_backend, s.session_epoch);
+                on_conn_closed(s.client_session, s.tx_backend, s.session_epoch, s.brutal_applied);
             }
         }
     }
@@ -1572,6 +1607,17 @@ fn handle_handshake(
         );
         return HandshakeOutcome::Close;
     }
+    // FEC 分组大小是请求形态，不是能力位：拒绝越界请求而非夹取（对齐 Go）。
+    // 本端客户端发送前已夹到协议范围，因此这条只拦畸形/第三方 peer；
+    // fec_group=0 在 fec=false 时合法，必须按 req.fec 门控，
+    // 否则所有非 FEC 握手都会被拒。
+    if req.fec && (req.fec_group < core.fec_group_min || req.fec_group > core.fec_group_max) {
+        warn!(
+            "[{}] connection refused: fec_group={} outside server policy [{}, {}]",
+            client_id, req.fec_group, core.fec_group_min, core.fec_group_max
+        );
+        return HandshakeOutcome::Close;
+    }
     if !is_valid_client_instance(&req.client_instance) {
         warn!(
             "[{}] connection refused: invalid client_instance",
@@ -1664,13 +1710,14 @@ fn handle_handshake(
                 }
             }
 
-            // FEC 协商：req.fec && fec_group >= 2 → XOR 模式
-            let fec_enc_k: i64 =
-                if req.fec && req.fec_group >= fec::FEC_MIN_GROUP as i64 {
-                    clamp_fec_group(req.fec_group.max(0) as usize) as i64
-                } else {
-                    0
-                };
+            // FEC 协商：req.fec 即 XOR 模式，K 直接取请求值——上面的拒连闸已
+            // 保证它在 [fec_group_min, fec_group_max] ⊆ [2,64] 内，无需再夹取；
+            // 未请求 FEC 时为 0（不编码）。
+            let fec_enc_k: i64 = if req.fec {
+                req.fec_group
+            } else {
+                0
+            };
             // 内层加密协商：只有一种算法。双方都声明 GCM 才启用；否则退回
             // 仅 TLS 一层（对齐 Go：不做弱降级，宁明不给降级）
             let salt_a = new_random_salt();
@@ -1703,10 +1750,9 @@ fn handle_handshake(
                 (None, None)
             };
 
+            // 面板展示：xor K=d / off
             let fec_mode = if fec_enc_k > 0 {
                 format!("xor K={}", fec_enc_k)
-            } else if req.fec {
-                "dup".to_string()
             } else {
                 "off".to_string()
             };
@@ -1742,7 +1788,7 @@ fn handle_handshake(
             *stat.fec_mode.lock() = fec_mode.clone();
             stat.enc_algo.store(enc_algo, Ordering::Relaxed);
 
-            let port = Arc::new(AsyncPort::new(client_id.clone(), req.fec && fec_enc_k == 0));
+            let port = Arc::new(AsyncPort::new(client_id.clone()));
             if fec_enc_k > 0 {
                 port.attach_encoder(fec_enc_k as usize, fec_tx);
             }
@@ -1805,7 +1851,8 @@ fn handle_handshake(
                 // 速率在下面的协商段才算出来，这里先留 0
                 brutal_tx: AtomicU64::new(0),
                 brutal_rx: AtomicU64::new(0),
-                brutal_applied: AtomicBool::new(false),
+                brutal_applied_conns: AtomicU64::new(0),
+                brutal_error: Mutex::new(String::new()),
             });
             sess.stat.active_conns.store(1, Ordering::Release);
             sessions.insert(client_id.clone(), sess.clone());
@@ -1841,25 +1888,42 @@ fn handle_handshake(
     // 服务端→客户端（下行），由本端 socket 整形，受本端下行预算约束；
     // client_tx_rate 是客户端→服务端（上行），客户端自己整形，本端只把它
     // 裁进自己的上行预算内。曾写反导致客户端面板"上行 125 配 30 上行总量"。
+    let group_offer = req.brutal_groups
+        && req.brutal_conns > 0 && req.brutal_conns <= 65536
+        && req.brutal_conn_index >= 0 && req.brutal_conn_index < req.brutal_conns
+        && req.brutal_total_tx <= MAX_BRUTAL_RATE_MBPS
+        && req.brutal_total_rx <= MAX_BRUTAL_RATE_MBPS;
+    let (requested_rx, requested_tx) = if group_offer {
+        (req.brutal_total_rx, req.brutal_total_tx)
+    } else {
+        // 对端未声明 group 语义或字段越界：没有逐连接预算可裁剪，按本端配置整形
+        (0, 0)
+    };
     let mut server_tx_rate = core.brutal_down;
     let mut client_tx_rate = core.brutal_up;
-    if req.brutal_rx > 0 && (core.brutal_down == 0 || req.brutal_rx < core.brutal_down) {
-        server_tx_rate = req.brutal_rx;
+    if requested_rx > 0 && (core.brutal_down == 0 || requested_rx < core.brutal_down) {
+        server_tx_rate = requested_rx;
     }
-    if req.brutal_tx > 0 && (core.brutal_up == 0 || req.brutal_tx < core.brutal_up) {
-        client_tx_rate = req.brutal_tx;
+    if requested_tx > 0 && (core.brutal_up == 0 || requested_tx < core.brutal_up) {
+        client_tx_rate = requested_tx;
     }
+    let server_legacy_rate_bps = if group_offer {
+        split_legacy_brutal_rate_bps(server_tx_rate, req.brutal_conns as usize, req.brutal_conn_index as usize)
+    } else { server_tx_rate * 1_000_000 / 8 };
     // 落档协商结果而不是配置值：客户端可以申请更低的预算，未启用时也记 0，
     // 面板据此区分"没配置"与"配置了但被对端压低"。applied 记 setsockopt 的
     // 真实返回值——内核没装 brutal 模块时这里必为 false。
-    let brutal_applied = if core.brutal && server_tx_rate > 0 {
-        apply_tcp_brutal(&sess.socket, server_tx_rate)
-    } else {
-        false
-    };
+    let brutal_result = if core.brutal && server_tx_rate > 0 {
+        let group_id = if group_offer { brutal_group_id("server", &response_token) } else { 0 };
+        apply_tcp_brutal(&sess.socket, server_tx_rate, server_legacy_rate_bps, group_id)
+    } else { BrutalApplyResult::default() };
+    sess.brutal_applied = brutal_result.applied;
+    if brutal_result.applied {
+        c_sess.brutal_applied_conns.fetch_add(1, Ordering::Relaxed);
+    }
+    *c_sess.brutal_error.lock() = brutal_result.error.clone();
     c_sess.brutal_tx.store(server_tx_rate, Ordering::Relaxed);
     c_sess.brutal_rx.store(client_tx_rate, Ordering::Relaxed);
-    c_sess.brutal_applied.store(brutal_applied, Ordering::Relaxed);
 
     let resp = HandshakeResp {
         protocol_version: req.protocol_version,
@@ -1873,11 +1937,12 @@ fn handle_handshake(
         gw_v4: core.gw_v4.clone(),
         gw_v6: core.gw_v6.clone(),
         padding: generate_padding(100, 500),
-        // 客户端视角的上行/下行：brutal_tx 是客户端自己整形的上行速率，
-        // brutal_rx 是本端整形的下行速率（即客户端的 rx）。本端自己的 tx 是
+        // 客户端视角的上行/下行总量：brutal_total_tx 是客户端自己整形的上行速率，
+        // brutal_total_rx 是本端整形的下行速率（即客户端的 rx）。本端自己的 tx 是
         // 下行、不是上行，传反会让两端视角整个对调。
-        brutal_tx: client_tx_rate,
-        brutal_rx: server_tx_rate,
+        brutal_groups: group_offer,
+        brutal_total_tx: client_tx_rate,
+        brutal_total_rx: server_tx_rate,
         fec: req.fec,
         fec_group: c_sess.fec_enc_k,
         encrypt: core.encrypt,
@@ -1903,9 +1968,15 @@ fn on_conn_closed(
     c_sess: Option<Arc<ClientSession>>,
     backend: Option<Arc<Backend>>,
     connection_epoch: u64,
+    brutal_applied: bool,
 ) {
     if let (Some(c_sess), Some(backend)) = (c_sess, backend) {
         c_sess.port.unregister_backend(&backend.ch);
+        if brutal_applied {
+            let _ = c_sess.brutal_applied_conns.fetch_update(
+                Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))
+            );
+        }
         if c_sess.epoch_state.read().epoch != connection_epoch {
             return;
         }
@@ -1968,6 +2039,84 @@ mod tests {
         assert_eq!(normalize_max_sessions(1), 1);
         assert_eq!(normalize_max_sessions(1024), 1024);
         assert_eq!(normalize_max_sessions(1_048_576), 1_048_576);
+    }
+
+    // ---------- FEC 分组策略 ----------
+
+    /// Go 端 server.go 的拒连条件，逐字复现以便矩阵化测试。
+    /// 只在 req.fec 为真时生效：fec_group=0 是"不启用 FEC"的合法表达。
+    fn go_refuses_fec_group(min: i64, max: i64, fec: bool, k: i64) -> bool {
+        fec && (k < min || k > max)
+    }
+
+    #[test]
+    fn fec_group_bounds_zero_normalizes_to_protocol_limits() {
+        // 对齐 Go applyDefaults：0 = 协议边界 [2,64]，即未配置时不额外限制。
+        assert_eq!(
+            crate::fec::normalize_fec_group_bounds(0, 0),
+            (crate::fec::FEC_MIN_GROUP as i64, crate::fec::FEC_MAX_GROUP as i64)
+        );
+        assert_eq!(crate::fec::normalize_fec_group_bounds(4, 8), (4, 8));
+        assert_eq!(crate::fec::normalize_fec_group_bounds(2, 0), (2, crate::fec::FEC_MAX_GROUP as i64));
+        assert_eq!(
+            crate::fec::normalize_fec_group_bounds(0, 16),
+            (crate::fec::FEC_MIN_GROUP as i64, 16)
+        );
+    }
+
+    #[test]
+    fn fec_group_policy_gate_matches_go() {
+        // 策略区间 [4,8]
+        for k in [3i64, 2, -3, 999_999, 10_000_000] {
+            assert!(
+                go_refuses_fec_group(4, 8, true, k),
+                "fec_group={} 低于/偏离策略下限应被拒",
+                k
+            );
+        }
+        for k in [9i64, 100, crate::fec::FEC_MAX_GROUP as i64] {
+            assert!(
+                go_refuses_fec_group(4, 8, true, k),
+                "fec_group={} 高于策略上限应被拒",
+                k
+            );
+        }
+        // 端点与中间值放行
+        for k in [4i64, 6, 8] {
+            assert!(
+                !go_refuses_fec_group(4, 8, true, k),
+                "fec_group={} 在策略区间内应放行",
+                k
+            );
+        }
+        // 未请求 FEC 时 fec_group 无意义，任何值都必须放行——否则所有非 FEC
+        // 握手（包括本端客户端发的 fec_group=0）都会被误拒。
+        for k in [0i64, -1, 3, 9, 999_999] {
+            assert!(
+                !go_refuses_fec_group(4, 8, false, k),
+                "fec=false 时 fec_group={} 不应被拒",
+                k
+            );
+        }
+        // 默认策略 = 协议边界：等价于只拦协议外取值
+        assert!(go_refuses_fec_group(
+            crate::fec::FEC_MIN_GROUP as i64,
+            crate::fec::FEC_MAX_GROUP as i64,
+            true,
+            1
+        ));
+        assert!(go_refuses_fec_group(
+            crate::fec::FEC_MIN_GROUP as i64,
+            crate::fec::FEC_MAX_GROUP as i64,
+            true,
+            crate::fec::FEC_MAX_GROUP as i64 + 1
+        ));
+        assert!(!go_refuses_fec_group(
+            crate::fec::FEC_MIN_GROUP as i64,
+            crate::fec::FEC_MAX_GROUP as i64,
+            true,
+            crate::fec::FEC_MAX_GROUP as i64
+        ));
     }
 
     // ---------- IPv4 池耗尽（档 D） ----------

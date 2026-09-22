@@ -15,11 +15,12 @@ use tracing_subscriber::EnvFilter;
 // ======================= 握手协议结构（与 Go frame.go 契约一致） =======================
 //
 // 黄金向量锁定的字段名集合：
-//   req : client_id, psk, mac, ipv4, ipv6, padding, brutal_tx, brutal_rx,
+//   req : client_id, psk, mac, ipv4, ipv6, padding,
+//         brutal_groups, brutal_total_tx, brutal_total_rx, brutal_conns, brutal_conn_index,
 //         fec, fec_group, encrypt, enc_algo
 //   resp: success, message, session_id, client_id, ipv4, ipv6, gw_v4, gw_v6,
-//         padding, brutal_tx, brutal_rx, fec, fec_group, encrypt, enc_algo,
-//         enc_salt, enc_salt2
+//         padding, brutal_groups, brutal_total_tx, brutal_total_rx,
+//         fec, fec_group, encrypt, enc_algo, enc_salt, enc_salt2
 // 除 client_id/psk（req）与 success/message/client_id/ipv4/ipv6（resp）外
 // 全部对齐 Go 的 omitempty：零值不出现在线路上。
 
@@ -39,10 +40,16 @@ pub struct HandshakeReq {
     pub ipv6: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub padding: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brutal_groups: bool,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub brutal_tx: u64,
+    pub brutal_total_tx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub brutal_rx: u64,
+    pub brutal_total_rx: u64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub brutal_conns: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub brutal_conn_index: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fec: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -76,10 +83,12 @@ pub struct HandshakeResp {
     pub gw_v6: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub padding: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brutal_groups: bool,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub brutal_tx: u64,
+    pub brutal_total_tx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub brutal_rx: u64,
+    pub brutal_total_rx: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fec: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -432,8 +441,7 @@ impl RuntimeCtx {
     pub fn from_args(args: &crate::Args, cfg_path: &str) -> Self {
         let pad_actual = crate::crypto::pad_mode_name();
         let web_https = !args.web_cert.is_empty() && !args.web_key.is_empty();
-        Self {
-            cfg: serde_json::json!({
+        let mut cfg = serde_json::json!({
                 "mode": args.mode,
                 "encrypt": args.encrypt,
                 "min_enc": args.min_enc,
@@ -466,8 +474,22 @@ impl RuntimeCtx {
                 "insecure": args.insecure,
                 "cert_sha256": args.cert_sha256,
                 "fwmark": args.fwmark,
+                "fwmark_priority": args.fwmark_priority,
+                // 表号永远等于 fwmark 值，这不是巧合而是约定：显式列出来，
+                // 免得用户拿错表号去查 ip route
+                "fwmark_table": args.fwmark,
+                "extra_routes": args.extra_routes,
+                "source_rules": args.source_rules,
                 "encrypt_present": args.encrypt_present,
-            }),
+            });
+        // FEC 分组策略是服务端专属配置。客户端模式下这两个值是协议边界默认，
+        // 显示出来会被误读成客户端策略，因此只在服务端模式下发。
+        if args.mode == "server" {
+            cfg["fec_group_min"] = serde_json::json!(args.fec_group_min);
+            cfg["fec_group_max"] = serde_json::json!(args.fec_group_max);
+        }
+        Self {
+            cfg,
             system: system_info(cfg_path),
         }
     }
@@ -522,17 +544,17 @@ pub fn brutal_system_status() -> serde_json::Value {
     let current = {
         let s = read_proc_trim("/proc/sys/net/ipv4/tcp_congestion_control");
         if s.is_empty() {
-            read_proc_trim("/proc/sys/net/ipv4/congestion_control")
+            String::new()
         } else {
             s
         }
     };
-    let avail_raw = read_proc_trim("/proc/sys/net/ipv4/congestion_control");
+    let avail_raw = read_proc_trim("/proc/sys/net/ipv4/tcp_available_congestion_control");
     let available: Vec<String> = if avail_raw.is_empty() {
         Vec::new()
     } else {
         avail_raw
-            .split('|')
+            .split_whitespace()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
@@ -772,11 +794,14 @@ function fmtBytes(b,s=false){
 function fmtDur(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   if(d>0)return d+'天'+h+'时';if(h>0)return h+'时'+m+'分';if(m>0)return m+'分'+(s%60)+'秒';return s+'秒';}
 function badge(f){if(!f||f==='off')return '<span class="badge b-off">关闭</span>';
-  if(f==='dup')return '<span class="badge b-dup">复制</span>';return '<span class="badge b-on">'+f+'</span>';}
+  return '<span class="badge b-on">'+f+'</span>';}
 // 内层只有一种算法（GCM），没有按算法编号切换的余地；0 = 明文
 function encBadge(a){if(a===2)return '<span class="badge b-on">GCM</span>';
   return '<span class="badge b-off">明文</span>';}
 function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
+// kvRows 的单元格值按 HTML 原样输出，徽章行需要标签；来自 ip stderr 的报错
+// 文本必须先转义，否则一条带 < 的内核消息就能改写面板结构
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 // 空值不占行：面板上留一堆空行只会让人误以为字段缺失是故障
 function kvRows(pairs){return pairs.filter(p=>p&&p[1]!==undefined&&p[1]!==null&&p[1]!==''&&p[1]!==false)
   .map(p=>'<tr><td class="k">'+p[0]+'</td><td class="v">'+p[1]+'</td></tr>').join('');}
@@ -834,7 +859,10 @@ async function fetchStats(){
       const bid=c.session_id?(c.session_id.length>10?c.session_id.slice(0,10)+'…':c.session_id):'-';
       // 上=客户端上行（会话里的 brutal_rx），下=服务端下发（会话里的 brutal_tx）。
       // 曾写成 brutal_tx / brutal_rx 却配「上/下」表头，两个方向整个对调。
-      const brut=c.brutal_rx||c.brutal_tx?((c.brutal_rx||0)+'↑/'+(c.brutal_tx||0)+'↓'):'-';
+      const brut=c.brutal_applied
+        ?((c.brutal_rx||0)+'↑/'+(c.brutal_tx||0)+'↓')
+        :((c.brutal_rx||c.brutal_tx)?'未生效':'-');
+      const brutTitle=c.brutal_error||'客户端→服务端（上行）/ 服务端→客户端（下行）(Mbps)';
       tbody+='<tr><td title="'+id+'">'+sid+'</td><td>'+(c.ipv4||'-')+'</td><td class="hide-sm">'+(c.ipv6||'-')+'</td>'+
         '<td class="hide-sm">'+(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
         '<td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
@@ -842,7 +870,7 @@ async function fetchStats(){
         '<td class="hide-sm">'+badge(c.fec)+'</td><td class="hide-sm">'+(c.fec_group||'-')+'</td>'+
         '<td class="hide-sm">'+encBadge(c.enc_algo)+'</td><td class="hide-sm" title="'+bid+'">'+bid+'</td>'+
         '<td class="hide-sm">'+(c.session_epoch||'-')+'</td>'+
-        '<td class="hide-sm" title="客户端→服务端（上行）/ 服务端→客户端（下行）(Mbps)">'+brut+'</td>'+
+        '<td class="hide-sm" title="'+brutTitle+'">'+brut+'</td>'+
         '<td class="hide-sm">'+(c.online_sec?fmtDur(c.online_sec):'-')+'</td>'+
         '<td>'+(data.mode==='server'?'<button class="btn" onclick="kickClient(\''+id+'\')">踢出</button>'+
           '<button class="btn blue" onclick="banClient(\''+id+'\',0)">封禁</button>':'-')+'</td></tr>';
@@ -924,6 +952,9 @@ function renderStatus(data){
     ['Brutal 下行 (Mbps)',c.brutal_down||'-'],
     ['FEC',c.fec?'开启':'关闭'],
     ['FEC 分组',c.fec_group||'-'],
+    // 服务端策略区间：对照每个客户端协商到的 K，越界的 FEC 握手会被拒
+    ['FEC 分组下限 fec_group_min',typeof c.fec_group_min==='number'?c.fec_group_min:'-'],
+    ['FEC 分组上限 fec_group_max',typeof c.fec_group_max==='number'?c.fec_group_max:'-'],
     ['物理连接数 conns',c.conns||'-'],
     ['工作线程 workers',c.workers||'-'],
     ['MTU',c.mtu||'-'],
@@ -939,7 +970,12 @@ function renderStatus(data){
     ['SNI 伪装',c.sni||'-'],
     ['服务端证书校验',c.insecure?'已跳过':'开启'],
     ['证书指纹 cert_sha256',c.cert_sha256||'-'],
-    ['FWMark',c.fwmark||'-'],
+    ['策略路由 fwmark',c.fwmark||'-'],
+    ['规则优先级 fwmark_priority',c.fwmark_priority||'自动'],
+    ['路由表号 fwmark_table',c.fwmark_table||'-'],
+    ['额外路由 extra_routes',Array.isArray(c.extra_routes)&&c.extra_routes.length?c.extra_routes.join(' ; '):'-'],
+    // 元素是对象，直接 join 会变成 [object Object]，转成 JSON 展示
+    ['按源前缀路由 source_rules',Array.isArray(c.source_rules)&&c.source_rules.length?c.source_rules.map(x=>JSON.stringify(x)).join(' ; '):'-'],
     ['encrypt 字段是否显式写入',c.encrypt_present===false?'未写（按开启处理）':'已写入'],
   ]);
 
@@ -956,6 +992,12 @@ function renderStatus(data){
     ['每连接下行预算 (Mbps)',g.rx_rate_mbps||'-'],
     ['会话上限',g.max_sessions||'-'],
     ['SOCKS5 代理',g.socks5?'开启（本端不整形）':'-'],
+    ['策略路由',
+      (typeof g.policy_routing==='boolean')
+        ? (g.policy_routing_error
+            ? '<span class="badge b-off">'+esc(g.policy_routing_error)+'</span>'
+            : '<span class="badge b-on">已生效</span>')
+        : '-'],
   ]);
 
   document.getElementById('st-brut').innerHTML=kvRows([
@@ -994,8 +1036,8 @@ function renderConns(data){
     '<td>'+(c.rtt_ms>=100000?'-':c.rtt_ms+' ms')+'</td><td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
     '<td class="hide-sm">'+c.retries+'</td><td class="hide-sm">'+(c.age_sec?fmtDur(c.age_sec):'-')+'</td>'+
     '<td class="hide-sm">'+badge(data.fec_mode||'off')+'</td><td class="hide-sm">'+encBadge(neg.enc_algo||0)+'</td>'+
-    '<td class="hide-sm">'+(c.brutal_applied?'<span class="badge b-on">已生效</span>':(b.enabled?'<span class="badge b-dup">未生效</span>':'<span class="badge b-off">未启用</span>'))+'</td>'+
-    '<td class="hide-sm" style="color:var(--err)" title="'+(c.last_error||'')+'">'+((c.last_error||'').slice(0,40))+'</td>'+
+    '<td class="hide-sm" title="'+(c.brutal_error||'')+'">'+(c.brutal_applied?'<span class="badge b-on">已生效</span>':(b.enabled?'<span class="badge b-dup">未生效</span>':'<span class="badge b-off">未启用</span>'))+'</td>'+
+    '<td class="hide-sm" style="color:var(--err)" title="'+(c.last_error||c.brutal_error||'')+'">'+((c.last_error||c.brutal_error||'').slice(0,40))+'</td>'+
     '<td><button class="btn gray" onclick="doAction(\'reconnect\')">重连</button></td></tr>').join('')||
     '<tr><td colspan="14" style="color:var(--muted)">无连接</td></tr>';
 }

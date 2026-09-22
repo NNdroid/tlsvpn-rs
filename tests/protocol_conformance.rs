@@ -231,10 +231,16 @@ struct HandshakeReqShape {
     ipv6: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     padding: String,
+    #[serde(skip_serializing_if = "is_false")]
+    brutal_groups: bool,
     #[serde(skip_serializing_if = "is_zero_u64")]
-    brutal_tx: u64,
+    brutal_total_tx: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
-    brutal_rx: u64,
+    brutal_total_rx: u64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    brutal_conns: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    brutal_conn_index: i64,
     #[serde(skip_serializing_if = "is_false")]
     fec: bool,
     #[serde(skip_serializing_if = "is_zero_i64")]
@@ -266,10 +272,12 @@ struct HandshakeRespShape {
     gw_v6: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     padding: String,
+    #[serde(skip_serializing_if = "is_false")]
+    brutal_groups: bool,
     #[serde(skip_serializing_if = "is_zero_u64")]
-    brutal_tx: u64,
+    brutal_total_tx: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
-    brutal_rx: u64,
+    brutal_total_rx: u64,
     #[serde(skip_serializing_if = "is_false")]
     fec: bool,
     #[serde(skip_serializing_if = "is_zero_i64")]
@@ -309,8 +317,11 @@ fn test_handshake_req_field_names() {
         ipv4: "1".into(),
         ipv6: "2".into(),
         padding: "x".into(),
-        brutal_tx: 1,
-        brutal_rx: 1,
+        brutal_groups: true,
+        brutal_total_tx: 30,
+        brutal_total_rx: 500,
+        brutal_conns: 4,
+        brutal_conn_index: 1,
         fec: true,
         fec_group: 4,
         encrypt: true,
@@ -348,8 +359,9 @@ fn test_handshake_resp_field_names() {
         gw_v4: "3".into(),
         gw_v6: "4".into(),
         padding: "x".into(),
-        brutal_tx: 1,
-        brutal_rx: 1,
+        brutal_groups: true,
+        brutal_total_tx: 30,
+        brutal_total_rx: 500,
         fec: true,
         fec_group: 4,
         encrypt: true,
@@ -363,8 +375,9 @@ fn test_handshake_resp_field_names() {
     keys.sort();
 
     let expected = [
-        "brutal_rx",
-        "brutal_tx",
+        "brutal_groups",
+        "brutal_total_rx",
+        "brutal_total_tx",
         "client_id",
         "enc_algo",
         "enc_salt",
@@ -397,8 +410,7 @@ fn test_golden_handshake_keys_match_rust() {
     // 黄金向量的键列表必须与 Rust 端完全相等，双向锁定：任何一端单方面加/删
     // 字段都会在这里失败。
     // 曾一度只能做单向子集——Go 生成器的样本漏填了 session_token，omitempty 把
-    // 它吞掉后 golden 只剩 12/17 个键。现已在 Go 侧补全样本并重跑
-    // -update-golden，golden 变成 13/18，相等关系成立。
+    // 它吞掉后字段集合不完整。Go 侧全字段样本与这里必须逐字相等。
     let g = golden_or_skip!();
 
     let req_full = HandshakeReqShape {
@@ -409,8 +421,11 @@ fn test_golden_handshake_keys_match_rust() {
         ipv4: "1".into(),
         ipv6: "2".into(),
         padding: "x".into(),
-        brutal_tx: 1,
-        brutal_rx: 1,
+        brutal_groups: true,
+        brutal_total_tx: 30,
+        brutal_total_rx: 500,
+        brutal_conns: 4,
+        brutal_conn_index: 1,
         fec: true,
         fec_group: 4,
         encrypt: true,
@@ -429,8 +444,9 @@ fn test_golden_handshake_keys_match_rust() {
         gw_v4: "3".into(),
         gw_v6: "4".into(),
         padding: "x".into(),
-        brutal_tx: 1,
-        brutal_rx: 1,
+        brutal_groups: true,
+        brutal_total_tx: 30,
+        brutal_total_rx: 500,
         fec: true,
         fec_group: 4,
         encrypt: true,
@@ -484,8 +500,11 @@ fn test_omitempty_semantics() {
         "ipv4",
         "ipv6",
         "padding",
-        "brutal_tx",
-        "brutal_rx",
+        "brutal_groups",
+        "brutal_total_tx",
+        "brutal_total_rx",
+        "brutal_conns",
+        "brutal_conn_index",
         "fec",
         "fec_group",
         "encrypt",

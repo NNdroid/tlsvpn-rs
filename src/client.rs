@@ -43,13 +43,16 @@ fn reconnect_backoff_delay(attempt: u32) -> Duration {
 /// 全局退出标记（信号处理置位）
 pub static EXIT: AtomicBool = AtomicBool::new(false);
 
-/// 退出时清理策略路由所需的信息（对齐 Go cleanPolicyRouting defer）
-static CLEANUP_INFO: std::sync::OnceLock<(String, i32, String, String)> =
-    std::sync::OnceLock::new();
+/// 退出时清理策略路由所需的完整参数（对齐 Go cleanPolicyRouting defer）。
+///
+/// 只保留最新一次安装的 spec：重复安装时旧规则已在安装前被
+/// policy_routing_cmds 的 pre 阶段按 mark+table 清掉，不存在需要同时清理
+/// 多组参数的情况。
+static CLEANUP_INFO: std::sync::OnceLock<PolicyRoutingSpec> = std::sync::OnceLock::new();
 
 pub fn on_exit_cleanup() {
-    if let Some((tap, fwmark, gw4, gw6)) = CLEANUP_INFO.get() {
-        clean_policy_routing(tap, *fwmark, gw4, gw6);
+    if let Some(spec) = CLEANUP_INFO.get() {
+        clean_policy_routing(spec);
     }
 }
 
@@ -141,8 +144,8 @@ pub struct ConnInfo {
     pub rx_bytes: AtomicU64,
     pub retries: AtomicU64,
     pub linked_at: AtomicI64,
-    // 本连接 TCP Brutal 是否真的生效（setsockopt 成功）
-    pub brutal_applied: AtomicBool,
+    // 本连接的内核实际状态；不能再用“无错误字符串”推断已生效。
+    pub brutal: Mutex<BrutalApplyResult>,
 }
 
 impl ConnInfo {
@@ -157,12 +160,13 @@ impl ConnInfo {
             rx_bytes: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             linked_at: AtomicI64::new(0),
-            brutal_applied: AtomicBool::new(false),
+            brutal: Mutex::new(BrutalApplyResult::default()),
         }
     }
 
     fn snapshot(&self, index: usize) -> serde_json::Value {
         let linked_at = self.linked_at.load(Ordering::Relaxed);
+        let brutal = self.brutal.lock().clone();
         serde_json::json!({
             "index": index,
             "target": self.target,
@@ -173,7 +177,13 @@ impl ConnInfo {
             "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
             "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
             "retries": self.retries.load(Ordering::Relaxed),
-            "brutal_applied": self.brutal_applied.load(Ordering::Relaxed),
+            "brutal_applied": brutal.applied,
+            "brutal_error": brutal.error,
+            "brutal_rate_bps": brutal.rate_bps,
+            "brutal_rate_mbps": brutal.rate_mbps,
+            "brutal_version": brutal.version,
+            "brutal_group_id": brutal.group_id,
+            "brutal_rule_managed": brutal.rule_managed,
             "age_sec": if linked_at > 0 {
                 (now_unix_ms() / 1000).saturating_sub(linked_at) as u64
             } else {
@@ -188,7 +198,7 @@ impl ConnInfo {
 #[derive(Default)]
 pub struct SessionState {
     server_session_id: String,
-    fec_negotiated: i64, // 0=未协商, >0=XOR 分组大小, -1=服务端不支持
+    fec_negotiated: i64, // 0=未协商, >0=XOR 分组大小
     fec_algo: i64,
     fec_salt_key: String,
     ic_tx: Option<Arc<InnerCipher>>,
@@ -199,6 +209,8 @@ pub struct SessionState {
     // 服务端下发的会话令牌；重连同一 client_id 时必须在握手里回带
     session_token: String,
     session_epoch: u64,
+    brutal_tx: u64,
+    brutal_rx: u64,
 }
 
 // ======================= 客户端 =======================
@@ -214,6 +226,12 @@ pub struct Client {
     pub insecure: bool,
     pub cert_hash: String,
     pub fwmark: i32,
+    /// 策略路由规则优先级；0 = 交给内核自动分配
+    pub fwmark_priority: i64,
+    /// 额外路由，iproute2 序列化语法（配置加载期已校验）
+    pub extra_routes: Vec<String>,
+    /// 按源地址前缀的规则，与 fwmark 相互独立（加载期已校验并补全掩码）
+    pub source_rules: Vec<crate::net::SourceRule>,
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
@@ -247,6 +265,10 @@ pub struct Client {
     pub assigned_v4: Mutex<String>,
     pub assigned_v6: Mutex<String>,
     pub fec_status: Mutex<String>,
+    // 策略路由实际生效状态。面板要区分"没配置"和"配置了但内核拒绝"，
+    // 所以成功与错误分开记录；多次物理连接会并发安装，故加锁。
+    pub pr_ok: Mutex<bool>,
+    pub pr_err: Mutex<String>,
     pub enc_algo_display: AtomicI64,
     pub force_generation: AtomicU64,
     pub instance_id: Mutex<String>,
@@ -299,6 +321,8 @@ impl WebStatsProvider for Client {
         let session_token = !sess.session_token.is_empty();
         let session_epoch = sess.session_epoch;
         let session_id = sess.server_session_id.clone();
+        let negotiated_brutal_tx = sess.brutal_tx;
+        let negotiated_brutal_rx = sess.brutal_rx;
         drop(sess);
         let local = serde_json::json!({
             "client_id": self.client_id,
@@ -323,23 +347,21 @@ impl WebStatsProvider for Client {
         // brutal 段把"配置意图"和"内核实际状态"分开设——非 Linux 或没装 brutal
         // 模块时 apply 必然失败，混在一起就无法区分"没配置"和"配置了没生效"。
         let n: u64 = if self.conns_count == 0 { 1 } else { self.conns_count as u64 };
-        let per_up = if self.brutal_up / n == 0 && self.brutal_up > 0 {
-            1
-        } else {
-            self.brutal_up / n
-        };
-        let per_down = if self.brutal_down / n == 0 && self.brutal_down > 0 {
-            1
-        } else {
-            self.brutal_down / n
-        };
+        let per_up_min = split_legacy_brutal_rate(self.brutal_up, n as usize, n.saturating_sub(1) as usize);
+        let per_up_max = split_legacy_brutal_rate(self.brutal_up, n as usize, 0);
+        let per_down_min = split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
+        let per_down_max = split_legacy_brutal_rate(self.brutal_down, n as usize, 0);
         // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
         let applied_conns = self
             .conn_infos
             .iter()
-            .filter(|c| c.brutal_applied.load(Ordering::Relaxed))
+            .filter(|c| c.brutal.lock().applied)
             .count();
         let brut = brutal_system_status();
+        // 策略路由生效状态。面板需要区分"没配 fwmark"和"配了但内核拒绝"，
+        // 所以 applied 与 error 分开记录。
+        let pr_applied = *self.pr_ok.lock();
+        let pr_error = self.pr_err.lock().clone();
         let negotiate = serde_json::json!({
             "protocol_version": 2,
             "fec": self.fec_mode,
@@ -349,9 +371,11 @@ impl WebStatsProvider for Client {
             "min_enc": min_enc_label(self.min_enc),
             "session_token": session_token,
             "session_epoch": session_epoch,
-            "tx_rate_mbps": per_up,
-            "rx_rate_mbps": per_down,
+            "tx_rate_mbps": negotiated_brutal_tx,
+            "rx_rate_mbps": negotiated_brutal_rx,
             "socks5": self.socks5.is_some(),
+            "policy_routing": self.fwmark > 0 && pr_applied,
+            "policy_routing_error": pr_error,
             "brutal": {
                 "enabled": self.brutal,
                 "up_mbps": self.brutal_up,
@@ -361,10 +385,10 @@ impl WebStatsProvider for Client {
                 "kernel_available": brut["kernel_available"].clone(),
                 "applied_conns": applied_conns,
                 "total_conns": self.conns_count,
-                "min_up_mbps": per_up,
-                "max_up_mbps": per_up,
-                "min_down_mbps": per_down,
-                "max_down_mbps": per_down,
+                "min_up_mbps": per_up_min,
+                "max_up_mbps": per_up_max,
+                "min_down_mbps": per_down_min,
+                "max_down_mbps": per_down_max,
                 "error": brut["error"].as_str().unwrap_or(""),
             }
         });
@@ -669,7 +693,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
     }
 
     // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
-    let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string(), args.fec));
+    let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
     {
         let dev = device.clone();
         let port = tx_port.clone();
@@ -757,6 +781,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         insecure: args.insecure,
         cert_hash: args.cert_sha256.clone(),
         fwmark: args.fwmark,
+        fwmark_priority: args.fwmark_priority,
+        extra_routes: args.extra_routes.clone(),
+        source_rules: args.source_rules.clone(),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
@@ -787,6 +814,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         assigned_v4: Mutex::new(String::new()),
         assigned_v6: Mutex::new(String::new()),
         fec_status: Mutex::new("off".into()),
+        pr_ok: Mutex::new(false),
+        pr_err: Mutex::new(String::new()),
         enc_algo_display: AtomicI64::new(0),
         force_generation: AtomicU64::new(0),
         instance_id: Mutex::new(random_instance_id()),
@@ -1018,19 +1047,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
     // 1. Brutal 速率均分（对齐 Go；brutal 关闭时仍上报速率供服务端裁剪）
     let conns = cl.conns_count as u64;
-    let client_tx_rate = if cl.brutal_up / conns == 0 && cl.brutal_up > 0 {
-        1
-    } else {
-        cl.brutal_up / conns
-    };
-    let client_rx_rate = if cl.brutal_down / conns == 0 && cl.brutal_down > 0 {
-        1
-    } else {
-        cl.brutal_down / conns
-    };
-    if cl.brutal && client_tx_rate > 0 && cl.socks5.is_none() {
+    let client_tx_rate_bps = split_legacy_brutal_rate_bps(cl.brutal_up, conns as usize, conn_index);
+    let instance_id = cl.instance_id.lock().clone();
+    let brutal_group = brutal_group_id("client", &instance_id);
+    if cl.brutal && client_tx_rate_bps > 0 && cl.socks5.is_none() {
         // 代理连接不做 shaping（流量不经过本进程），此时 applied 必须是 false
-        ci.brutal_applied.store(apply_tcp_brutal(&raw, client_tx_rate), Ordering::Relaxed);
+        *ci.brutal.lock() = apply_tcp_brutal(&raw, cl.brutal_up, client_tx_rate_bps, brutal_group);
+    } else {
+        *ci.brutal.lock() = BrutalApplyResult::default();
     }
 
     // 2. TLS 连接与握手（10s 超时对齐 Go SetDeadline）
@@ -1101,7 +1125,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let session_token = cl.session.lock().session_token.clone();
     let req = HandshakeReq {
         protocol_version: 2,
-        client_instance: cl.instance_id.lock().clone(),
+        client_instance: instance_id,
         client_id: cl.client_id.clone(),
         psk: hash_psk(&cl.psk),
         mac: cl.mac.clone(),
@@ -1114,8 +1138,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         } else {
             0
         },
-        brutal_tx: client_tx_rate,
-        brutal_rx: client_rx_rate,
+        brutal_groups: true,
+        brutal_total_tx: cl.brutal_up,
+        brutal_total_rx: cl.brutal_down,
+        brutal_conns: cl.conns_count as i64,
+        brutal_conn_index: conn_index as i64,
         encrypt: cl.encrypt,
         enc_algo: CLIENT_ENC_ALGO_SUPPORT,
         session_token,
@@ -1145,6 +1172,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             resp.protocol_version
         );
         return Duration::ZERO;
+    }
+
+    if cl.brutal && resp.brutal_groups && resp.brutal_total_tx > 0 && cl.socks5.is_none() {
+        let legacy_bps = split_legacy_brutal_rate_bps(resp.brutal_total_tx, cl.conns_count, conn_index);
+        *ci.brutal.lock() = apply_tcp_brutal(&sock, resp.brutal_total_tx, legacy_bps, brutal_group);
     }
 
     // 4. 内层加密协商（对齐 Go）
@@ -1220,9 +1252,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     conn_index, resp.fec_group, resp.fec_group
                 );
             } else {
-                st.fec_negotiated = -1;
-                *cl.fec_status.lock() = "dup".into();
-                info!("[Conn {}] Server lacks XOR FEC support, falling back to legacy duplication mode", conn_index);
+                // 服务端协商不出可用分组（fec_group < 2）：本次不开 FEC，
+                // fec_negotiated 保持 0，后续连接继续重试
+                *cl.fec_status.lock() = "off".into();
+                warn!(
+                    "[Conn {}] FEC requested but server negotiated fec_group={}, FEC disabled",
+                    conn_index, resp.fec_group
+                );
             }
         }
         if cl.fec_mode && st.fec_negotiated > 0 {
@@ -1256,6 +1292,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         st.gw_v4 = resp.gw_v4.clone();
         st.gw_v6 = resp.gw_v6.clone();
+        if resp.brutal_groups {
+            st.brutal_tx = resp.brutal_total_tx;
+            st.brutal_rx = resp.brutal_total_rx;
+        }
         // 记下服务端下发的会话令牌，供后续重连回带。服务端未开启
         // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
         st.session_token = resp.session_token.clone();
@@ -1290,13 +1330,30 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     if cl.tap_name != "mem" {
         #[cfg(target_os = "linux")]
         setup_interface(cl, &resp.ipv4, &resp.ipv6);
-        setup_policy_routing(&cl.tap_name, cl.fwmark, &resp.gw_v4, &resp.gw_v6);
-        let _ = CLEANUP_INFO.set((
-            cl.tap_name.clone(),
-            cl.fwmark,
-            resp.gw_v4.clone(),
-            resp.gw_v6.clone(),
-        ));
+        // 规则与路由由本进程自管，用户不需要（也不应）再写一份 systemd drop-in：
+        // 两者并存时同一条 fwmark 规则会按 priority 竞争，结果取决于内核裁决顺序。
+        let pr_spec = PolicyRoutingSpec {
+            mark: cl.fwmark,
+            priority: cl.fwmark_priority,
+            tap_name: cl.tap_name.clone(),
+            gw_v4: resp.gw_v4.clone(),
+            gw_v6: resp.gw_v6.clone(),
+            extra_routes: cl.extra_routes.clone(),
+            source_rules: cl.source_rules.clone(),
+        };
+        match setup_policy_routing(&pr_spec) {
+            Ok(()) => {
+                *cl.pr_ok.lock() = true;
+                *cl.pr_err.lock() = String::new();
+            }
+            Err(e) => {
+                // 上抛而不是吞掉：半装状态（有规则没路由）比明确报错更糟
+                warn!("policy routing: {e}");
+                *cl.pr_ok.lock() = false;
+                *cl.pr_err.lock() = e;
+            }
+        }
+        let _ = CLEANUP_INFO.set(pr_spec);
     }
 
     // 7. 注册端口后端 + RTT 轮询线程
