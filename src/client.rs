@@ -1722,9 +1722,6 @@ fn tls_exchange_resp(
 // Linux 下用 ip 命令配置接口地址；命令序列（顺序、nodad、replace）见
 // utils::tap_addr_cmds，那是 web.bind=tunnel 能绑上 v6 隧道 IP 的前提。
 #[cfg(target_os = "linux")]
-use std::process::Command;
-
-#[cfg(target_os = "linux")]
 fn setup_interface(cl: &Arc<Client>, v4cidr: &str, v6cidr: &str) {
     crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(&cl.tap_name, v4cidr, v6cidr));
 }
