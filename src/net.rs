@@ -852,48 +852,6 @@ fn run_ip(args: &[String], errs: &mut Vec<String>) -> bool {
     }
 }
 
-/// TAP 就绪等待上限。tap 常由外部单元（systemd-networkd 之类）在本进程之后才建立，
-/// 这是 systemd ExecStartPre 轮询 `ip link show` 的等价物。
-#[cfg(target_os = "linux")]
-const TAP_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 判断 /sys/class/net/<if>/operstate 的内容是否表示链路已可用于路由。
-///
-/// 纯函数，内容从文件读进来，好单测。sysfs 文件的内容就是裸状态词（`unknown\n`），
-/// 不是 `ip link show` 的 `operstate up` 形式，两种都认。除 up 之外还接受
-/// unknown：tap 没有物理链路可报，即使已 `ip link set up` 也可能停在 unknown。
-pub fn tap_operstate_ready(content: &str) -> bool {
-    for line in content.lines() {
-        let value = line.strip_prefix("operstate ").unwrap_or(line).trim();
-        if !value.is_empty() {
-            return matches!(value, "up" | "unknown");
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-pub fn wait_for_tap(tap_name: &str, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let path = format!("/sys/class/net/{}/operstate", tap_name);
-    loop {
-        match std::fs::read_to_string(&path) {
-            Ok(content) if tap_operstate_ready(&content) => return Ok(()),
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "tap {} not ready after {}s (checked {})",
-                tap_name,
-                timeout.as_secs(),
-                path
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(remaining.min(Duration::from_millis(500)));
-    }
-}
-
 /// 安装策略路由。路由表号恒等于 fwmark。
 ///
 /// 失败会把 `ip` 的 stderr 原文带上抛，不再静默吞掉——半装状态（有规则没路由、
@@ -903,7 +861,8 @@ pub fn setup_policy_routing(spec: &PolicyRoutingSpec) -> Result<(), String> {
     if !spec.enabled() {
         return Ok(());
     }
-    wait_for_tap(&spec.tap_name, TAP_WAIT_TIMEOUT)?;
+    // 不等待接口就绪：TAP 是本进程自己建的，晚到的接口下次重拨自会重试
+    // （对齐 Go 的 client.setupInterface，两侧都不轮询）。
     let (pre, install) = policy_routing_cmds(spec)?;
     info!(
         "🔀 Configuring Policy Routing (fwmark {} table {} priority {}, {} extra routes; {} source rules)",
@@ -2198,20 +2157,5 @@ mod tests {
         assert!(clean_policy_routing_cmds(&s).is_empty());
         assert_eq!(PolicyRoutingSpec::default().priority_label(), "auto");
         assert_eq!(policy_spec().priority_label(), "1000");
-    }
-
-    #[test]
-    fn tap_operstate_ready_accepts_up_and_unknown_only() {
-        // sysfs 文件的内容就是裸状态词
-        assert!(tap_operstate_ready("unknown\n"));
-        assert!(tap_operstate_ready("up\n"));
-        assert!(!tap_operstate_ready("down\n"));
-        assert!(!tap_operstate_ready("dormant\n"));
-        assert!(!tap_operstate_ready(""));
-        // 也认 ip link show 的展示形式
-        assert!(tap_operstate_ready("operstate up\n"));
-        assert!(tap_operstate_ready("operstate  unknown\n"));
-        assert!(!tap_operstate_ready("operstate down\n"));
-        assert!(!tap_operstate_ready("operstate\n"));
     }
 }
