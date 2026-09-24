@@ -1620,7 +1620,7 @@ mod tests {
                 } else {
                     data += 1;
                 }
-                release_shared_frame(f.data);
+                drop(f.data);
             }
         }
         assert_eq!(data, 2);
