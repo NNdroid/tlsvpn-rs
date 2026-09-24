@@ -1263,7 +1263,10 @@ fn worker_loop(
 
         for (token, sess) in mio_sessions.iter_mut() {
             let idle_time = sess.last_rx.elapsed().as_secs();
-            if idle_time > 30 {
+            // 15s 无下行数据视为链路死亡（对齐 Go 15s 读超时）。4s 心跳下
+            // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
+            // "connection lost: timeout" 窗口。
+            if idle_time > 15 {
                 closed_tokens.push(*token);
                 continue;
             }

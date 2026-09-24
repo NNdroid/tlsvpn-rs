@@ -29,16 +29,24 @@ const RECONNECT_BACKOFF_RESET: Duration = Duration::from_secs(30);
 
 fn reconnect_backoff_delay(attempt: u32) -> Duration {
     let shift = attempt.min(5);
-    let mut d = RECONNECT_BACKOFF_BASE * (1u32 << shift);
-    if d > RECONNECT_BACKOFF_MAX || d.is_zero() {
-        d = RECONNECT_BACKOFF_MAX;
+    let mut d_ms = RECONNECT_BACKOFF_BASE.as_millis() as u64 * (1u64 << shift);
+    let max_ms = RECONNECT_BACKOFF_MAX.as_millis() as u64;
+    if d_ms > max_ms || d_ms == 0 {
+        d_ms = max_ms;
     }
-    // 25% 随机抖动（对齐 Go：d - d/8 + jitter/2）
+    // ±33% 对称抖动（对齐 Go）：把 4 条共享同一 ISP 路径的连接在时间上错开，
+    // 避免 ISP 抖动时全体同步重拨。封顶阶段上界被裁到 max_ms，下界仍在 2/3 d。
+    let third = d_ms / 3;
+    let jitter_range = (third * 2).max(1u64) as usize;
     let jitter = crate::utils::RNG.with(|rng| {
-        let j = (d / 4).as_millis() as usize;
-        Duration::from_millis(rng.borrow_mut().gen_range(0, j.max(1)) as u64)
+        rng.borrow_mut().gen_range(0usize, jitter_range) as u64
     });
-    d - d / 8 + jitter / 2
+    let delay_ms = third * 2 + jitter;
+    if delay_ms > max_ms {
+        RECONNECT_BACKOFF_MAX
+    } else {
+        Duration::from_millis(delay_ms)
+    }
 }
 
 /// 全局退出标记（信号处理置位）
@@ -1504,6 +1512,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut scanner = FrameScanner::new();
     let mut last_keepalive = Instant::now();
     let mut last_rx = Instant::now();
+    // 写进度检测：write_tls 每次真正推出一批字节即视为进度。半开路径下
+    // socket 侧永远"可写"但数据被静默丢弃，非阻塞模型下没有 deadline 能
+    // 感知——连续 10s 无进度即判死，对齐 Go 的 SetWriteDeadline(10s)。
+    let mut last_write_progress = Instant::now();
     let mut conn_closed = false;
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
@@ -1671,7 +1683,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 Ok(0) => {
                     break;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // 真正推出了字节：刷新写进度时间戳
+                    last_write_progress = Instant::now();
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -1684,8 +1699,16 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
-        // 空闲保护：30s 无任何下行数据视为链路死亡（对齐 Go 30s 读超时）
-        if last_rx.elapsed() > Duration::from_secs(30) {
+        // 写进度检测：10s 无字节实际推出视为半开路径，主动断连重拨。
+        // 只读超时是双向检测器；半开场景下本端读方向可能仍在收对端心跳，
+        // 面板会显示 tunnel up 但链路已单向死亡——写进度是唯一能自查的信号。
+        if last_write_progress.elapsed() > Duration::from_secs(10) {
+            warn!("write stalled for >10s; closing the connection");
+            conn_closed = true;
+        }
+
+        // 空闲保护：15s 无任何下行数据视为链路死亡（对齐 Go 15s 读超时）
+        if last_rx.elapsed() > Duration::from_secs(15) {
             conn_closed = true;
         }
     }
