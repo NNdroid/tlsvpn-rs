@@ -954,6 +954,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             if !f.data.is_empty() {
                 let _ = dev_writer.send(&f.data);
             }
+            // TAP 是该分支终点；若没有其它 Arc 持有者，归还 2KB 热帧池。
+            release_shared_frame(f.data);
         }
     });
 
@@ -963,7 +965,9 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         loop {
             if let Ok(n) = dev_reader.recv(&mut buf) {
                 if n > 0 {
-                    vs_for_tap.process_frame(TAP_PORT_ID, Arc::new(buf[..n].to_vec()));
+                    let mut frame = acquire_frame_vec(n);
+                    frame.copy_from_slice(&buf[..n]);
+                    vs_for_tap.process_frame(TAP_PORT_ID, Arc::new(frame));
                 }
             }
         }
@@ -1508,7 +1512,10 @@ fn process_plain_frames(
                 }
 
                 if seq == 0 && !sess.handshake_done {
-                    match handle_handshake(sess, core, &data, tarpit) {
+                    let outcome = handle_handshake(sess, core, &data, tarpit);
+                    // 握手解析完成后不再需要原始 JSON payload，立即归还热帧池。
+                    release_frame_vec(data);
+                    match outcome {
                         HandshakeOutcome::Ok => {
                             sess.handshake_done = true;
                             sess.scanner.set_max_data_len(MAX_DATA_LENGTH);
@@ -1534,6 +1541,7 @@ fn process_plain_frames(
                                 }
                                 Err(_) => {
                                     debug!("dropped tampered/foreign frame (seq={})", seq);
+                                    release_frame_vec(data);
                                     continue;
                                 }
                             }
@@ -1542,10 +1550,15 @@ fn process_plain_frames(
 
                     let c_sess = match &sess.client_session {
                         Some(c) => c.clone(),
-                        None => continue,
+                        None => {
+                            release_frame_vec(data);
+                            continue;
+                        }
                     };
                     let epoch = c_sess.epoch_state.read();
                     if sess.session_epoch != epoch.epoch {
+                        drop(epoch);
+                        release_frame_vec(data);
                         *close = true;
                         break;
                     }
@@ -1566,6 +1579,7 @@ fn process_plain_frames(
                                     );
                                 };
                                 dec.on_parity(&data, &mut sink);
+                                release_shared_frame(data);
                                 continue;
                             }
                         }
@@ -1580,6 +1594,8 @@ fn process_plain_frames(
 
                     if !c_sess.dedup.lock().is_duplicate(seq) {
                         deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
+                    } else {
+                        release_shared_frame(data);
                     }
                 }
             }
@@ -1661,6 +1677,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     while let Ok(f) = sess.rx.try_recv() {
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
         append_padded_frame(&mut sess.send_buf, f.seq, &f.data, ic_ref);
+        release_shared_frame(f.data);
         pulled += 1;
         if sess.send_buf.len() >= 64 * 1024 || pulled >= 1024 {
             break;
