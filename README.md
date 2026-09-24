@@ -104,6 +104,8 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 
 All defaults match the Go implementation 1:1. Two fields are Rust extensions (`workers`, `mtu`) — Go has no such keys and refuses a config file containing them, so they only belong in Rust-only files.
 
+Session resume tokens are a mandatory protocol-v2 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
+
 | Field | Default | Where | Description |
 | --- | --- | --- | --- |
 | `mode` | (required) | — | `server` or `client` |
@@ -125,8 +127,6 @@ All defaults match the Go implementation 1:1. Two fields are Rust extensions (`w
 | `web.auth` | (required when enabled) | — | Basic Auth as `user:pass`, compared as fixed-length SHA-256 digests. Known example credentials are rejected |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving. On Linux the tunnel addresses are brought `up` first and the v6 address gets `nodad` — without it a v6 address that has no RA to answer for stays tentative forever, and `[fd00::1]:8080` never binds |
 | `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
-Session resume tokens are a mandatory protocol-v2 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
-
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
 | `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
