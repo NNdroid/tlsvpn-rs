@@ -22,6 +22,18 @@ jobs:
     - name: Test Core Logic
       run: cargo test --verbose
 
+    - name: Check Linux ARM64 dataplane
+      # The primary deployment class includes ARM64 SBCs. This compile check
+      # exercises the AArch64 NEON FEC path which native x86 CI cannot see.
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      run: |
+        rustup target add aarch64-unknown-linux-gnu
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+        cargo check --target aarch64-unknown-linux-gnu --verbose
+
     - name: Verify protocol golden vectors (cross-language contract)
       env:
         TLSVPN_GOLDEN: "testdata/protocol_golden.json"
