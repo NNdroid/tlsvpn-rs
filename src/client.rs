@@ -766,21 +766,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     }
 
     let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));
-    // 重排就绪帧写 TAP 线程
-    {
-        let reorder = reorder_buf.clone();
-        let dev = device.clone();
-        std::thread::spawn(move || loop {
-            if EXIT.load(Ordering::Relaxed) {
-                return;
-            }
-            let ready = reorder.lock().flush_timeout();
-            for f in ready {
-                let _ = dev.send(&f);
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        });
-    }
+    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline
+    // 会合并 session reorder deadline，仅在真实 gap 存在时提前唤醒。
 
     let config = build_tls_config(args);
 
@@ -1464,43 +1451,23 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
     drop(network_setup_guard);
 
-    // 7. 注册端口后端 + RTT 轮询线程
-    // 事件驱动：端口投递帧 → 唤醒本连接的 mio poller，主循环可真正阻塞
+    // 7. 注册端口后端。RTT/reorder deadline 合并进本连接 mio loop，
+    // 不再为每条物理连接额外创建 RTT timer thread。
     let conn_waker: Arc<mio::Waker> =
         Arc::new(mio::Waker::new(poll.registry(), TOKEN_WAKE).expect("Waker init"));
     let rtt_cache = Arc::new(AtomicU32::new(50000));
     let (tx, rx) = bounded(1024);
-    cl.tx_port.register_backend(Arc::new(Backend {
+    let backend = Arc::new(Backend {
         ch: tx.clone(),
         rtt_cache: rtt_cache.clone(),
         notify: Some(Arc::new(BackendNotify::new(
             conn_waker.clone(),
-            // 客户端单连接：dirty 队列仅作协议占位，唤醒本身即信号
+            // 客户端只看 TOKEN_WAKE，本队列用于复用统一通知结构。
             Arc::new(ArrayQueue::new(1)),
             TOKEN_WAKE,
         ))),
-    }));
-    let rtt_stop = Arc::new(AtomicBool::new(false));
-    {
-        // 对齐 Go startRTTPoller：200ms 巡检 TCP_INFO；代理模式下无端到端
-        // RTT 语义，保持默认估值（Go asTCPConn nil 路径）
-        let sock_for_rtt = std_for_rtt;
-        let proxied = cl.socks5.is_some();
-        let stop = rtt_stop.clone();
-        let cache = rtt_cache.clone();
-        std::thread::spawn(move || {
-            let sock = sock_for_rtt;
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(200));
-                if let (false, Some(s)) = (proxied, sock.as_ref()) {
-                    let rtt = get_tcp_rtt(s);
-                    if rtt > 0 {
-                        cache.store(rtt, Ordering::Relaxed);
-                    }
-                }
-            }
-        });
-    }
+    });
+    cl.tx_port.register_backend(backend.clone());
 
     cl.live_conns.fetch_add(1, Ordering::Relaxed);
     *ci.rtt_cache.lock() = rtt_cache.clone();
@@ -1508,15 +1475,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     *ci.state.lock() = "up".into();
     *ci.last_error.lock() = String::new();
 
-    // 8. 主事件循环：读事件 → 解帧处理；拉取端口通道 → 成帧发送；保活
+    // 8. 主事件循环：读事件 → 解帧处理；拉取端口通道 → 成帧发送；保活。
     let mut scanner = FrameScanner::new();
     let mut last_keepalive = Instant::now();
     let mut last_rx = Instant::now();
-    // 写进度检测：write_tls 每次真正推出一批字节即视为进度。半开路径下
-    // socket 侧永远"可写"但数据被静默丢弃，非阻塞模型下没有 deadline 能
-    // 感知——连续 10s 无进度即判死，对齐 Go 的 SetWriteDeadline(10s)。
     let mut last_write_progress = Instant::now();
+    let mut next_rtt_refresh = Instant::now();
+    let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
+
+    // 发送聚合缓冲永久复用。旧代码每次成功发送后 Vec::new()，导致约 64KB
+    // capacity 被反复释放/重新申请。
+    send_buf.clear();
+    send_buf.reserve((64 * 1024 + 4096).saturating_sub(send_buf.capacity()));
+    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
         if cl.tx_port.is_sequence_exhausted() {
@@ -1534,13 +1506,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if cl.force_generation.load(Ordering::Acquire) != reconnect_generation {
             break;
         }
-        // 阻塞等待：socket 可读或端口 Waker 唤醒；1s 超时兜底保活/空闲检查
-        if poll
-            .poll(&mut events, Some(Duration::from_secs(1)))
-            .is_err()
-        {
+
+        // 把 RTT 刷新与重排 gap deadline 合并进同一个 poll timeout。
+        // 无 gap 时不会再有独立的 5ms reorder 轮询线程。
+        let now = Instant::now();
+        let mut poll_timeout = Duration::from_secs(1);
+        if !proxied {
+            poll_timeout = poll_timeout.min(next_rtt_refresh.saturating_duration_since(now));
+        }
+        if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
+            poll_timeout = poll_timeout.min(wait);
+        }
+        if poll.poll(&mut events, Some(poll_timeout)).is_err() {
             break;
         }
+
         let mut woken = false;
         let mut readable = false;
         for ev in events.iter() {
@@ -1551,17 +1531,38 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
+        // RTT 采样在连接线程内完成，消除每连接一个 200ms sleeper thread。
+        if !proxied && Instant::now() >= next_rtt_refresh {
+            if let Some(s) = std_for_rtt.as_ref() {
+                let rtt = get_tcp_rtt(s);
+                if rtt > 0 {
+                    rtt_cache.store(rtt, Ordering::Relaxed);
+                }
+            }
+            next_rtt_refresh = Instant::now() + Duration::from_millis(200);
+        }
+
+        // gap timeout 只在 deadline 到期时产生输出；scratch Vec 在整个连接期复用。
+        reorder_ready.clear();
+        {
+            cl.reorder_buf
+                .lock()
+                .flush_timeout_into(&mut reorder_ready);
+        }
+        for ordered in reorder_ready.drain(..) {
+            let _ = cl.tap.send(&ordered);
+        }
+
         // ---- 下行读取（仅 socket 可读时）----
         let mut got_rx = false;
         if readable {
             loop {
                 match tls.read_tls(&mut sock) {
                     Ok(0) => {
+                        conn_closed = true;
                         break;
                     }
-                    Ok(_) => {
-                        got_rx = true;
-                    }
+                    Ok(_) => got_rx = true,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -1569,6 +1570,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                         break
                     }
                     Err(_) => {
+                        conn_closed = true;
                         break;
                     }
                 }
@@ -1582,23 +1584,25 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         // ---- 帧处理：解密 → FEC/去重/重排 → TAP ----
+        // 统计先在线程本地累加，一轮 parser drain 结束后再写共享原子。
+        let mut rx_bytes_batch = 0u64;
+        let mut rx_packets_batch = 0u64;
+        let fec_dec = if use_xor_fec {
+            cl.fec_dec.lock().clone()
+        } else {
+            None
+        };
+
         loop {
             match scanner.read_frame(&mut tls.reader()) {
                 Ok(Some((raw, seq))) => {
-                    // 心跳帧（空负载）：刷新活跃度、不计统计、不入 FEC/重排
                     if raw.is_empty() {
                         continue;
                     }
                     let mut data = raw;
-                    cl.rx_bytes
-                        .fetch_add((data.len() + 10) as u64, Ordering::Relaxed);
-                    cl.rx_packets.fetch_add(1, Ordering::Relaxed);
-                    ci.rx_bytes
-                        .fetch_add((data.len() + 10) as u64, Ordering::Relaxed);
-                    if data.is_empty() {
-                        continue;
-                    }
-                    // 内层解密（GCM 校验失败丢弃，对齐 Go openInPlace）
+                    rx_bytes_batch = rx_bytes_batch.saturating_add((data.len() + 10) as u64);
+                    rx_packets_batch = rx_packets_batch.saturating_add(1);
+
                     if seq != 0 {
                         if let Some(ic) = &ic_rx {
                             let wire_len = data.len() as u32;
@@ -1614,77 +1618,94 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                             }
                         }
                     }
+
                     let data = Arc::new(data);
-                    // XOR 校验帧 → FEC 解码器，恢复帧注入重排缓冲后写 TAP
-                    if seq == 0 && use_xor_fec {
-                        let dec = cl.fec_dec.lock().clone();
-                        if let Some(dec) = dec {
+                    if seq == 0 {
+                        if let Some(dec) = &fec_dec {
                             if fec::is_parity_frame(&data) {
-                                let mut sink = make_tap_sink(&cl);
+                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                    deliver_to_tap(&cl, s, f, &mut reorder_ready);
+                                };
                                 dec.on_parity(&data, &mut sink);
                                 continue;
                             }
                         }
                     }
-                    if use_xor_fec {
-                        let dec = cl.fec_dec.lock().clone();
-                        if let Some(dec) = dec {
-                            let mut sink = make_tap_sink(&cl);
-                            dec.on_data(seq, &data, &mut sink);
-                            continue;
-                        }
+
+                    // 数据帧同时进入 FEC 累加器和正常交付路径。旧实现这里
+                    // dec.on_data 后 continue，导致启用 XOR FEC 时原始数据帧
+                    // 根本不进入 TAP；服务端一直是正确的“双路径”语义。
+                    if let Some(dec) = &fec_dec {
+                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                            deliver_to_tap(&cl, s, f, &mut reorder_ready);
+                        };
+                        dec.on_data(seq, &data, &mut sink);
                     }
-                    // 去重 + 重排
+
                     if !cl.dedup.lock().is_duplicate(seq) {
-                        let ready = cl.reorder_buf.lock().insert(seq, data);
-                        for ordered in ready {
-                            let _ = cl.tap.send(&ordered);
-                        }
+                        deliver_to_tap(&cl, seq, data, &mut reorder_ready);
                     }
                 }
                 Ok(None) => break,
                 Err(_) => {
+                    conn_closed = true;
                     break;
                 }
             }
         }
+        if rx_packets_batch != 0 {
+            cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
+            cl.rx_packets
+                .fetch_add(rx_packets_batch, Ordering::Relaxed);
+            ci.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
+        }
 
-        // ---- 上行：端口唤醒或定时兜底时拉帧成批发送 ----
+        // ---- 上行：端口唤醒时拉帧成批发送 ----
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
+        let mut tx_packets_batch = 0u64;
         if woken {
+            if let Some(n) = &backend.notify {
+                // 在 drain 前清 pending；并发的新生产者会重新触发 wake。
+                n.consume_wake();
+            }
             while let Ok(f) = rx.try_recv() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
                 append_padded_frame(&mut send_buf, f.seq, &f.data, ic_ref);
-                cl.tx_packets.fetch_add(1, Ordering::Relaxed);
+                tx_packets_batch += 1;
                 if send_buf.len() >= 64 * 1024 {
                     break;
                 }
             }
         }
-        // 保活：4s 无业务帧也发一帧（对齐 Go keepAliveTicker）
+
         if send_buf.is_empty() && last_keepalive.elapsed() > Duration::from_secs(4) {
             append_padded_frame(&mut send_buf, 0, &[], None);
         }
         if !send_buf.is_empty() {
-            cl.tx_bytes
-                .fetch_add(send_buf.len() as u64, Ordering::Relaxed);
-            ci.tx_bytes
-                .fetch_add(send_buf.len() as u64, Ordering::Relaxed);
+            let wire_bytes = send_buf.len() as u64;
             if tls.writer().write_all(&send_buf).is_err() {
                 break;
             }
+            if tx_packets_batch != 0 {
+                cl.tx_packets
+                    .fetch_add(tx_packets_batch, Ordering::Relaxed);
+            }
+            cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+            ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
             last_keepalive = Instant::now();
-            send_buf = Vec::new();
+            // 仅清长度，保留 capacity 给下一批。
+            send_buf.clear();
         }
-        // 冲刷写队列（非阻塞；WouldBlock 等下次 poll 后写事件/重试）
+
+        // 冲刷写队列（非阻塞；WouldBlock 等下次 poll 后重试）
         while tls.wants_write() {
             match tls.write_tls(&mut sock) {
                 Ok(0) => {
+                    conn_closed = true;
                     break;
                 }
                 Ok(_) => {
-                    // 真正推出了字节：刷新写进度时间戳
                     last_write_progress = Instant::now();
                 }
                 Err(e)
@@ -1694,31 +1715,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     break
                 }
                 Err(_) => {
+                    conn_closed = true;
                     break;
                 }
             }
         }
 
-        // 写进度检测：10s 无字节实际推出视为半开路径，主动断连重拨。
-        // 只读超时是双向检测器；半开场景下本端读方向可能仍在收对端心跳，
-        // 面板会显示 tunnel up 但链路已单向死亡——写进度是唯一能自查的信号。
         if last_write_progress.elapsed() > Duration::from_secs(10) {
             warn!("write stalled for >10s; closing the connection");
             conn_closed = true;
         }
-
-        // 空闲保护：15s 无任何下行数据视为链路死亡（对齐 Go 15s 读超时）
         if last_rx.elapsed() > Duration::from_secs(15) {
             conn_closed = true;
         }
     }
 
-    // 干净断开：补发 TLS close_notify 并冲刷记录缓冲。rustls 在 Drop 时不发，
-    // 而 Go 的 tls.Conn.Close() 会自动发。缺了它，服务端读到的是 UnexpectedEof
-    // 而不是正常 EOF，客户端主动断开（强踢、退避重拨、退出）看起来像链路中断。
-    // send_close_notify 在已发过致命告警时是空操作。非阻塞 socket 上写不出去
-    // （对端已消失或缓冲满）时立即放弃——连接反正已经没了，不能因为补发一次
-    // 告警而拖住重连。
     tls.send_close_notify();
     while tls.wants_write() {
         match tls.write_tls(&mut sock) {
@@ -1727,20 +1738,24 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
     }
 
-    rtt_stop.store(true, Ordering::Relaxed);
     cl.tx_port.unregister_backend(&tx);
     cl.live_conns.fetch_sub(1, Ordering::Relaxed);
     *ci.state.lock() = "retrying".into();
     linked_at.elapsed()
 }
 
-/// 恢复帧注入重排缓冲后写 TAP 的通用回调
-fn make_tap_sink(cl: &Arc<Client>) -> impl FnMut(u32, Arc<Vec<u8>>) + '_ {
-    move |s: u32, f: Arc<Vec<u8>>| {
-        let ready = cl.reorder_buf.lock().insert(s, f);
-        for ordered in ready {
-            let _ = cl.tap.send(&ordered);
-        }
+/// 把数据/恢复帧注入重排缓冲并写 TAP。ready 由连接线程长期复用，
+/// 正常顺序流不会为 `Vec<Arc<_>>` 额外 malloc。
+fn deliver_to_tap(
+    cl: &Arc<Client>,
+    seq: u32,
+    frame: Arc<Vec<u8>>,
+    ready: &mut Vec<Arc<Vec<u8>>>,
+) {
+    ready.clear();
+    cl.reorder_buf.lock().insert_into(seq, frame, ready);
+    for ordered in ready.drain(..) {
+        let _ = cl.tap.send(&ordered);
     }
 }
 
