@@ -1595,6 +1595,39 @@ mod tests {
     }
 
     #[test]
+    fn fec_parity_is_sent_once_across_multiple_backends() {
+        let port = AsyncPort::new("single-parity".into());
+        let (b0, r0) = make_backend();
+        let (b1, r1) = make_backend();
+        let (b2, r2) = make_backend();
+        b0.rtt_cache.store(1_000, Ordering::Relaxed);
+        b1.rtt_cache.store(2_000, Ordering::Relaxed);
+        b2.rtt_cache.store(3_000, Ordering::Relaxed);
+        port.register_backend(b0);
+        port.register_backend(b1);
+        port.register_backend(b2);
+        port.reset_epoch(2, None);
+
+        port.write_frame(Arc::new(vec![0x11; 1400]));
+        port.write_frame(Arc::new(vec![0x22; 1400]));
+
+        let mut data = 0usize;
+        let mut parity = 0usize;
+        for rx in [&r0, &r1, &r2] {
+            while let Ok(f) = rx.try_recv() {
+                if f.seq == 0 {
+                    parity += 1;
+                } else {
+                    data += 1;
+                }
+                release_shared_frame(f.data);
+            }
+        }
+        assert_eq!(data, 2);
+        assert_eq!(parity, 1, "one FEC group must emit exactly one parity copy");
+    }
+
+    #[test]
     fn parity_counter_survives_epoch_reset() {
         let port = AsyncPort::new("parity".into());
         let (backend, _rx) = make_backend();
