@@ -36,9 +36,9 @@ e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; ex
 CERT="$E2E_CERT"
 KEY="$E2E_KEY"
 
-# run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC SRV_TOKEN CLI_EXTRA [SRV_CFG] [EXPECT]
+# run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC LEGACY_TOKEN CLI_EXTRA [SRV_CFG] [EXPECT]
 # SRV/CLI 取值：rs | go | rsold | goold
-# SRV_PAD / SRV_MINENC / SRV_TOKEN 是服务端特性旋钮：非空才写入对应键。
+# SRV_PAD / SRV_MINENC 是正常配置旋钮；LEGACY_TOKEN 只用于旧配置迁移测试。
 # 两实现 flags 均已移除（2026-09-19），一律拼 config.json 后 -c 启动；
 # 旋钮为空就省键 —— pre-feature 旧二进制（rsold/goold）的 schema 没有这些键，
 # DisallowUnknownFields 会拒收。需要完整定制时用 go_cfg_now 生成 SRV_CFG 传入。
@@ -227,8 +227,8 @@ echo "=================================================================="
 echo " P4  旧配置迁移：legacy session_token=false 可读，但不能关闭随机令牌"
 echo "     当前配置契约已删除该字段；这里仅验证升级兼容，安全语义由 protocol v2 固定。"
 echo "=================================================================="
-go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->rsNEW" go rs "" "" "" "" "$CFGF"
-go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->goNEW" go go "" "" "" "" "$CFGF"
+go_cfg_now 1 false "" ""; run_case "goNEW(legacy-token=false)->rsNEW" go rs "" "" "" "" "$CFGF"
+go_cfg_now 1 false "" ""; run_case "rsNEW(legacy-token=false)->goNEW" rs go "" "" "" "" "$CFGF"
 
 for d in "${TMPDIRS[@]}"; do rm -rf "$d"; done
 e2e_reap_all
