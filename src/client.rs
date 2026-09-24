@@ -751,7 +751,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                 }
                 match dev.recv(&mut buf) {
                     Ok(n) if n > 0 => {
-                        port.write_frame(Arc::new(buf[..n].to_vec()));
+                        let mut frame = acquire_frame_vec(n);
+                        frame.copy_from_slice(&buf[..n]);
+                        port.write_frame(Arc::new(frame));
                     }
                     Ok(_) => {}
                     Err(_) => {
@@ -1551,6 +1553,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         for ordered in reorder_ready.drain(..) {
             let _ = cl.tap.send(&ordered);
+            release_shared_frame(ordered);
         }
 
         // ---- 下行读取（仅 socket 可读时）----
@@ -1613,6 +1616,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 }
                                 Err(_) => {
                                     debug!("dropped tampered/foreign frame (seq={})", seq);
+                                    release_frame_vec(data);
                                     continue;
                                 }
                             }
@@ -1627,6 +1631,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                     deliver_to_tap(&cl, s, f, &mut reorder_ready);
                                 };
                                 dec.on_parity(&data, &mut sink);
+                                release_shared_frame(data);
                                 continue;
                             }
                         }
@@ -1644,6 +1649,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
                     if !cl.dedup.lock().is_duplicate(seq) {
                         deliver_to_tap(&cl, seq, data, &mut reorder_ready);
+                    } else {
+                        release_shared_frame(data);
                     }
                 }
                 Ok(None) => break,
@@ -1672,6 +1679,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             while let Ok(f) = rx.try_recv() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
                 append_padded_frame(&mut send_buf, f.seq, &f.data, ic_ref);
+                release_shared_frame(f.data);
                 tx_packets_batch += 1;
                 if send_buf.len() >= 64 * 1024 {
                     break;
@@ -1756,6 +1764,7 @@ fn deliver_to_tap(
     cl.reorder_buf.lock().insert_into(seq, frame, ready);
     for ordered in ready.drain(..) {
         let _ = cl.tap.send(&ordered);
+        release_shared_frame(ordered);
     }
 }
 
@@ -1797,7 +1806,9 @@ fn tls_exchange_resp(
                 if data.is_empty() {
                     continue; // 空帧（心跳）不是握手响应
                 }
-                if let Ok(r) = serde_json::from_slice::<HandshakeResp>(&data) {
+                let parsed = serde_json::from_slice::<HandshakeResp>(&data);
+                release_frame_vec(data);
+                if let Ok(r) = parsed {
                     if r.success {
                         debug!(
 							"[Conn {}] <= handshake response session={} proto={} epoch={} fec={}/{} enc={}/{} token_present={}",
