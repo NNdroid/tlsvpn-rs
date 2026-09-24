@@ -167,8 +167,8 @@ impl FrameScanner {
                     return Ok(Some((Vec::new(), seq)));
                 }
 
-                let mut data = Vec::with_capacity(data_len.max(64));
-                data.extend_from_slice(
+                let mut data = acquire_frame_vec(data_len);
+                data.copy_from_slice(
                     &self.buffer[self.offset - total_len..self.offset - total_len + data_len],
                 );
 
