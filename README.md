@@ -96,8 +96,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "web": { "addr": ":8080", "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD", "bind": "tunnel", "cert": "", "key": "" },
   "client": { "conns": 4, "fec": true, "fec_group": 4, "sni": "www.cloudflare.com",
               "insecure": false, "cert_sha256": "", "req_v4": "", "req_v6": "", "fwmark": 0 },
-  "server": { "v4_cidr": "10.0.0.0/24", "v6_cidr": "fd00::/64", "cert": "", "key": "",
-              "session_token": true, "max_sessions": 1024 }
+  "server": { "v4_cidr": "10.0.0.0/24", "v6_cidr": "fd00::/64", "cert": "", "key": "", "max_sessions": 1024 }
 }
 ```
 
@@ -126,10 +125,11 @@ All defaults match the Go implementation 1:1. Two fields are Rust extensions (`w
 | `web.auth` | (required when enabled) | — | Basic Auth as `user:pass`, compared as fixed-length SHA-256 digests. Known example credentials are rejected |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving. On Linux the tunnel addresses are brought `up` first and the v6 address gets `nodad` — without it a v6 address that has no RA to answer for stays tentative forever, and `[fd00::1]:8080` never binds |
 | `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
+Session resume tokens are a mandatory protocol-v2 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
+
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
 | `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
-| `server.session_token` | `false` | server | Compatibility field only — the Rust server always issues a random 256-bit resume token and rotates the key epoch on reconnect, whatever this value is. Retained so a Go config file stays readable (`deny_unknown_fields` would otherwise refuse it) |
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `server.fec_group_min` | `2` | server | Lower bound on a peer's FEC group size K; an FEC handshake below it is refused |
 | `server.fec_group_max` | `64` | server | Upper bound on a peer's FEC group size K; an FEC handshake above it is refused. Neither end is clamped, and defaults are the protocol limits so nothing is limited unless configured. The parity is broadcast to all N backends, so the redundancy ratio is N/K: a `min` floor bounds bandwidth, a `max` ceiling bounds pending-frame buffering and recovery latency |
@@ -190,7 +190,7 @@ cargo build --examples                          # Rust probe
 | Suite | Cases | Covers |
 | --- | ---: | --- |
 | `accept` | 21 | Feature matrix: all on, all off (fallback), both-ends-upgraded, plus 5 pre-v2-rejection cases that need old binaries |
-| `tok` | 6 | Resume-token hijack via two same-MAC clients — 4 cross-language rejects + 2 `session_token=false` still-rejected controls |
+| `tok` | 4 | Resume-token hijack via two same-MAC clients — all four Rust/Go server-client combinations must reject a new process that lacks the current token |
 | `pad` | 12 | `pad_mode` off / bucket / bogus × rs,go server × rs,go client |
 | `minenc` | 19 | `min_enc` floors × declared `enc_algo`, including an unknown algo ID, plus 3 Go-probe crossings |
 | `cfg` | 38 | 6 config dimensions × 4 rs/go combinations (CIDR pools, `client.conns`, `web.auth`, panel HTTPS, `web.bind=tunnel`, `log_level`) + 7 startup-rejection cases × 2 implementations |
