@@ -2,7 +2,6 @@ use lazy_static::lazy_static;
 use std::cell::RefCell;
 
 use crate::utils::FastRand;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,43 +60,40 @@ lazy_static! {
     };
 }
 
-// 高速环形去重器 (用于 FEC 过滤)，与 Go DeDuplicator 一致
+// 高速固定窗口去重器（用于 FEC 恢复帧与迟到原始帧）。
+//
+// 重排窗口只有 2048，而去重槽位有 4096（2 的幂）。因此窗口内两个合法
+// 不同 seq 不会落到同一槽位；直接保存完整 seq 即可判断重复，不需要
+// HashSet 的 hash/contains/remove/insert 热路径。
+const DEDUP_WINDOW: usize = 4096;
+const DEDUP_MASK: usize = DEDUP_WINDOW - 1;
+
 pub struct DeDuplicator {
-    set: HashSet<u32>,
-    ring: [u32; 4096],
-    idx: usize,
+    slots: [u32; DEDUP_WINDOW],
 }
 
 impl DeDuplicator {
     pub fn new() -> Self {
         Self {
-            set: HashSet::with_capacity(4096),
-            ring: [0; 4096],
-            idx: 0,
+            slots: [0; DEDUP_WINDOW],
         }
     }
+
+    #[inline]
     pub fn is_duplicate(&mut self, seq: u32) -> bool {
         if seq == 0 {
             return false;
         }
-        if self.set.contains(&seq) {
+        let idx = (seq as usize) & DEDUP_MASK;
+        if self.slots[idx] == seq {
             return true;
         }
-
-        let oldest = self.ring[self.idx];
-        if oldest != 0 {
-            self.set.remove(&oldest);
-        }
-
-        self.ring[self.idx] = seq;
-        self.set.insert(seq);
-        self.idx = (self.idx + 1) % 4096;
+        self.slots[idx] = seq;
         false
     }
+
     pub fn reset(&mut self) {
-        self.set.clear();
-        self.ring.fill(0);
-        self.idx = 0;
+        self.slots.fill(0);
     }
 }
 
@@ -299,6 +295,21 @@ mod tests {
         let buf = acquire_frame_vec(1400);
         assert_eq!(buf.capacity(), HOT_FRAME_CLASS);
         release_frame_vec(buf);
+    }
+
+    #[test]
+    fn deduplicator_uses_fixed_sequence_slots() {
+        let mut d = DeDuplicator::new();
+        assert!(!d.is_duplicate(1));
+        assert!(d.is_duplicate(1));
+
+        // 4097 与 1 共槽；进入新窗口后覆盖旧 seq，随后 4097 才被识别为重复。
+        assert!(!d.is_duplicate(4097));
+        assert!(d.is_duplicate(4097));
+        assert!(!d.is_duplicate(1), "过期窗口的旧 seq 不应永久保留");
+
+        d.reset();
+        assert!(!d.is_duplicate(4097));
     }
 
     #[test]
