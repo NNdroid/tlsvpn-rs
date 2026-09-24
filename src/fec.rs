@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::buffer::{acquire_frame_vec, release_frame_vec};
 use crate::crypto::*;
 
 pub const FEC_MAGIC: u8 = 0xFE;
@@ -278,7 +279,7 @@ impl FecEncoder {
     fn build_parity(&mut self) -> Vec<u8> {
         let max_len = self.acc.len();
         let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
-        let mut buf = vec![0u8; 6 + 4 * self.lens.len() + max_len + tag_len];
+        let mut buf = acquire_frame_vec(6 + 4 * self.lens.len() + max_len + tag_len);
         buf[0] = FEC_MAGIC;
         BigEndian::write_u32(&mut buf[1..5], self.seqs[0]);
         buf[5] = self.lens.len() as u8;
@@ -342,7 +343,11 @@ impl FecDecoder {
 
     pub fn reset(&self) {
         let mut inner = self.inner.lock();
-        inner.groups.clear();
+        for (_, mut g) in inner.groups.drain() {
+            if let Some(parity) = g.parity.take() {
+                release_frame_vec(parity);
+            }
+        }
         inner.done.clear();
     }
 
@@ -410,7 +415,7 @@ impl FecDecoder {
             }
         }
 
-        let mut pb = vec![0u8; max_len];
+        let mut pb = acquire_frame_vec(max_len);
         if let Some(ic) = &self.ic {
             // 解密校验载荷；AAD 与编码端一致：[加密区域长度(4BE) || groupStart(4BE)]
             let mut aad = [0u8; 8];
@@ -427,6 +432,7 @@ impl FecDecoder {
                     pb.truncate(n);
                 }
                 Err(_) => {
+                    release_frame_vec(pb);
                     return; // GCM 校验失败，整组放弃
                 }
             }
@@ -436,11 +442,13 @@ impl FecDecoder {
 
         let mut inner = self.inner.lock();
         if is_done(&inner.done, start) {
+            release_frame_vec(pb);
             return;
         }
         {
             let g = entry(&mut inner.groups, start);
             if g.parity.is_some() {
+                release_frame_vec(pb);
                 return; // 同组重复校验帧（多连接广播副本）
             }
             g.k = k;
@@ -472,7 +480,11 @@ fn mark_done(done: &mut Vec<u32>, start: u32) {
 fn entry<'a>(groups: &'a mut HashMap<u32, FecGroupState>, start: u32) -> &'a mut FecGroupState {
     if groups.len() >= FEC_MAX_PENDING_GROUPS && !groups.contains_key(&start) {
         if let Some(oldest_start) = groups.keys().copied().min() {
-            groups.remove(&oldest_start);
+            if let Some(mut old) = groups.remove(&oldest_start) {
+                if let Some(parity) = old.parity.take() {
+                    release_frame_vec(parity);
+                }
+            }
         }
     }
     groups.entry(start).or_insert_with(|| FecGroupState {
@@ -513,7 +525,7 @@ fn try_recover(inner: &mut FecDecoderInner, start: u32, out: &mut dyn FnMut(u32,
             if n > g.acc.len() {
                 g.acc.resize(n, 0);
             }
-            let mut r = vec![0u8; n];
+            let mut r = acquire_frame_vec(n);
             xor_combine(&mut r, parity, &g.acc);
             rec = Some((r, mi));
         }
@@ -528,9 +540,10 @@ fn try_recover(inner: &mut FecDecoderInner, start: u32, out: &mut dyn FnMut(u32,
         }
     }
     if let Some(mut g) = inner.groups.remove(&start) {
-        if let Some(_parity) = g.parity.take() {
+        if let Some(parity) = g.parity.take() {
             let lost_n = (0..g.k).filter(|i| g.got_mask & (1u64 << i) == 0).count() as u64;
             inner.lost += lost_n;
+            release_frame_vec(parity);
         }
         mark_done(&mut inner.done, start);
     }
