@@ -68,7 +68,7 @@ plus a `server` or `client` block.
 
 Driver is `scripts/e2e_test.sh`, which runs five suites: `accept`, `tok`, `pad`,
 `minenc`, `cfg`. Shared helpers and cert generation are in `scripts/e2e_lib.sh`.
-Fresh-checkout reference run: 88 pass / 0 fail / 7 skip (the skips are
+Fresh-checkout reference run: 86 pass / 0 fail / 7 skip (the skips are
 mixed-version cases gated on `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`,
 `E2E_GO_OLD_BIN`, which are absent on a clean checkout by design), ~850s.
 
