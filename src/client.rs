@@ -1096,17 +1096,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     *ci.remote.lock() = raw.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     *ci.state.lock() = "connecting".into();
 
-    // 1. Brutal 速率均分（对齐 Go；brutal 关闭时仍上报速率供服务端裁剪）
+    // 1. 先只计算 Brutal 预算，不在 TLS / TLSVPN 握手前切拥塞控制。
+    // Brutal 是数据面优化；与 Go 一致，必须等应用层 HandshakeResp 成功后再启用。
     let conns = cl.conns_count as u64;
     let client_tx_rate_bps = split_legacy_brutal_rate_bps(cl.brutal_up, conns as usize, conn_index);
     let instance_id = cl.instance_id.lock().clone();
     let brutal_group = brutal_group_id("client", &instance_id);
-    if cl.brutal && client_tx_rate_bps > 0 && cl.socks5.is_none() {
-        // 代理连接不做 shaping（流量不经过本进程），此时 applied 必须是 false
-        *ci.brutal.lock() = apply_tcp_brutal(&raw, cl.brutal_up, client_tx_rate_bps, brutal_group);
-    } else {
-        *ci.brutal.lock() = BrutalApplyResult::default();
-    }
+    *ci.brutal.lock() = BrutalApplyResult::default();
 
     // 2. TLS 连接与握手（10s 超时对齐 Go SetDeadline）
     let server_name = match ServerName::try_from(cl.sni.clone()) {
@@ -1225,9 +1221,23 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         return Duration::ZERO;
     }
 
-    if cl.brutal && resp.brutal_groups && resp.brutal_total_tx > 0 && cl.socks5.is_none() {
-        let legacy_bps = split_legacy_brutal_rate_bps(resp.brutal_total_tx, cl.conns_count, conn_index);
-        *ci.brutal.lock() = apply_tcp_brutal(&sock, resp.brutal_total_tx, legacy_bps, brutal_group);
+    // TLS + TLSVPN 握手都已完成，现在才启用 Brutal。优先采用服务端裁剪后的
+    // group 总预算；若对端未返回 group 语义，则兼容旧端，按本地逐连接预算应用。
+    if cl.brutal && client_tx_rate_bps > 0 && cl.socks5.is_none() {
+        let (total_rate, legacy_bps) =
+            if resp.brutal_groups && resp.brutal_total_tx > 0 {
+                (
+                    resp.brutal_total_tx,
+                    split_legacy_brutal_rate_bps(
+                        resp.brutal_total_tx,
+                        cl.conns_count,
+                        conn_index,
+                    ),
+                )
+            } else {
+                (cl.brutal_up, client_tx_rate_bps)
+            };
+        *ci.brutal.lock() = apply_tcp_brutal(&sock, total_rate, legacy_bps, brutal_group);
     }
 
     // 4. 内层加密协商（对齐 Go）
