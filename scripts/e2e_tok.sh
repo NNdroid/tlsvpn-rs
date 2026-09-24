@@ -15,8 +15,6 @@
 #   WEB_BASE     client A 的 Web 面板端口，B 用 +1   default 9500
 #   PSK          default e2e_secret
 #   MAC          default aa:bb:cc:dd:ee:01
-#   TOKEN_FIELD  true | false   default true
-#     session_token 是配置兼容字段；false 也不得关闭 protocol v2 的令牌保护。
 #   LABEL
 set -uo pipefail
 
@@ -29,7 +27,6 @@ PORT="${PORT:-18500}"
 WEB_BASE="${WEB_BASE:-9500}"
 PSK="$E2E_PSK"
 MAC="${MAC:-aa:bb:cc:dd:ee:01}"
-TOKEN_FIELD="${TOKEN_FIELD:-true}"
 LABEL="${LABEL:-}"
 
 SRV_BIN="$E2E_RS_BIN"; [ "$SRV" = go ] && SRV_BIN="$E2E_GO_BIN"
@@ -59,17 +56,15 @@ trap cleanup EXIT
 
 # --- 服务端 ---
 if [ "$SRV" = rs ]; then
-  # Rust 服务端：flags 已移除（2026-09-19），一律走配置文件。
-  ST="$TOKEN_FIELD"
+  # Rust 服务端：session token 是 protocol v2 固定能力，不再有配置开关。
   e2e_config "$TMP/srv.json" server "127.0.0.1:$PORT" \
     "\"psk\": \"$PSK\"" \
     '"encrypt": true' \
     '"log_level": "info"' \
-    "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\", \"session_token\": $ST}"
+    "\"server\": {\"cert\": \"$CERT\", \"key\": \"$KEY\", \"v4_cidr\": \"10.77.0.0/24\", \"v6_cidr\": \"fd77::/64\"}"
   "$SRV_BIN" -c "$(e2e_winpath "$TMP/srv.json")" >"$SRV_LOG" 2>&1 &
 else
-  # Go/Rust 都保留该字段用于配置互读，但 v2 安全语义不受其值影响。
-  ST="$TOKEN_FIELD"
+  # Go 服务端同样固定启用 session token。
   cat >"$TMP/srv.json" <<EOF
 {
   "mode": "server",
@@ -82,8 +77,7 @@ else
     "v4_cidr": "10.77.0.0/24",
     "v6_cidr": "fd77::/64",
     "cert": "$CERT",
-    "key": "$KEY",
-    "session_token": $ST
+    "key": "$KEY"
   }
 }
 EOF
@@ -123,7 +117,7 @@ sleep 5
 start_cli "$B_LOG" "$((WEB_BASE + 1))"
 sleep 6
 
-echo "===== label=$LABEL srv=$SRV cli=$CLI token_field=$TOKEN_FIELD ====="
+echo "===== label=$LABEL srv=$SRV cli=$CLI ====="
 echo "----- server log (handshake decisions) -----"
 e2e_strip "$SRV_LOG" | grep -Ei "online|revive|reconnect refused|session|token" | tail -15
 echo "----- client A log (tail 8) -----"
@@ -142,9 +136,9 @@ DENY=$(grep -c "reconnect refused: invalid session token" "$SRV_LOG" || true)
 echo "server: 上线=$UP 复活=$REVIVE 令牌拒绝=$DENY"
 
 PASS=0
-# A 上线一次；B 被令牌/实例校验拦下；配置字段 false 也不得允许接管。
+# A 上线一次；B 必须被固定启用的令牌/实例校验拦下。
 if [ "$UP" -eq 1 ] && [ "$DENY" -ge 1 ] && [ "$REVIVE" -eq 0 ]; then
   PASS=1
 fi
-e2e_result "$PASS" "${LABEL:-$SRV->$CLI token_field=$TOKEN_FIELD}"
+e2e_result "$PASS" "${LABEL:-$SRV->$CLI}"
 exit $((1 - PASS))
