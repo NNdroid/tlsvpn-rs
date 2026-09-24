@@ -267,6 +267,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hot_frame_pool_keeps_common_ethernet_capacity_bounded() {
+        let mut buf = acquire_frame_vec(1514);
+        assert_eq!(buf.len(), 1514);
+        assert_eq!(buf.capacity(), HOT_FRAME_CLASS);
+        buf[0] = 0x5a;
+        release_frame_vec(buf);
+
+        let buf = acquire_frame_vec(1500);
+        assert_eq!(buf.len(), 1500);
+        assert_eq!(buf.capacity(), HOT_FRAME_CLASS);
+        release_frame_vec(buf);
+    }
+
+    #[test]
+    fn shared_frame_only_recycles_after_last_owner() {
+        let frame = Arc::new(acquire_frame_vec(1400));
+        let other = frame.clone();
+        release_shared_frame(frame);
+        assert_eq!(other.len(), 1400);
+        // 最后一个 owner 才能 try_unwrap 并归池。
+        release_shared_frame(other);
+
+        let buf = acquire_frame_vec(1400);
+        assert_eq!(buf.capacity(), HOT_FRAME_CLASS);
+        release_frame_vec(buf);
+    }
+
+    #[test]
     fn authenticated_replay_sequence_is_delivered_only_once() {
         let mut rb = ReorderBuffer::new();
         let first = rb.insert(42, Arc::new(vec![0x41]));
