@@ -1487,7 +1487,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // 发送聚合缓冲永久复用。旧代码每次成功发送后 Vec::new()，导致约 64KB
     // capacity 被反复释放/重新申请。
     send_buf.clear();
-    send_buf.reserve((64 * 1024 + 4096).saturating_sub(send_buf.capacity()));
+    send_buf.reserve((64usize * 1024 + 4096).saturating_sub(send_buf.capacity()));
     let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
