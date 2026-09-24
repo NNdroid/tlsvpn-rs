@@ -1,9 +1,49 @@
 use lazy_static::lazy_static;
+use crossbeam_queue::ArrayQueue;
 
 use crate::utils::FastRand;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+const HOT_FRAME_CLASS: usize = 2048;
+const HOT_FRAME_POOL_ITEMS: usize = 1024;
+
+lazy_static! {
+    // 典型 1500B Ethernet + 16B GCM tag/FEC descriptor 都落在 2KB 档。
+    // 有界 1024 项，最多保留约 2MiB payload capacity，避免“为了池化而囤内存”。
+    static ref HOT_FRAME_POOL: ArrayQueue<Vec<u8>> = ArrayQueue::new(HOT_FRAME_POOL_ITEMS);
+}
+
+#[inline]
+pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= HOT_FRAME_CLASS {
+        let mut buf = HOT_FRAME_POOL
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(HOT_FRAME_CLASS));
+        buf.resize(len, 0);
+        return buf;
+    }
+    vec![0u8; len]
+}
+
+#[inline]
+pub fn release_frame_vec(mut buf: Vec<u8>) {
+    if buf.capacity() == HOT_FRAME_CLASS {
+        buf.clear();
+        let _ = HOT_FRAME_POOL.push(buf);
+    }
+}
+
+#[inline]
+pub fn release_shared_frame(frame: Arc<Vec<u8>>) {
+    if let Ok(buf) = Arc::try_unwrap(frame) {
+        release_frame_vec(buf);
+    }
+}
 
 lazy_static! {
     pub static ref PADDING_CACHE: Vec<u8> = {
