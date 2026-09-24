@@ -1509,16 +1509,47 @@ mod tests {
             notify: None,
         });
         let backends = vec![a.clone(), b.clone()];
-        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &b));
+        assert_eq!(port.pick_backend_index(&backends), Some(1));
 
         a.rtt_cache.store(240_000, Ordering::Relaxed);
         b.rtt_cache.store(255_000, Ordering::Relaxed);
-        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &b));
+        assert_eq!(
+            port.pick_backend_index(&backends),
+            Some(1),
+            "hysteresis should keep the current path"
+        );
 
         while b.ch.len() < b.ch.capacity().unwrap() - 2 {
             b.ch.try_send(VPNFrame { seq: 0, data: Arc::new(Vec::new()) }).unwrap();
         }
-        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &a));
+        assert_eq!(
+            port.pick_backend_index(&backends),
+            Some(0),
+            "near-full preferred queue must trigger an immediate switch"
+        );
+    }
+
+    #[test]
+    fn backend_notify_coalesces_until_consumed() {
+        let mut poll = mio::Poll::new().unwrap();
+        let dirty = Arc::new(ArrayQueue::new(8));
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(99)).unwrap());
+        let notify = BackendNotify::new(waker, dirty.clone(), mio::Token(7));
+
+        notify.wake();
+        notify.wake();
+        notify.wake();
+        assert_eq!(dirty.len(), 1, "multiple producer frames must coalesce to one dirty token");
+        assert_eq!(dirty.pop(), Some(mio::Token(7)));
+
+        notify.consume_wake();
+        notify.wake();
+        assert_eq!(dirty.len(), 1, "consumer re-arm must allow the next batch to wake");
+        assert_eq!(dirty.pop(), Some(mio::Token(7)));
+
+        // Keep poll mutable/live so the Waker remains valid for the whole test.
+        let mut events = mio::Events::with_capacity(4);
+        let _ = poll.poll(&mut events, Some(Duration::from_millis(0)));
     }
 
     #[test]
