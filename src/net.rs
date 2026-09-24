@@ -1004,7 +1004,7 @@ pub struct Backend {
 }
 
 /// 异步聚合端口，分发行为对齐 Go AsyncPort.dispatchBatch：
-/// - 挂载 XOR FEC 编码器时：数据帧 MinRTT 单路发送，校验帧向所有连接广播；
+/// - 挂载 XOR FEC 编码器时：数据帧 MinRTT 单路发送，校验帧只发一份并在健康连接间轮转；
 /// - 普通模式：MinRTT 单路发送。
 pub struct AsyncPort {
     pub id: String,
@@ -1014,6 +1014,7 @@ pub struct AsyncPort {
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
     schedule_tick: AtomicU32,
+    parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
@@ -1028,6 +1029,7 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
             schedule_tick: AtomicU32::new(0),
+            parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
@@ -1043,6 +1045,7 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
+        self.parity_cursor.store(0, Ordering::Release);
         *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
             Some(FecEncoder::new(k, ic))
         } else {
@@ -1165,6 +1168,42 @@ impl AsyncPort {
         self.pick_backend_index(backends)
     }
 
+    /// parity 只需被会话级 decoder 收到一份。多连接时从轮转游标开始，
+    /// 优先选择与当前 data path 不同且队列健康的后端，兼顾路径分散和 1/K 带宽。
+    fn parity_backend_index(
+        &self,
+        backends: &[Arc<Backend>],
+        data_idx: Option<usize>,
+    ) -> Option<usize> {
+        if backends.is_empty() {
+            return None;
+        }
+        let start = self.parity_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        if backends.len() > 1 {
+            for offset in 0..backends.len() {
+                let idx = (start + offset) % backends.len();
+                if Some(idx) == data_idx {
+                    continue;
+                }
+                if Self::backend_score(&backends[idx]).is_some() {
+                    return Some(idx);
+                }
+            }
+        }
+        if let Some(idx) = data_idx {
+            if idx < backends.len() && Self::backend_score(&backends[idx]).is_some() {
+                return Some(idx);
+            }
+        }
+        for offset in 0..backends.len() {
+            let idx = (start + offset) % backends.len();
+            if Self::backend_score(&backends[idx]).is_some() {
+                return Some(idx);
+            }
+        }
+        Some(start)
+    }
+
     pub fn write_frame(&self, frame: Arc<Vec<u8>>) {
         if frame.is_empty() {
             return;
@@ -1187,7 +1226,8 @@ impl AsyncPort {
             .as_mut()
             .and_then(|enc| enc.add(seq, &frame));
 
-        if let Some(idx) = self.selected_backend_index(&backends) {
+        let data_idx = self.selected_backend_index(&backends);
+        if let Some(idx) = data_idx {
             self.send_frame_to(&backends[idx], seq, &frame);
         } else {
             self.drop_n(1);
@@ -1196,8 +1236,10 @@ impl AsyncPort {
         if let Some(par) = parity {
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
             let par = Arc::new(par);
-            for b in backends.iter() {
-                self.send_frame_to(b, 0, &par);
+            if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
+                self.send_frame_to(&backends[idx], 0, &par);
+            } else {
+                self.drop_n(1);
             }
         }
     }
