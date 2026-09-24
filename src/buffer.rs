@@ -95,11 +95,19 @@ impl ReorderBuffer {
         }
     }
 
-    /// 将收到的包推入缓冲区，返回按序就绪的帧（所有权转移给调用方）。
-    pub fn insert(&mut self, seq: u32, data: Arc<Vec<u8>>) -> Vec<Arc<Vec<u8>>> {
+    /// 热路径版本：把按序就绪帧追加到调用方复用的 scratch Vec。
+    ///
+    /// 典型无丢包链路每个输入帧都会立即就绪。旧接口每包构造一个
+    /// `Vec<Arc<Vec<u8>>>`，造成纯 allocator churn；由调用方长期复用
+    /// scratch 后，顺序流不再为重排输出额外分配。
+    pub fn insert_into(
+        &mut self,
+        seq: u32,
+        data: Arc<Vec<u8>>,
+        ready: &mut Vec<Arc<Vec<u8>>>,
+    ) {
         if seq == 0 {
-            // 心跳/校验帧等控制类不进入重排（对齐 Go Insert 的 seq==0 分支）
-            return Vec::new();
+            return;
         }
 
         if self.expected_seq == 0 {
@@ -108,34 +116,34 @@ impl ReorderBuffer {
 
         // 丢弃太老的包（int32 语义比较，对齐 Go）
         let diff = seq.wrapping_sub(self.expected_seq) as i32;
-        if diff < 0 {
-            return Vec::new();
-        }
-
-        // 乱序窗口超出限制，防极端情况内存溢出
-        if diff as u32 >= REORDER_WINDOW {
-            return Vec::new();
+        if diff < 0 || diff as u32 >= REORDER_WINDOW {
+            return;
         }
 
         let idx = (seq % REORDER_WINDOW) as usize;
         // 去重：如果坑里已经有包了，保留先到者，丢弃后到者
         if self.ring[idx].is_some() {
-            return Vec::new();
+            return;
         }
 
         self.ring[idx] = Some(data);
         self.bitmap[idx / 64] |= 1u64 << (idx % 64);
 
-        // 刚好匹配，批量按序输出
         if seq == self.expected_seq {
-            return self.flush_locked();
+            self.flush_locked_into(ready);
+        } else {
+            self.refresh_gap(Instant::now());
         }
-        self.refresh_gap(Instant::now());
-        Vec::new()
     }
 
-    fn flush_locked(&mut self) -> Vec<Arc<Vec<u8>>> {
+    /// 兼容包装：测试和非热路径可继续按返回 Vec 的方式使用。
+    pub fn insert(&mut self, seq: u32, data: Arc<Vec<u8>>) -> Vec<Arc<Vec<u8>>> {
         let mut ready = Vec::new();
+        self.insert_into(seq, data, &mut ready);
+        ready
+    }
+
+    fn flush_locked_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
         self.gap_since = None;
         while let Some(frame) = self.ring[(self.expected_seq % REORDER_WINDOW) as usize].take() {
             let idx = (self.expected_seq % REORDER_WINDOW) as usize;
@@ -146,7 +154,6 @@ impl ReorderBuffer {
             self.expected_seq = self.expected_seq.wrapping_add(1);
         }
         self.refresh_gap(Instant::now());
-        ready
     }
 
     fn has_gap(&self) -> bool {
@@ -186,10 +193,10 @@ impl ReorderBuffer {
     }
 
     /// 缺口 deadline 到达后向前寻找第一个已收到的帧，跳过永久缺失序号。
-    pub fn flush_timeout(&mut self) -> Vec<Arc<Vec<u8>>> {
-        let Some(since) = self.gap_since else { return Vec::new(); };
+    pub fn flush_timeout_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
+        let Some(since) = self.gap_since else { return };
         if since.elapsed() < REORDER_SKIP_DELAY || !self.has_gap() {
-            return Vec::new();
+            return;
         }
         // 超时才会扫描，O(窗口) 不进入正常数据热路径，并且正确覆盖环形首字
         // 低位（旧位图扫描在 expected 位于字中部时会漏掉该区域）。
@@ -200,11 +207,18 @@ impl ReorderBuffer {
                 self.gap_since = None;
                 self.stats.timeout_flushes = self.stats.timeout_flushes.saturating_add(1);
                 self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(delta as u64);
-                return self.flush_locked();
+                self.flush_locked_into(ready);
+                return;
             }
         }
         self.gap_since = None;
-        Vec::new()
+    }
+
+    /// 兼容包装；热路径优先使用 `flush_timeout_into`。
+    pub fn flush_timeout(&mut self) -> Vec<Arc<Vec<u8>>> {
+        let mut ready = Vec::new();
+        self.flush_timeout_into(&mut ready);
+        ready
     }
 }
 
