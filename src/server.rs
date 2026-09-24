@@ -365,8 +365,6 @@ pub struct ServerCore {
     pub psk: String,
     pub psk_hash: String,
     pub encrypt: bool,
-    // 重连接入既有会话时必须回带会话令牌（opt-in，默认关闭）
-    pub session_token: bool,
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
@@ -543,7 +541,7 @@ impl WebStatsProvider for ServerCore {
             "enc_algo": if self.encrypt { ENC_ALGO_GCM } else { ENC_ALGO_NONE },
             "pad_mode": pad_mode_name(),
             "min_enc": min_enc_label(self.min_enc),
-            "session_token": self.session_token,
+            "session_token": true,
             "max_sessions": self.max_sessions,
 
             "brutal": {
@@ -860,7 +858,6 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         psk: args.psk.clone(),
         psk_hash: hash_psk(&args.psk),
         encrypt: args.encrypt,
-        session_token: args.session_token,
         // 强度下限解析一次，握手热路径只读整数
         min_enc: min_enc_rank(&args.min_enc),
         // 0 = 默认 1024：直接跑 --max-sessions 0 也不该变成"无上限"，否则
