@@ -1137,6 +1137,8 @@ fn worker_loop(
 
     let mut mio_sessions: HashMap<Token, MioSession> = HashMap::new();
     let mut unique_token: usize = 2;
+    // worker 串行处理事件，可复用同一个重排输出 scratch，避免每包/每 timeout malloc。
+    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
 
     loop {
         if crate::client::EXIT.load(Ordering::Relaxed) {
@@ -1409,7 +1411,13 @@ fn worker_loop(
                                     }
                                 }
                                 if !close {
-                                    process_plain_frames(sess, &core, &mut close, &mut tarpit);
+                                    process_plain_frames(
+                                        sess,
+                                        &core,
+                                        &mut close,
+                                        &mut tarpit,
+                                        &mut reorder_ready,
+                                    );
                                 }
                             } else {
                                 if !sess.handshake_done {
@@ -1447,8 +1455,12 @@ fn worker_loop(
             .filter(|session| seen_reorder.insert(Arc::as_ptr(session) as usize))
             .collect();
         for session in reorder_sessions {
-            let ready = session.reorder_buf.lock().flush_timeout();
-            for ordered in ready {
+            reorder_ready.clear();
+            session
+                .reorder_buf
+                .lock()
+                .flush_timeout_into(&mut reorder_ready);
+            for ordered in reorder_ready.drain(..) {
                 core.vswitch.process_frame(&session.stat.client_id, ordered);
             }
         }
@@ -1474,29 +1486,31 @@ fn process_plain_frames(
     core: &Arc<ServerCore>,
     close: &mut bool,
     tarpit: &mut bool,
+    reorder_ready: &mut Vec<Arc<Vec<u8>>>,
 ) {
+    // 共享统计按一次 TLS plaintext drain 聚合，降低多 worker 写同一 cache line 的频率。
+    let mut rx_bytes_batch = 0u64;
+    let mut rx_packets_batch = 0u64;
+
     loop {
         match sess.scanner.read_frame(&mut sess.tls.reader()) {
             Ok(Some((raw, seq))) => {
-                // 心跳帧（空负载）：对齐 Go —— 不计统计、不入 FEC/重排，
-                // 刷新连接活跃度保持空闲隧道存活
                 if raw.is_empty() {
                     sess.last_rx = Instant::now();
                     continue;
                 }
                 let mut data = raw;
-                if let Some(s) = &sess.client_session {
-                    s.stat
-                        .rx_bytes
-                        .fetch_add((data.len() + 10) as u64, Ordering::Relaxed);
-                    s.stat.rx_packets.fetch_add(1, Ordering::Relaxed);
+
+                if sess.handshake_done {
+                    rx_bytes_batch =
+                        rx_bytes_batch.saturating_add((data.len() + 10) as u64);
+                    rx_packets_batch = rx_packets_batch.saturating_add(1);
                 }
 
                 if seq == 0 && !sess.handshake_done {
                     match handle_handshake(sess, core, &data, tarpit) {
                         HandshakeOutcome::Ok => {
                             sess.handshake_done = true;
-                            // 认证已通过：恢复数据帧的线路全量上限（jumbo 帧合法）
                             sess.scanner.set_max_data_len(MAX_DATA_LENGTH);
                         }
                         HandshakeOutcome::Close => {
@@ -1510,10 +1524,6 @@ fn process_plain_frames(
                         }
                     }
                 } else if sess.handshake_done {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    // 内层解密（GCM 校验失败丢弃，对齐 Go openInPlace）
                     if seq != 0 {
                         if let Some(ic) = &sess.ic_rx {
                             let wire_len = data.len() as u32;
@@ -1529,6 +1539,7 @@ fn process_plain_frames(
                             }
                         }
                     }
+
                     let c_sess = match &sess.client_session {
                         Some(c) => c.clone(),
                         None => continue,
@@ -1541,26 +1552,34 @@ fn process_plain_frames(
                     let fec_dec = epoch.fec_dec.clone();
                     drop(epoch);
                     let data = Arc::new(data);
-                    // XOR 校验帧 → 会话级 FEC 解码器
+
                     if seq == 0 {
                         if let Some(dec) = &fec_dec {
                             if fec::is_parity_frame(&data) {
-                                let mut sink = make_sink(&c_sess, core);
+                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                    deliver_to_vswitch(
+                                        &c_sess,
+                                        core,
+                                        s,
+                                        f,
+                                        reorder_ready,
+                                    );
+                                };
                                 dec.on_parity(&data, &mut sink);
                                 continue;
                             }
                         }
                     }
+
                     if let Some(dec) = &fec_dec {
-                        let mut sink = make_sink(&c_sess, core);
+                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                            deliver_to_vswitch(&c_sess, core, s, f, reorder_ready);
+                        };
                         dec.on_data(seq, &data, &mut sink);
                     }
-                    // 去重 + 重排，理顺后交交换机
+
                     if !c_sess.dedup.lock().is_duplicate(seq) {
-                        let ready = c_sess.reorder_buf.lock().insert(seq, data);
-                        for ordered in ready {
-                            core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
-                        }
+                        deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
                     }
                 }
             }
@@ -1578,28 +1597,50 @@ fn process_plain_frames(
             }
         }
     }
+
+    if rx_packets_batch != 0 {
+        if let Some(s) = &sess.client_session {
+            s.stat.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
+            s.stat
+                .rx_packets
+                .fetch_add(rx_packets_batch, Ordering::Relaxed);
+        }
+    }
 }
 
-fn make_sink(c_sess: &Arc<ClientSession>, core: &Arc<ServerCore>) -> impl FnMut(u32, Arc<Vec<u8>>) {
-    let reorder = c_sess.reorder_buf.clone();
-    let cid = c_sess.stat.client_id.clone();
-    let vs = core.vswitch.clone();
-    move |seq: u32, f: Arc<Vec<u8>>| {
-        let ready = reorder.lock().insert(seq, f);
-        for ordered in ready {
-            vs.process_frame(&cid, ordered);
-        }
+
+fn deliver_to_vswitch(
+    c_sess: &Arc<ClientSession>,
+    core: &Arc<ServerCore>,
+    seq: u32,
+    frame: Arc<Vec<u8>>,
+    ready: &mut Vec<Arc<Vec<u8>>>,
+) {
+    ready.clear();
+    c_sess
+        .reorder_buf
+        .lock()
+        .insert_into(seq, frame, ready);
+    for ordered in ready.drain(..) {
+        core.vswitch
+            .process_frame(&c_sess.stat.client_id, ordered);
     }
 }
 
 /// 从端口通道拉帧成批发送（对齐 Go 下行写协程）
 fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
-    // 写积压未消化时不继续拉帧（防内存膨胀，等 10s 卡死保护或恢复）
+    // consumer 在真正 drain 前清 wake pending；此后并发入队会重新唤醒 poller。
+    if let Some(backend) = &sess.tx_backend {
+        if let Some(n) = &backend.notify {
+            n.consume_wake();
+        }
+    }
+
     if sess.write_stalled.is_some() {
-        // 仍尝试继续冲刷 rustls 内部队列
         drain_tls(sess, close);
         return;
     }
+
     let ic_tx = sess.client_session.as_ref().and_then(|s| {
         let epoch = s.epoch_state.read();
         if epoch.epoch != sess.session_epoch {
@@ -1614,26 +1655,31 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
             return;
         }
     }
-    let mut pulled = 0usize;
+
+    let mut pulled = 0u64;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
         append_padded_frame(&mut sess.send_buf, f.seq, &f.data, ic_ref);
-        if let Some(s) = &sess.client_session {
-            s.stat.tx_packets.fetch_add(1, Ordering::Relaxed);
-        }
         pulled += 1;
         if sess.send_buf.len() >= 64 * 1024 || pulled >= 1024 {
             break;
         }
     }
+
     if !sess.send_buf.is_empty() {
         if let Some(s) = &sess.client_session {
+            if pulled != 0 {
+                s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
+            }
             s.stat
                 .tx_bytes
                 .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
         }
-        let _ = sess.tls.writer().write_all(&sess.send_buf);
+        if sess.tls.writer().write_all(&sess.send_buf).is_err() {
+            *close = true;
+            return;
+        }
         sess.send_buf.clear();
     }
     drain_tls(sess, close);
