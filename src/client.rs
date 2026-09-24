@@ -1486,10 +1486,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
 
-    // 发送聚合缓冲永久复用。旧代码每次成功发送后 Vec::new()，导致约 64KB
-    // capacity 被反复释放/重新申请。
+    // 发送聚合缓冲永久复用，并扩大到 256KiB：rustls 仍会自行切 TLS record，
+    // 但减少 writer()/write_tls 调用和 socket syscall，吞吐优先。
+    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
     send_buf.clear();
-    send_buf.reserve((64usize * 1024 + 4096).saturating_sub(send_buf.capacity()));
+    send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
@@ -1681,7 +1682,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 append_padded_frame(&mut send_buf, f.seq, &f.data, ic_ref);
                 release_shared_frame(f.data);
                 tx_packets_batch += 1;
-                if send_buf.len() >= 64 * 1024 {
+                if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
                 }
             }
