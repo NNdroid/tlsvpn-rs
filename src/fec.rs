@@ -56,6 +56,13 @@ fn xor_into(acc: &mut [u8], data: &[u8]) {
             return unsafe { xor_into_avx2(acc, data) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // AArch64 baseline 包含 Advanced SIMD/NEON；R5S 等 ARM64 设备直接走
+        // 128-bit XOR，避免逐 8 字节循环成为 FEC 热点。
+        return unsafe { xor_into_neon(acc, data) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     xor_into_u64(acc, data);
 }
 
@@ -67,6 +74,11 @@ fn xor_combine(out: &mut [u8], parity: &[u8], acc: &[u8]) {
             return unsafe { xor_combine_avx2(out, parity, acc) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { xor_combine_neon(out, parity, acc) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     xor_combine_u64(out, parity, acc);
 }
 
@@ -162,6 +174,43 @@ unsafe fn xor_combine_avx2(out: &mut [u8], parity: &[u8], acc: &[u8]) {
     }
 }
 
+
+// ---------- NEON 路径（AArch64 baseline） ----------
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn xor_into_neon(acc: &mut [u8], data: &[u8]) {
+    use std::arch::aarch64::*;
+    let n = acc.len().min(data.len());
+    let n16 = n / 16;
+    let mut i = 0usize;
+    for _ in 0..n16 {
+        let a = vld1q_u8(acc.as_ptr().add(i));
+        let d = vld1q_u8(data.as_ptr().add(i));
+        vst1q_u8(acc.as_mut_ptr().add(i), veorq_u8(a, d));
+        i += 16;
+    }
+    for (a, d) in acc[i..n].iter_mut().zip(data[i..n].iter()) {
+        *a ^= *d;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn xor_combine_neon(out: &mut [u8], parity: &[u8], acc: &[u8]) {
+    use std::arch::aarch64::*;
+    let n = out.len().min(parity.len()).min(acc.len());
+    let n16 = n / 16;
+    let mut i = 0usize;
+    for _ in 0..n16 {
+        let p = vld1q_u8(parity.as_ptr().add(i));
+        let a = vld1q_u8(acc.as_ptr().add(i));
+        vst1q_u8(out.as_mut_ptr().add(i), veorq_u8(p, a));
+        i += 16;
+    }
+    for j in i..n {
+        out[j] = parity[j] ^ acc[j];
+    }
+}
+
 /// 判断一个已解密线路帧是否为 XOR 校验帧（对齐 Go isParityFrame）
 pub fn is_parity_frame(frame: &[u8]) -> bool {
     frame.len() >= 7 && frame[0] == FEC_MAGIC
@@ -175,24 +224,26 @@ pub struct FecEncoder {
     lens: Vec<usize>,
     acc: Vec<u8>,
     ic: Option<Arc<InnerCipher>>,
-    parity_sent: std::sync::atomic::AtomicU64,
+    parity_sent: u64,
 }
 
 impl FecEncoder {
     pub fn new(k: usize, ic: Option<Arc<InnerCipher>>) -> Self {
+        let k = clamp_fec_group(k);
         Self {
-            k: clamp_fec_group(k),
-            seqs: Vec::new(),
-            lens: Vec::new(),
-            acc: Vec::new(),
+            k,
+            seqs: Vec::with_capacity(k),
+            lens: Vec::with_capacity(k),
+            // 常见 Ethernet payload 一次扩到 2KB 档，之后复用。
+            acc: Vec::with_capacity(2048),
             ic,
-            parity_sent: std::sync::atomic::AtomicU64::new(0),
+            // encoder 本身已由 AsyncPort mutex 串行访问，无需再做原子计数。
+            parity_sent: 0,
         }
     }
 
     pub fn parity_sent(&self) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.parity_sent.load(Relaxed)
+        self.parity_sent
     }
 
     /// 把一个数据帧计入当前分组；凑满 K 帧时生成校验帧并重置分组。
@@ -211,8 +262,7 @@ impl FecEncoder {
             return None;
         }
         let parity = self.build_parity();
-        use std::sync::atomic::Ordering::Relaxed;
-        self.parity_sent.fetch_add(1, Relaxed);
+        self.parity_sent = self.parity_sent.saturating_add(1);
         self.reset();
         Some(parity)
     }
@@ -282,8 +332,8 @@ impl FecDecoder {
             k: clamp_fec_group(k),
             ic,
             inner: Mutex::new(FecDecoderInner {
-                groups: HashMap::new(),
-                done: Vec::new(),
+                groups: HashMap::with_capacity(64),
+                done: Vec::with_capacity(FEC_DONE_CACHE),
                 recovered: 0,
                 lost: 0,
             }),
