@@ -46,6 +46,7 @@ pub struct Args {
     pub sni: String,
     pub insecure: bool,
     pub cert_sha256: String,
+    pub interface_manager: String,
     pub fwmark: i32,
     // 策略路由规则优先级（0 = 交给内核自动分配），与 extra_routes 一起描述
     // 客户端侧 fwmark 表的内容。
@@ -152,6 +153,8 @@ struct ServerConfigFile {
 #[derive(serde::Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields, default)]
 struct ClientConfigFile {
+    #[serde(default)]
+    interface_manager: String,
     req_v4: String,
     req_v6: String,
     sni: String,
@@ -279,6 +282,11 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         insecure: cfg.client.insecure,
         cert_sha256: cfg.client.cert_sha256,
+        interface_manager: if cfg.client.interface_manager.is_empty() {
+            "self".into()
+        } else {
+            cfg.client.interface_manager
+        },
         fwmark: cfg.client.fwmark,
         // 0 是"交给内核分配"的保留值，不做默认填充（对齐 Go applyDefaults）
         fwmark_priority: cfg.client.fwmark_priority,
@@ -472,6 +480,14 @@ fn validate_args(args: &Args) -> Result<(), String> {
         return Err(format!("min_enc {:?} requires encrypt=true", args.min_enc));
     }
     if args.mode == "client" {
+        // 直接构造 Args 的嵌入方/单元测试可能绕过 load_config_file；空值与 Go
+        // applyDefaults 一样按 self 处理，只有显式请求未实现的 netifd 才拒绝。
+        if !args.interface_manager.is_empty() && args.interface_manager != "self" {
+            return Err(format!(
+                "client.interface_manager {:?} is unsupported by tlsvpn-rs (want self)",
+                args.interface_manager
+            ));
+        }
         if args.conns < 1 {
             return Err("client conns must be >= 1".into());
         }
@@ -832,6 +848,7 @@ mod tests {
     "key": ""
   },
   "client": {
+    "interface_manager": "self",
     "conns": 4,
     "fec": true,
     "fec_group": 4,
@@ -856,6 +873,9 @@ mod tests {
             let cfg = serde_json::from_str::<ConfigFile>(raw)
                 .unwrap_or_else(|e| panic!("Go {} 配置解析失败: {}", name, e));
             assert_eq!(cfg.mode, name);
+            if name == "client" {
+                assert_eq!(cfg.client.interface_manager, "self");
+            }
             assert_eq!(cfg.pad_mode, "bucket", "{} 配置的 pad_mode 未读入", name);
             assert!(
                 cfg.server.session_token == (name == "server"),
@@ -890,6 +910,9 @@ mod tests {
                 s.remove("session_token");
                 s.remove("max_sessions");
             }
+            if let Some(c) = top.get_mut("client").and_then(|c| c.as_object_mut()) {
+                c.remove("interface_manager");
+            }
             if let Some(w) = top.get_mut("web").and_then(|w| w.as_object_mut()) {
                 w.remove("cert");
                 w.remove("key");
@@ -909,6 +932,26 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn interface_manager_defaults_to_self_and_rejects_netifd() {
+        let mut without = serde_json::from_str::<serde_json::Value>(GO_CLIENT_CONFIG).unwrap();
+        without["client"].as_object_mut().unwrap().remove("interface_manager");
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tlsvpn-interface-manager-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&without).unwrap()).unwrap();
+        let args = load_config_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(args.interface_manager, "self");
+
+        let mut netifd = serde_json::from_str::<serde_json::Value>(GO_CLIENT_CONFIG).unwrap();
+        netifd["client"]["interface_manager"] = serde_json::json!("netifd");
+        std::fs::write(&path, serde_json::to_vec(&netifd).unwrap()).unwrap();
+        let args = load_config_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.contains("unsupported by tlsvpn-rs"), "unexpected error: {err}");
     }
 
     #[test]

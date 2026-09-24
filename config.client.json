@@ -22,6 +22,7 @@
     "key": ""
   },
   "client": {
+    "interface_manager": "self",
     "conns": 4,
     "fec": true,
     "fec_group": 4,

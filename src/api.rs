@@ -594,6 +594,7 @@ impl RuntimeCtx {
                 "sni": args.sni,
                 "insecure": args.insecure,
                 "cert_sha256": args.cert_sha256,
+                "interface_manager": args.interface_manager,
                 "fwmark": args.fwmark,
                 "fwmark_priority": args.fwmark_priority,
                 // 表号永远等于 fwmark 值，这不是巧合而是约定：显式列出来，

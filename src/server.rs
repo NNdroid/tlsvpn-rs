@@ -218,6 +218,8 @@ pub struct SessionEpochState {
     pub instance_id: String,
     pub epoch: u64,
     pub resume_token: String,
+    // 两阶段 rollover：先在响应中持续下发，客户端回带后才提升为 current。
+    pub pending_resume_token: String,
     pub enc_algo: i64,
     pub salt_a: [u8; ENC_SALT_SIZE],
     pub salt_b: [u8; ENC_SALT_SIZE],
@@ -1687,6 +1689,38 @@ enum HandshakeOutcome {
     TarpitClose,
 }
 
+fn valid_session_token_format(token: &str) -> bool {
+    token.len() == 64 && hex::decode(token).map(|raw| raw.len() == 32).unwrap_or(false)
+}
+
+fn accept_session_resume_token(epoch: &mut SessionEpochState, presented: &str) -> bool {
+    if verify_random_session_token(&epoch.resume_token, presented) {
+        return true;
+    }
+    if !epoch.pending_resume_token.is_empty()
+        && verify_random_session_token(&epoch.pending_resume_token, presented)
+    {
+        epoch.resume_token = std::mem::take(&mut epoch.pending_resume_token);
+        return true;
+    }
+    false
+}
+
+fn ensure_pending_resume_token(epoch: &mut SessionEpochState) -> Result<(), String> {
+    if epoch.pending_resume_token.is_empty() {
+        epoch.pending_resume_token = new_session_token()?;
+    }
+    Ok(())
+}
+
+fn response_resume_token(epoch: &SessionEpochState) -> String {
+    if epoch.pending_resume_token.is_empty() {
+        epoch.resume_token.clone()
+    } else {
+        epoch.pending_resume_token.clone()
+    }
+}
+
 fn rotate_session_epoch(
     session: &Arc<ClientSession>,
     core: &Arc<ServerCore>,
@@ -1725,7 +1759,6 @@ fn rotate_session_epoch(
     }
     epoch.instance_id = instance_id.to_string();
     epoch.epoch = epoch.epoch.saturating_add(1);
-    epoch.resume_token = new_session_token()?;
     epoch.salt_a = salt_a;
     epoch.salt_b = salt_b;
     epoch.ic_tx = ic_tx;
@@ -1858,8 +1891,8 @@ fn handle_handshake(
             let needs_rotation = existing.epoch_state.read().instance_id != req.client_instance;
             if needs_rotation {
                 let valid_token = {
-                    let epoch = existing.epoch_state.read();
-                    verify_random_session_token(&epoch.resume_token, &req.session_token)
+                    let mut epoch = existing.epoch_state.write();
+                    accept_session_resume_token(&mut epoch, &req.session_token)
                 };
                 if !valid_token {
                     warn!(
@@ -1872,10 +1905,24 @@ fn handle_handshake(
                     warn!("[{}] failed to rotate session key epoch: {}", client_id, e);
                     return HandshakeOutcome::Close;
                 }
+                {
+                    let mut epoch = existing.epoch_state.write();
+                    if let Err(e) = ensure_pending_resume_token(&mut epoch) {
+                        warn!("[{}] failed to prepare the next session token: {}", client_id, e);
+                        return HandshakeOutcome::Close;
+                    }
+                }
                 info!(
                     "[{}] rotated session key epoch for a new client process instance",
                     client_id
                 );
+            } else {
+                let mut epoch = existing.epoch_state.write();
+                if !epoch.pending_resume_token.is_empty()
+                    && verify_random_session_token(&epoch.pending_resume_token, &req.session_token)
+                {
+                    epoch.resume_token = std::mem::take(&mut epoch.pending_resume_token);
+                }
             }
             info!(
                 "[{}] ⚡ session revived before the destroy countdown expired (seamless handover)",
@@ -2003,12 +2050,16 @@ fn handle_handshake(
                 None
             };
 
-            let resume_token = match new_session_token() {
-                Ok(token) => token,
-                Err(e) => {
-                    core.pool.lock().release(&mac, &v4ip, &v6ip);
-                    error!("[{}] failed to generate session token: {}", client_id, e);
-                    return HandshakeOutcome::Close;
+            let resume_token = if valid_session_token_format(&req.session_token) {
+                req.session_token.clone()
+            } else {
+                match new_session_token() {
+                    Ok(token) => token,
+                    Err(e) => {
+                        core.pool.lock().release(&mac, &v4ip, &v6ip);
+                        error!("[{}] failed to generate session token: {}", client_id, e);
+                        return HandshakeOutcome::Close;
+                    }
                 }
             };
 
@@ -2044,6 +2095,7 @@ fn handle_handshake(
                     instance_id: req.client_instance.clone(),
                     epoch: 1,
                     resume_token,
+                    pending_resume_token: String::new(),
                     enc_algo,
                     salt_a,
                     salt_b,
@@ -2070,7 +2122,7 @@ fn handle_handshake(
     sess.session_epoch = epoch_snapshot.epoch;
     let response_epoch = epoch_snapshot.epoch;
     let response_enc_algo = epoch_snapshot.enc_algo;
-    let response_token = epoch_snapshot.resume_token.clone();
+    let response_token = response_resume_token(&epoch_snapshot);
     let (response_enc_salt, response_enc_salt2) =
         if response_enc_algo == ENC_ALGO_GCM {
             (
@@ -2115,18 +2167,8 @@ fn handle_handshake(
     let server_legacy_rate_bps = if group_offer {
         split_legacy_brutal_rate_bps(server_tx_rate, req.brutal_conns as usize, req.brutal_conn_index as usize)
     } else { server_tx_rate * 1_000_000 / 8 };
-    // 落档协商结果而不是配置值：客户端可以申请更低的预算，未启用时也记 0，
-    // 面板据此区分"没配置"与"配置了但被对端压低"。applied 记 setsockopt 的
-    // 真实返回值——内核没装 brutal 模块时这里必为 false。
-    let brutal_result = if core.brutal && server_tx_rate > 0 {
-        let group_id = if group_offer { brutal_group_id("server", &response_token) } else { 0 };
-        apply_tcp_brutal(&sess.socket, server_tx_rate, server_legacy_rate_bps, group_id)
-    } else { BrutalApplyResult::default() };
-    sess.brutal_applied = brutal_result.applied;
-    if brutal_result.applied {
-        c_sess.brutal_applied_conns.fetch_add(1, Ordering::Relaxed);
-    }
-    *c_sess.brutal_error.lock() = brutal_result.error.clone();
+    // 先记录协商预算；Brutal 必须等成功响应进入 TLS/TCP 写路径后再应用，
+    // 否则 setsockopt 的异常时延会让客户端误以为应用层握手卡死。
     c_sess.brutal_tx.store(server_tx_rate, Ordering::Relaxed);
     c_sess.brutal_rx.store(client_tx_rate, Ordering::Relaxed);
 
@@ -2154,18 +2196,31 @@ fn handle_handshake(
         enc_algo: response_enc_algo,
         enc_salt: response_enc_salt,
         enc_salt2: response_enc_salt2,
-        session_token: response_token,
+        session_token: response_token.clone(),
         tls: observed_tls_handshake(sess),
     };
     let resp_json = serde_json::to_vec(&resp).unwrap();
     let mut buf = Vec::with_capacity(1024);
     append_padded_frame(&mut buf, 0, &resp_json, None);
-    let _ = sess.tls.writer().write_all(&buf);
+    if let Err(e) = sess.tls.writer().write_all(&buf) {
+        debug!("[{}] failed to queue handshake response: {}", resp.client_id, e);
+        return HandshakeOutcome::Close;
+    }
     let mut close = false;
     drain_tls(sess, &mut close);
     if close {
         return HandshakeOutcome::Close;
     }
+
+    let brutal_result = if core.brutal && server_tx_rate > 0 {
+        let group_id = if group_offer { brutal_group_id("server", &response_token) } else { 0 };
+        apply_tcp_brutal(&sess.socket, server_tx_rate, server_legacy_rate_bps, group_id)
+    } else { BrutalApplyResult::default() };
+    sess.brutal_applied = brutal_result.applied;
+    if brutal_result.applied {
+        c_sess.brutal_applied_conns.fetch_add(1, Ordering::Relaxed);
+    }
+    *c_sess.brutal_error.lock() = brutal_result.error.clone();
     HandshakeOutcome::Ok
 }
 
@@ -2206,6 +2261,51 @@ fn on_conn_closed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn epoch_with_token(token: String) -> SessionEpochState {
+        SessionEpochState {
+            instance_id: "instance-a".into(),
+            epoch: 1,
+            resume_token: token,
+            pending_resume_token: String::new(),
+            enc_algo: ENC_ALGO_NONE,
+            salt_a: [0; ENC_SALT_SIZE],
+            salt_b: [0; ENC_SALT_SIZE],
+            ic_tx: None,
+            ic_rx: None,
+            fec_dec: None,
+        }
+    }
+
+    #[test]
+    fn session_token_rollover_survives_lost_handshake_response() {
+        let current = new_session_token().unwrap();
+        let mut epoch = epoch_with_token(current.clone());
+        ensure_pending_resume_token(&mut epoch).unwrap();
+        let pending = epoch.pending_resume_token.clone();
+        assert_ne!(pending, current);
+        assert_eq!(response_resume_token(&epoch), pending);
+
+        // 模拟携带 pending 的响应丢失：旧 current 仍须可用，且重试不能覆盖 pending。
+        assert!(accept_session_resume_token(&mut epoch, &current));
+        ensure_pending_resume_token(&mut epoch).unwrap();
+        assert_eq!(epoch.pending_resume_token, pending);
+
+        // 客户端终于回带 pending 后才提升，旧 current 随即失效。
+        assert!(accept_session_resume_token(&mut epoch, &pending));
+        assert_eq!(epoch.resume_token, pending);
+        assert!(epoch.pending_resume_token.is_empty());
+        assert!(!accept_session_resume_token(&mut epoch, &current));
+    }
+
+    #[test]
+    fn session_token_format_for_server_restart_continuity() {
+        let token = new_session_token().unwrap();
+        assert!(valid_session_token_format(&token));
+        for bad in [String::new(), "abcd".into(), "z".repeat(64), "0".repeat(63)] {
+            assert!(!valid_session_token_format(&bad), "malformed token accepted: {bad:?}");
+        }
+    }
 
     // ---------- 会话上限（档 D） ----------
 
