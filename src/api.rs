@@ -58,8 +58,8 @@ pub struct HandshakeReq {
     pub encrypt: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub enc_algo: i64,
-    // 客户端回带上一次收到的会话令牌（hex）。服务端开启 session_token 时，
-    // 重连既有会话必须携带正确令牌；旧版实现不发送本字段 → 空串。
+    // 客户端回带上一次收到的会话令牌（hex）。protocol v2 固定要求
+    // 新进程接管既有会话时携带正确令牌；首次接入时为空串。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_token: String,
 }
@@ -134,7 +134,7 @@ pub struct HandshakeResp {
     pub enc_salt: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enc_salt2: String,
-    // 本次会话的重连接入令牌（hex）；仅在服务端开启 session_token 时下发，
+    // 本次会话的重连接入令牌（hex）；protocol v2 固定下发，
     // 客户端须在下一次同一 client_id 的握手里回带。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_token: String,
@@ -585,7 +585,6 @@ impl RuntimeCtx {
                 "web_bind": args.web_bind,
                 "web_https": web_https,
                 "encrypt_psk": true,
-                "session_token": args.session_token,
                 "max_sessions": args.max_sessions,
                 "v4_cidr": args.v4cidr,
                 "v6_cidr": args.v6cidr,
@@ -1084,7 +1083,6 @@ function renderStatus(data){
     ['TAP 接口',c.tap||'-'],
     ['MAC 地址',c.mac||'-'],
     ['SOCKS5 代理',c.socks5?'开启':'关闭'],
-    ['会话令牌 session_token',c.session_token?'开启':'关闭'],
     ['会话上限 max_sessions',c.max_sessions||'-'],
     ['IPv4 网段 v4_cidr',c.v4_cidr||'-'],
     ['IPv6 网段 v6_cidr',c.v6_cidr||'-'],
