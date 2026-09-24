@@ -132,9 +132,9 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `server.fec_group_min` | `2` | server | Lower bound on a peer's FEC group size K; an FEC handshake below it is refused |
-| `server.fec_group_max` | `64` | server | Upper bound on a peer's FEC group size K; an FEC handshake above it is refused. Neither end is clamped, and defaults are the protocol limits so nothing is limited unless configured. The parity is broadcast to all N backends, so the redundancy ratio is N/K: a `min` floor bounds bandwidth, a `max` ceiling bounds pending-frame buffering and recovery latency |
+| `server.fec_group_max` | `64` | server | Upper bound on a peer's FEC group size K; an FEC handshake above it is refused. Neither end is clamped, and defaults are the protocol limits so nothing is limited unless configured. One parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K: a `min` floor bounds bandwidth, while a `max` ceiling bounds pending-frame buffering and recovery latency |
 | `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
-| `client.fec` | `false` | client | XOR-parity FEC over multipath; the parity is broadcast to all N backends, so the redundancy ratio is N/K |
+| `client.fec` | `false` | client | XOR-parity FEC over multipath; one parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K |
 | `client.fec_group` | `4` | client | XOR FEC group size K (2–64), clamped into range before it goes on the wire; the server may refuse an out-of-policy K |
 | `client.sni` | `www.cloudflare.com` | client | SNI domain for handshake camouflage |
 | `client.insecure` | `false` | client | Skip server TLS verification (prefer `cert_sha256`) |
