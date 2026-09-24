@@ -1672,6 +1672,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
+    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
     let mut pulled = 0u64;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
@@ -1679,7 +1680,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         append_padded_frame(&mut sess.send_buf, f.seq, &f.data, ic_ref);
         release_shared_frame(f.data);
         pulled += 1;
-        if sess.send_buf.len() >= 64 * 1024 || pulled >= 1024 {
+        if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
         }
     }
