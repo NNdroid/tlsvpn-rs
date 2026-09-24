@@ -24,8 +24,10 @@ struct GoldenVectors {
     psk_hashes: Vec<PSKHashVec>,
     gcm_domain_vectors: Vec<GcmDomainVec>,
     frame_headers: Vec<FrameHeaderVec>,
+    tls_fingerprint_vectors: Vec<TlsFingerprintVec>,
     handshake_req_keys: Vec<String>,
     handshake_resp_keys: Vec<String>,
+    tls_info_keys: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +52,15 @@ struct FrameHeaderVec {
     pad_len: u16,
     seq: u32,
     header_hex: String,
+}
+
+#[derive(Deserialize)]
+struct TlsFingerprintVec {
+    cipher_suites: Vec<u16>,
+    signature_schemes: Vec<u16>,
+    groups: Vec<u16>,
+    alpn: Vec<String>,
+    fingerprint_sha256: String,
 }
 
 // ---------- 被测实现（与 src/crypto.rs 保持同源逻辑） ----------
@@ -93,6 +104,27 @@ fn build_frame_header(data_len: u32, pad_len: u16, seq: u32) -> [u8; 10] {
     h
 }
 
+fn is_tls_grease(v: u16) -> bool {
+    (v >> 8) as u8 == v as u8 && (v as u8 & 0x0f) == 0x0a
+}
+
+fn tls_client_hello_fingerprint(v: &TlsFingerprintVec) -> String {
+    let mut canonical = b"tls-clienthello-v1\0".to_vec();
+    for values in [&v.cipher_suites, &v.signature_schemes, &v.groups] {
+        let normalized: Vec<u16> = values.iter().copied().filter(|x| !is_tls_grease(*x)).collect();
+        canonical.extend_from_slice(&(normalized.len() as u16).to_be_bytes());
+        for value in normalized {
+            canonical.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    canonical.extend_from_slice(&(v.alpn.len() as u16).to_be_bytes());
+    for proto in &v.alpn {
+        canonical.extend_from_slice(&(proto.len() as u16).to_be_bytes());
+        canonical.extend_from_slice(proto.as_bytes());
+    }
+    hex::encode(Sha256::digest(&canonical))
+}
+
 // ---------- 黄金向量加载 ----------
 
 fn load_golden() -> Option<GoldenVectors> {
@@ -111,8 +143,15 @@ fn load_golden() -> Option<GoldenVectors> {
     if !path.exists() {
         return None;
     }
-    let raw = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&raw).ok()
+    // 文件存在却读不出/解析失败是协议测试自身损坏，绝不能伪装成“文件缺失”跳过。
+    // 新增向量曾把 Go nil slice 写成 null，Rust Vec 解析失败，而旧代码把整套
+    // 跨语言测试静默跳过；这里让这种情况明确失败。
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("读取黄金向量 {} 失败: {e}", path.display()));
+    Some(
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("解析黄金向量 {} 失败: {e}", path.display())),
+    )
 }
 
 macro_rules! golden_or_skip {
@@ -210,6 +249,18 @@ fn test_frame_header_is_big_endian() {
     assert_eq!(&h[0..4], &[0x00, 0x00, 0x00, 0x02], "data_len 必须为大端序");
 }
 
+#[test]
+fn test_tls_client_hello_fingerprint_vectors() {
+    let g = golden_or_skip!();
+    for v in &g.tls_fingerprint_vectors {
+        assert_eq!(
+            tls_client_hello_fingerprint(v),
+            v.fingerprint_sha256,
+            "TLS ClientHello fingerprint drifted between Go and Rust"
+        );
+    }
+}
+
 // ---------- 握手 JSON 字段契约 ----------
 //
 // 这里定义与 Go 端 HandshakeReq/HandshakeResp 对应的结构，
@@ -254,6 +305,51 @@ struct HandshakeReqShape {
 }
 
 #[derive(serde::Serialize, Default)]
+struct TlsHandshakeInfoShape {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    fingerprint_kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    fingerprint_sha256: String,
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    version_id: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    version: String,
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    cipher_suite_id: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    cipher_suite: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    alpn: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    sni: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    offered_cipher_suites: Vec<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    offered_signature_schemes: Vec<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    offered_groups: Vec<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    offered_alpn: Vec<String>,
+}
+
+fn full_tls_info_shape() -> TlsHandshakeInfoShape {
+    TlsHandshakeInfoShape {
+        fingerprint_kind: "tls-clienthello-v1".into(),
+        fingerprint_sha256: "abc".into(),
+        version_id: 0x0304,
+        version: "TLS 1.3".into(),
+        cipher_suite_id: 0x1301,
+        cipher_suite: "TLS_AES_128_GCM_SHA256".into(),
+        alpn: "h2".into(),
+        sni: "example.com".into(),
+        offered_cipher_suites: vec![0x1301],
+        offered_signature_schemes: vec![0x0804],
+        offered_groups: vec![0x001d],
+        offered_alpn: vec!["h2".into()],
+    }
+}
+
+#[derive(serde::Serialize, Default)]
 struct HandshakeRespShape {
     #[serde(skip_serializing_if = "is_zero_i64")]
     protocol_version: i64,
@@ -292,9 +388,14 @@ struct HandshakeRespShape {
     enc_salt2: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     session_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsHandshakeInfoShape>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
 fn is_zero_i64(v: &i64) -> bool {
@@ -369,6 +470,7 @@ fn test_handshake_resp_field_names() {
         enc_salt: "a".into(),
         enc_salt2: "b".into(),
         session_token: "t".into(),
+        tls: Some(full_tls_info_shape()),
     };
     let val: serde_json::Value = serde_json::to_value(&full).unwrap();
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
@@ -396,6 +498,7 @@ fn test_handshake_resp_field_names() {
         "session_id",
         "session_token",
         "success",
+        "tls",
     ];
     let mut exp: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
     exp.sort();
@@ -454,6 +557,7 @@ fn test_golden_handshake_keys_match_rust() {
         enc_salt: "a".into(),
         enc_salt2: "b".into(),
         session_token: "t".into(),
+        tls: Some(full_tls_info_shape()),
     };
     for (what, golden, shape) in [
         (
@@ -480,6 +584,13 @@ fn test_golden_handshake_keys_match_rust() {
             rust_only
         );
     }
+
+    let tls_shape = serde_json::to_value(full_tls_info_shape()).unwrap();
+    let tls_have: std::collections::BTreeSet<String> =
+        tls_shape.as_object().unwrap().keys().cloned().collect();
+    let tls_golden: std::collections::BTreeSet<String> =
+        g.tls_info_keys.iter().cloned().collect();
+    assert_eq!(tls_have, tls_golden, "TLSHandshakeInfo 字段集与 Go 端不一致");
 }
 
 #[test]

@@ -212,6 +212,7 @@ pub struct SessionState {
     session_epoch: u64,
     brutal_tx: u64,
     brutal_rx: u64,
+    tls: Option<TLSHandshakeInfo>,
 }
 
 // ======================= 客户端 =======================
@@ -328,6 +329,7 @@ impl WebStatsProvider for Client {
         let session_id = sess.server_session_id.clone();
         let negotiated_brutal_tx = sess.brutal_tx;
         let negotiated_brutal_rx = sess.brutal_rx;
+        let negotiated_tls = sess.tls.clone();
         drop(sess);
         let reorder = self.reorder_buf.lock().stats();
         let local = serde_json::json!({
@@ -390,6 +392,7 @@ impl WebStatsProvider for Client {
             "session_epoch": session_epoch,
             "tx_rate_mbps": negotiated_brutal_tx,
             "rx_rate_mbps": negotiated_brutal_rx,
+            "tls": negotiated_tls,
             "socks5": self.socks5.is_some(),
             "policy_routing": self.fwmark > 0 && pr_applied,
             "policy_routing_error": pr_error,
@@ -1347,6 +1350,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // 记下服务端下发的会话令牌，供后续重连回带。服务端未开启
         // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
         st.session_token = resp.session_token.clone();
+        // 服务端返回的是它实际看到的 ClientHello；旧服务端没有该可选字段时清空，
+        // 避免重连到旧节点后面板继续展示上一个节点的陈旧观测值。
+        st.tls = resp.tls.clone();
         // 落盘：进程重启后第一次握手就能回带令牌接回同一会话
         persist_session_state(
             cl,

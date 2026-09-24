@@ -4,6 +4,8 @@ use crossbeam_queue::ArrayQueue;
 use mio::net::{TcpListener, TcpStream as MioTcpStream};
 use mio::{Events, Interest, Poll, Token};
 use parking_lot::{Mutex, RwLock};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, ServerConnection};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -228,6 +230,7 @@ struct MioSession {
     socket: MioTcpStream,
     remote_ip: String,
     tls: ServerConnection,
+    tls_observed: Arc<Mutex<Option<TLSHandshakeInfo>>>,
     scanner: FrameScanner,
     rx: Receiver<VPNFrame>,
     handshake_done: bool,
@@ -243,6 +246,92 @@ struct MioSession {
     session_epoch: u64,
     write_stalled: Option<Instant>,
     brutal_applied: bool,
+}
+
+#[derive(Debug)]
+struct ObservingCertResolver {
+    inner: Arc<dyn ResolvesServerCert>,
+    observed: Arc<Mutex<Option<TLSHandshakeInfo>>>,
+}
+
+impl ResolvesServerCert for ObservingCertResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let info = {
+            let offered_cipher_suites = normalize_tls_u16(
+                &hello.cipher_suites().iter().map(|v| u16::from(*v)).collect::<Vec<_>>(),
+            );
+            let offered_signature_schemes = normalize_tls_u16(
+                &hello.signature_schemes().iter().map(|v| u16::from(*v)).collect::<Vec<_>>(),
+            );
+            let offered_groups = normalize_tls_u16(
+                &hello
+                    .named_groups()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| u16::from(*v))
+                    .collect::<Vec<_>>(),
+            );
+            let offered_alpn_bytes: Vec<Vec<u8>> = hello
+                .alpn()
+                .map(|protocols| protocols.map(|p| p.to_vec()).collect())
+                .unwrap_or_default();
+            let offered_alpn: Vec<String> = offered_alpn_bytes
+                .iter()
+                .map(|p| match std::str::from_utf8(p) {
+                    Ok(value) => value.to_owned(),
+                    Err(_) => format!("hex:{}", hex::encode(p)),
+                })
+                .collect();
+            let fingerprint_sha256 = tls_client_hello_fingerprint_bytes(
+                &offered_cipher_suites,
+                &offered_signature_schemes,
+                &offered_groups,
+                &offered_alpn_bytes,
+            );
+            TLSHandshakeInfo {
+                fingerprint_kind: TLS_CLIENT_HELLO_FINGERPRINT_KIND.into(),
+                fingerprint_sha256,
+                sni: normalize_tls_sni(hello.server_name().unwrap_or("")),
+                offered_cipher_suites,
+                offered_signature_schemes,
+                offered_groups,
+                offered_alpn,
+                ..Default::default()
+            }
+        };
+        *self.observed.lock() = Some(info);
+        self.inner.resolve(hello)
+    }
+
+    fn only_raw_public_keys(&self) -> bool {
+        self.inner.only_raw_public_keys()
+    }
+}
+
+fn observed_tls_handshake(sess: &MioSession) -> Option<TLSHandshakeInfo> {
+    let mut info = sess.tls_observed.lock().clone().unwrap_or_default();
+    let version = sess.tls.protocol_version().map(u16::from).unwrap_or(0);
+    let cipher_suite = sess
+        .tls
+        .negotiated_cipher_suite()
+        .map(|suite| u16::from(suite.suite()))
+        .unwrap_or(0);
+    if version == 0 && cipher_suite == 0 && info.fingerprint_sha256.is_empty() {
+        return None;
+    }
+    info.version_id = version;
+    info.version = tls_version_name(version);
+    info.cipher_suite_id = cipher_suite;
+    info.cipher_suite = tls_cipher_suite_name(cipher_suite);
+    info.alpn = sess
+        .tls
+        .alpn_protocol()
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .unwrap_or_default();
+    if info.sni.is_empty() {
+        info.sni = normalize_tls_sni(sess.tls.server_name().unwrap_or(""));
+    }
+    Some(info)
 }
 
 /// 源 MAC 归属校验判定（对齐 Go validateSrcMAC）：会话端口只允许声明本会话
@@ -1109,12 +1198,20 @@ fn worker_loop(
             // 131070 长度把扫描缓冲扩到 131KB/连接；认证通过后恢复全量上限
             let mut scanner = FrameScanner::new();
             scanner.set_max_data_len(HANDSHAKE_DATA_LENGTH);
+            let tls_observed = Arc::new(Mutex::new(None));
+            let mut connection_tls_config = (*tls_config).clone();
+            connection_tls_config.cert_resolver = Arc::new(ObservingCertResolver {
+                inner: connection_tls_config.cert_resolver.clone(),
+                observed: tls_observed.clone(),
+            });
+            let tls = ServerConnection::new(Arc::new(connection_tls_config)).unwrap();
             mio_sessions.insert(
                 t,
                 MioSession {
                     socket,
                     remote_ip,
-                    tls: ServerConnection::new(tls_config.clone()).unwrap(),
+                    tls,
+                    tls_observed,
                     scanner,
                     rx,
                     handshake_done: false,
@@ -2058,6 +2155,7 @@ fn handle_handshake(
         enc_salt: response_enc_salt,
         enc_salt2: response_enc_salt2,
         session_token: response_token,
+        tls: observed_tls_handshake(sess),
     };
     let resp_json = serde_json::to_vec(&resp).unwrap();
     let mut buf = Vec::with_capacity(1024);

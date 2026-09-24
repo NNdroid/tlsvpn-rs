@@ -724,3 +724,25 @@ fn test_dashboard_escapes_html_and_attribute_delimiters() {
         assert!(html.contains(token), "dashboard esc() missing {token:?}");
     }
 }
+
+#[test]
+fn test_dashboard_renders_server_observed_tls() {
+    let src = fs::read_to_string("src/api.rs").expect("读取 src/api.rs");
+    let html = extract_html(&src).expect("提取 DASHBOARD_HTML");
+    for token in [
+        "fingerprint_sha256",
+        "fingerprint_kind",
+        "cipher_suite_id",
+        "offered_cipher_suites",
+        "自定义，非 JA3/JA4",
+    ] {
+        assert!(html.contains(token), "dashboard does not render TLS field {token:?}");
+    }
+    for token in [
+        "esc(tls.fingerprint_kind+':'+tls.fingerprint_sha256)",
+        "esc(tls.cipher_suite",
+        "esc(tls.sni)",
+    ] {
+        assert!(html.contains(token), "server-observed TLS value is not escaped via {token:?}");
+    }
+}

@@ -64,6 +64,39 @@ pub struct HandshakeReq {
     pub session_token: String,
 }
 
+pub const TLS_CLIENT_HELLO_FINGERPRINT_KIND: &str = "tls-clienthello-v1";
+
+/// 服务端实际观测到的 ClientHello 与最终协商摘要。它不是 JA3/JA4：rustls 与
+/// Go 标准库都不暴露完整原始扩展顺序，因此这里只哈希两端都能可靠取得的有序
+/// 特征。响应仅在应用层 PSK 验证成功后返回，且不包含随机数、票据、证书正文或密钥。
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct TLSHandshakeInfo {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint_sha256: String,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub version_id: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub cipher_suite_id: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cipher_suite: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alpn: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sni: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_cipher_suites: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_signature_schemes: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_groups: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_alpn: Vec<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct HandshakeResp {
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -105,9 +138,15 @@ pub struct HandshakeResp {
     // 客户端须在下一次同一 client_id 的握手里回带。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_token: String,
+    // 新客户端把缺失视为旧服务端；旧客户端由 serde 默认忽略未知字段，支持滚动升级。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TLSHandshakeInfo>,
 }
 
 pub fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+pub fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
 pub fn is_zero_i64(v: &i64) -> bool {
@@ -115,6 +154,86 @@ pub fn is_zero_i64(v: &i64) -> bool {
 }
 pub fn is_false(v: &bool) -> bool {
     !*v
+}
+
+pub fn is_tls_grease(v: u16) -> bool {
+    (v >> 8) as u8 == v as u8 && (v as u8 & 0x0f) == 0x0a
+}
+
+pub fn normalize_tls_u16(values: &[u16]) -> Vec<u16> {
+    values.iter().copied().filter(|v| !is_tls_grease(*v)).collect()
+}
+
+/// 规范字节串：kind + NUL；cipher/signature/group 各为 u16 大端项数和有序项；
+/// ALPN 为 u16 项数及每项的 u16 字节长度和原始字节。SNI 不进摘要，避免仅因
+/// 伪装域名变化就把同一种客户端实现误判成另一种指纹。
+pub fn tls_client_hello_fingerprint(
+    ciphers: &[u16],
+    signatures: &[u16],
+    groups: &[u16],
+    alpn: &[String],
+) -> String {
+    let alpn_bytes: Vec<Vec<u8>> = alpn.iter().map(|v| v.as_bytes().to_vec()).collect();
+    tls_client_hello_fingerprint_bytes(ciphers, signatures, groups, &alpn_bytes)
+}
+
+pub fn tls_client_hello_fingerprint_bytes(
+    ciphers: &[u16],
+    signatures: &[u16],
+    groups: &[u16],
+    alpn: &[Vec<u8>],
+) -> String {
+    let mut canonical = Vec::with_capacity(256);
+    canonical.extend_from_slice(TLS_CLIENT_HELLO_FINGERPRINT_KIND.as_bytes());
+    canonical.push(0);
+    let mut write_u16_list = |values: &[u16]| {
+        let normalized = normalize_tls_u16(values);
+        let count = normalized.len().min(u16::MAX as usize);
+        canonical.extend_from_slice(&(count as u16).to_be_bytes());
+        for value in normalized.into_iter().take(count) {
+            canonical.extend_from_slice(&value.to_be_bytes());
+        }
+    };
+    write_u16_list(ciphers);
+    write_u16_list(signatures);
+    write_u16_list(groups);
+    let count = alpn.len().min(u16::MAX as usize);
+    canonical.extend_from_slice(&(count as u16).to_be_bytes());
+    for bytes in alpn.iter().take(count) {
+        let len = bytes.len().min(u16::MAX as usize);
+        canonical.extend_from_slice(&(len as u16).to_be_bytes());
+        canonical.extend_from_slice(&bytes[..len]);
+    }
+    hex::encode(Sha256::digest(&canonical))
+}
+
+pub fn normalize_tls_sni(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+pub fn tls_version_name(version: u16) -> String {
+    match version {
+        0x0303 => "TLS 1.2".into(),
+        0x0304 => "TLS 1.3".into(),
+        0 => String::new(),
+        other => format!("0x{other:04x}"),
+    }
+}
+
+pub fn tls_cipher_suite_name(suite: u16) -> String {
+    match suite {
+        0x1301 => "TLS_AES_128_GCM_SHA256".into(),
+        0x1302 => "TLS_AES_256_GCM_SHA384".into(),
+        0x1303 => "TLS_CHACHA20_POLY1305_SHA256".into(),
+        0xc02b => "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".into(),
+        0xc02c => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384".into(),
+        0xc02f => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into(),
+        0xc030 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".into(),
+        0xcca8 => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256".into(),
+        0xcca9 => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256".into(),
+        0 => String::new(),
+        other => format!("0x{other:04x}"),
+    }
 }
 
 // ======================= 运行时统计（面板/指标用） =======================
@@ -917,7 +1036,7 @@ async function fetchStats(){
 }
 
 function renderStatus(data){
-  const s=data.system||{},c=data.cfg||{},g=data.negotiate||{},b=g.brutal||{},bs=data.brutal_system||{},mem=data.mem||{};
+  const s=data.system||{},c=data.cfg||{},g=data.negotiate||{},b=g.brutal||{},tls=g.tls||{},bs=data.brutal_system||{},mem=data.mem||{};
   // 内核态（模块在不在、当前 cc、可用列表）来自 brutal_system：它每轮都算，不依赖有没有会话。
   // 协商对象里的同名字段只在 brutal_system 缺时才兜底，免得一台没有任何客户端的机器
   // 只显示一堆 '-'，看不出 Brutal 到底能不能用。
@@ -993,6 +1112,12 @@ function renderStatus(data){
     ['会话代际 epoch',g.session_epoch||'-'],
     ['每连接上行预算 (Mbps)',g.tx_rate_mbps||'-'],
     ['每连接下行预算 (Mbps)',g.rx_rate_mbps||'-'],
+    ['最近连接 ClientHello 指纹（自定义，非 JA3/JA4）',tls.fingerprint_sha256?'<span class="mono">'+esc(tls.fingerprint_kind+':'+tls.fingerprint_sha256)+'</span>':'-'],
+    ['TLS 协商版本',tls.version?'<span class="mono">'+esc(tls.version+' (0x'+Number(tls.version_id||0).toString(16).padStart(4,'0')+')')+'</span>':'-'],
+    ['TLS 协商套件',tls.cipher_suite?'<span class="mono">'+esc(tls.cipher_suite+' (0x'+Number(tls.cipher_suite_id||0).toString(16).padStart(4,'0')+')')+'</span>':'-'],
+    ['TLS ALPN',tls.alpn?'<span class="mono">'+esc(tls.alpn)+'</span>':'-'],
+    ['TLS SNI',tls.sni?'<span class="mono">'+esc(tls.sni)+'</span>':'-'],
+    ['ClientHello 特征数',tls.fingerprint_sha256?'<span class="mono">'+(tls.offered_cipher_suites||[]).length+' cipher / '+(tls.offered_signature_schemes||[]).length+' sig / '+(tls.offered_groups||[]).length+' group / '+(tls.offered_alpn||[]).length+' ALPN</span>':'-'],
     ['会话上限',g.max_sessions||'-'],
     ['SOCKS5 代理',g.socks5?'开启（本端不整形）':'-'],
     ['策略路由',
@@ -1488,6 +1613,94 @@ pub fn start_web_server_tunnel(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn tls_client_hello_fingerprint_is_stable_across_grease() {
+        let alpn = vec!["h2".to_string(), "http/1.1".to_string()];
+        let want = tls_client_hello_fingerprint(
+            &[0x1301, 0x1302, 0xc02f],
+            &[0x0804, 0x0403],
+            &[0x001d, 0x0017],
+            &alpn,
+        );
+        let got = tls_client_hello_fingerprint(
+            &[0x0a0a, 0x1301, 0x1302, 0xc02f, 0xfafa],
+            &[0x0804, 0x2a2a, 0x0403],
+            &[0x1a1a, 0x001d, 0x0017],
+            &alpn,
+        );
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 64);
+    }
+
+    #[test]
+    fn tls_client_hello_fingerprint_keeps_opaque_alpn_bytes() {
+        let a = tls_client_hello_fingerprint_bytes(&[0x1301], &[], &[], &[vec![0xff, 0x00]]);
+        let b = tls_client_hello_fingerprint_bytes(&[0x1301], &[], &[], &[vec![0xef, 0xbf, 0xbd, 0x00]]);
+        assert_ne!(a, b, "opaque ALPN bytes must not collapse through UTF-8 replacement");
+    }
+
+    #[test]
+    fn handshake_tls_summary_is_optional_and_contains_no_secret_fields() {
+        let minimal = serde_json::to_string(&HandshakeResp::default()).unwrap();
+        assert!(!minimal.contains("\"tls\""));
+
+        let resp = HandshakeResp {
+            tls: Some(TLSHandshakeInfo {
+                fingerprint_kind: TLS_CLIENT_HELLO_FINGERPRINT_KIND.into(),
+                fingerprint_sha256: "a".repeat(64),
+                version_id: 0x0304,
+                version: "TLS 1.3".into(),
+                cipher_suite_id: 0x1301,
+                cipher_suite: "TLS_AES_128_GCM_SHA256".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&resp).unwrap();
+        for forbidden in [
+            "client_random",
+            "server_random",
+            "session_ticket",
+            "private_key",
+            "master_secret",
+            "certificate_der",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked forbidden field {forbidden}");
+        }
+    }
+
+    #[test]
+    fn handshake_tls_rolling_upgrade_is_bidirectionally_compatible() {
+        // old writer -> new reader
+        let old_wire = r#"{"success":true,"message":"OK","client_id":"c","ipv4":"10.0.0.2/24","ipv6":"fd00::2/80"}"#;
+        let current: HandshakeResp = serde_json::from_str(old_wire).unwrap();
+        assert!(current.tls.is_none());
+
+        // new writer -> old reader：serde 默认忽略未知字段，旧客户端继续读取核心字段。
+        #[derive(serde::Deserialize)]
+        struct LegacyHandshakeResp {
+            success: bool,
+            client_id: String,
+        }
+        let new_wire = serde_json::to_string(&HandshakeResp {
+            success: true,
+            message: "OK".into(),
+            client_id: "c".into(),
+            ipv4: "10.0.0.2/24".into(),
+            ipv6: "fd00::2/80".into(),
+            tls: Some(TLSHandshakeInfo {
+                fingerprint_kind: TLS_CLIENT_HELLO_FINGERPRINT_KIND.into(),
+                fingerprint_sha256: "a".repeat(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let legacy: LegacyHandshakeResp = serde_json::from_str(&new_wire).unwrap();
+        assert!(legacy.success);
+        assert_eq!(legacy.client_id, "c");
+    }
 
     struct StubProvider;
     impl WebStatsProvider for StubProvider {
