@@ -4,7 +4,7 @@
 #   P1 安全配置   —— pad_mode=bucket + min_enc=gcm + protocol v2
 #   P2 可选调优关闭 —— padding=off / 无 min_enc，但 protocol v2 仍强制
 #   P3 新旧混装   —— 默认必须拒绝缺少 protocol v2 的旧对端
-#   P4 兼容字段   —— session_token=false 不得关闭 v2 随机令牌保护
+#   P4 旧配置迁移 —— legacy session_token=false 可读取，但不得改变 v2 令牌保护
 #
 # 用自包含探针（--tap mem），协议级验证，不需要 CAP_NET_ADMIN。
 # 判据：探针退出 0 + 服务端日志无错误标记（解密失败/panic/校验失败/拒绝连接）。
@@ -146,23 +146,25 @@ run_case() {
   fi
 }
 
-# go_cfg_now IS_SERVER TOK PAD MINENC
+# go_cfg_now IS_SERVER LEGACY_TOKEN PAD MINENC
+# LEGACY_TOKEN 仅供 P4 验证旧配置迁移；空串表示当前配置契约，不生成该键。
 # 为「下一个」将要执行的 run_case 生成配置文件。run_case 会先把 CASE_N 加 1
 # 再取端口，所以这里针对 CASE_N+1 生成。
 CFGF=""
 go_cfg_now() {
   local is_srv="$1" tok="$2" pad="$3" minenc="$4"
-  local d f port mac
+  local d f port mac legacy_token=""
   d="$(mktemp -d)"; TMPDIRS+=("$d")
   f="$(e2e_winpath "$d/srv.json")"
   port="$(case_port $((CASE_N + 1)))"
   mac="$(case_mac $((CASE_N + 1)))"
+  [ -n "$tok" ] && legacy_token=", \"session_token\": $tok"
   if [ "$is_srv" = 1 ]; then
     cat > "$f" <<EOF
 {"mode": "server", "psk": "$PSK", "addr": "127.0.0.1:$port", "tap": "mem",
  "log_level": "info", "encrypt": true, "min_enc": "$minenc", "pad_mode": "$pad",
  "server": {"v4_cidr": "10.77.0.0/24", "v6_cidr": "fd77::/64",
-            "cert": "$CERT", "key": "$KEY", "session_token": $tok}}
+            "cert": "$CERT", "key": "$KEY"$legacy_token}}
 EOF
   else
     cat > "$f" <<EOF
@@ -183,12 +185,12 @@ echo "=================================================================="
 echo " P1  安全配置：pad_mode=bucket + min_enc=gcm + protocol v2"
 echo "     探针声明 enc_algo=2(GCM)，满足 min_enc 下限"
 echo "=================================================================="
-run_case "rs->rs 全开"      rs rs bucket gcm 1 "--enc-algo 2"
-run_case "rs->go 全开"      rs go bucket gcm 1 "--enc-algo 2"
+run_case "rs->rs 全开"      rs rs bucket gcm "" "--enc-algo 2"
+run_case "rs->go 全开"      rs go bucket gcm "" "--enc-algo 2"
 run_case "go->rs 全开"      go rs "" "" "" "--enc-algo 2"
 run_case "go->go 全开"      go go "" "" "" "-enc-algo 2"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->rs" go rs "" "" "" "--enc-algo 2" "$CFGF"
-go_cfg_now 1 true bucket gcm; run_case "go(tok,cfg)->go" go go "" "" "" "-enc-algo 2" "$CFGF"
+go_cfg_now 1 "" bucket gcm; run_case "go(cfg)->rs" go rs "" "" "" "--enc-algo 2" "$CFGF"
+go_cfg_now 1 "" bucket gcm; run_case "go(cfg)->go" go go "" "" "" "-enc-algo 2" "$CFGF"
 
 echo ""
 echo "=================================================================="
@@ -222,8 +224,8 @@ run_case "goNEW->goNEW"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
-echo " P4  session_token 兼容字段：即使写 false，v2 随机令牌也不能被关闭"
-echo "     该字段只为 Go/Rust 配置文件互读保留；安全语义由 protocol v2 固定。"
+echo " P4  旧配置迁移：legacy session_token=false 可读，但不能关闭随机令牌"
+echo "     当前配置契约已删除该字段；这里仅验证升级兼容，安全语义由 protocol v2 固定。"
 echo "=================================================================="
 go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->rsNEW" go rs "" "" "" "" "$CFGF"
 go_cfg_now 1 false "" ""; run_case "goNEW(token=false)->goNEW" go go "" "" "" "" "$CFGF"
