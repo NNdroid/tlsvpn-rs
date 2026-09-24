@@ -23,20 +23,21 @@ pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<
 
     let start_idx = buf.len();
     let needed = 10 + data_len + enc_tag + pad_len;
-    // reserve + set_len 代替 resize：省掉对即将全部覆写区域的 memset
+    // 逐段追加，既避免 resize 清零整块 payload/padding，也不把未初始化容量
+    // 通过 set_len 暴露成 &[u8]（后者违反 Vec 的初始化约束，属于未定义行为）。
     buf.reserve(needed);
-    unsafe {
-        buf.set_len(start_idx + needed);
-    }
 
     let wire_len = (data_len + enc_tag) as u32;
-    buf[start_idx..start_idx + 4].copy_from_slice(&wire_len.to_be_bytes());
-    buf[start_idx + 4..start_idx + 6].copy_from_slice(&(pad_len as u16).to_be_bytes());
-    buf[start_idx + 6..start_idx + 10].copy_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&wire_len.to_be_bytes());
+    buf.extend_from_slice(&(pad_len as u16).to_be_bytes());
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(data);
+    if enc_tag > 0 {
+        buf.resize(buf.len() + enc_tag, 0);
+    }
 
     if data_len > 0 {
         let payload_start = start_idx + 10;
-        buf[payload_start..payload_start + data_len].copy_from_slice(data);
         if let Some(c) = ic {
             if seq != 0 {
                 c.seal_in_place(
@@ -50,10 +51,8 @@ pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<
     }
 
     if pad_len > 0 {
-        let pad_start = start_idx + 10 + data_len + enc_tag;
         let offset = RNG.with(|rng| rng.borrow_mut().gen_range(0, PADDING_CACHE.len() - pad_len));
-        buf[pad_start..pad_start + pad_len]
-            .copy_from_slice(&PADDING_CACHE[offset..offset + pad_len]);
+        buf.extend_from_slice(&PADDING_CACHE[offset..offset + pad_len]);
     }
 }
 
@@ -133,11 +132,8 @@ impl FrameScanner {
             }
         }
 
-        loop {
-            let available = self.buffer.len() - self.offset;
-            if available < HEADER_SIZE {
-                break;
-            }
+        let available = self.buffer.len() - self.offset;
+        if available >= HEADER_SIZE {
             let data_len = BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
             let pad_len =
                 BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
@@ -186,7 +182,6 @@ impl FrameScanner {
 
                 return Ok(Some((data, seq)));
             }
-            break;
         }
 
         if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384) {

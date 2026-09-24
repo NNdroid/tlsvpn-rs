@@ -709,3 +709,18 @@ fn test_dashboard_element_ids_exist() {
         missing.join(", ")
     );
 }
+
+#[test]
+fn test_dashboard_escapes_html_and_attribute_delimiters() {
+    let src = fs::read_to_string("src/api.rs").expect("读取 src/api.rs");
+    let html = extract_html(&src).expect("提取 DASHBOARD_HTML");
+    for token in [
+        "replace(/&/g,'&amp;')",
+        "replace(/</g,'&lt;')",
+        "replace(/>/g,'&gt;')",
+        "replace(/\\x22/g,'&quot;')",
+        "replace(/\\x27/g,'&#39;')",
+    ] {
+        assert!(html.contains(token), "dashboard esc() missing {token:?}");
+    }
+}

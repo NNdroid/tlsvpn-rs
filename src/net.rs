@@ -6,7 +6,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
@@ -221,15 +221,28 @@ fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy
         }
     }
     let read_size = if version >= BRUTAL_V2_VERSION { 20 } else { 12 };
-    if let Ok(actual) = ops.get_params(read_size).and_then(|p| decode_brutal_params_bps(&p).map_err(BrutalSockError::Other)) {
-        result.rate_bps = actual.0;
-        result.rate_mbps = actual.0 * 8 / 1_000_000;
-        result.cwnd_gain = actual.1;
-        result.group_id = actual.2;
-    } else {
-        result.rate_bps = rate_bps;
-        result.rate_mbps = rate_bps * 8 / 1_000_000;
-        result.group_id = if use_group { group_id } else { 0 };
+    match ops.get_params(read_size).and_then(|p| decode_brutal_params_bps(&p).map_err(BrutalSockError::Other)) {
+        Ok(actual) => {
+            result.rate_bps = actual.0;
+            result.rate_mbps = actual.0 * 8 / 1_000_000;
+            result.cwnd_gain = actual.1;
+            result.group_id = actual.2;
+        }
+        Err(BrutalSockError::Locked) if result.rule_managed => {
+            // 锁定规则允许内核拒绝 TCP_BRUTAL_PARAMS 读写。算法确实已启用，
+            // 但用户请求值不是内核实际值，不能伪装成已读回的限速。
+            result.rate_bps = 0;
+            result.rate_mbps = 0;
+            result.group_id = 0;
+            result.error = "TCP Brutal is active under a locked rule; actual rate and group are unavailable".into();
+        }
+        Err(e) => {
+            // 参数已经成功写入；读回失败只影响可观测性，不应把连接降级成未启用。
+            result.rate_bps = rate_bps;
+            result.rate_mbps = rate_bps * 8 / 1_000_000;
+            result.group_id = if use_group { group_id } else { 0 };
+            result.error = format!("TCP Brutal applied but parameter readback failed: {:?}", e);
+        }
     }
     result.applied = true;
     result
@@ -286,7 +299,13 @@ impl BrutalSocketOps for LinuxBrutalSocket {
 pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, total_rate: u64, legacy_rate: u64, group_id: u64) -> BrutalApplyResult {
     let mut ops = LinuxBrutalSocket { fd: stream.as_raw_fd() };
     let result = configure_tcp_brutal(&mut ops, total_rate, legacy_rate, group_id);
-    if result.applied { debug!("Applied TCP Brutal: {:?}", result); } else { warn!("TCP Brutal not applied: {}", result.error); }
+    if result.applied && result.error.is_empty() {
+        debug!("Applied TCP Brutal: {:?}", result);
+    } else if result.applied {
+        warn!("TCP Brutal is active with limited observability: {}", result.error);
+    } else {
+        warn!("TCP Brutal not applied: {}", result.error);
+    }
     result
 }
 
@@ -972,8 +991,10 @@ pub struct AsyncPort {
     pub id: String,
     tx_seq: AtomicU32,
     backends: RwLock<Vec<Arc<Backend>>>,
+    preferred: Mutex<Option<Weak<Backend>>>,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
+    parity_sent: AtomicU64,
     sequence_exhausted: AtomicBool,
 }
 
@@ -983,8 +1004,10 @@ impl AsyncPort {
             id,
             tx_seq: AtomicU32::new(0),
             backends: RwLock::new(Vec::new()),
+            preferred: Mutex::new(None),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
+            parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
         }
     }
@@ -1013,11 +1036,7 @@ impl AsyncPort {
     }
 
     pub fn parity_sent(&self) -> u64 {
-        self.encoder
-            .lock()
-            .as_ref()
-            .map(|e| e.parity_sent())
-            .unwrap_or(0)
+        self.parity_sent.load(Ordering::Relaxed)
     }
 
     pub fn register_backend(&self, backend: Arc<Backend>) {
@@ -1027,6 +1046,15 @@ impl AsyncPort {
         self.backends
             .write()
             .retain(|b| !b.ch.same_channel(ch_to_remove));
+        let mut preferred = self.preferred.lock();
+        if preferred
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|b| b.ch.same_channel(ch_to_remove))
+            .unwrap_or(false)
+        {
+            *preferred = None;
+        }
     }
 
     fn drop_n(&self, n: u64) {
@@ -1055,29 +1083,51 @@ impl AsyncPort {
         0
     }
 
-    /// MinRTT 选路：延迟 + 积压惩罚评分，全部拥塞时回落到首个后端
-    fn pick_backend<'a>(&self, backends: &'a [Arc<Backend>]) -> Option<Arc<Backend>> {
+    fn backend_score(b: &Backend) -> Option<u32> {
+        let q_len = b.ch.len();
+        let capacity = b.ch.capacity().unwrap_or(4096);
+        if capacity <= 2 || q_len >= capacity - 2 {
+            return None;
+        }
+        let rtt = b.rtt_cache.load(Ordering::Relaxed);
+        let penalty = if q_len > 10 {
+            (q_len as u64 - 10) * 1000
+        } else {
+            0
+        };
+        Some((rtt as u64 + penalty).min(u32::MAX as u64) as u32)
+    }
+
+    /// MinRTT + 积压评分，并为当前路径保留 12.5% RTT（最低 5ms）滞回。
+    /// 相近 WAN 连接的轻微抖动不会让相邻序号跨 TCP 流来回切换。
+    fn pick_backend(&self, backends: &[Arc<Backend>]) -> Option<Arc<Backend>> {
         let mut best: Option<&Arc<Backend>> = None;
         let mut min_score = u32::MAX;
         for b in backends {
-            let q_len = b.ch.len();
-            if q_len >= b.ch.capacity().unwrap_or(4096) - 2 {
-                continue;
-            }
-            let rtt = b.rtt_cache.load(Ordering::Relaxed);
-            // 积压超过 10 个包才开始惩罚
-            let penalty = if q_len > 10 {
-                (q_len as u32 - 10) * 1000
-            } else {
-                0
-            };
-            let score = rtt + penalty;
+            let Some(score) = Self::backend_score(b) else { continue; };
             if score < min_score {
                 min_score = score;
                 best = Some(b);
             }
         }
-        best.or_else(|| backends.first()).cloned()
+        let mut selected = best.or_else(|| backends.first()).cloned();
+        if let (Some(candidate), Some(current)) = (
+            selected.as_ref(),
+            self.preferred.lock().as_ref().and_then(Weak::upgrade),
+        ) {
+            if !Arc::ptr_eq(candidate, &current)
+                && backends.iter().any(|b| Arc::ptr_eq(b, &current))
+            {
+                if let Some(current_score) = Self::backend_score(&current) {
+                    let hysteresis = 5_000u32.max(current.rtt_cache.load(Ordering::Relaxed) / 8);
+                    if current_score as u64 <= min_score as u64 + hysteresis as u64 {
+                        selected = Some(current);
+                    }
+                }
+            }
+        }
+        *self.preferred.lock() = selected.as_ref().map(Arc::downgrade);
+        selected
     }
 
     pub fn write_frame(&self, frame: Arc<Vec<u8>>) {
@@ -1093,42 +1143,24 @@ impl AsyncPort {
             return;
         }
 
-        if self.encoder.lock().is_some() {
-            // XOR FEC：数据帧计入编码器（端口级串行，先分配 seq）；
-            // 组满生成校验帧广播，数据帧本身按 MinRTT 单路发送。
-            let Some(seq) = self.next_seq() else {
-                self.drop_n(1);
-                return;
-            };
-            let parity = {
-                let mut enc = self.encoder.lock();
-                match enc.as_mut().unwrap().add(seq, &frame) {
-                    Some(p) => Some(p),
-                    None => None,
-                }
-            };
-            if let Some(b) = self.pick_backend(&backends) {
-                self.send_frame_to(&b, seq, &frame);
-            } else {
-                self.drop_n(1);
-            }
-            if let Some(par) = parity {
-                let par = Arc::new(par);
-                for b in backends.iter() {
-                    self.send_frame_to(b, 0, &par);
-                }
-            }
-            return;
-        }
-
         let Some(seq) = self.next_seq() else {
             self.drop_n(1);
             return;
         };
+        // 编码器只持有一次锁：ResetEpoch 与数据线程并发时不会在两次 lock
+        // 之间把 Some 改成 None，避免旧版 unwrap 竞态。
+        let parity = self.encoder.lock().as_mut().and_then(|enc| enc.add(seq, &frame));
         if let Some(b) = self.pick_backend(&backends) {
             self.send_frame_to(&b, seq, &frame);
         } else {
             self.drop_n(1);
+        }
+        if let Some(par) = parity {
+            self.parity_sent.fetch_add(1, Ordering::Relaxed);
+            let par = Arc::new(par);
+            for b in backends.iter() {
+                self.send_frame_to(b, 0, &par);
+            }
         }
     }
 
@@ -1421,6 +1453,51 @@ mod tests {
         port.reset_epoch(0, None);
         assert_eq!(port.next_seq(), Some(1));
         assert!(!port.is_sequence_exhausted());
+    }
+
+    #[test]
+    fn async_port_keeps_sticky_path_until_backpressure() {
+        let port = AsyncPort::new("sticky".into());
+        let (tx_a, _rx_a) = crossbeam_channel::bounded(32);
+        let (tx_b, _rx_b) = crossbeam_channel::bounded(32);
+        let a = Arc::new(Backend {
+            ch: tx_a,
+            rtt_cache: Arc::new(AtomicU32::new(250_000)),
+            notify: None,
+        });
+        let b = Arc::new(Backend {
+            ch: tx_b,
+            rtt_cache: Arc::new(AtomicU32::new(240_000)),
+            notify: None,
+        });
+        let backends = vec![a.clone(), b.clone()];
+        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &b));
+
+        a.rtt_cache.store(240_000, Ordering::Relaxed);
+        b.rtt_cache.store(255_000, Ordering::Relaxed);
+        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &b));
+
+        while b.ch.len() < b.ch.capacity().unwrap() - 2 {
+            b.ch.try_send(VPNFrame { seq: 0, data: Arc::new(Vec::new()) }).unwrap();
+        }
+        assert!(Arc::ptr_eq(&port.pick_backend(&backends).unwrap(), &a));
+    }
+
+    #[test]
+    fn parity_counter_survives_epoch_reset() {
+        let port = AsyncPort::new("parity".into());
+        let (backend, _rx) = make_backend();
+        port.register_backend(backend);
+        port.reset_epoch(4, None);
+        for i in 0..4 {
+            port.write_frame(Arc::new(vec![i]));
+        }
+        assert_eq!(port.parity_sent(), 1);
+        port.reset_epoch(4, None);
+        for i in 0..4 {
+            port.write_frame(Arc::new(vec![i]));
+        }
+        assert_eq!(port.parity_sent(), 2);
     }
 
     /// 从收帧端取走当前所有帧的载荷末字节（测试断言顺序与内容用）
@@ -1725,6 +1802,7 @@ mod tests {
         version: Result<u32, BrutalSockError>,
         set_algo_locked: bool,
         set_params_locked: bool,
+        get_params_locked: bool,
         fail_params: bool,
         params: Vec<u8>,
         algo_calls: Vec<String>,
@@ -1734,7 +1812,7 @@ mod tests {
         fn v2() -> Self {
             Self {
                 congestion: "cubic".into(), version: Ok(BRUTAL_V2_VERSION),
-                set_algo_locked: false, set_params_locked: false,
+                set_algo_locked: false, set_params_locked: false, get_params_locked: false,
                 fail_params: false, params: Vec::new(), algo_calls: Vec::new(),
             }
         }
@@ -1763,6 +1841,7 @@ mod tests {
             Ok(())
         }
         fn get_params(&mut self, size: usize) -> Result<Vec<u8>, BrutalSockError> {
+            if self.get_params_locked { return Err(BrutalSockError::Locked); }
             if self.params.len() == size { Ok(self.params.clone()) } else { Err(BrutalSockError::Other("no params".into())) }
         }
     }
@@ -1793,6 +1872,16 @@ mod tests {
         let got = configure_tcp_brutal(&mut locked, 30, legacy_8mbps, 42);
         assert!(got.applied && got.rule_managed);
         assert_eq!((got.rate_mbps, got.cwnd_gain, got.group_id), (125, 15, 7));
+
+        let mut unreadable = FakeBrutalSocket::v2();
+        unreadable.congestion = "brutal".into();
+        unreadable.set_algo_locked = true;
+        unreadable.set_params_locked = true;
+        unreadable.get_params_locked = true;
+        let got = configure_tcp_brutal(&mut unreadable, 30, legacy_8mbps, 42);
+        assert!(got.applied && got.rule_managed);
+        assert_eq!((got.rate_bps, got.rate_mbps, got.group_id), (0, 0, 0));
+        assert!(got.error.contains("actual rate and group are unavailable"));
 
         let mut failed = FakeBrutalSocket::v2();
         failed.fail_params = true;

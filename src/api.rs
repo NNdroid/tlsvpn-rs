@@ -453,6 +453,8 @@ impl RuntimeCtx {
                 "fec": args.fec,
                 "fec_group": args.fec_group,
                 "log_level": args.loglevel,
+                "up": !args.up.is_empty(),
+                "down": !args.down.is_empty(),
                 "conns": args.conns,
                 "workers": args.workers,
                 "mtu": args.mtu,
@@ -670,7 +672,7 @@ footer { text-align:center; color:var(--muted); font-size:.78em; margin-top:16px
   <div class="card"><div class="sub">总发送</div><div class="kpi" id="total-tx">0 B</div><div class="sub">↑ <span id="total-tx-speed" class="speed">0 B/s</span></div></div>
   <div class="card"><div class="sub">总接收</div><div class="kpi" id="total-rx">0 B</div><div class="sub">↓ <span id="total-rx-speed" class="speed">0 B/s</span></div></div>
   <div class="card"><div class="sub">运行时长</div><div class="kpi" id="uptime">-</div><div class="sub">版本 <span id="ver">-</span> · GC <a href="#" onclick="doAction('gc');return false;" style="color:#5b84b1">立即回收</a></div></div>
-  <div class="card"><div class="sub">FEC 恢复 / 确认丢失</div><div class="kpi" id="fec-kpi">-</div><div class="sub">校验帧 <span id="parity">-</span> · 丢帧(队列) <span id="dropped">-</span></div></div>
+  <div class="card"><div class="sub">FEC 恢复 / 确认丢失</div><div class="kpi" id="fec-kpi">-</div><div class="sub">校验帧 <span id="parity">-</span> · 丢帧(队列) <span id="dropped">-</span> · 重排跳过 <span id="reorder-skipped">-</span></div></div>
   <div class="card"><div class="sub">进程内存</div><div class="kpi" id="mem">-</div><div class="sub">线程数: <span id="goroutines">-</span></div></div>
   <div class="card" id="ippool-card" style="display:none"><div class="sub">IPv4 地址池</div><div class="kpi" id="ippool-kpi">-</div><div class="sub">IPv6 已分配: <span id="v6used">-</span></div></div>
 </div>
@@ -801,7 +803,7 @@ function encBadge(a){if(a===2)return '<span class="badge b-on">GCM</span>';
 function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
 // kvRows 的单元格值按 HTML 原样输出，徽章行需要标签；来自 ip stderr 的报错
 // 文本必须先转义，否则一条带 < 的内核消息就能改写面板结构
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\x22/g,'&quot;').replace(/\x27/g,'&#39;');}
 // 空值不占行：面板上留一堆空行只会让人误以为字段缺失是故障
 function kvRows(pairs){return pairs.filter(p=>p&&p[1]!==undefined&&p[1]!==null&&p[1]!==''&&p[1]!==false)
   .map(p=>'<tr><td class="k">'+p[0]+'</td><td class="v">'+p[1]+'</td></tr>').join('');}
@@ -863,14 +865,14 @@ async function fetchStats(){
         ?((c.brutal_rx||0)+'↑/'+(c.brutal_tx||0)+'↓')
         :((c.brutal_rx||c.brutal_tx)?'未生效':'-');
       const brutTitle=c.brutal_error||'客户端→服务端（上行）/ 服务端→客户端（下行）(Mbps)';
-      tbody+='<tr><td title="'+id+'">'+sid+'</td><td>'+(c.ipv4||'-')+'</td><td class="hide-sm">'+(c.ipv6||'-')+'</td>'+
-        '<td class="hide-sm">'+(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
+      tbody+='<tr><td title="'+esc(id)+'">'+esc(sid)+'</td><td>'+esc(c.ipv4||'-')+'</td><td class="hide-sm">'+esc(c.ipv6||'-')+'</td>'+
+        '<td class="hide-sm">'+esc(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
         '<td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
         '<td class="speed">'+fmtBytes(sx,true)+'</td><td class="speed">'+fmtBytes(sr,true)+'</td>'+
         '<td class="hide-sm">'+badge(c.fec)+'</td><td class="hide-sm">'+(c.fec_group||'-')+'</td>'+
-        '<td class="hide-sm">'+encBadge(c.enc_algo)+'</td><td class="hide-sm" title="'+bid+'">'+bid+'</td>'+
+        '<td class="hide-sm">'+encBadge(c.enc_algo)+'</td><td class="hide-sm" title="'+esc(bid)+'">'+esc(bid)+'</td>'+
         '<td class="hide-sm">'+(c.session_epoch||'-')+'</td>'+
-        '<td class="hide-sm" title="'+brutTitle+'">'+brut+'</td>'+
+        '<td class="hide-sm" title="'+esc(brutTitle)+'">'+brut+'</td>'+
         '<td class="hide-sm">'+(c.online_sec?fmtDur(c.online_sec):'-')+'</td>'+
         '<td>'+(data.mode==='server'?'<button class="btn" onclick="kickClient(\''+id+'\')">踢出</button>'+
           '<button class="btn blue" onclick="banClient(\''+id+'\',0)">封禁</button>':'-')+'</td></tr>';
@@ -893,6 +895,7 @@ async function fetchStats(){
     document.getElementById('fec-kpi').innerHTML=(f.recovered||0)+' <small style="font-size:.6em;color:var(--muted)">/</small> '+(f.lost||0);
     document.getElementById('parity').innerText=f.parity_tx||0;
     document.getElementById('dropped').innerText=data.dropped_frames||0;
+    document.getElementById('reorder-skipped').innerText=(data.reorder||{}).skipped_frames||0;
     const m=data.mem||{};
     // 取不到时后端给 0。直接显示 "0.0 MB / 0" 会让运维以为进程几乎不占内存，
     // 真相是没有统计到——留空比给个假的零诚实。
@@ -1021,6 +1024,7 @@ function renderStatus(data){
   else if(ker.kernel_supported!==true){txt=ker.error||'内核不可用：TCP Brutal 无法生效。';bad=true;}
   else if(b.total_conns>0&&b.applied_conns<b.total_conns){
     txt='内核支持，但仅 '+b.applied_conns+'/'+b.total_conns+' 条连接真正生效。'+(b.socks5?'（走 SOCKS5 代理的连接不整形）':'');bad=true;}
+  else if(ker.error){txt='连接已生效，但状态读取受限：'+ker.error;bad=true;}
   else{txt='内核支持且所有连接均已生效。';}
   note.className=bad?'note bad':'note';
   note.textContent=txt;
@@ -1031,13 +1035,13 @@ function renderConns(data){
   if(data.mode!=='client'){document.getElementById('conns-body').innerHTML='<tr><td colspan="14" style="color:var(--muted)">仅客户端模式提供</td></tr>';return;}
   const neg=data.negotiate||{},b=neg.brutal||{};
   const brutCell=b.enabled?(b.total_conns?b.applied_conns+'/'+b.total_conns+' 已生效':'未生效'):'关闭';
-  document.getElementById('conns-body').innerHTML=list.map(c=>'<tr><td>'+c.index+'</td><td>'+c.target+'</td><td>'+(c.remote||'-')+'</td>'+
-    '<td>'+(c.state==='up'?'<span class="badge b-on">up</span>':c.state==='connecting'?'<span class="badge b-dup">connecting</span>':'<span class="badge b-off">'+c.state+'</span>')+'</td>'+
+  document.getElementById('conns-body').innerHTML=list.map(c=>'<tr><td>'+c.index+'</td><td>'+esc(c.target)+'</td><td>'+esc(c.remote||'-')+'</td>'+
+    '<td>'+(c.state==='up'?'<span class="badge b-on">up</span>':c.state==='connecting'?'<span class="badge b-dup">connecting</span>':'<span class="badge b-off">'+esc(c.state)+'</span>')+'</td>'+
     '<td>'+(c.rtt_ms>=100000?'-':c.rtt_ms+' ms')+'</td><td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
     '<td class="hide-sm">'+c.retries+'</td><td class="hide-sm">'+(c.age_sec?fmtDur(c.age_sec):'-')+'</td>'+
     '<td class="hide-sm">'+badge(data.fec_mode||'off')+'</td><td class="hide-sm">'+encBadge(neg.enc_algo||0)+'</td>'+
-    '<td class="hide-sm" title="'+(c.brutal_error||'')+'">'+(c.brutal_applied?'<span class="badge b-on">已生效</span>':(b.enabled?'<span class="badge b-dup">未生效</span>':'<span class="badge b-off">未启用</span>'))+'</td>'+
-    '<td class="hide-sm" style="color:var(--err)" title="'+(c.last_error||c.brutal_error||'')+'">'+((c.last_error||c.brutal_error||'').slice(0,40))+'</td>'+
+    '<td class="hide-sm" title="'+esc(c.brutal_error||'')+'">'+(c.brutal_applied?'<span class="badge b-on">已生效</span>':(b.enabled?'<span class="badge b-dup">未生效</span>':'<span class="badge b-off">未启用</span>'))+'</td>'+
+    '<td class="hide-sm" style="color:var(--err)" title="'+esc(c.last_error||c.brutal_error||'')+'">'+esc((c.last_error||c.brutal_error||'').slice(0,40))+'</td>'+
     '<td><button class="btn gray" onclick="doAction(\'reconnect\')">重连</button></td></tr>').join('')||
     '<tr><td colspan="14" style="color:var(--muted)">无连接</td></tr>';
 }
@@ -1045,7 +1049,7 @@ function renderMacs(data){
   const t=document.getElementById('macs-body');
   if(data.mode!=='server'){t.innerHTML='<tr><td colspan="3" style="color:var(--muted)">仅服务端模式提供</td></tr>';return;}
   const list=data.mac_table||[];
-  t.innerHTML=list.map(e=>'<tr><td>'+e.mac+'</td><td>'+e.port+'</td><td>'+e.age_sec+' 秒前</td></tr>').join('')||
+  t.innerHTML=list.map(e=>'<tr><td>'+esc(e.mac)+'</td><td>'+esc(e.port)+'</td><td>'+e.age_sec+' 秒前</td></tr>').join('')||
     '<tr><td colspan="3" style="color:var(--muted)">尚未学习到 MAC</td></tr>';
 }
 function renderBans(data){
@@ -1078,7 +1082,7 @@ async function pollLogs(){
     const lines=await res.json();
     if(!lines.length)return;
     const box=document.getElementById('logbox');
-    box.innerHTML+=lines.map(l=>'<div class="lv-'+l.level+'">['+l.time+'] '+l.level+' '+l.msg.replace(/</g,'&lt;')+'</div>').join('');
+    box.innerHTML+=lines.map(l=>'<div class="lv-'+esc(l.level)+'">['+esc(l.time)+'] '+esc(l.level)+' '+esc(l.msg)+'</div>').join('');
     logSeq=lines[lines.length-1].seq;
     if(document.getElementById('autoscroll').checked)box.scrollTop=box.scrollHeight;
   }catch(e){showErr('日志',e&&e.message||e);}

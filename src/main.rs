@@ -13,6 +13,7 @@ pub mod client_state;
 pub mod crypto;
 pub mod fec;
 pub mod frame;
+pub mod hooks;
 pub mod net;
 pub mod server;
 pub mod socks5;
@@ -34,6 +35,8 @@ pub struct Args {
     pub mac: String,
     pub addr: String,
     pub loglevel: String,
+    pub up: String,
+    pub down: String,
     pub v4cidr: String,
     pub v6cidr: String,
     pub cert: String,
@@ -91,6 +94,8 @@ struct ConfigFile {
     mac: String,
     addr: String,
     log_level: String,
+    up: String,
+    down: String,
     encrypt: bool,
     // 空串 = 无下限（与旧版一致）；见 min_enc_rank
     #[serde(default)]
@@ -209,6 +214,8 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.log_level
         },
+        up: cfg.up,
+        down: cfg.down,
         encrypt: if encrypt_present { cfg.encrypt } else { true },
         encrypt_present,
         pad_mode: cfg.pad_mode,
@@ -308,7 +315,24 @@ fn config_file_readable(label: &str, path: &str) -> Result<(), String> {
     }
 }
 
+fn validate_hook_path(name: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.contains(['\0', '\r', '\n']) {
+        return Err(format!("{} hook path contains control characters", name));
+    }
+    // Path::is_absolute follows the build host.  Accept a leading slash too so
+    // Windows-side config tooling can validate a Linux deployment file.
+    if !std::path::Path::new(value).is_absolute() && !value.starts_with('/') {
+        return Err(format!("{} hook must be an absolute executable path", name));
+    }
+    Ok(())
+}
+
 fn validate_args(args: &Args) -> Result<(), String> {
+    validate_hook_path("up", &args.up)?;
+    validate_hook_path("down", &args.down)?;
     if args.brutal_up > crate::net::MAX_BRUTAL_RATE_MBPS
         || args.brutal_down > crate::net::MAX_BRUTAL_RATE_MBPS
     {
@@ -693,36 +717,42 @@ fn main() {
         );
     }
 
-    match args.mode.as_str() {
+    let run_result = match args.mode.as_str() {
         "server" => {
-            start_server(&args, Arc::new(RuntimeCtx::from_args(&args, &config_path)));
+            start_server(
+                &args,
+                &config_path,
+                Arc::new(RuntimeCtx::from_args(&args, &config_path)),
+            )
         }
         "client" => {
             start_client(
                 &args,
                 &config_path,
                 Arc::new(RuntimeCtx::from_args(&args, &config_path)),
-            );
-            on_exit_cleanup();
+            )
         }
         other => {
-            error!(
+            Err(format!(
                 "Invalid configuration: unknown mode {:?} (want \"server\" or \"client\")",
                 other
-            );
-            std::process::exit(1);
+            ))
         }
+    };
+    if let Err(e) = run_result {
+        error!("{}", e);
+        std::process::exit(1);
     }
     tracing::info!("Program exited gracefully.");
 }
 
 fn install_signal_handler() {
     ctrlc::set_handler(|| {
+        if EXIT.swap(true, Ordering::SeqCst) {
+            tracing::error!("Received a second termination signal; forcing exit");
+            std::process::exit(130);
+        }
         tracing::info!("Received termination signal, shutting down...");
-        EXIT.store(true, Ordering::SeqCst);
-        // 给工作线程一点时间完成清理
-        client::on_exit_cleanup();
-        std::process::exit(0);
     })
     .ok();
 }
@@ -735,6 +765,14 @@ mod tests {
     use std::io::Read;
     use std::time::Instant;
 
+    #[test]
+    fn lifecycle_hook_paths_must_be_absolute() {
+        assert!(super::validate_hook_path("up", "relative.sh").is_err());
+        assert!(super::validate_hook_path("up", "/etc/openvpn/up.sh").is_ok());
+        assert!(super::validate_hook_path("down", "").is_ok());
+        assert!(super::validate_hook_path("down", "/tmp/bad\npath").is_err());
+    }
+
     // ---------- 配置文件兼容性（与 Go 仓库 config.*.json 逐字段对齐） ----------
 
     // Go 仓库 config.server.json 的原样内容
@@ -743,6 +781,8 @@ mod tests {
   "psk": "test-only-high-entropy-secret-4e390397818f",
   "addr": ":4000",
   "log_level": "info",
+  "up": "",
+  "down": "",
   "encrypt": true,
   "pad_mode": "bucket",
   "brutal": true,
@@ -774,6 +814,8 @@ mod tests {
   "psk": "test-only-high-entropy-secret-4e390397818f",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
+  "up": "",
+  "down": "",
   "encrypt": true,
   "pad_mode": "bucket",
   "brutal": true,
@@ -1392,6 +1434,8 @@ fn example_config_json() -> &'static str {
   "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
+  "up": "",
+  "down": "",
   "encrypt": true,
   "min_enc": "gcm",
   "pad_mode": "bucket",

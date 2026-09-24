@@ -79,6 +79,8 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "log_level": "info",
+  "up": "",
+  "down": "",
   "encrypt": true,
   "min_enc": "gcm",
   "pad_mode": "bucket",
@@ -107,6 +109,7 @@ All defaults match the Go implementation 1:1. Two fields are Rust extensions (`w
 | `mode` | (required) | — | `server` or `client` |
 | `psk` | (required) | — | High-entropy pre-shared key. Empty and known placeholder values are rejected |
 | `addr` | server `0.0.0.0:4000` | — | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated targets for multi-IP round-robin |
+| `up` / `down` | (empty) | — | Absolute executable paths for process-level tunnel lifecycle hooks |
 | `encrypt` | `true` when omitted in JSON | — | Inner AES-256-GCM with per-session salts and separate data/FEC key domains |
 | `min_enc` | `""` | — | Strength floor: `gcm` refuses peers that cannot negotiate GCM, `""`/`any` sets no floor. Requires `encrypt: true`; connections below the floor are refused |
 | `pad_mode` | `bucket` | — | Full-record padding: `bucket` maps every record to a fixed size with positive padding; only `off` permits zero padding |
@@ -142,6 +145,16 @@ All defaults match the Go implementation 1:1. Two fields are Rust extensions (`w
 | `client.source_rules` | `[]` | client | Policy-routing rules matched on the packet's **source prefix** instead of `SO_MARK`. Each entry installs `ip rule from <from> table <table>` plus that table's default routes (from the gateways the server sends) and any `routes` you list. Use it for traffic that has no socket to mark — e.g. packets an NPT gateway forwards, whose return flow must be pinned to the tunnel TAP. `from` may be a bare address (completed to a host route); `table` is mandatory and must be in `[1, 65535]`, excluding the kernel-reserved `253`/`254`/`255`; `priority` is a uint32, `0` = kernel-assigned. Validated at config load |
 
 **Policy routing is owned by the process, not by systemd.** With a non-zero `fwmark` — or a non-empty `client.source_rules` — the client installs the `ip rule` entries and the routes itself, and it removes whatever it installed on exit. For the fwmark rule the table number is always equal to the fwmark value — a `fwmark` of `0x100` means table `256`, so don't reach for a different table number; `source_rules` tables are whatever you configured, and nothing derives them for you. It waits up to 30 s for the TAP to exist and be up before touching routing, so a network manager that creates the device later doesn't need a separate ordering unit. Do **not** also keep an external drop-in doing the same work: two rules for one fwmark compete by priority, the kernel serves whichever wins, and each of them believes it owns the table. The dashboard's *Status → Configuration* page lists the fwmark, priority, table number, extra routes and source rules, and *Status → Negotiation* shows whether policy routing actually took effect or the exact `ip` error it hit.
+
+### `up` / `down` lifecycle hooks
+
+```json
+{ "up": "/etc/openvpn/up.sh", "down": "/etc/openvpn/down.sh" }
+```
+
+The Go and Rust builds use the same semantics. Hooks are executed directly, not through `sh -c`, so the file needs a shebang and executable permission (`chmod 0755`); paths must be absolute. Each hook has a 30-second timeout and uses the configuration directory as its working directory. `up` runs once after the TAP addresses and built-in policy routing are ready. Parallel connections and short reconnects do not run it again. `down` runs once while the TAP still exists on graceful shutdown, and is also attempted after a partially successful `up`. A failing `up` aborts startup; a failing `down` returns a failing process status. Hooks run with the same UID/capabilities as tlsvpn and are **not a sandbox**: only point them at administrator-controlled files. The inherited environment is reduced to a safe PATH/locale (plus required Windows system variables), so service credentials are not forwarded. The timeout terminates the immediate hook process, not an arbitrary descendant tree; scripts must supervise and clean up any children they create. The first SIGINT/SIGTERM begins this graceful path, while a second signal forces exit. `SIGKILL`, a kernel panic, or power loss cannot run cleanup code.
+
+Scripts receive OpenVPN-style variables `script_type`, `dev`, `dev_type=tap`, `config`, `ifconfig_local`, `ifconfig_ipv6_local`, `route_vpn_gateway`, and `route_ipv6_gateway`, plus `TLSVPN_SCRIPT_TYPE`, `TLSVPN_MODE`, `TLSVPN_DEV`, `TLSVPN_CONFIG`, `TLSVPN_IPV4`, `TLSVPN_IPV6`, `TLSVPN_GATEWAY_V4`, and `TLSVPN_GATEWAY_V6`. The PSK is deliberately never exported.
 
 Keys that belong to the other mode are accepted but have no effect (a server ignores `client.*`, a client ignores `server.*`). Every non-default one is called out on startup — `ignored (mode=server has no effect on them): server.v4_cidr, server.v6_cidr, server.cert` — so a value pasted into the wrong block can't fail silently. Defaults are not listed, since they just mean the key wasn't written.
 

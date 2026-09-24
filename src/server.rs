@@ -19,6 +19,7 @@ use crate::buffer::*;
 use crate::crypto::*;
 use crate::fec::{self, FecDecoder};
 use crate::frame::*;
+use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::tap::{MemTap, TapDevice};
 use crate::utils::*;
@@ -357,6 +358,10 @@ impl WebStatsProvider for ServerCore {
         let mut rec = 0u64;
         let mut lost = 0u64;
         let mut parity = 0u64;
+        let mut dropped = 0u64;
+        let mut reorder_gap = 0u64;
+        let mut reorder_flushes = 0u64;
+        let mut reorder_skipped = 0u64;
         for (id, s) in sessions.iter() {
             let epoch = s.epoch_state.read();
             if let Some(dec) = &epoch.fec_dec {
@@ -365,6 +370,11 @@ impl WebStatsProvider for ServerCore {
                 lost += l;
             }
             parity += s.port.parity_sent();
+            dropped += s.port.dropped();
+            let reorder = s.reorder_buf.lock().stats();
+            reorder_gap += reorder.gap_events;
+            reorder_flushes += reorder.timeout_flushes;
+            reorder_skipped += reorder.skipped_frames;
             clients.insert(
                 id.clone(),
                 serde_json::json!({
@@ -385,6 +395,7 @@ impl WebStatsProvider for ServerCore {
                     "brutal_applied": s.brutal_applied_conns.load(Ordering::Relaxed) > 0,
                     "brutal_applied_conns": s.brutal_applied_conns.load(Ordering::Relaxed),
                     "brutal_error": s.brutal_error.lock().clone(),
+                    "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
                     "online_sec": s.created_at.elapsed().as_secs(),
                     "uptime_sec": s.created_at.elapsed().as_secs(),
                 }),
@@ -405,6 +416,18 @@ impl WebStatsProvider for ServerCore {
         let applied: usize = sessions.values()
             .map(|s| s.brutal_applied_conns.load(Ordering::Relaxed) as usize)
             .sum();
+        let mut brutal_errors = Vec::<String>::new();
+        for session in sessions.values() {
+            let error = session.brutal_error.lock();
+            if !error.is_empty() && !brutal_errors.contains(&error) {
+                brutal_errors.push(error.clone());
+            }
+        }
+        let brutal_error = if brutal_errors.is_empty() {
+            brut["error"].as_str().unwrap_or("").to_string()
+        } else {
+            brutal_errors.join("; ")
+        };
         let total_conns: usize = sessions.values()
             .map(|s| s.stat.active_conns.load(Ordering::Relaxed).max(0) as usize)
             .sum();
@@ -445,7 +468,7 @@ impl WebStatsProvider for ServerCore {
                 "max_up_mbps": max_up,
                 "min_down_mbps": min_down,
                 "max_down_mbps": max_down,
-                "error": brut["error"].as_str().unwrap_or(""),
+                "error": brutal_error,
             }
         });
         serde_json::json!({
@@ -458,8 +481,9 @@ impl WebStatsProvider for ServerCore {
             "global_rx_bytes": 0,
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
-            "dropped_frames": 0,
+            "dropped_frames": dropped,
             "fec": {"enabled": true, "parity_tx": parity, "recovered": rec, "lost": lost},
+            "reorder": {"gap_events": reorder_gap, "timeout_flushes": reorder_flushes, "skipped_frames": reorder_skipped},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
             "ip_pool": {"v4_used": v4_used, "v4_total": v4_total, "v6_used": v6_used},
             "banned": banned,
@@ -472,6 +496,7 @@ impl WebStatsProvider for ServerCore {
         let sessions = self.sessions.read();
         let (mut tx, mut rx, mut pk) = (0u64, 0u64, 0u64);
         let (mut rec, mut lost) = (0u64, 0u64);
+        let (mut dropped, mut reorder_gap, mut reorder_flushes, mut reorder_skipped) = (0u64, 0u64, 0u64, 0u64);
         for s in sessions.values() {
             tx += s.stat.tx_bytes.load(Ordering::Relaxed);
             rx += s.stat.rx_bytes.load(Ordering::Relaxed);
@@ -483,6 +508,11 @@ impl WebStatsProvider for ServerCore {
                 rec += r;
                 lost += l;
             }
+            dropped += s.port.dropped();
+            let reorder = s.reorder_buf.lock().stats();
+            reorder_gap += reorder.gap_events;
+            reorder_flushes += reorder.timeout_flushes;
+            reorder_skipped += reorder.skipped_frames;
         }
         let (v4_used, v4_total, v6_used) = self.pool.lock().status();
         let mut m = String::new();
@@ -564,6 +594,30 @@ impl WebStatsProvider for ServerCore {
                 "Frames confirmed lost despite FEC",
                 "counter",
                 lost.to_string(),
+            );
+            emit(
+                "tlsvpn_port_dropped_frames_total",
+                "Frames dropped due to backpressure",
+                "counter",
+                dropped.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_gap_events_total",
+                "Observed sequence gaps",
+                "counter",
+                reorder_gap.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_timeout_flushes_total",
+                "Gap timeouts that resumed delivery",
+                "counter",
+                reorder_flushes.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_skipped_frames_total",
+                "Missing sequence slots skipped after timeout",
+                "counter",
+                reorder_skipped.to_string(),
             );
             emit(
                 "tlsvpn_banned_clients",
@@ -695,8 +749,13 @@ fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> 
 
 // ======================= 服务端主流程 =======================
 
-pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
+pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Result<(), String> {
     info!("Starting TCP TLS server process...");
+    let hooks = LifecycleHooks::new(args.up.clone(), args.down.clone());
+    #[cfg(target_os = "linux")]
+    let mut tap_setup_error: Option<String> = None;
+    #[cfg(not(target_os = "linux"))]
+    let tap_setup_error: Option<String> = None;
 
     let (pool, gw_v4, gw_v6) = IpPool::new(&args.v4cidr, &args.v6cidr);
     let v4_mask_bits = pool.v4_mask_bits;
@@ -781,35 +840,15 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
         // 对齐 Go：TAP 挂网关地址（网络基址+1），而不是网络号。先 up 再挂
         // 地址、v6 加 nodad，否则 web.bind=tunnel 的面板绑定不上 v6 网关。
         #[cfg(target_os = "linux")]
-        crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(
+        if let Err(e) = crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(
             &args.tap,
             &core.ipv4_cidr(&gw_v4),
             &core.ipv6_cidr(&gw_v6),
-        ));
+        )) {
+            tap_setup_error = Some(e);
+        }
         Arc::new(dev)
     };
-
-    if !args.web.is_empty() {
-        match args.web_bind.as_str() {
-            "tunnel" => start_web_server_tunnel(
-                web_port(&args.web),
-                args.web_auth.clone(),
-                args.web_cert.clone(),
-                args.web_key.clone(),
-                core.clone(),
-                ctx.clone(),
-                core.clone(),
-            ),
-            _ => start_web_server(
-                args.web.clone(),
-                args.web_auth.clone(),
-                args.web_cert.clone(),
-                args.web_key.clone(),
-                core.clone(),
-                ctx.clone(),
-            ),
-        }
-    }
 
     let dev_writer = device.clone();
     let dev_reader = dev_writer.clone();
@@ -844,10 +883,7 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
 
     let tls_config = match build_server_tls(&args.cert, &args.key) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Invalid configuration: {}", e);
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("Invalid configuration: {e}")),
     };
 
     let n_workers = if args.workers > 0 {
@@ -875,6 +911,60 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
     } else {
         args.addr.clone()
     };
+    let socket_addr = bind_addr
+        .parse()
+        .map_err(|e| format!("invalid TCP listen address {bind_addr}: {e}"))?;
+    let listener = TcpListener::bind(socket_addr)
+        .map_err(|e| format!("TCP Listen error on {bind_addr}: {e}"))?;
+
+    let hook_env = HookEnv {
+        mode: "server".into(),
+        dev: args.tap.clone(),
+        config: config_path.to_string(),
+        ipv4: core.ipv4_cidr(&gw_v4),
+        ipv6: core.ipv6_cidr(&gw_v6),
+        gateway_v4: gw_v4.clone(),
+        gateway_v6: gw_v6.clone(),
+    };
+    hooks.activate(hook_env.clone());
+    if hooks.configured() {
+        if let Some(e) = tap_setup_error {
+            let cleanup = hooks.down();
+            return Err(match cleanup {
+                Ok(()) => format!("Server tunnel interface is not ready; refusing to run up hook: {e}"),
+                Err(down) => format!("Server tunnel interface is not ready: {e}; cleanup failed: {down}"),
+            });
+        }
+        if let Err(e) = hooks.up(hook_env) {
+            let cleanup = hooks.down();
+            return Err(match cleanup {
+                Ok(()) => e,
+                Err(down) => format!("{e}; cleanup failed: {down}"),
+            });
+        }
+    }
+
+    if !args.web.is_empty() {
+        match args.web_bind.as_str() {
+            "tunnel" => start_web_server_tunnel(
+                web_port(&args.web),
+                args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
+                core.clone(),
+                ctx.clone(),
+                core.clone(),
+            ),
+            _ => start_web_server(
+                args.web.clone(),
+                args.web_auth.clone(),
+                args.web_cert.clone(),
+                args.web_key.clone(),
+                core.clone(),
+                ctx.clone(),
+            ),
+        }
+    }
 
     let mut handles = Vec::new();
     for rx in accept_rxs {
@@ -884,18 +974,19 @@ pub fn start_server(args: &Args, ctx: Arc<RuntimeCtx>) {
     }
     {
         let txs = accept_txs;
-        handles.push(std::thread::spawn(move || acceptor_loop(bind_addr, txs)));
+        handles.push(std::thread::spawn(move || acceptor_loop(listener, txs)));
     }
     for h in handles {
         let _ = h.join();
     }
+    hooks.down()
 }
 
 const TOKEN_WAKE: Token = Token(1);
 
 /// 接入线程：只负责 accept、socket 调优和轮询分发（对齐 Go 每连接一个
 /// 协程的接入模型，用 accept 通道 hand-off 避免跨线程注册 mio）。
-fn acceptor_loop(bind_addr: String, queues: Vec<Sender<MioTcpStream>>) {
+fn acceptor_loop(mut listener: TcpListener, queues: Vec<Sender<MioTcpStream>>) {
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
@@ -904,13 +995,6 @@ fn acceptor_loop(bind_addr: String, queues: Vec<Sender<MioTcpStream>>) {
         }
     };
     let mut events = Events::with_capacity(256);
-    let mut listener = match TcpListener::bind(bind_addr.parse().unwrap()) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("TCP Listen error: {}", e);
-            std::process::exit(1);
-        }
-    };
     poll.registry()
         .register(&mut listener, Token(0), Interest::READABLE)
         .unwrap();
@@ -972,8 +1056,17 @@ fn worker_loop(
         }
 
         // 只注册 READABLE（修复旧版 WRITABLE 恒注册导致的水平触发空转）。
-        // 数据下行由 Waker 唤醒；250ms 超时仅用于保活/RTT/空闲等定时巡检。
-        poll.poll(&mut events, Some(Duration::from_millis(250)))
+        // 无重排缺口时保持 250ms 运维巡检；出现缺口后把 poll deadline 收紧到
+        // 该会话的精确剩余时间，避免固定 250ms 盲等或 5ms 空转。
+        let mut poll_timeout = Duration::from_millis(250);
+        for sess in mio_sessions.values() {
+            if let Some(c_sess) = &sess.client_session {
+                if let Some(wait) = c_sess.reorder_buf.lock().next_timeout() {
+                    poll_timeout = poll_timeout.min(wait);
+                }
+            }
+        }
+        poll.poll(&mut events, Some(poll_timeout))
             .unwrap();
 
         let mut closed_tokens: Vec<Token> = Vec::new();
@@ -1243,6 +1336,21 @@ fn worker_loop(
                         on_conn_closed(s.client_session, s.tx_backend, s.session_epoch, s.brutal_applied);
                     }
                 }
+            }
+        }
+
+        // 先处理本轮所有可读事件，让刚到达的缺失帧有机会补洞；随后才执行超时
+        // 跳过。一个逻辑会话可能有多条连接落在同一 worker，只处理一次。
+        let mut seen_reorder = HashSet::new();
+        let reorder_sessions: Vec<_> = mio_sessions
+            .values()
+            .filter_map(|sess| sess.client_session.clone())
+            .filter(|session| seen_reorder.insert(Arc::as_ptr(session) as usize))
+            .collect();
+        for session in reorder_sessions {
+            let ready = session.reorder_buf.lock().flush_timeout();
+            for ordered in ready {
+                core.vswitch.process_frame(&session.stat.client_id, ordered);
             }
         }
 

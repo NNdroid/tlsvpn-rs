@@ -16,6 +16,7 @@ use crate::buffer::*;
 use crate::crypto::*;
 use crate::fec::{self, clamp_fec_group, FecDecoder};
 use crate::frame::*;
+use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::socks5::{split_host_port, Socks5Proxy};
 use crate::tap::{MemTap, TapDevice};
@@ -274,6 +275,10 @@ pub struct Client {
     pub instance_id: Mutex<String>,
     pub sequence_rekeying: AtomicBool,
     pub started_at: Instant,
+    pub hooks: Arc<LifecycleHooks>,
+    pub hook_config_path: String,
+    pub fatal_error: Mutex<Option<String>>,
+    pub network_setup: Mutex<()>,
 }
 
 impl TunnelIpSource for Client {
@@ -324,6 +329,7 @@ impl WebStatsProvider for Client {
         let negotiated_brutal_tx = sess.brutal_tx;
         let negotiated_brutal_rx = sess.brutal_rx;
         drop(sess);
+        let reorder = self.reorder_buf.lock().stats();
         let local = serde_json::json!({
             "client_id": self.client_id,
             "ipv4": self.assigned_v4.lock().clone(),
@@ -352,12 +358,23 @@ impl WebStatsProvider for Client {
         let per_down_min = split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
         let per_down_max = split_legacy_brutal_rate(self.brutal_down, n as usize, 0);
         // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
-        let applied_conns = self
-            .conn_infos
-            .iter()
-            .filter(|c| c.brutal.lock().applied)
-            .count();
+        let mut applied_conns = 0usize;
+        let mut brutal_errors = Vec::<String>::new();
+        for conn in &self.conn_infos {
+            let result = conn.brutal.lock();
+            if result.applied {
+                applied_conns += 1;
+            }
+            if !result.error.is_empty() && !brutal_errors.contains(&result.error) {
+                brutal_errors.push(result.error.clone());
+            }
+        }
         let brut = brutal_system_status();
+        let brutal_error = if brutal_errors.is_empty() {
+            brut["error"].as_str().unwrap_or("").to_string()
+        } else {
+            brutal_errors.join("; ")
+        };
         // 策略路由生效状态。面板需要区分"没配 fwmark"和"配了但内核拒绝"，
         // 所以 applied 与 error 分开记录。
         let pr_applied = *self.pr_ok.lock();
@@ -389,7 +406,7 @@ impl WebStatsProvider for Client {
                 "max_up_mbps": per_up_max,
                 "min_down_mbps": per_down_min,
                 "max_down_mbps": per_down_max,
-                "error": brut["error"].as_str().unwrap_or(""),
+                "error": brutal_error,
             }
         });
 
@@ -405,6 +422,7 @@ impl WebStatsProvider for Client {
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
             "fec": {"enabled": self.fec_mode, "parity_tx": self.tx_port.parity_sent(), "recovered": rec, "lost": lost},
+            "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
             "conns": conns,
             "fec_mode": fec_status,
@@ -420,6 +438,7 @@ impl WebStatsProvider for Client {
             .as_ref()
             .map(|d| d.stats())
             .unwrap_or((0, 0));
+        let reorder = self.reorder_buf.lock().stats();
         let mut m = String::new();
         {
             let mut emit = |name: &str, help: &str, typ: &str, val: String| {
@@ -481,6 +500,24 @@ impl WebStatsProvider for Client {
                 "Frames confirmed lost despite FEC",
                 "counter",
                 lost.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_gap_events_total",
+                "Observed sequence gaps",
+                "counter",
+                reorder.gap_events.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_timeout_flushes_total",
+                "Gap timeouts that resumed delivery",
+                "counter",
+                reorder.timeout_flushes.to_string(),
+            );
+            emit(
+                "tlsvpn_reorder_skipped_frames_total",
+                "Missing sequence slots skipped after timeout",
+                "counter",
+                reorder.skipped_frames.to_string(),
             );
         }
         m
@@ -544,7 +581,7 @@ fn persist_session_state(cl: &Client, session_id: &str, token: &str, epoch: u64)
     }
 }
 
-pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
+pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Result<(), String> {
     info!("Starting TCP TLS client process...");
 
     // 进程身份落盘（<config>.state）：MAC 派生 client_id，client_id 决定服务端
@@ -567,7 +604,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         }
         Err(e) => {
             error!("{}", e);
-            return;
+            return Err(e);
         }
         Ok(None) => {
             if !identity.mac.is_empty() {
@@ -667,8 +704,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         .filter(|s| !s.is_empty())
         .collect();
     if targets.is_empty() {
-        error!("Client addr resolved to zero endpoints; check the addr field in the config file");
-        return;
+        return Err("Client addr resolved to zero endpoints; check the addr field in the config file".into());
     }
 
     // SOCKS5 全局代理
@@ -678,8 +714,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         match Socks5Proxy::parse(&args.socks5) {
             Some(p) => Some(Arc::new(p)),
             None => {
-                error!("Invalid SOCKS5 proxy spec: {}", args.socks5);
-                return;
+                return Err(format!("Invalid SOCKS5 proxy spec: {}", args.socks5));
             }
         }
     };
@@ -821,6 +856,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
         instance_id: Mutex::new(random_instance_id()),
         sequence_rekeying: AtomicBool::new(false),
         started_at: Instant::now(),
+        hooks: Arc::new(LifecycleHooks::new(args.up.clone(), args.down.clone())),
+        hook_config_path: config_path.to_string(),
+        fatal_error: Mutex::new(None),
+        network_setup: Mutex::new(()),
     };
     let client = Arc::new(client);
 
@@ -865,6 +904,15 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) {
     for h in handles {
         let _ = h.join();
     }
+    on_exit_cleanup();
+    let down_result = client.hooks.down();
+    if let Some(fatal) = client.fatal_error.lock().take() {
+        return match down_result {
+            Ok(()) => Err(fatal),
+            Err(cleanup) => Err(format!("{fatal}; cleanup failed: {cleanup}")),
+        };
+    }
+    down_result
 }
 
 fn build_tls_config(args: &Args) -> Arc<ClientConfig> {
@@ -1327,9 +1375,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
 
     // 6. 配置接口与策略路由（Linux；对齐 Go setupInterface/setupPolicyRouting）
+    let network_setup_guard = cl.network_setup.lock();
+    let mut readiness_error: Option<String> = None;
     if cl.tap_name != "mem" {
         #[cfg(target_os = "linux")]
-        setup_interface(cl, &resp.ipv4, &resp.ipv6);
+        if let Err(e) = setup_interface(cl, &resp.ipv4, &resp.ipv6) {
+            warn!("tunnel interface configuration failed: {e}");
+            readiness_error = Some(e);
+        }
         // 规则与路由由本进程自管，用户不需要（也不应）再写一份 systemd drop-in：
         // 两者并存时同一条 fwmark 规则会按 priority 竞争，结果取决于内核裁决顺序。
         let pr_spec = PolicyRoutingSpec {
@@ -1350,11 +1403,42 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 // 上抛而不是吞掉：半装状态（有规则没路由）比明确报错更糟
                 warn!("policy routing: {e}");
                 *cl.pr_ok.lock() = false;
-                *cl.pr_err.lock() = e;
+                *cl.pr_err.lock() = e.clone();
+                if readiness_error.is_none() {
+                    readiness_error = Some(e);
+                }
             }
         }
         let _ = CLEANUP_INFO.set(pr_spec);
     }
+
+    if cl.hooks.configured() {
+        let hook_env = HookEnv {
+            mode: "client".into(),
+            dev: cl.tap_name.clone(),
+            config: cl.hook_config_path.clone(),
+            ipv4: resp.ipv4.clone(),
+            ipv6: resp.ipv6.clone(),
+            gateway_v4: resp.gw_v4.clone(),
+            gateway_v6: resp.gw_v6.clone(),
+        };
+        let hook_result = if let Some(e) = readiness_error {
+            cl.hooks.activate(hook_env);
+            Err(format!("cannot run lifecycle up hook before tunnel networking is ready: {e}"))
+        } else {
+            cl.hooks.up(hook_env)
+        };
+        if let Err(e) = hook_result {
+            *ci.last_error.lock() = e.clone();
+            let mut fatal = cl.fatal_error.lock();
+            if fatal.is_none() {
+                *fatal = Some(e);
+            }
+            EXIT.store(true, Ordering::SeqCst);
+            return Duration::ZERO;
+        }
+    }
+    drop(network_setup_guard);
 
     // 7. 注册端口后端 + RTT 轮询线程
     // 事件驱动：端口投递帧 → 唤醒本连接的 mio poller，主循环可真正阻塞
@@ -1722,6 +1806,6 @@ fn tls_exchange_resp(
 // Linux 下用 ip 命令配置接口地址；命令序列（顺序、nodad、replace）见
 // utils::tap_addr_cmds，那是 web.bind=tunnel 能绑上 v6 隧道 IP 的前提。
 #[cfg(target_os = "linux")]
-fn setup_interface(cl: &Arc<Client>, v4cidr: &str, v6cidr: &str) {
-    crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(&cl.tap_name, v4cidr, v6cidr));
+fn setup_interface(cl: &Arc<Client>, v4cidr: &str, v6cidr: &str) -> Result<(), String> {
+    crate::utils::apply_ip_cmds(&crate::utils::tap_addr_cmds(&cl.tap_name, v4cidr, v6cidr))
 }

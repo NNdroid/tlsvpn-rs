@@ -219,8 +219,9 @@ pub fn tap_addr_cmds<'a>(tap: &'a str, v4cidr: &'a str, v6cidr: &'a str) -> Vec<
 /// 地址配不上时隧道网关不可达，web.bind=tunnel 会对着一个不存在的地址反复
 /// bind 失败。以前静默丢弃退出码，表现只能是"面板连不上"，看不到原因。
 #[cfg(target_os = "linux")]
-pub fn apply_ip_cmds(cmds: &[Vec<&str>]) {
+pub fn apply_ip_cmds(cmds: &[Vec<&str>]) -> Result<(), String> {
     use std::process::Command;
+    let mut errors = Vec::new();
     for cmd in cmds {
         let what = cmd.join(" ");
         match Command::new("ip").args(cmd).output() {
@@ -233,10 +234,15 @@ pub fn apply_ip_cmds(cmds: &[Vec<&str>]) {
                     err
                 };
                 tracing::warn!("ip {what} failed: {detail}");
+                errors.push(format!("ip {what}: {detail}"));
             }
-            Err(e) => tracing::warn!("ip {what} failed: {e}"),
+            Err(e) => {
+                tracing::warn!("ip {what} failed: {e}");
+                errors.push(format!("ip {what}: {e}"));
+            }
         }
     }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
 }
 
 /// 面板监听地址算不算「对外」：非回环地址就算。对齐 Go main.go 的 web.auth 提示判断。

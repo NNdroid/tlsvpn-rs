@@ -3,6 +3,8 @@
   "psk": "REPLACE-WITH-A-RANDOM-SECRET",
   "addr": ":4000",
   "log_level": "info",
+  "up": "",
+  "down": "",
   "encrypt": true,
   "min_enc": "gcm",
   "pad_mode": "bucket",
