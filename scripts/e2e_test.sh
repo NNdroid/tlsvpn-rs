@@ -100,17 +100,14 @@ suite_accept() {
 }
 
 suite_tok() {
-  # 四种跨语言组合都拒绝；另用同语言组合验证兼容字段 false 也不能关闭保护。
-  local -a jobs=(
-    "rs rs true" "rs go true" "go rs true" "go go true"
-    "rs rs false" "go go false"
-  )
-  local i=0 s c token_field fails=0
-  echo "  protocol v2：4 组跨语言拒绝 + 2 组 session_token=false 仍拒绝"
+  # Session token 是 protocol v2 固定能力；四种跨语言组合都必须拒绝同 MAC 的新实例劫持。
+  local -a jobs=("rs rs" "rs go" "go rs" "go go")
+  local i=0 s c fails=0
+  echo "  protocol v2：4 组跨语言固定 session-token 接管拒绝"
   for spec in "${jobs[@]}"; do
-    set -- $spec; s="$1"; c="$2"; token_field="$3"
-    SRV="$s" CLI="$c" TOKEN_FIELD="$token_field" PORT="$((PORT_BASE_TOK + i * 10))" \
-      WEB_BASE="$((9500 + i * 2))" LABEL="tok_${s}->${c}_field-${token_field}" \
+    set -- $spec; s="$1"; c="$2"
+    SRV="$s" CLI="$c" PORT="$((PORT_BASE_TOK + i * 10))" \
+      WEB_BASE="$((9500 + i * 2))" LABEL="tok_${s}->${c}" \
       bash "$HERE/e2e_tok.sh" || fails=$((fails + 1))
     i=$((i + 1))
   done
