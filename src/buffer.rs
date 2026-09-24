@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use crossbeam_queue::ArrayQueue;
+use std::cell::RefCell;
 
 use crate::utils::FastRand;
 use std::collections::HashSet;
@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HOT_FRAME_CLASS: usize = 2048;
-const HOT_FRAME_POOL_ITEMS: usize = 1024;
+const HOT_FRAME_POOL_ITEMS_PER_THREAD: usize = 64;
 
-lazy_static! {
-    // 典型 1500B Ethernet + 16B GCM tag/FEC descriptor 都落在 2KB 档。
-    // 有界 1024 项，最多保留约 2MiB payload capacity，避免“为了池化而囤内存”。
-    static ref HOT_FRAME_POOL: ArrayQueue<Vec<u8>> = ArrayQueue::new(HOT_FRAME_POOL_ITEMS);
+thread_local! {
+    // FrameScanner/连接 worker 的 acquire/release 几乎都发生在同一线程。
+    // 用 TLS 小栈避免全局 ArrayQueue 每帧做原子同步；每线程最多保留
+    // 64 * 2KB = 128KB，线程退出时自动释放。
+    static HOT_FRAME_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -22,7 +23,7 @@ pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
     }
     if len <= HOT_FRAME_CLASS {
         let mut buf = HOT_FRAME_POOL
-            .pop()
+            .with(|pool| pool.borrow_mut().pop())
             .unwrap_or_else(|| Vec::with_capacity(HOT_FRAME_CLASS));
         buf.resize(len, 0);
         return buf;
@@ -32,10 +33,16 @@ pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
 
 #[inline]
 pub fn release_frame_vec(mut buf: Vec<u8>) {
-    if buf.capacity() == HOT_FRAME_CLASS {
-        buf.clear();
-        let _ = HOT_FRAME_POOL.push(buf);
+    if buf.capacity() != HOT_FRAME_CLASS {
+        return;
     }
+    buf.clear();
+    HOT_FRAME_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < HOT_FRAME_POOL_ITEMS_PER_THREAD {
+            pool.push(buf);
+        }
+    });
 }
 
 #[inline]
