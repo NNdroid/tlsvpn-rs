@@ -76,7 +76,6 @@ pub struct Args {
     pub mtu: u16,
     pub pad_mode: String,
     pub min_enc: String,
-    pub session_token: bool,
     pub max_sessions: i32,
     // 服务端接受的对端 FEC 分组大小 K 的区间（默认 = 协议边界，不额外限制）。
     // 越界的 FEC 请求按请求形态错误拒连，不夹取：见 server::handle_handshake。
@@ -134,9 +133,6 @@ struct ServerConfigFile {
     v6_cidr: String,
     cert: String,
     key: String,
-    // 重连接入既有会话时必须回带会话令牌（opt-in，默认关闭）
-    #[serde(default)]
-    session_token: bool,
     // 并发会话数上限（0 = 默认 1024）。Go 示例配置恒含此字段：不声明的话
     // deny_unknown_fields 会让 -c 指向 Go 的 config.server.json 直接解析失败。
     #[serde(default)]
@@ -183,13 +179,25 @@ fn load_config_file(path: &str) -> Result<Args, String> {
     // 是唯一还能看到原始 JSON 的地方。未写 encrypt 按开启处理——模板一直输出
     // true，省略字段若仍按零值 false 处理，整条链路会静默跑明文，与模板读起来
     // 完全相反。要显式关闭必须写 "encrypt": false。
-    let encrypt_present = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| v.get("encrypt").and_then(|e| e.as_bool()))
+    let mut raw_value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
+    let encrypt_present = raw_value
+        .get("encrypt")
+        .and_then(|e| e.as_bool())
         .is_some();
 
+    // server.session_token 已从配置契约删除：resume token 是 protocol v2 的强制属性。
+    // 升级时仍接受旧配置中的该键，但无论 true/false 都忽略；其余未知字段继续由
+    // deny_unknown_fields 严格拒绝，避免拼写错误静默失效。
+    if let Some(server) = raw_value
+        .get_mut("server")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        server.remove("session_token");
+    }
+
     let mut cfg: ConfigFile =
-        serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
+        serde_json::from_value(raw_value).map_err(|e| format!("parse config {}: {}", path, e))?;
 
     // source_rules 的 from 要就地补全成带掩码的形式，安装逻辑才不用自己推断地址族；
     // 表号没有可推导的默认值，漏写必须在启动前报出来。放在这里而不是 validate_args
@@ -264,7 +272,6 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         cert: cfg.server.cert,
         key: cfg.server.key,
-        session_token: cfg.server.session_token,
         // 0 = 默认 1024（对齐 Go applyDefaults）；客户端模式下该值无人消费
         max_sessions: if cfg.server.max_sessions == 0 {
             1024
@@ -712,9 +719,6 @@ fn main() {
         if !args.key.is_empty() {
             ignored.push("server.key");
         }
-        if args.session_token {
-            ignored.push("server.session_token");
-        }
         if args.max_sessions != 1024 {
             ignored.push("server.max_sessions");
         }
@@ -818,7 +822,6 @@ mod tests {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": true,
     "max_sessions": 1024
   }
 }
@@ -867,8 +870,8 @@ mod tests {
 
     #[test]
     fn go_config_files_parse_verbatim() {
-        // Go 的配置文件必须能被 Rust 原样读入（含 pad_mode / server.session_token /
-        // web.cert / web.key），否则 -c 指向 Go 配置时启动直接失败。
+        // Go 的当前配置文件必须能被 Rust 原样读入（含 pad_mode / web.cert /
+        // web.key），否则 -c 指向 Go 配置时启动直接失败。
         for (name, raw) in [("server", GO_SERVER_CONFIG), ("client", GO_CLIENT_CONFIG)] {
             let cfg = serde_json::from_str::<ConfigFile>(raw)
                 .unwrap_or_else(|e| panic!("Go {} 配置解析失败: {}", name, e));
@@ -877,11 +880,6 @@ mod tests {
                 assert_eq!(cfg.client.interface_manager, "self");
             }
             assert_eq!(cfg.pad_mode, "bucket", "{} 配置的 pad_mode 未读入", name);
-            assert!(
-                cfg.server.session_token == (name == "server"),
-                "{} 配置的 session_token 未按预期读入",
-                name
-            );
             // Go 配置不含 workers / mtu / min_enc，缺省值必须与 flag 默认一致
             assert_eq!(cfg.workers, 0);
             assert_eq!(cfg.mtu, 0, "mtu 缺省应由 load_config_file 归一到 1500");
@@ -907,7 +905,6 @@ mod tests {
             top.remove("pad_mode");
             top.remove("min_enc");
             if let Some(s) = top.get_mut("server").and_then(|s| s.as_object_mut()) {
-                s.remove("session_token");
                 s.remove("max_sessions");
             }
             if let Some(c) = top.get_mut("client").and_then(|c| c.as_object_mut()) {
@@ -921,11 +918,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Go {} 配置去字段后解析失败: {}", name, e));
             assert!(cfg.pad_mode.is_empty(), "{}: pad_mode 缺省应为空串", name);
             assert!(cfg.min_enc.is_empty(), "{}: min_enc 缺省应为空串", name);
-            assert!(
-                !cfg.server.session_token,
-                "{}: session_token 缺省应为 false",
-                name
-            );
             assert_eq!(
                 cfg.server.max_sessions, 0,
                 "{}: max_sessions 缺省应为 0",
@@ -1086,6 +1078,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_token_is_accepted_but_ignored() {
+        for legacy in [false, true] {
+            let mut v: serde_json::Value = serde_json::from_str(GO_SERVER_CONFIG).unwrap();
+            v["server"]["session_token"] = serde_json::json!(legacy);
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!(
+                "tlsvpn-legacy-session-token-{}-{}.json",
+                std::process::id(),
+                legacy
+            ));
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+            let args = load_config_file(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("legacy session_token={} rejected: {}", legacy, e));
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(args.mode, "server");
+        }
+    }
+
+    #[test]
     fn config_file_still_rejects_unknown_fields() {
         // 兼容三档字段不是靠放开 deny_unknown_fields 实现的
         let raw = GO_SERVER_CONFIG.replace(
@@ -1107,7 +1118,6 @@ mod tests {
         assert_eq!(cfg.mode, "client");
         assert_eq!(cfg.min_enc, "gcm");
         assert_eq!(cfg.pad_mode, "bucket");
-        assert!(cfg.server.session_token);
     }
 
     #[test]
@@ -1514,7 +1524,6 @@ fn example_config_json() -> &'static str {
     "v6_cidr": "fd00::/64",
     "cert": "",
     "key": "",
-    "session_token": true,
     "max_sessions": 1024
   }
 }"#
