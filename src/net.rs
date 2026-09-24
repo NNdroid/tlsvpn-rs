@@ -5,8 +5,8 @@ use mio;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
@@ -956,6 +956,9 @@ pub struct BackendNotify {
     waker: Arc<mio::Waker>,
     dirty: Arc<ArrayQueue<mio::Token>>,
     token: mio::Token,
+    // 同一 backend 只允许一个未消费的 wake。高吞吐时几十个连续 frame
+    // 合并成一次 poll 唤醒，避免每包 eventfd/write syscall。
+    pending: AtomicBool,
 }
 
 impl BackendNotify {
@@ -968,13 +971,29 @@ impl BackendNotify {
             waker,
             dirty,
             token,
+            pending: AtomicBool::new(false),
         }
     }
 
     #[inline]
     pub fn wake(&self) {
-        let _ = self.dirty.push(self.token);
-        let _ = self.waker.wake();
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // dirty 队列满时 poller 通常已经被其它 backend 唤醒；即使 token
+            // 没排进去，周期巡检仍会 drain。不能在这里阻塞数据面。
+            let _ = self.dirty.push(self.token);
+            let _ = self.waker.wake();
+        }
+    }
+
+    /// consumer 在开始 drain 前清 pending。之后若生产者又入队，它会重新
+    /// 触发 wake，因此不存在“清标志后新帧被吞掉”的 lost-wakeup 窗口。
+    #[inline]
+    pub fn consume_wake(&self) {
+        self.pending.store(false, Ordering::Release);
     }
 }
 
@@ -991,7 +1010,10 @@ pub struct AsyncPort {
     pub id: String,
     tx_seq: AtomicU32,
     backends: RwLock<Vec<Arc<Backend>>>,
-    preferred: Mutex<Option<Weak<Backend>>>,
+    // 后端列表在读锁保护期间索引稳定；用原子索引代替每包
+    // Mutex<Weak<Backend>> + upgrade/Arc 比较。
+    preferred: AtomicUsize,
+    schedule_tick: AtomicU32,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
@@ -1004,7 +1026,8 @@ impl AsyncPort {
             id,
             tx_seq: AtomicU32::new(0),
             backends: RwLock::new(Vec::new()),
-            preferred: Mutex::new(None),
+            preferred: AtomicUsize::new(usize::MAX),
+            schedule_tick: AtomicU32::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
@@ -1046,15 +1069,8 @@ impl AsyncPort {
         self.backends
             .write()
             .retain(|b| !b.ch.same_channel(ch_to_remove));
-        let mut preferred = self.preferred.lock();
-        if preferred
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map(|b| b.ch.same_channel(ch_to_remove))
-            .unwrap_or(false)
-        {
-            *preferred = None;
-        }
+        // 后端删除会改变 Vec 索引；这是冷路径，直接让下一帧重新评分。
+        self.preferred.store(usize::MAX, Ordering::Release);
     }
 
     fn drop_n(&self, n: u64) {
@@ -1099,42 +1115,58 @@ impl AsyncPort {
     }
 
     /// MinRTT + 积压评分，并为当前路径保留 12.5% RTT（最低 5ms）滞回。
-    /// 相近 WAN 连接的轻微抖动不会让相邻序号跨 TCP 流来回切换。
-    fn pick_backend(&self, backends: &[Arc<Backend>]) -> Option<Arc<Backend>> {
-        let mut best: Option<&Arc<Backend>> = None;
+    /// 返回后端索引，避免在每帧路径构造/升级 Weak Arc。
+    fn pick_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
+        let mut best_idx = None;
         let mut min_score = u32::MAX;
-        for b in backends {
-            let Some(score) = Self::backend_score(b) else { continue; };
+        for (idx, b) in backends.iter().enumerate() {
+            let Some(score) = Self::backend_score(b) else { continue };
             if score < min_score {
                 min_score = score;
-                best = Some(b);
+                best_idx = Some(idx);
             }
         }
-        let mut selected = best.or_else(|| backends.first()).cloned();
-        if let (Some(candidate), Some(current)) = (
-            selected.as_ref(),
-            self.preferred.lock().as_ref().and_then(Weak::upgrade),
-        ) {
-            if !Arc::ptr_eq(candidate, &current)
-                && backends.iter().any(|b| Arc::ptr_eq(b, &current))
-            {
-                if let Some(current_score) = Self::backend_score(&current) {
-                    let hysteresis = 5_000u32.max(current.rtt_cache.load(Ordering::Relaxed) / 8);
-                    if current_score as u64 <= min_score as u64 + hysteresis as u64 {
-                        selected = Some(current);
-                    }
+
+        let mut selected = best_idx.or_else(|| (!backends.is_empty()).then_some(0))?;
+        let current = self.preferred.load(Ordering::Relaxed);
+        if current < backends.len() && current != selected {
+            if let Some(current_score) = Self::backend_score(&backends[current]) {
+                let hysteresis =
+                    5_000u32.max(backends[current].rtt_cache.load(Ordering::Relaxed) / 8);
+                if current_score as u64 <= min_score as u64 + hysteresis as u64 {
+                    selected = current;
                 }
             }
         }
-        *self.preferred.lock() = selected.as_ref().map(Arc::downgrade);
-        selected
+        self.preferred.store(selected, Ordering::Relaxed);
+        Some(selected)
+    }
+
+    /// 数据帧热路径。路径 RTT/队列不会在相邻几个以太帧之间发生有意义的变化，
+    /// 因此正常情况下复用 16 帧当前后端；当前队列接近满时立即重新评分。
+    /// 这把 backends 扫描从“每包”降低到约“每 16 包一次”，同时保留快速故障切换。
+    fn selected_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
+        if backends.is_empty() {
+            return None;
+        }
+        if backends.len() == 1 {
+            self.preferred.store(0, Ordering::Relaxed);
+            return Some(0);
+        }
+
+        let current = self.preferred.load(Ordering::Relaxed);
+        let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
+        if (tick & 0x0f) != 0
+            && current < backends.len()
+            && Self::backend_score(&backends[current]).is_some()
+        {
+            return Some(current);
+        }
+        self.pick_backend_index(backends)
     }
 
     pub fn write_frame(&self, frame: Arc<Vec<u8>>) {
         if frame.is_empty() {
-            // 零长帧不携带数据：不消耗 seq、不参与 FEC 分组
-            // （对齐 Go a2701e4：否则接收端按算术分组会把该槽位视为
-            // 永久缺失，毒化整组恢复）
             return;
         }
         let backends = self.backends.read();
@@ -1147,14 +1179,20 @@ impl AsyncPort {
             self.drop_n(1);
             return;
         };
-        // 编码器只持有一次锁：ResetEpoch 与数据线程并发时不会在两次 lock
-        // 之间把 Some 改成 None，避免旧版 unwrap 竞态。
-        let parity = self.encoder.lock().as_mut().and_then(|enc| enc.add(seq, &frame));
-        if let Some(b) = self.pick_backend(&backends) {
-            self.send_frame_to(&b, seq, &frame);
+
+        // FEC encoder 是 session/port 级串行状态；只持锁一次。
+        let parity = self
+            .encoder
+            .lock()
+            .as_mut()
+            .and_then(|enc| enc.add(seq, &frame));
+
+        if let Some(idx) = self.selected_backend_index(&backends) {
+            self.send_frame_to(&backends[idx], seq, &frame);
         } else {
             self.drop_n(1);
         }
+
         if let Some(par) = parity {
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
             let par = Arc::new(par);
