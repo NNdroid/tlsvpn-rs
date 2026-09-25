@@ -1571,23 +1571,21 @@ impl VSwitch {
             }
         }
 
-        let mut known_unicast = false;
         if (dst_mac[0] & 1) == 0 {
             if let Some(entry) = self.mac_table.get(&dst_mac) {
-                known_unicast = true;
                 // 保持 MAC entry guard 到 ports lookup 完成，直接借用 &str；
                 // 旧代码每个已知单播都 clone String，产生一次堆分配。
                 if entry.port_id != src_port_id {
                     if let Some(port) = self.ports.get(entry.port_id.as_str()) {
-                        port.write_frame(frame.clone());
+                        // 已知单播是唯一消费者，直接移动 Arc，连引用计数增减也省掉。
+                        port.write_frame(frame);
                     }
                 }
+                return;
             }
         }
 
-        if !known_unicast {
-            self.flood(src_port_id, frame);
-        }
+        self.flood(src_port_id, frame);
     }
 
     /// 洪泛到所有其他端口，但每源端口有独立的广播预算：线速广播会被复制
