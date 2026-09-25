@@ -1015,6 +1015,7 @@ pub struct AsyncPort {
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
     schedule_tick: AtomicU32,
+    data_cursor: AtomicUsize,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
@@ -1030,6 +1031,7 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
             schedule_tick: AtomicU32::new(0),
+            data_cursor: AtomicUsize::new(0),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1046,6 +1048,7 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
+        self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
         *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
             Some(FecEncoder::new(k, ic))
@@ -1083,10 +1086,10 @@ impl AsyncPort {
         }
     }
 
-    /// 以 Arc 共享帧投递给单个后端（零拷贝：引用计数 +1）；队列满时丢弃。
-    /// 投递成功即唤醒后端 poller（事件驱动，替代轮询）。
-    /// 返回 0（成功）或 1（丢弃），用于丢帧统计。
-    fn send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> u64 {
+    /// 尝试把共享帧投递给单个后端。失败时不记 drop，让调用方有机会
+    /// 尝试其它物理路径；只有所有后端都满时才统一计一次丢包。
+    #[inline]
+    fn try_send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> bool {
         if b.ch
             .try_send(VPNFrame {
                 seq,
@@ -1094,13 +1097,46 @@ impl AsyncPort {
             })
             .is_err()
         {
-            self.drop_n(1);
-            return 1;
+            return false;
         }
         if let Some(n) = &b.notify {
             n.wake();
         }
-        0
+        true
+    }
+
+    fn send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> u64 {
+        if self.try_send_frame_to(b, seq, data) {
+            return 0;
+        }
+        self.drop_n(1);
+        1
+    }
+
+    /// 数据面投递：优先 selected path；该队列在选择与真正 enqueue 之间若
+    /// 瞬时塞满，就尝试其它健康后端，避免无谓制造 sequence hole。
+    fn send_data_frame_to_any(
+        &self,
+        backends: &[Arc<Backend>],
+        preferred_idx: Option<usize>,
+        seq: u32,
+        data: &Arc<Vec<u8>>,
+    ) -> Option<usize> {
+        if let Some(idx) = preferred_idx {
+            if idx < backends.len() && self.try_send_frame_to(&backends[idx], seq, data) {
+                return Some(idx);
+            }
+        }
+        for (idx, b) in backends.iter().enumerate() {
+            if Some(idx) == preferred_idx || Self::backend_score(b).is_none() {
+                continue;
+            }
+            if self.try_send_frame_to(b, seq, data) {
+                return Some(idx);
+            }
+        }
+        self.drop_n(1);
+        None
     }
 
     fn backend_score(b: &Backend) -> Option<u32> {
@@ -1146,10 +1182,12 @@ impl AsyncPort {
         Some(selected)
     }
 
-    /// 数据帧热路径。路径 RTT/队列不会在相邻几个以太帧之间发生有意义的变化，
-    /// 因此正常情况下复用 16 帧当前后端；当前队列接近满时立即重新评分。
-    /// 这把 backends 扫描从“每包”降低到约“每 16 包一次”，同时保留快速故障切换。
-    fn selected_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
+    const MULTIPATH_STRIPE_BACKLOG: usize = 32;
+
+    /// 低负载保持 sticky MinRTT；只有当前可用路径已经出现持续队列积压时，
+    /// 才在 RTT/score 接近最佳值的健康路径间轮转。Rust 没有 Go AsyncPort 的
+    /// 输入队列，因此用 backend backlog 作为 bulk-pressure 信号。
+    fn selected_data_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
         if backends.is_empty() {
             return None;
         }
@@ -1159,14 +1197,37 @@ impl AsyncPort {
         }
 
         let current = self.preferred.load(Ordering::Relaxed);
-        let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
-        if (tick & 0x0f) != 0
-            && current < backends.len()
-            && Self::backend_score(&backends[current]).is_some()
-        {
-            return Some(current);
+        let under_pressure = current < backends.len()
+            && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_BACKLOG;
+
+        if !under_pressure {
+            let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
+            if (tick & 0x0f) != 0
+                && current < backends.len()
+                && Self::backend_score(&backends[current]).is_some()
+            {
+                return Some(current);
+            }
+            return self.pick_backend_index(backends);
         }
-        self.pick_backend_index(backends)
+
+        let best = self.pick_backend_index(backends)?;
+        let best_rtt = backends[best].rtt_cache.load(Ordering::Relaxed);
+        let slack = 5_000u32.max(best_rtt / 4);
+        let max_rtt = best_rtt as u64 + slack as u64;
+        let best_score = Self::backend_score(&backends[best]).unwrap_or(best_rtt);
+        let max_score = best_score as u64 + slack as u64;
+
+        let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        for offset in 0..backends.len() {
+            let idx = (start + offset) % backends.len();
+            let Some(score) = Self::backend_score(&backends[idx]) else { continue };
+            let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
+            if rtt as u64 <= max_rtt && score as u64 <= max_score {
+                return Some(idx);
+            }
+        }
+        Some(best)
     }
 
     /// parity 只需被会话级 decoder 收到一份。多连接时从轮转游标开始，
@@ -1227,12 +1288,8 @@ impl AsyncPort {
             .as_mut()
             .and_then(|enc| enc.add(seq, &frame));
 
-        let data_idx = self.selected_backend_index(&backends);
-        if let Some(idx) = data_idx {
-            self.send_frame_to(&backends[idx], seq, &frame);
-        } else {
-            self.drop_n(1);
-        }
+        let selected_idx = self.selected_data_backend_index(&backends);
+        let data_idx = self.send_data_frame_to_any(&backends, selected_idx, seq, &frame);
 
         if let Some(par) = parity {
             if backends.len() < 2 {
