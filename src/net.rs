@@ -1548,6 +1548,11 @@ impl VSwitch {
                     }
                 }
 
+                // 统一锁顺序为 ports -> mac_table。remove_port() 也是先删 ports
+                // 再 retain mac_table；如果在 entry shard guard 内再 ports.get()，
+                // 会形成 mac -> ports / ports -> mac 的反向锁序并存在死锁风险。
+                let learned_port = self.ports.get(src_port_id).map(|p| p.value().clone());
+
                 // entry() 把“检查是否刚被固定”为 static 和更新放进同一 shard lock，
                 // 避免握手线程与动态学习线程竞态时覆盖 static mapping。
                 match self.mac_table.entry(src_mac) {
@@ -1560,17 +1565,15 @@ impl VSwitch {
                                 return;
                             }
                         } else {
-                            let learned_port = self.ports.get(src_port_id).map(|p| p.value().clone());
                             occupied.insert(MacEntry {
                                 port_id: src_port_id.to_string(),
-                                port: learned_port,
+                                port: learned_port.clone(),
                                 updated_at: Instant::now(),
                                 static_entry: was_static,
                             });
                         }
                     }
                     Entry::Vacant(vacant) => {
-                        let learned_port = self.ports.get(src_port_id).map(|p| p.value().clone());
                         vacant.insert(MacEntry {
                             port_id: src_port_id.to_string(),
                             port: learned_port,
