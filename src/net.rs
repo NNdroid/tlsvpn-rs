@@ -1633,6 +1633,63 @@ mod tests {
     }
 
     #[test]
+    fn async_port_bulk_stripes_only_across_close_rtt_paths() {
+        let port = AsyncPort::new("bulk-stripe".into());
+
+        let mk = |rtt: u32| {
+            let (tx, _rx) = crossbeam_channel::bounded(4096);
+            Arc::new(Backend {
+                ch: tx,
+                rtt_cache: Arc::new(AtomicU32::new(rtt)),
+                notify: None,
+            })
+        };
+        let a = mk(100_000);
+        let b = mk(105_000);
+        let slow = mk(180_000);
+        let backends = vec![a, b, slow];
+
+        let mut used = std::collections::HashSet::new();
+        // 48 tight calls contain multiple 16-frame reevaluation points inside the
+        // bulk window, so the close-RTT paths should both carry chunks.
+        for _ in 0..48 {
+            used.insert(port.selected_backend_index(&backends).unwrap());
+        }
+
+        assert!(used.contains(&0), "best path must carry bulk traffic");
+        assert!(used.contains(&1), "close-RTT path should be used for bulk striping");
+        assert!(
+            !used.contains(&2),
+            "slow path must stay excluded from bulk striping: used={used:?}"
+        );
+    }
+
+    #[test]
+    fn async_port_sparse_traffic_stays_on_min_rtt_path() {
+        let port = AsyncPort::new("sparse-sticky".into());
+        let mk = |rtt: u32| {
+            let (tx, _rx) = crossbeam_channel::bounded(4096);
+            Arc::new(Backend {
+                ch: tx,
+                rtt_cache: Arc::new(AtomicU32::new(rtt)),
+                notify: None,
+            })
+        };
+        let backends = vec![mk(100_000), mk(105_000)];
+
+        assert_eq!(port.selected_backend_index(&backends), Some(0));
+        std::thread::sleep(DATA_STRIPE_BULK_GAP + Duration::from_millis(2));
+        for _ in 0..15 {
+            assert_eq!(port.selected_backend_index(&backends), Some(0));
+        }
+        assert_eq!(
+            port.selected_backend_index(&backends),
+            Some(0),
+            "sparse traffic must keep MinRTT rather than stripe"
+        );
+    }
+
+    #[test]
     fn backend_notify_coalesces_until_consumed() {
         let mut poll = mio::Poll::new().unwrap();
         let dirty = Arc::new(ArrayQueue::new(8));
