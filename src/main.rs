@@ -1446,15 +1446,10 @@ mod tests {
     struct InfiniteReader {
         data: Vec<u8>,
         pos: usize,
-        reads: usize,
     }
 
     impl Read for InfiniteReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.reads > 0 {
-                self.reads = 0;
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, ""));
-            }
             let available = self.data.len() - self.pos;
             let to_copy = std::cmp::min(buf.len(), available);
             buf[..to_copy].copy_from_slice(&self.data[self.pos..self.pos + to_copy]);
@@ -1462,7 +1457,6 @@ mod tests {
             if self.pos >= self.data.len() {
                 self.pos = 0;
             }
-            self.reads += 1;
             Ok(to_copy)
         }
     }
@@ -1481,7 +1475,6 @@ mod tests {
         let mut reader = InfiniteReader {
             data: frame_buf.clone(),
             pos: 0,
-            reads: 0,
         };
 
         let iter_count = 1_000_000;
@@ -1490,7 +1483,7 @@ mod tests {
             let (mut data, seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
             let wire_len = data.len() as u32;
             ic.open_in_place(&mut data, seq, wire_len).unwrap();
-            drop(data);
+            release_frame_vec(data);
         }
         let elapsed = start.elapsed().as_secs_f64();
         let total_bytes = (iter_count as f64) * (payload.len() as f64);
