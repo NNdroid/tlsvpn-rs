@@ -1620,6 +1620,52 @@ mod tests {
     }
 
     #[test]
+    fn bulk_striping_uses_only_low_rtt_uncongested_paths() {
+        let port = AsyncPort::new("bulk-striping".into());
+
+        let (a, _ra) = make_backend();
+        let (b, _rb) = make_backend();
+        let (slow, _rs) = make_backend();
+        a.rtt_cache.store(10_000, Ordering::Relaxed);
+        b.rtt_cache.store(11_000, Ordering::Relaxed);
+        slow.rtt_cache.store(30_000, Ordering::Relaxed);
+        let backends = vec![a.clone(), b.clone(), slow.clone()];
+
+        // 轻载：仍然使用 MinRTT。
+        for _ in 0..8 {
+            assert_eq!(port.selected_backend_index(&backends), Some(0));
+        }
+
+        // bulk helper 本身只允许 A/B 参加，30ms 路径不能被轮转到。
+        let mut seen_a = false;
+        let mut seen_b = false;
+        for _ in 0..24 {
+            match port.bulk_backend_index(&backends) {
+                Some(0) => seen_a = true,
+                Some(1) => seen_b = true,
+                Some(2) => panic!("high-RTT backend participated in striping"),
+                other => panic!("unexpected backend selection: {:?}", other),
+            }
+        }
+        assert!(seen_a && seen_b, "both low-RTT paths must participate");
+
+        // 即使 RTT 接近，明显积压的 B 也必须退出候选集。
+        for i in 0..20u32 {
+            b.ch.try_send(VPNFrame {
+                seq: i + 1,
+                data: Arc::new(vec![0u8; 64]),
+            }).unwrap();
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                port.bulk_backend_index(&backends),
+                Some(0),
+                "queued backend must not participate in striping"
+            );
+        }
+    }
+
+    #[test]
     fn backend_notify_coalesces_until_consumed() {
         let mut poll = mio::Poll::new().unwrap();
         let dirty = Arc::new(ArrayQueue::new(8));
