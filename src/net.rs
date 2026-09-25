@@ -1,6 +1,6 @@
 use crossbeam_channel::{Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use mio;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -1332,6 +1332,7 @@ impl AsyncPort {
 struct MacEntry {
     port_id: String,
     updated_at: Instant,
+    static_entry: bool,
 }
 
 pub struct VSwitch {
@@ -1380,9 +1381,9 @@ impl VSwitch {
         let vs_clone = vs.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(300));
-            vs_clone
-                .mac_table
-                .retain(|_, entry| entry.updated_at.elapsed() < Duration::from_secs(1800));
+            vs_clone.mac_table.retain(|_, entry| {
+                entry.static_entry || entry.updated_at.elapsed() < Duration::from_secs(1800)
+            });
         });
 
         vs
@@ -1395,6 +1396,23 @@ impl VSwitch {
 
     pub fn add_port(&self, id: String, port: Arc<AsyncPort>) {
         self.ports.insert(id, port);
+    }
+
+    /// 已认证 session 的注册 MAC 在握手期固定到端口。static entry 生命周期
+    /// 与端口一致，因此数据热路径无需每帧 DashMap 源查找/Instant::elapsed/
+    /// validate_mac 回调。
+    pub fn add_static_mac(&self, port_id: String, mac: [u8; 6]) {
+        if mac == [0u8; 6] {
+            return;
+        }
+        self.mac_table.insert(
+            mac,
+            MacEntry {
+                port_id,
+                updated_at: Instant::now(),
+                static_entry: true,
+            },
+        );
     }
 
     pub fn remove_port(&self, id: &str) {
@@ -1442,13 +1460,37 @@ impl VSwitch {
                         m[0], m[1], m[2], m[3], m[4], m[5]
                     ),
                     e.value().port_id.clone(),
-                    e.value().updated_at.elapsed().as_secs(),
+                    if e.value().static_entry {
+                        0
+                    } else {
+                        e.value().updated_at.elapsed().as_secs()
+                    },
                 )
             })
             .collect()
     }
 
     pub fn process_frame(&self, src_port_id: &str, frame: Arc<Vec<u8>>) {
+        self.process_frame_inner(src_port_id, None, frame)
+    }
+
+    /// 已认证 session 热路径：registered_mac 在握手期已经固定并写入 static
+    /// MAC 表项。每包只比较 6 字节，不再查询源 MAC DashMap 或 sessions 锁。
+    pub fn process_session_frame(
+        &self,
+        src_port_id: &str,
+        registered_mac: [u8; 6],
+        frame: Arc<Vec<u8>>,
+    ) {
+        self.process_frame_inner(src_port_id, Some(registered_mac), frame)
+    }
+
+    fn process_frame_inner(
+        &self,
+        src_port_id: &str,
+        registered_mac: Option<[u8; 6]>,
+        frame: Arc<Vec<u8>>,
+    ) {
         if frame.len() < 14 {
             return;
         }
@@ -1463,33 +1505,69 @@ impl VSwitch {
         let mut src_mac = [0u8; 6];
         src_mac.copy_from_slice(&frame[6..12]);
 
-        // MAC 学习：仅在端口变化或超过 5 秒时写入（对齐 Go needUpdate，
-        // 避免每帧分配 String）
-        let need_update = match self.mac_table.get(&src_mac) {
-            Some(e) => e.port_id != src_port_id || e.updated_at.elapsed() > Duration::from_secs(5),
-            None => true,
-        };
-        if need_update {
-            // 源 MAC 归属校验：端口只能声明自己会话注册的 MAC。冒充帧整帧丢弃
-            // （既不学习也不转发——转发等于允许攻击者以受害者身份注入流量）。
-            if let Some(f) = self.validate_mac.read().as_ref() {
-                if !f(src_port_id, &src_mac) {
-                    self.spoof_drops.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
-                        "VSWITCH drop spoofed srcMAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} from port {}",
-                        src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
-                        src_port_id
-                    );
-                    return;
+        if let Some(registered) = registered_mac.filter(|m| *m != [0u8; 6]) {
+            if src_mac != registered {
+                self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        } else {
+            // TAP / legacy-no-MAC 仍走动态学习。static session entry 不可被其它
+            // 动态端口覆盖；可信 TAP 可携带相同源 MAC 转发，但不会改写映射。
+            let (need_update, static_elsewhere) = match self.mac_table.get(&src_mac) {
+                Some(e) if e.static_entry => (false, e.port_id != src_port_id),
+                Some(e) => (
+                    e.port_id != src_port_id
+                        || e.updated_at.elapsed() > Duration::from_secs(5),
+                    false,
+                ),
+                None => (true, false),
+            };
+
+            if static_elsewhere && src_port_id != self.trusted_port {
+                self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            if need_update {
+                if let Some(f) = self.validate_mac.read().as_ref() {
+                    if !f(src_port_id, &src_mac) {
+                        self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            "VSWITCH drop spoofed srcMAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} from port {}",
+                            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+                            src_port_id
+                        );
+                        return;
+                    }
+                }
+
+                // entry() 把“检查是否刚被固定”为 static 和更新放进同一 shard lock，
+                // 避免握手线程与动态学习线程竞态时覆盖 static mapping。
+                match self.mac_table.entry(src_mac) {
+                    Entry::Occupied(mut occupied) => {
+                        let current = occupied.get();
+                        if current.static_entry && current.port_id != src_port_id {
+                            if src_port_id != self.trusted_port {
+                                self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        } else {
+                            occupied.insert(MacEntry {
+                                port_id: src_port_id.to_string(),
+                                updated_at: Instant::now(),
+                                static_entry: current.static_entry,
+                            });
+                        }
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(MacEntry {
+                            port_id: src_port_id.to_string(),
+                            updated_at: Instant::now(),
+                            static_entry: false,
+                        });
+                    }
                 }
             }
-            self.mac_table.insert(
-                src_mac,
-                MacEntry {
-                    port_id: src_port_id.to_string(),
-                    updated_at: Instant::now(),
-                },
-            );
         }
 
         let mut target_port_id = None;
