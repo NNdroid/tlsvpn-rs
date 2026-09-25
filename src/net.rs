@@ -1651,7 +1651,7 @@ mod tests {
 
         // 真实生产入口：当前 A 队列积压到阈值，且到 16-frame burst 边界时，
         // selected_backend_index 必须能切到 B，而不是 helper 永远没人调用。
-        for i in 0..Self::MULTIPATH_STRIPE_QUEUE {
+        for i in 0..AsyncPort::MULTIPATH_STRIPE_QUEUE {
             a.ch.try_send(VPNFrame {
                 seq: 100 + i as u32,
                 data: Arc::new(vec![0u8; 64]),
