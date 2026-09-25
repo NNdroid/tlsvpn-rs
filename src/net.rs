@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use mio;
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
-use crate::buffer::release_frame_vec;
+use crate::buffer::{release_frame_vec, release_shared_frame};
 use crate::crypto::*;
 use crate::fec::FecEncoder;
 use crate::frame::VPNFrame;
@@ -1060,56 +1060,72 @@ impl AsyncPort {
         }
     }
 
-    /// 尝试把共享帧投递给单个后端。失败时不记 drop，让调用方有机会
-    /// 尝试其它物理路径；只有所有后端都满时才统一计一次丢包。
+    /// 尝试把 Arc 所有权直接投递给单个后端。crossbeam 在队列满/断开时
+    /// 会把原 VPNFrame 返还，因此 fallback 到下一条物理路径无需 Arc::clone。
+    /// 成功路径也不再有“clone + 调用方 drop”这一对原子引用计数操作。
     #[inline]
-    fn try_send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> bool {
-        if b.ch
-            .try_send(VPNFrame {
-                seq,
-                data: data.clone(),
-            })
-            .is_err()
-        {
-            return false;
+    fn try_send_owned_frame_to(
+        &self,
+        b: &Backend,
+        seq: u32,
+        data: Arc<Vec<u8>>,
+    ) -> Result<(), Arc<Vec<u8>>> {
+        match b.ch.try_send(VPNFrame { seq, data }) {
+            Ok(()) => {
+                if let Some(n) = &b.notify {
+                    n.wake();
+                }
+                Ok(())
+            }
+            Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => {
+                Err(frame.data)
+            }
         }
-        if let Some(n) = &b.notify {
-            n.wake();
-        }
-        true
     }
 
-    fn send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> u64 {
-        if self.try_send_frame_to(b, seq, data) {
-            return 0;
+    fn send_owned_frame_to(&self, b: &Backend, seq: u32, data: Arc<Vec<u8>>) -> u64 {
+        match self.try_send_owned_frame_to(b, seq, data) {
+            Ok(()) => 0,
+            Err(data) => {
+                self.drop_n(1);
+                release_shared_frame(data);
+                1
+            }
         }
-        self.drop_n(1);
-        1
     }
 
-    /// 数据面投递：优先 selected path；该队列在选择与真正 enqueue 之间若
-    /// 瞬时塞满，就尝试其它健康后端，避免无谓制造 sequence hole。
-    fn send_data_frame_to_any(
+    /// 数据面投递：优先 selected path；若选择与 enqueue 之间该队列瞬时塞满，
+    /// 从 TrySendError 取回同一个 Arc，再 move 到其它健康路径。
+    fn send_data_frame_to_any_owned(
         &self,
         backends: &[Arc<Backend>],
         preferred_idx: Option<usize>,
         seq: u32,
-        data: &Arc<Vec<u8>>,
+        data: Arc<Vec<u8>>,
     ) -> Option<usize> {
+        let mut data = data;
+
         if let Some(idx) = preferred_idx {
-            if idx < backends.len() && self.try_send_frame_to(&backends[idx], seq, data) {
-                return Some(idx);
+            if idx < backends.len() {
+                match self.try_send_owned_frame_to(&backends[idx], seq, data) {
+                    Ok(()) => return Some(idx),
+                    Err(returned) => data = returned,
+                }
             }
         }
+
         for (idx, b) in backends.iter().enumerate() {
             if Some(idx) == preferred_idx || Self::backend_score(b).is_none() {
                 continue;
             }
-            if self.try_send_frame_to(b, seq, data) {
-                return Some(idx);
+            match self.try_send_owned_frame_to(b, seq, data) {
+                Ok(()) => return Some(idx),
+                Err(returned) => data = returned,
             }
         }
+
         self.drop_n(1);
+        release_shared_frame(data);
         None
     }
 
@@ -1274,7 +1290,7 @@ impl AsyncPort {
             .and_then(|enc| enc.add(seq, &frame));
 
         let selected_idx = self.selected_data_backend_index(&backends);
-        let data_idx = self.send_data_frame_to_any(&backends, selected_idx, seq, &frame);
+        let data_idx = self.send_data_frame_to_any_owned(&backends, selected_idx, seq, frame);
 
         if let Some(par) = parity {
             if backends.len() < 2 {
@@ -1287,9 +1303,10 @@ impl AsyncPort {
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
             let par = Arc::new(par);
             if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
-                self.send_frame_to(&backends[idx], 0, &par);
+                self.send_owned_frame_to(&backends[idx], 0, par);
             } else {
                 self.drop_n(1);
+                release_shared_frame(par);
             }
         }
     }
