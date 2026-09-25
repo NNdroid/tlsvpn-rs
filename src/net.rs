@@ -2001,6 +2001,82 @@ mod tests {
     }
 
     #[test]
+    fn static_session_mac_fast_path_skips_validator_and_aging() {
+        let vs = VSwitch::new();
+        let port_a = Arc::new(AsyncPort::new("A".into()));
+        let (backend_a, _rx_a) = make_backend();
+        port_a.register_backend(backend_a);
+        vs.add_port("A".into(), port_a);
+
+        let mac_a = [0x02, 0, 0, 0, 0, 0x11];
+        vs.add_static_mac("A".into(), mac_a);
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cb = calls.clone();
+        vs.set_validate_mac(Arc::new(move |_, _| {
+            calls_cb.fetch_add(1, Ordering::Relaxed);
+            false
+        }));
+
+        vs.process_session_frame("A", mac_a, eth_frame(&mac_a, &mac_a, &[0x01]));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(vs.spoof_drops(), 0);
+
+        let entry = vs.mac_table.get(&mac_a).expect("static MAC entry");
+        assert_eq!(entry.port_id, "A");
+        assert!(entry.static_entry);
+        drop(entry);
+
+        // static mapping 不参与动态 aging；快照年龄固定为 0。
+        {
+            let mut entry = vs.mac_table.get_mut(&mac_a).unwrap();
+            entry.updated_at = Instant::now() - Duration::from_secs(7200);
+        }
+        vs.mac_table.retain(|_, entry| {
+            entry.static_entry || entry.updated_at.elapsed() < Duration::from_secs(1800)
+        });
+        assert_eq!(vs.mac_port(&mac_a), Some("A".to_string()));
+        let snap = vs.mac_snapshot();
+        let row = snap.iter().find(|(m, _, _)| m.ends_with(":11")).unwrap();
+        assert_eq!(row.2, 0);
+
+        let spoof = [0x02, 0, 0, 0, 0, 0x22];
+        vs.process_session_frame("A", mac_a, eth_frame(&mac_a, &spoof, &[0x02]));
+        assert_eq!(vs.spoof_drops(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dynamic_port_cannot_overwrite_static_session_mac() {
+        let vs = VSwitch::new();
+        let port_a = Arc::new(AsyncPort::new("A".into()));
+        let port_legacy = Arc::new(AsyncPort::new("LEGACY".into()));
+        let port_tap = Arc::new(AsyncPort::new(TAP_PORT_ID.into()));
+        let (backend_a, rx_a) = make_backend();
+        port_a.register_backend(backend_a);
+        vs.add_port("A".into(), port_a);
+        vs.add_port("LEGACY".into(), port_legacy);
+        vs.add_port(TAP_PORT_ID.into(), port_tap);
+
+        let mac_a = [0x02, 0, 0, 0, 0, 0x41];
+        vs.add_static_mac("A".into(), mac_a);
+        vs.set_validate_mac(Arc::new(|port, _| port == "LEGACY" || port == TAP_PORT_ID));
+
+        // legacy/no-MAC 端口即使 validate 回调放行，也不能抢走 pinned mapping。
+        vs.process_frame("LEGACY", eth_frame(&mac_a, &mac_a, &[0x01]));
+        assert_eq!(vs.spoof_drops(), 1);
+        assert_eq!(vs.mac_port(&mac_a), Some("A".to_string()));
+        assert!(rx_a.try_recv().is_err(), "legacy spoof must be dropped");
+
+        // trusted TAP 可发送同源 MAC，但 mapping 仍保持指向 authenticated session。
+        vs.process_frame(TAP_PORT_ID, eth_frame(&mac_a, &mac_a, &[0x02]));
+        assert_eq!(vs.spoof_drops(), 1);
+        assert_eq!(vs.mac_port(&mac_a), Some("A".to_string()));
+        let delivered = rx_a.try_recv().expect("trusted TAP frame should forward");
+        release_shared_frame(delivered.data);
+    }
+
+    #[test]
     fn src_mac_ownership_blocks_impersonation() {
         let vs = VSwitch::new();
         let port_a = Arc::new(AsyncPort::new("A".into()));
