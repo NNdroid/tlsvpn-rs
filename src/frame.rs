@@ -105,16 +105,77 @@ impl FrameScanner {
         }
     }
 
+    /// 如果当前扫描缓冲已经含有完整帧，优先直接取出，不触碰底层 reader。
+    ///
+    /// TCP/TLS 一次 read 经常带回多帧；旧实现每次 read_frame() 都先再次调用
+    /// reader.read()，即使 buffer 里已经有完整帧，也会额外制造一次
+    /// read/WOULDBLOCK syscall。Go FrameScanner 一直是“缓存优先”，这里对齐它。
+    fn take_buffered_frame(&mut self) -> io::Result<Option<(Vec<u8>, u32)>> {
+        let available = self.buffer.len() - self.offset;
+        if available < HEADER_SIZE {
+            return Ok(None);
+        }
+
+        let data_len =
+            BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
+        let pad_len =
+            BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
+        let seq = BigEndian::read_u32(&self.buffer[self.offset + 6..self.offset + 10]);
+
+        if data_len > self.max_data_len {
+            self.buffer.clear();
+            self.offset = 0;
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid frame data length",
+            ));
+        }
+
+        let total_len = data_len + pad_len;
+        if available < HEADER_SIZE + total_len {
+            return Ok(None);
+        }
+
+        let payload_start = self.offset + HEADER_SIZE;
+        self.offset += HEADER_SIZE + total_len;
+
+        let out = if data_len == 0 {
+            // 心跳/控制帧：返回空帧给调用方，由读循环刷新读超时。
+            (Vec::new(), seq)
+        } else {
+            let mut data = acquire_frame_vec(data_len);
+            data.copy_from_slice(&self.buffer[payload_start..payload_start + data_len]);
+            (data, seq)
+        };
+
+        self.compact_consumed();
+        Ok(Some(out))
+    }
+
+    #[inline]
+    fn compact_consumed(&mut self) {
+        if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384) {
+            let remain = self.buffer.len() - self.offset;
+            self.buffer.copy_within(self.offset.., 0);
+            self.buffer.truncate(remain);
+            self.offset = 0;
+        }
+    }
+
     /// 读取一帧。与 Go 行为一致：
-    /// - dataLen > max_data_len → InvalidData 错误并清空缓冲（认证前为
-    ///   HANDSHAKE_DATA_LENGTH，认证后为 MAX_DATA_LENGTH）；
-    /// - dataLen == 0 的空帧（心跳等）直接跳过，不返回给调用方；
-    /// - 无完整帧时返回 Ok(None)。
+    /// - 优先消费扫描缓冲中已经完整的帧，避免每帧额外 read/WOULDBLOCK；
+    /// - dataLen > max_data_len → InvalidData 错误并清空缓冲；
+    /// - dataLen == 0 的空帧返回空 Vec，供调用方刷新空闲计时；
+    /// - 无完整帧且底层暂不可读时返回 Ok(None)。
     pub fn read_frame<R: Read>(&mut self, reader: &mut R) -> io::Result<Option<(Vec<u8>, u32)>> {
-        // 直接读进缓冲的空闲尾部，省一次 16KB 栈→堆中转拷贝。
-        // 与 bytes crate 内部相同的 spare-capacity 模式：read 只写前 n 字节，
-        // 写完立即 set_len 暴露且仅暴露已初始化部分。
         loop {
+            if let Some(frame) = self.take_buffered_frame()? {
+                return Ok(Some(frame));
+            }
+
+            // 有已消费前缀时先整理，给后续 socket read 尽量大的连续尾部。
+            self.compact_consumed();
+
             if self.buffer.len() == self.buffer.capacity() {
                 self.buffer.reserve(16384);
             }
@@ -123,75 +184,16 @@ impl FrameScanner {
             match reader
                 .read(unsafe { std::slice::from_raw_parts_mut(base.add(self.buffer.len()), spare) })
             {
-                Ok(0) => break,
+                Ok(0) => return Ok(None),
                 Ok(n) => unsafe {
                     self.buffer.set_len(self.buffer.len() + n);
                 },
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
                 Err(e) => return Err(e),
             }
         }
-
-        let available = self.buffer.len() - self.offset;
-        if available >= HEADER_SIZE {
-            let data_len = BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
-            let pad_len =
-                BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
-            let seq = BigEndian::read_u32(&self.buffer[self.offset + 6..self.offset + 10]);
-            let total_len = data_len + pad_len;
-
-            if data_len > self.max_data_len {
-                self.buffer.clear();
-                self.offset = 0;
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "invalid frame data length",
-                ));
-            }
-
-            if available >= HEADER_SIZE + total_len {
-                self.offset += HEADER_SIZE + total_len;
-
-                if data_len == 0 {
-                    // 心跳/控制帧：返回空帧给调用方，由读循环刷新读超时。
-                    // 旧实现（Go 与本仓库）在此静默跳过，导致空闲隧道的
-                    // 30 秒读超时永不刷新、每 30 秒被误杀重连一次
-                    // （对齐 Go a2701e4 后的 ReadFrame 语义）。
-                    if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384)
-                    {
-                        let remain = self.buffer.len() - self.offset;
-                        self.buffer.copy_within(self.offset.., 0);
-                        self.buffer.truncate(remain);
-                        self.offset = 0;
-                    }
-                    return Ok(Some((Vec::new(), seq)));
-                }
-
-                let mut data = acquire_frame_vec(data_len);
-                data.copy_from_slice(
-                    &self.buffer[self.offset - total_len..self.offset - total_len + data_len],
-                );
-
-                // 压缩缓冲区（对齐 Go：offset==len 或 offset>16384 时整理）
-                if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384) {
-                    let remain = self.buffer.len() - self.offset;
-                    self.buffer.copy_within(self.offset.., 0);
-                    self.buffer.truncate(remain);
-                    self.offset = 0;
-                }
-
-                return Ok(Some((data, seq)));
-            }
-        }
-
-        if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384) {
-            let remain = self.buffer.len() - self.offset;
-            self.buffer.copy_within(self.offset.., 0);
-            self.buffer.truncate(remain);
-            self.offset = 0;
-        }
-        Ok(None)
     }
+
 }
 
 #[derive(Clone)]
@@ -271,6 +273,55 @@ mod tests {
         buf.extend_from_slice(&data_len.to_be_bytes());
         buf.extend_from_slice(&pad_len.to_be_bytes());
         buf.extend_from_slice(&seq.to_be_bytes());
+    }
+
+    struct OneBurstReader {
+        data: Vec<u8>,
+        sent: bool,
+        reads: usize,
+    }
+
+    impl std::io::Read for OneBurstReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.sent {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            assert!(out.len() >= self.data.len());
+            out[..self.data.len()].copy_from_slice(&self.data);
+            self.sent = true;
+            Ok(self.data.len())
+        }
+    }
+
+    #[test]
+    fn buffered_frames_are_consumed_before_reader_reentry() {
+        let mut burst = Vec::new();
+        append_frame_head(&mut burst, 3, 0, 11);
+        burst.extend_from_slice(b"one");
+        append_frame_head(&mut burst, 3, 0, 12);
+        burst.extend_from_slice(b"two");
+
+        let mut reader = OneBurstReader { data: burst, sent: false, reads: 0 };
+        let mut scanner = FrameScanner::new();
+
+        let (first, first_seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(first_seq, 11);
+        assert_eq!(first, b"one");
+        assert_eq!(
+            reader.reads, 1,
+            "首个完整帧到达后不应再额外 read 一次只为拿到 WouldBlock"
+        );
+        release_frame_vec(first);
+
+        let (second, second_seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(second_seq, 12);
+        assert_eq!(second, b"two");
+        assert_eq!(
+            reader.reads, 1,
+            "扫描缓冲已有第二帧时必须零 syscall 直接返回"
+        );
+        release_frame_vec(second);
     }
 
     #[test]
