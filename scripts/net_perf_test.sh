@@ -304,6 +304,10 @@ iperf_one_way() {
     ok "iperf3 $label: ${mbps} Mbps (>= ${IPERF_MIN_MBPS})"
   else
     fail "iperf3 $label: ${mbps} Mbps < ${IPERF_MIN_MBPS} threshold"
+    log "iperf3 $label end-summary diagnostics:"
+    printf "%s\n" "$json" |
+      grep -E '"(error|bytes|bits_per_second|retransmits)"' | tail -24 |
+      sed 's/^/[netperf]     /' || true
   fi
 }
 
@@ -433,7 +437,18 @@ run_group() {
   ping_check "v6 cli→gw" "$GW_V6" v6
   traceroute_check "v4" "$GW_V4" v4
   traceroute_check "v6" "$GW_V6" v6
+  local fail_before_iperf=$FAIL
   iperf_check
+  if (( FAIL > fail_before_iperf )); then
+    log "--- client TAP counters after iperf failure ---"
+    ip netns exec "$NS_CLI" ip -s link show "$TAP_CLI" 2>&1 | sed 's/^/[netperf]     /' || true
+    log "--- server TAP counters after iperf failure ---"
+    ip netns exec "$NS_SRV" ip -s link show "$TAP_SRV" 2>&1 | sed 's/^/[netperf]     /' || true
+    log "--- client log tail after iperf failure ---"
+    tail -80 "$SRV_DIR/cli.log" 2>/dev/null | sed 's/^/[netperf]     /' || true
+    log "--- server log tail after iperf failure ---"
+    tail -80 "$SRV_DIR/srv.log" 2>/dev/null | sed 's/^/[netperf]     /' || true
+  fi
   librespeed_check
   return 0
 }
