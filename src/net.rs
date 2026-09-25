@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
+use crate::buffer::release_frame_vec;
 use crate::crypto::*;
 use crate::fec::FecEncoder;
 use crate::frame::VPNFrame;
@@ -1234,6 +1235,13 @@ impl AsyncPort {
         }
 
         if let Some(par) = parity {
+            if backends.len() < 2 {
+                // 单条 TCP 是严格有序流：后生成的 parity 无法越过同一路径里
+                // 尚未交付的原始数据，因此没有提前恢复价值。encoder 仍持续
+                // 维护分组状态，只是不把这份 parity 发上线路。
+                release_frame_vec(par);
+                return;
+            }
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
             let par = Arc::new(par);
             if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
