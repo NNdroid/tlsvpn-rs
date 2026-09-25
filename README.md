@@ -7,7 +7,7 @@ The Rust and Go binaries are **fully interchangeable**: any client works against
 ## Features
 
 - **Camouflage** — real TLS with ALPN (`h2`/`http1.1`) and randomized payload padding. Invalid-PSK connections get an nginx-styled 403 page or a slow-loris tarpit; probes (printable first byte) are detected inside the TLS stream as well.
-- **Inner encryption (optional)** — AES-256-GCM *inside* TLS, with random per-direction salts, separate data/FEC keys, `nonce = seq‖salt`, and AAD over `wireLen‖seq`. Protocol v2 only.
+- **Inner encryption (optional)** — authenticated AES-GCM *inside* TLS, with random per-direction salts, separate data/FEC keys, `nonce = seq‖salt`, and AAD over `wireLen‖seq`. `enc_algo: "gcm256"` remains the compatibility default; `"gcm128"` is an explicit performance mode. Both peers must match exactly.
 - **Server-observed TLS diagnostics** — a successful application handshake can return an optional `tls` object with the negotiated version/cipher/ALPN/SNI and the ordered ClientHello cipher, signature, group and ALPN features actually seen by the server. The client Web UI displays the `tls-clienthello-v1` SHA-256. It filters GREASE and is intentionally **not called JA3/JA4**, because rustls/Go do not expose the full raw extension order. The digest is for diagnostics, not authentication; randoms, tickets, certificate bodies and key material are never returned.
 - **Multipath & FEC** — parallel TCP connections with MinRTT load balancing, or XOR-parity FEC: one parity frame per K data frames (≈1/K overhead) so any single lost frame is reconstructed transparently. Duplication FEC remains the automatic fallback.
 - **Resilience** — comma-separated server addresses with round-robin per connection, exponential backoff with jitter, 30s-stable reset.
@@ -38,6 +38,7 @@ sudo ./target/release/tlsvpn -c server.json
   "psk": "GENERATE-A-UNIQUE-RANDOM-SECRET",
   "addr": ":4000",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "web": { "addr": ":8080", "auth": "admin:GENERATE-A-UNIQUE-PASSWORD", "bind": "tunnel" },
   "server": { "cert": "server.crt", "key": "server.key" }
 }
@@ -51,6 +52,7 @@ sudo ./target/release/tlsvpn -c server.json
   "psk": "GENERATE-A-UNIQUE-RANDOM-SECRET",
   "addr": "203.0.113.10:4000,[2001:db8::10]:4000",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "brutal": true, "brutal_up": 100, "brutal_down": 500,
   "client": { "conns": 4, "fec": true, "fec_group": 4 }
 }
@@ -83,6 +85,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "up": "",
   "down": "",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "min_enc": "gcm",
   "pad_mode": "bucket",
   "brutal": true,
@@ -112,8 +115,9 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `psk` | (required) | — | High-entropy pre-shared key. Empty and known placeholder values are rejected |
 | `addr` | server `0.0.0.0:4000` | — | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated targets for multi-IP round-robin |
 | `up` / `down` | (empty) | — | Absolute executable paths for process-level tunnel lifecycle hooks |
-| `encrypt` | `true` when omitted in JSON | — | Inner AES-256-GCM with per-session salts and separate data/FEC key domains |
-| `min_enc` | `""` | — | Strength floor: `gcm` refuses peers that cannot negotiate GCM, `""`/`any` sets no floor. Requires `encrypt: true`; connections below the floor are refused |
+| `encrypt` | `true` when omitted in JSON | — | Enable inner authenticated AES-GCM |
+| `enc_algo` | `gcm256` | — | `gcm256` = AES-256-GCM compatibility default; `gcm128` = explicit AES-128-GCM performance mode. Both peers must match exactly |
+| `min_enc` | `""` | — | Strength floor: `gcm` requires authenticated GCM at the configured key size, `""`/`any` sets no floor. Requires `encrypt: true` |
 | `pad_mode` | `bucket` | — | Full-record padding: `bucket` maps every record to a fixed size with positive padding; only `off` permits zero padding |
 | `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |

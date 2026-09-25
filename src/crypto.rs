@@ -1,21 +1,21 @@
 use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Tag};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::utils::*;
 
-// 与 Go 端 crypto.go 对齐的算法常量。只有一种内层算法，历史上还有
-// 0=AES-CTR 与 3=GCM-v2，已随旧协议兼容一并移除。
+// 与 Go 端 crypto.go 对齐的算法常量。2 保持既有 AES-256-GCM wire 语义；
+// 3 曾被历史 GCM-v2 占用，新的显式 AES-128-GCM 使用 4。
 pub const ENC_ALGO_NONE: i64 = 0;
 pub const ENC_ALGO_GCM: i64 = 2;
+pub const ENC_ALGO_GCM128: i64 = 4;
 pub const GCM_TAG_SIZE: usize = 16;
 pub const GCM_NONCE_SIZE: usize = 12;
 pub const ENC_SALT_SIZE: usize = 8;
 
-// 客户端握手请求里声明的本端最高算法支持（对齐 Go clientEncAlgoSupport）。
-// 服务端要求完全相等：声明不了 GCM 的对端一律拒连，不做弱降级。
+// 兼容旧调用的默认算法；实际客户端握手由配置 enc_algo 显式选择。
 pub const CLIENT_ENC_ALGO_SUPPORT: i64 = ENC_ALGO_GCM;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -215,9 +215,10 @@ pub fn min_enc_invalid_error(mode: &str) -> String {
 /// GCM 密钥派生标签（对齐 Go gcmKeyLabel）；FEC 校验帧追加 "_fec"。
 /// 与 Go 逐字节一致是互通的前提，不得单独改动。
 pub const GCM_KEY_LABEL: &str = "_enc_key";
+pub const GCM128_KEY_LABEL: &str = "_enc_key128";
 
-/// 按标签派生 AES-256 key。psk 与标签直接拼接后取 SHA-256，
-/// 顺序与 Go 的 sha256(psk + label) 一致。
+/// 按标签派生 32 字节材料。AES-128 使用独立 label 的前 16 字节；
+/// 与 Go 的 sha256(psk + label) 完全一致。
 fn derive_key_labeled(psk: &str, label: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(format!("{}{}", psk, label).as_bytes());
@@ -227,6 +228,26 @@ fn derive_key_labeled(psk: &str, label: &str) -> [u8; 32] {
     key
 }
 
+pub fn enc_algo_from_config(mode: &str) -> i64 {
+    if mode.trim().eq_ignore_ascii_case("gcm128") {
+        ENC_ALGO_GCM128
+    } else {
+        ENC_ALGO_GCM
+    }
+}
+
+pub fn enc_algo_label(algo: i64) -> &'static str {
+    match algo {
+        ENC_ALGO_GCM128 => "gcm128",
+        ENC_ALGO_GCM => "gcm256",
+        _ => "none",
+    }
+}
+
+pub fn is_gcm_algo(algo: i64) -> bool {
+    algo == ENC_ALGO_GCM || algo == ENC_ALGO_GCM128
+}
+
 /// 每会话随机的方向盐（crypto/rand 等价物，对齐 Go newRandomSalt）
 pub fn new_random_salt() -> [u8; ENC_SALT_SIZE] {
     let mut s = [0u8; ENC_SALT_SIZE];
@@ -234,12 +255,15 @@ pub fn new_random_salt() -> [u8; ENC_SALT_SIZE] {
     s
 }
 
-/// 内层载荷加密器（对齐 Go 的 innerCipher）。只有一种算法：AES-256-GCM，
-/// nonce = seq(4BE) || salt(8B)，AAD = wireLen(4BE) || seq(4BE)，密文后附
-/// 16B 标签（线路 dataLen = 明文长 + 16）。
+/// 内层载荷 AES-GCM。AES-256 是兼容默认；AES-128 仅在 enc_algo=gcm128
+/// 显式协商后启用。nonce/AAD/tag/frame wire format 对两者完全相同。
 pub enum InnerCipher {
-    Gcm {
+    Gcm256 {
         aead: Aes256Gcm,
+        salt: [u8; ENC_SALT_SIZE],
+    },
+    Gcm128 {
+        aead: Aes128Gcm,
         salt: [u8; ENC_SALT_SIZE],
     },
 }
@@ -247,13 +271,26 @@ pub enum InnerCipher {
 type GcmNonce = aes_gcm::Nonce<aes_gcm::aead::consts::U12>;
 
 impl InnerCipher {
+    /// 历史 API：固定 AES-256-GCM。
     pub fn gcm(psk: &str, salt: &[u8]) -> Result<InnerCipher, String> {
-        Self::gcm_domain(psk, salt, "data")
+        Self::gcm_for_algo(psk, salt, ENC_ALGO_GCM)
     }
 
-    /// 按密钥域构造 GCM 加密器："data" 是帧载荷，"fec" 是校验帧——
-    /// 两个域用独立密钥，避免同一 AES 密钥跨用途复用。
+    pub fn gcm_for_algo(psk: &str, salt: &[u8], algo: i64) -> Result<InnerCipher, String> {
+        Self::gcm_domain_for_algo(psk, salt, "data", algo)
+    }
+
+    /// 历史 API：固定 AES-256-GCM data/fec domain。
     pub fn gcm_domain(psk: &str, salt: &[u8], domain: &str) -> Result<InnerCipher, String> {
+        Self::gcm_domain_for_algo(psk, salt, domain, ENC_ALGO_GCM)
+    }
+
+    pub fn gcm_domain_for_algo(
+        psk: &str,
+        salt: &[u8],
+        domain: &str,
+        algo: i64,
+    ) -> Result<InnerCipher, String> {
         if salt.len() != ENC_SALT_SIZE {
             return Err(format!(
                 "encryption salt must be {} bytes, got {}",
@@ -264,31 +301,48 @@ impl InnerCipher {
         if domain != "data" && domain != "fec" {
             return Err(format!("unknown GCM domain {:?}", domain));
         }
+
+        let base = match algo {
+            ENC_ALGO_GCM => GCM_KEY_LABEL,
+            ENC_ALGO_GCM128 => GCM128_KEY_LABEL,
+            _ => return Err(format!("unsupported GCM algorithm {}", algo)),
+        };
         let label = if domain == "fec" {
-            format!("{}_fec", GCM_KEY_LABEL)
+            format!("{}_fec", base)
         } else {
-            GCM_KEY_LABEL.to_string()
+            base.to_string()
         };
         let key = derive_key_labeled(psk, &label);
-        let aead = Aes256Gcm::new(&key.into());
         let mut s = [0u8; ENC_SALT_SIZE];
         s.copy_from_slice(salt);
-        Ok(InnerCipher::Gcm { aead, salt: s })
-    }
 
-    pub fn is_gcm(&self) -> bool {
-        matches!(self, InnerCipher::Gcm { .. })
-    }
-
-    /// 该加密器在线路上额外占用的字节数（对齐 Go tagLen）
-    pub fn tag_len(&self) -> usize {
-        match self {
-            InnerCipher::Gcm { .. } => GCM_TAG_SIZE,
+        match algo {
+            ENC_ALGO_GCM => {
+                let aead = Aes256Gcm::new_from_slice(&key)
+                    .map_err(|_| "invalid AES-256-GCM key".to_string())?;
+                Ok(InnerCipher::Gcm256 { aead, salt: s })
+            }
+            ENC_ALGO_GCM128 => {
+                let aead = Aes128Gcm::new_from_slice(&key[..16])
+                    .map_err(|_| "invalid AES-128-GCM key".to_string())?;
+                Ok(InnerCipher::Gcm128 { aead, salt: s })
+            }
+            _ => unreachable!(),
         }
     }
 
+    pub fn is_gcm(&self) -> bool {
+        true
+    }
+
+    pub fn tag_len(&self) -> usize {
+        GCM_TAG_SIZE
+    }
+
     fn gcm_nonce(&self, seq: u32) -> GcmNonce {
-        let InnerCipher::Gcm { salt, .. } = self;
+        let salt = match self {
+            InnerCipher::Gcm256 { salt, .. } | InnerCipher::Gcm128 { salt, .. } => salt,
+        };
         let mut nonce = [0u8; GCM_NONCE_SIZE];
         nonce[0..4].copy_from_slice(&seq.to_be_bytes());
         nonce[4..].copy_from_slice(salt);
@@ -304,25 +358,24 @@ fn gcm_aad(wire_len: u32, seq: u32) -> [u8; 8] {
 }
 
 impl InnerCipher {
-    /// 就地加密 region 的前 pt_len 字节；region 必须预留 tag_len() 空间。
-    /// 对齐 Go sealInPlace：region = [明文 pt_len][标签空间]。
     pub fn seal_in_place(&self, region: &mut [u8], pt_len: usize, seq: u32, wire_len: u32) {
         if pt_len == 0 {
             return;
         }
-        match self {
-            InnerCipher::Gcm { aead, .. } => {
-                let (ct, tag_space) = region.split_at_mut(pt_len);
-                let tag = aead
-                    .encrypt_in_place_detached(&self.gcm_nonce(seq), &gcm_aad(wire_len, seq), ct)
-                    .expect("GCM encryption cannot fail");
-                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
-            }
-        }
+        let nonce = self.gcm_nonce(seq);
+        let aad = gcm_aad(wire_len, seq);
+        let (ct, tag_space) = region.split_at_mut(pt_len);
+        let tag = match self {
+            InnerCipher::Gcm256 { aead, .. } => aead
+                .encrypt_in_place_detached(&nonce, &aad, ct)
+                .expect("GCM encryption cannot fail"),
+            InnerCipher::Gcm128 { aead, .. } => aead
+                .encrypt_in_place_detached(&nonce, &aad, ct)
+                .expect("GCM encryption cannot fail"),
+        };
+        tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
     }
 
-    /// 就地解密并校验，成功后 data 截断为明文。
-    /// GCM 校验失败返回 Err（对齐 Go openInPlace）。
     pub fn open_in_place<'a>(
         &self,
         data: &'a mut [u8],
@@ -332,27 +385,24 @@ impl InnerCipher {
         if data.is_empty() {
             return Ok(data);
         }
-        match self {
-            InnerCipher::Gcm { aead, .. } => {
-                if data.len() < GCM_TAG_SIZE {
-                    return Err(());
-                }
-                let (ct, tag) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
-                let tag_arr = Tag::from_slice(tag);
-                aead.decrypt_in_place_detached(
-                    &self.gcm_nonce(seq),
-                    &gcm_aad(wire_len, seq),
-                    ct,
-                    tag_arr,
-                )
-                .map_err(|_| ())?;
-                Ok(ct)
-            }
+        if data.len() < GCM_TAG_SIZE {
+            return Err(());
         }
+        let nonce = self.gcm_nonce(seq);
+        let aad = gcm_aad(wire_len, seq);
+        let (ct, tag) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
+        let tag_arr = Tag::from_slice(tag);
+        match self {
+            InnerCipher::Gcm256 { aead, .. } => aead
+                .decrypt_in_place_detached(&nonce, &aad, ct, tag_arr)
+                .map_err(|_| ())?,
+            InnerCipher::Gcm128 { aead, .. } => aead
+                .decrypt_in_place_detached(&nonce, &aad, ct, tag_arr)
+                .map_err(|_| ())?,
+        }
+        Ok(ct)
     }
 
-    /// 解密 src（GCM 时含标签）写入 dst，返回明文切片。对齐 Go openTo，
-    /// 供 FEC 校验载荷解密使用；aad 必须与 seal 时一致。
     pub fn open_to<'a>(
         &self,
         dst: &'a mut [u8],
@@ -360,23 +410,26 @@ impl InnerCipher {
         seq: u32,
         aad: &[u8],
     ) -> Result<&'a mut [u8], ()> {
-        match self {
-            InnerCipher::Gcm { aead, .. } => {
-                if src.len() < GCM_TAG_SIZE {
-                    return Err(());
-                }
-                let (ct, tag) = src.split_at(src.len() - GCM_TAG_SIZE);
-                if dst.len() < ct.len() {
-                    return Err(());
-                }
-                let out = &mut dst[..ct.len()];
-                out.copy_from_slice(ct);
-                let tag_arr = Tag::from_slice(tag);
-                aead.decrypt_in_place_detached(&self.gcm_nonce(seq), aad, out, tag_arr)
-                    .map_err(|_| ())?;
-                Ok(&mut dst[..ct.len()])
-            }
+        if src.len() < GCM_TAG_SIZE {
+            return Err(());
         }
+        let (ct, tag) = src.split_at(src.len() - GCM_TAG_SIZE);
+        if dst.len() < ct.len() {
+            return Err(());
+        }
+        let out = &mut dst[..ct.len()];
+        out.copy_from_slice(ct);
+        let nonce = self.gcm_nonce(seq);
+        let tag_arr = Tag::from_slice(tag);
+        match self {
+            InnerCipher::Gcm256 { aead, .. } => aead
+                .decrypt_in_place_detached(&nonce, aad, out, tag_arr)
+                .map_err(|_| ())?,
+            InnerCipher::Gcm128 { aead, .. } => aead
+                .decrypt_in_place_detached(&nonce, aad, out, tag_arr)
+                .map_err(|_| ())?,
+        }
+        Ok(out)
     }
 }
 
@@ -701,13 +754,13 @@ mod tests {
 
     /// Go 端 server.go 的拒连条件，逐字复现以便矩阵化测试。
     fn server_rejects_min_enc(encrypt: bool, min_enc: i64, declared_algo: i64) -> bool {
-        encrypt && min_enc > 0 && declared_algo != ENC_ALGO_GCM
+        encrypt && min_enc > 0 && !is_gcm_algo(declared_algo)
     }
 
     /// Go 端 client.go 的拒连条件：不看 encrypt（协商结果已是最终值），
     /// 低于本地下限即视为握手失败并触发重连。
     fn client_rejects_min_enc(min_enc: i64, negotiated_algo: i64) -> bool {
-        min_enc > 0 && negotiated_algo != ENC_ALGO_GCM
+        min_enc > 0 && !is_gcm_algo(negotiated_algo)
     }
 
     #[test]
@@ -774,6 +827,41 @@ mod tests {
     }
 
     #[test]
+    fn gcm128_roundtrip_and_algorithm_domain_separation() {
+        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let psk = "same_psk";
+        let pt = vec![0x6au8; 1400];
+        let wire_len = (pt.len() + GCM_TAG_SIZE) as u32;
+
+        let g128_tx = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
+        let g128_rx = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
+        let g256 = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM).unwrap();
+
+        let mut wire = vec![0u8; wire_len as usize];
+        wire[..pt.len()].copy_from_slice(&pt);
+        g128_tx.seal_in_place(&mut wire, pt.len(), 77, wire_len);
+        let mut roundtrip = wire.clone();
+        let plain = g128_rx
+            .open_in_place(&mut roundtrip, 77, wire_len)
+            .expect("AES-128-GCM roundtrip");
+        assert_eq!(plain, pt.as_slice());
+
+        let mut wrong = wire.clone();
+        assert!(
+            g256.open_in_place(&mut wrong, 77, wire_len).is_err(),
+            "AES-128 ciphertext must not authenticate under AES-256 key domain"
+        );
+
+        let key128 = derive_key_labeled(psk, GCM128_KEY_LABEL);
+        let key256 = derive_key_labeled(psk, GCM_KEY_LABEL);
+        assert_ne!(&key128[..16], &key256[..16]);
+        assert_eq!(enc_algo_from_config("gcm128"), ENC_ALGO_GCM128);
+        assert_eq!(enc_algo_from_config(""), ENC_ALGO_GCM);
+        assert_eq!(enc_algo_label(ENC_ALGO_GCM128), "gcm128");
+        assert!(is_gcm_algo(ENC_ALGO_GCM128));
+    }
+
+    #[test]
     fn gcm_data_and_fec_domains_never_share_ciphertext() {
         let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let data = InnerCipher::gcm_domain("domain_psk", &salt, "data").unwrap();
@@ -801,6 +889,7 @@ mod tests {
             "GCM 下限必须拒绝未声明 GCM 能力的客户端"
         );
         assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM));
+        assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM128));
         // encrypt=false 时下限失效（此时本不该配置 min_enc，校验层已拦）
         assert!(!server_rejects_min_enc(false, ENC_RANK_GCM, ENC_ALGO_NONE));
         // 未知算法 ID 必须被 GCM 下限拦下——用 >= 比较会让它漏过去
@@ -820,6 +909,7 @@ mod tests {
             "服务端降级到明文时必须判定握手失败并重连"
         );
         assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM));
+        assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM128));
         assert!(
             client_rejects_min_enc(ENC_RANK_GCM, 3),
             "未知算法 ID 的协商结果不得被当成 GCM"

@@ -68,6 +68,7 @@ pub struct Args {
     pub web_cert: String,
     pub web_key: String,
     pub encrypt: bool,
+    pub enc_algo: String, // gcm256（默认）| gcm128（显式性能模式）
     // 配置文件里是否显式写了 encrypt。bool 无法自辨"字段缺失"与"显式 false"，
     // 靠这个标记让 main 能给运维一条明确提示。不参与任何运行时逻辑。
     pub encrypt_present: bool,
@@ -97,6 +98,8 @@ struct ConfigFile {
     up: String,
     down: String,
     encrypt: bool,
+    #[serde(default)]
+    enc_algo: String,
     // 空串 = 无下限（与旧版一致）；见 min_enc_rank
     #[serde(default)]
     min_enc: String,
@@ -228,6 +231,11 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         up: cfg.up,
         down: cfg.down,
         encrypt: if encrypt_present { cfg.encrypt } else { true },
+        enc_algo: if (if encrypt_present { cfg.encrypt } else { true }) {
+            if cfg.enc_algo.is_empty() { "gcm256".into() } else { cfg.enc_algo }
+        } else {
+            cfg.enc_algo
+        },
         encrypt_present,
         pad_mode: cfg.pad_mode,
         min_enc: if (if encrypt_present { cfg.encrypt } else { true }) && cfg.min_enc.is_empty() {
@@ -476,6 +484,18 @@ fn validate_args(args: &Args) -> Result<(), String> {
     // 配置加载层强校验；set_pad_mode 的 bucket 回落只兜住面板热更路径
     if !crypto::pad_mode_valid(&args.pad_mode) {
         return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
+    }
+    match args.enc_algo.as_str() {
+        "" | "gcm256" | "gcm128" => {}
+        _ => {
+            return Err(format!(
+                "invalid enc_algo {:?} (want gcm256 or gcm128)",
+                args.enc_algo
+            ))
+        }
+    }
+    if !args.enc_algo.is_empty() && !args.encrypt {
+        return Err(format!("enc_algo {:?} requires encrypt=true", args.enc_algo));
     }
     // min_enc 取大小写敏感的闭集；"any" 与空串等价（都等于不设下限）
     match args.min_enc.as_str() {
@@ -1116,6 +1136,7 @@ mod tests {
         let cfg = serde_json::from_str::<ConfigFile>(&raw)
             .unwrap_or_else(|e| panic!("--print-config 模板解析失败: {}", e));
         assert_eq!(cfg.mode, "client");
+        assert_eq!(cfg.enc_algo, "");
         assert_eq!(cfg.min_enc, "gcm");
         assert_eq!(cfg.pad_mode, "bucket");
     }
@@ -1132,6 +1153,7 @@ mod tests {
         assert_eq!(args.workers, 0);
         assert_eq!(args.conns, 4);
         assert_eq!(args.pad_mode, "bucket");
+        assert_eq!(args.enc_algo, "gcm256");
         assert_eq!(args.min_enc, "gcm");
     }
 
