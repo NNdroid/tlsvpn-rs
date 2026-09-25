@@ -754,13 +754,13 @@ mod tests {
 
     /// Go 端 server.go 的拒连条件，逐字复现以便矩阵化测试。
     fn server_rejects_min_enc(encrypt: bool, min_enc: i64, declared_algo: i64) -> bool {
-        encrypt && min_enc > 0 && declared_algo != ENC_ALGO_GCM
+        encrypt && min_enc > 0 && !is_gcm_algo(declared_algo)
     }
 
     /// Go 端 client.go 的拒连条件：不看 encrypt（协商结果已是最终值），
     /// 低于本地下限即视为握手失败并触发重连。
     fn client_rejects_min_enc(min_enc: i64, negotiated_algo: i64) -> bool {
-        min_enc > 0 && negotiated_algo != ENC_ALGO_GCM
+        min_enc > 0 && !is_gcm_algo(negotiated_algo)
     }
 
     #[test]
@@ -827,6 +827,41 @@ mod tests {
     }
 
     #[test]
+    fn gcm128_roundtrip_and_algorithm_domain_separation() {
+        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let psk = "same_psk";
+        let pt = vec![0x6au8; 1400];
+        let wire_len = (pt.len() + GCM_TAG_SIZE) as u32;
+
+        let g128_tx = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
+        let g128_rx = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
+        let g256 = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM).unwrap();
+
+        let mut wire = vec![0u8; wire_len as usize];
+        wire[..pt.len()].copy_from_slice(&pt);
+        g128_tx.seal_in_place(&mut wire, pt.len(), 77, wire_len);
+        let mut roundtrip = wire.clone();
+        let plain = g128_rx
+            .open_in_place(&mut roundtrip, 77, wire_len)
+            .expect("AES-128-GCM roundtrip");
+        assert_eq!(plain, pt.as_slice());
+
+        let mut wrong = wire.clone();
+        assert!(
+            g256.open_in_place(&mut wrong, 77, wire_len).is_err(),
+            "AES-128 ciphertext must not authenticate under AES-256 key domain"
+        );
+
+        let key128 = derive_key_labeled(psk, GCM128_KEY_LABEL);
+        let key256 = derive_key_labeled(psk, GCM_KEY_LABEL);
+        assert_ne!(&key128[..16], &key256[..16]);
+        assert_eq!(enc_algo_from_config("gcm128"), ENC_ALGO_GCM128);
+        assert_eq!(enc_algo_from_config(""), ENC_ALGO_GCM);
+        assert_eq!(enc_algo_label(ENC_ALGO_GCM128), "gcm128");
+        assert!(is_gcm_algo(ENC_ALGO_GCM128));
+    }
+
+    #[test]
     fn gcm_data_and_fec_domains_never_share_ciphertext() {
         let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let data = InnerCipher::gcm_domain("domain_psk", &salt, "data").unwrap();
@@ -854,6 +889,7 @@ mod tests {
             "GCM 下限必须拒绝未声明 GCM 能力的客户端"
         );
         assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM));
+        assert!(!server_rejects_min_enc(true, ENC_RANK_GCM, ENC_ALGO_GCM128));
         // encrypt=false 时下限失效（此时本不该配置 min_enc，校验层已拦）
         assert!(!server_rejects_min_enc(false, ENC_RANK_GCM, ENC_ALGO_NONE));
         // 未知算法 ID 必须被 GCM 下限拦下——用 >= 比较会让它漏过去
@@ -873,6 +909,7 @@ mod tests {
             "服务端降级到明文时必须判定握手失败并重连"
         );
         assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM));
+        assert!(!client_rejects_min_enc(ENC_RANK_GCM, ENC_ALGO_GCM128));
         assert!(
             client_rejects_min_enc(ENC_RANK_GCM, 3),
             "未知算法 ID 的协商结果不得被当成 GCM"
