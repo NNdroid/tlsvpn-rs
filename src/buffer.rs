@@ -237,11 +237,11 @@ impl ReorderBuffer {
         }
 
         let mut new_size = old_size;
-        while (new_size as u32) <= required_distance && new_size < REORDER_MAX_WINDOW as usize {
+        while (new_size as u32) < required_distance && new_size < REORDER_MAX_WINDOW as usize {
             new_size <<= 1;
         }
         new_size = new_size.min(REORDER_MAX_WINDOW as usize);
-        if (new_size as u32) <= required_distance {
+        if (new_size as u32) < required_distance {
             return false;
         }
 
@@ -463,6 +463,20 @@ mod tests {
         assert_eq!(rb.stats().skipped_frames, 4094);
     }
 
+
+    #[test]
+    fn reorder_growth_uses_smallest_power_of_two_window() {
+        let mut rb = ReorderBuffer::new();
+        assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);
+
+        // expected=2, seq=4097 -> distance=4095, so 4096 slots are exactly enough.
+        assert!(rb.insert(4097, Arc::new(vec![0x5a])).is_empty());
+        assert_eq!(
+            rb.ring.len(),
+            4096,
+            "exact power-of-two boundary must not overgrow to 8192"
+        );
+    }
 
     #[test]
     fn timeout_scan_wraps_into_lower_bits_of_the_same_bitmap_word() {
