@@ -1571,20 +1571,21 @@ impl VSwitch {
             }
         }
 
-        let mut target_port_id = None;
+        let mut known_unicast = false;
         if (dst_mac[0] & 1) == 0 {
             if let Some(entry) = self.mac_table.get(&dst_mac) {
-                target_port_id = Some(entry.port_id.clone());
+                known_unicast = true;
+                // 保持 MAC entry guard 到 ports lookup 完成，直接借用 &str；
+                // 旧代码每个已知单播都 clone String，产生一次堆分配。
+                if entry.port_id != src_port_id {
+                    if let Some(port) = self.ports.get(entry.port_id.as_str()) {
+                        port.write_frame(frame.clone());
+                    }
+                }
             }
         }
 
-        if let Some(target) = target_port_id {
-            if target != src_port_id {
-                if let Some(port) = self.ports.get(&target) {
-                    port.write_frame(frame);
-                }
-            }
-        } else {
+        if !known_unicast {
             self.flood(src_port_id, frame);
         }
     }
