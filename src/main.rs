@@ -1136,6 +1136,7 @@ mod tests {
         let cfg = serde_json::from_str::<ConfigFile>(&raw)
             .unwrap_or_else(|e| panic!("--print-config 模板解析失败: {}", e));
         assert_eq!(cfg.mode, "client");
+        assert_eq!(cfg.enc_algo, "gcm256");
         assert_eq!(cfg.min_enc, "gcm");
         assert_eq!(cfg.pad_mode, "bucket");
     }
@@ -1152,6 +1153,7 @@ mod tests {
         assert_eq!(args.workers, 0);
         assert_eq!(args.conns, 4);
         assert_eq!(args.pad_mode, "bucket");
+        assert_eq!(args.enc_algo, "gcm256");
         assert_eq!(args.min_enc, "gcm");
     }
 
@@ -1510,6 +1512,7 @@ fn example_config_json() -> &'static str {
   "up": "",
   "down": "",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "min_enc": "gcm",
   "pad_mode": "bucket",
   "brutal": true,
