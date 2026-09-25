@@ -11,10 +11,19 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
+        include:
+          - target: x86_64-unknown-linux-musl
+            suffix: ""
+            rustflags: ""
+          - target: aarch64-unknown-linux-musl
+            suffix: ""
+            rustflags: ""
+          - target: aarch64-unknown-linux-musl
+            suffix: "-cortex-a55"
+            rustflags: "-C target-cpu=cortex-a55"
+          - target: armv7-unknown-linux-musleabihf
+            suffix: ""
+            rustflags: ""
     
     steps:
       - uses: actions/checkout@v4
@@ -29,19 +38,25 @@ jobs:
       # 编译 Release 版本
       - name: Build
         uses: houseabsolute/actions-rust-cross@v0
+        env:
+          # Generic aarch64 stays portable. The extra Cortex-A55 artifact is
+          # explicitly opt-in for RK3568/R5S-class devices.
+          RUSTFLAGS: ${{ matrix.rustflags }}
         with:
           target: ${{ matrix.target }}
           args: "--release"
           strip: true
 
       - name: Rename artifact
-        run: mv target/${{ matrix.target }}/release/tlsvpn target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}
+        run: |
+          mv target/${{ matrix.target }}/release/tlsvpn \
+            target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}${{ matrix.suffix }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tlsvpn-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}
+          name: tlsvpn-${{ matrix.target }}${{ matrix.suffix }}
+          path: target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}${{ matrix.suffix }}
 
   # 发布任务：等待所有 build 任务完成后执行
   release:
