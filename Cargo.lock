@@ -1107,7 +1107,6 @@ dependencies = [
 name = "tlsvpn"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "base64ct",
  "byteorder",
  "crossbeam-channel",
@@ -1122,6 +1121,7 @@ dependencies = [
  "mimalloc",
  "mio",
  "parking_lot",
+ "ring 0.17.14",
  "rustls 0.23.43",
  "rustls-pemfile 2.2.0",
  "serde",
