@@ -1294,6 +1294,7 @@ fn worker_loop(
             // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
             // "connection lost: timeout" 窗口。
             if idle_time > 15 {
+                debug!("closing token {:?}: no TLS receive progress for {}s", token, idle_time);
                 closed_tokens.push(*token);
                 continue;
             }
@@ -1315,11 +1316,15 @@ fn worker_loop(
                 sess.rtt_timer = Instant::now();
             }
 
-            if sess.last_keepalive.elapsed() > Duration::from_secs(4) {
+            if sess.last_keepalive.elapsed() > Duration::from_secs(4)
+                && sess.write_stalled.is_none()
+                && !sess.tls.wants_write()
+            {
                 sess.send_buf.clear();
                 append_padded_frame(&mut sess.send_buf, 0, &[], None);
-                let _ = sess.tls.writer().write_all(&sess.send_buf);
-                sess.last_keepalive = Instant::now();
+                if sess.tls.writer().write_all(&sess.send_buf).is_ok() {
+                    sess.last_keepalive = Instant::now();
+                }
             }
 
             if let Some(c_sess) = &sess.client_session {
@@ -1334,14 +1339,17 @@ fn worker_loop(
                             c_sess.stat.client_id
                         );
                     }
+                    debug!("closing token {:?}: sequence space exhausted", token);
                     closed_tokens.push(*token);
                     continue;
                 }
                 if c_sess.epoch_state.read().epoch != sess.session_epoch {
+                    debug!("closing token {:?}: session epoch mismatch", token);
                     closed_tokens.push(*token);
                     continue;
                 }
                 if c_sess.stat.force_disconnect.load(Ordering::Relaxed) {
+                    debug!("closing token {:?}: forced disconnect", token);
                     closed_tokens.push(*token);
                     continue;
                 }
@@ -1350,6 +1358,7 @@ fn worker_loop(
             // 写积压超过 10s 视为对端卡死（对齐 Go SetWriteDeadline(10s)）
             if let Some(stalled_at) = sess.write_stalled {
                 if stalled_at.elapsed() > Duration::from_secs(10) {
+                    debug!("closing token {:?}: TLS write stalled for >10s", token);
                     closed_tokens.push(*token);
                     continue;
                 }
@@ -1399,61 +1408,92 @@ fn worker_loop(
                     }
 
                     if !close {
-                        let mut progress = false;
-                        loop {
+                        // mio readiness is edge-triggered: keep servicing this fd
+                        // until the underlying socket itself returns WouldBlock.
+                        // Interleave every ciphertext read with rustls processing and
+                        // plaintext frame draining so neither rustls buffer can become
+                        // the reason we stop before reaching EAGAIN.
+                        'socket_read: loop {
                             match sess.tls.read_tls(&mut sess.socket) {
                                 Ok(0) => {
+                                    debug!(
+                                        "closing token {:?}: tls.read_tls returned EOF",
+                                        token
+                                    );
                                     close = true;
-                                    break;
+                                    break 'socket_read;
                                 }
                                 Ok(_) => {
-                                    progress = true;
+                                    sess.last_rx = Instant::now();
                                 }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break 'socket_read;
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "closing token {:?}: tls.read_tls failed: {}",
+                                        token,
+                                        e
+                                    );
                                     close = true;
-                                    break;
+                                    break 'socket_read;
                                 }
                             }
-                        }
-                        if progress {
-                            sess.last_rx = Instant::now();
-                        }
 
-                        if progress && !close {
-                            if sess.tls.process_new_packets().is_ok() {
-                                // 第二层嗅探（对齐 Go peekBuf2 >= 0x20 检查）：
-                                // TLS 明文流首字节为探测流量 → 回 403
-                                if !sess.sniffed_inner {
-                                    match sess.scanner.peek_first_byte() {
-                                        Some(b) if b >= 0x20 => {
-                                            let is_h2 = sess.tls.alpn_protocol() == Some(b"h2");
-                                            serve_fallback_http(&mut sess.tls.writer(), is_h2);
-                                            close = true;
-                                        }
-                                        Some(_) => sess.sniffed_inner = true,
-                                        None => {}
-                                    }
-                                }
-                                if !close {
-                                    process_plain_frames(
-                                        sess,
-                                        &core,
-                                        &mut close,
-                                        &mut tarpit,
-                                        &mut reorder_ready,
-                                    );
-                                }
-                            } else {
+                            if let Err(e) = sess.tls.process_new_packets() {
+                                debug!(
+                                    "closing token {:?}: tls.process_new_packets failed: {}",
+                                    token,
+                                    e
+                                );
                                 if !sess.handshake_done {
                                     serve_fallback_http(&mut sess.socket, false);
                                 }
                                 close = true;
+                                break 'socket_read;
+                            }
+
+                            // 第二层嗅探（对齐 Go peekBuf2 >= 0x20 检查）。
+                            if !sess.sniffed_inner {
+                                match sess.scanner.peek_first_byte() {
+                                    Some(b) if b >= 0x20 => {
+                                        let is_h2 =
+                                            sess.tls.alpn_protocol() == Some(b"h2");
+                                        serve_fallback_http(
+                                            &mut sess.tls.writer(),
+                                            is_h2,
+                                        );
+                                        close = true;
+                                    }
+                                    Some(_) => sess.sniffed_inner = true,
+                                    None => {}
+                                }
+                            }
+
+                            if !close {
+                                process_plain_frames(
+                                    sess,
+                                    &core,
+                                    &mut close,
+                                    &mut tarpit,
+                                    &mut reorder_ready,
+                                );
+                            }
+                            if close {
+                                break 'socket_read;
+                            }
+
+                            // TLS handshake/application responses generated while
+                            // consuming plaintext should not accumulate while we
+                            // continue draining the readable edge.
+                            drain_tls(sess, &mut close);
+                            if close {
+                                break 'socket_read;
                             }
                         }
 
-                        // 冲刷 TLS 积压：握手期（ServerHello 等）与数据期共用；
-                        // 写入遇 WouldBlock 时下次 poll 后继续
+                        // One final flush covers data queued by the last processed
+                        // frame before read_tls reached WouldBlock.
                         if !close {
                             drain_tls(sess, &mut close);
                         }
@@ -1586,6 +1626,7 @@ fn process_plain_frames(
                     };
                     let epoch = c_sess.epoch_state.read();
                     if sess.session_epoch != epoch.epoch {
+                        debug!("closing session plaintext path: epoch mismatch");
                         drop(epoch);
                         release_frame_vec(data);
                         *close = true;
@@ -1629,7 +1670,8 @@ fn process_plain_frames(
                 }
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(e) => {
+                debug!("closing session plaintext path: frame scanner failed: {}", e);
                 if !sess.handshake_done {
                     let is_h2 = sess.tls.alpn_protocol() == Some(b"h2");
                     serve_fallback_http(&mut sess.tls.writer(), is_h2);
@@ -1688,9 +1730,11 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
-    if sess.write_stalled.is_some() {
+    if sess.write_stalled.is_some() || sess.tls.wants_write() {
         drain_tls(sess, close);
-        return;
+        if *close || sess.tls.wants_write() {
+            return;
+        }
     }
 
     let ic_tx = sess.client_session.as_ref().and_then(|s| {
@@ -1708,7 +1752,9 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
-    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
+    // Stay below rustls' bounded outgoing plaintext buffer. A 256KiB
+    // write_all() can fail with WriteZero before ciphertext is drained.
+    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     let mut pulled = 0u64;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
@@ -1730,7 +1776,8 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
                 .tx_bytes
                 .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
         }
-        if sess.tls.writer().write_all(&sess.send_buf).is_err() {
+        if let Err(e) = sess.tls.writer().write_all(&sess.send_buf) {
+            debug!("closing session: tls plaintext writer failed: {}", e);
             *close = true;
             return;
         }
@@ -1744,6 +1791,7 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
     while sess.tls.wants_write() {
         match sess.tls.write_tls(&mut sess.socket) {
             Ok(0) => {
+                debug!("closing session: tls.write_tls returned zero");
                 *close = true;
                 break;
             }
@@ -1754,7 +1802,8 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
                 }
                 break;
             }
-            Err(_) => {
+            Err(e) => {
+                debug!("closing session: tls.write_tls failed: {}", e);
                 *close = true;
                 break;
             }

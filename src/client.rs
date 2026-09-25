@@ -1500,16 +1500,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut next_rtt_refresh = Instant::now();
     let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
+    let mut close_reason = String::new();
 
-    // 发送聚合缓冲永久复用，并扩大到 256KiB：rustls 仍会自行切 TLS record，
-    // 但减少 writer()/write_tls 调用和 socket syscall，吞吐优先。
-    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
+    // Keep one plaintext batch below rustls' bounded outgoing plaintext
+    // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
+    // buffer") before write_tls() gets a chance to drain ciphertext.
+    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
         if cl.tx_port.is_sequence_exhausted() {
+            close_reason = "sequence space exhausted".into();
             if cl
                 .sequence_rekeying
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1522,6 +1525,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             break;
         }
         if cl.force_generation.load(Ordering::Acquire) != reconnect_generation {
+            close_reason = "forced reconnect generation changed".into();
             break;
         }
 
@@ -1535,7 +1539,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
             poll_timeout = poll_timeout.min(wait);
         }
-        if poll.poll(&mut events, Some(poll_timeout)).is_err() {
+        if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
+            close_reason = format!("mio poll failed: {e}");
             break;
         }
 
@@ -1572,38 +1577,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             release_shared_frame(ordered);
         }
 
-        // ---- 下行读取（仅 socket 可读时）----
-        let mut got_rx = false;
-        if readable {
-            loop {
-                match tls.read_tls(&mut sock) {
-                    Ok(0) => {
-                        conn_closed = true;
-                        break;
-                    }
-                    Ok(_) => got_rx = true,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break
-                    }
-                    Err(_) => {
-                        conn_closed = true;
-                        break;
-                    }
-                }
-            }
-            if got_rx {
-                last_rx = Instant::now();
-                if tls.process_new_packets().is_err() {
-                    conn_closed = true;
-                }
-            }
-        }
-
-        // ---- 帧处理：解密 → FEC/去重/重排 → TAP ----
-        // 统计先在线程本地累加，一轮 parser drain 结束后再写共享原子。
+        // ---- 下行读取：mio 是边沿触发，必须真正 drain socket 到 WouldBlock。----
+        // 每次 read_tls 后立即 process_new_packets + drain plaintext，避免 rustls
+        // 的 bounded encrypted/plaintext buffers 在高速流量下先填满，从而留下
+        // 一个仍 readable 但再也没有新 edge 的 socket。
         let mut rx_bytes_batch = 0u64;
         let mut rx_packets_batch = 0u64;
         let fec_dec = if use_xor_fec {
@@ -1612,70 +1589,112 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             None
         };
 
-        loop {
-            match scanner.read_frame(&mut tls.reader()) {
-                Ok(Some((raw, seq))) => {
-                    if raw.is_empty() {
-                        continue;
+        if readable {
+            'socket_read: loop {
+                match tls.read_tls(&mut sock) {
+                    Ok(0) => {
+                        close_reason = "tls.read_tls returned EOF".into();
+                        conn_closed = true;
+                        break 'socket_read;
                     }
-                    let mut data = raw;
-                    rx_bytes_batch = rx_bytes_batch.saturating_add((data.len() + 10) as u64);
-                    rx_packets_batch = rx_packets_batch.saturating_add(1);
-
-                    if seq != 0 {
-                        if let Some(ic) = &ic_rx {
-                            let wire_len = data.len() as u32;
-                            match ic.open_in_place(&mut data, seq, wire_len) {
-                                Ok(plain) => {
-                                    let n = plain.len();
-                                    data.truncate(n);
-                                }
-                                Err(_) => {
-                                    debug!("dropped tampered/foreign frame (seq={})", seq);
-                                    release_frame_vec(data);
-                                    continue;
-                                }
-                            }
+                    Ok(_) => {
+                        last_rx = Instant::now();
+                        if let Err(e) = tls.process_new_packets() {
+                            close_reason = format!("tls.process_new_packets failed: {e}");
+                            conn_closed = true;
+                            break 'socket_read;
                         }
                     }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break 'socket_read;
+                    }
+                    Err(e) => {
+                        close_reason = format!("tls.read_tls failed: {e}");
+                        conn_closed = true;
+                        break 'socket_read;
+                    }
+                }
 
-                    let data = Arc::new(data);
-                    if seq == 0 {
-                        if let Some(dec) = &fec_dec {
-                            if fec::is_parity_frame(&data) {
+                // Drain all plaintext made available by this TLS read before
+                // attempting another socket read. This keeps rustls buffers bounded
+                // while still draining the edge-triggered fd all the way to EAGAIN.
+                loop {
+                    match scanner.read_frame(&mut tls.reader()) {
+                        Ok(Some((raw, seq))) => {
+                            if raw.is_empty() {
+                                continue;
+                            }
+                            let mut data = raw;
+                            rx_bytes_batch =
+                                rx_bytes_batch.saturating_add((data.len() + 10) as u64);
+                            rx_packets_batch = rx_packets_batch.saturating_add(1);
+
+                            if seq != 0 {
+                                if let Some(ic) = &ic_rx {
+                                    let wire_len = data.len() as u32;
+                                    match ic.open_in_place(&mut data, seq, wire_len) {
+                                        Ok(plain) => {
+                                            let n = plain.len();
+                                            data.truncate(n);
+                                        }
+                                        Err(_) => {
+                                            debug!(
+                                                "dropped tampered/foreign frame (seq={})",
+                                                seq
+                                            );
+                                            release_frame_vec(data);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            let data = Arc::new(data);
+                            if seq == 0 {
+                                if let Some(dec) = &fec_dec {
+                                    if fec::is_parity_frame(&data) {
+                                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                            deliver_to_tap(
+                                                &cl,
+                                                s,
+                                                f,
+                                                &mut reorder_ready,
+                                            );
+                                        };
+                                        dec.on_parity(&data, &mut sink);
+                                        release_shared_frame(data);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if let Some(dec) = &fec_dec {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
                                     deliver_to_tap(&cl, s, f, &mut reorder_ready);
                                 };
-                                dec.on_parity(&data, &mut sink);
+                                dec.on_data(seq, &data, &mut sink);
+                            }
+
+                            if !cl.dedup.lock().is_duplicate(seq) {
+                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);
+                            } else {
                                 release_shared_frame(data);
-                                continue;
                             }
                         }
+                        Ok(None) => break,
+                        Err(e) => {
+                            close_reason = format!("frame scanner failed: {e}");
+                            conn_closed = true;
+                            break 'socket_read;
+                        }
                     }
-
-                    // 数据帧同时进入 FEC 累加器和正常交付路径。旧实现这里
-                    // dec.on_data 后 continue，导致启用 XOR FEC 时原始数据帧
-                    // 根本不进入 TAP；服务端一直是正确的“双路径”语义。
-                    if let Some(dec) = &fec_dec {
-                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                            deliver_to_tap(&cl, s, f, &mut reorder_ready);
-                        };
-                        dec.on_data(seq, &data, &mut sink);
-                    }
-
-                    if !cl.dedup.lock().is_duplicate(seq) {
-                        deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-                    } else {
-                        release_shared_frame(data);
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    conn_closed = true;
-                    break;
                 }
             }
         }
+
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
             cl.rx_packets
@@ -1687,9 +1706,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
-        if woken {
+        if !tls.wants_write() && (woken || !rx.is_empty()) {
             if let Some(n) = &backend.notify {
-                // 在 drain 前清 pending；并发的新生产者会重新触发 wake。
+                // Only clear pending when we are actually going to drain the
+                // backend queue. If TLS is socket-backpressured, leave pending
+                // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
             while let Ok(f) = rx.try_recv() {
@@ -1703,12 +1724,16 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
-        if send_buf.is_empty() && last_keepalive.elapsed() > Duration::from_secs(4) {
+        if send_buf.is_empty()
+            && !tls.wants_write()
+            && last_keepalive.elapsed() > Duration::from_secs(4)
+        {
             append_padded_frame(&mut send_buf, 0, &[], None);
         }
         if !send_buf.is_empty() {
             let wire_bytes = send_buf.len() as u64;
-            if tls.writer().write_all(&send_buf).is_err() {
+            if let Err(e) = tls.writer().write_all(&send_buf) {
+                close_reason = format!("tls plaintext writer failed: {e}");
                 break;
             }
             if tx_packets_batch != 0 {
@@ -1726,6 +1751,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         while tls.wants_write() {
             match tls.write_tls(&mut sock) {
                 Ok(0) => {
+                    close_reason = "tls.write_tls returned zero".into();
                     conn_closed = true;
                     break;
                 }
@@ -1738,7 +1764,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 {
                     break
                 }
-                Err(_) => {
+                Err(e) => {
+                    close_reason = format!("tls.write_tls failed: {e}");
                     conn_closed = true;
                     break;
                 }
@@ -1746,13 +1773,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         if last_write_progress.elapsed() > Duration::from_secs(10) {
+            close_reason = "write stalled for >10s".into();
             warn!("write stalled for >10s; closing the connection");
             conn_closed = true;
         }
         if last_rx.elapsed() > Duration::from_secs(15) {
+            close_reason = "no TLS receive progress for >15s".into();
             conn_closed = true;
         }
     }
+
+    if close_reason.is_empty() {
+        close_reason = "connection loop ended without an explicit reason".into();
+    }
+    warn!("[Conn {}] data loop closing: {}", conn_index, close_reason);
 
     tls.send_close_notify();
     while tls.wants_write() {

@@ -10,12 +10,11 @@
 # bring the link up, and assign addresses. Anything short of that prints
 # SKIP with the precise missing step and exits 0, keeping CI green.
 #
-# Note the gate is deliberately stricter than "can I create a TAP?": that
-# alone passes on ubuntu-latest, where TUNSETIFF is allowed but RTNL is not,
-# so the job would proceed and the server would die before binding its port,
-# which looked like "server did not start". Both endpoints run on the same
-# machine, so the measured throughput reflects the tunnel stack itself
-# (TLS + inner crypto + vswitch), not the physical network.
+# Server and client run in separate network namespaces connected only by a
+# veth underlay. Their 10.77.0.x / fd77:: tunnel addresses therefore cannot
+# become local addresses in the same namespace and bypass the TAP/tunnel path.
+# The measured throughput is local-machine tunnel-stack throughput
+# (TAP + TLS + inner crypto + vswitch), not physical-network throughput.
 #
 # Env:
 #   BIN_SRV / BIN_CLI       server/client binary paths (required)
@@ -43,6 +42,16 @@ FLAVOR_CLI="${FLAVOR_CLI:-rs}"
 TAP_SRV="tap_t0"
 TAP_CLI="tap_t1"
 
+# Keep tunnel endpoints in separate network namespaces. If both tunnel IPs
+# live in one namespace, Linux table local can satisfy ping/iperf without TAP.
+NS_SRV="tlsvpn-srv-$$"
+NS_CLI="tlsvpn-cli-$$"
+UNDERLAY_SRV="192.0.2.1"
+UNDERLAY_CLI="192.0.2.2"
+UNDERLAY_PREFIX=30
+VETH_SRV="tvs$$"
+VETH_CLI="tvc$$"
+
 PASS=0; FAIL=0; SKIPPED=0
 log()  { echo "[netperf] $*"; }
 ok()   { echo "[netperf] ✅ $*"; PASS=$((PASS+1)); }
@@ -50,36 +59,43 @@ fail() { echo "[netperf] ❌ $*"; FAIL=$((FAIL+1)); }
 skip() { echo "[netperf] ⏭️  $*"; SKIPPED=$((SKIPPED+1)); }
 
 # ---------------------------------------------------------------------------
-# Capability gate: a real tunnel needs root + the whole RTNL path, not just
-# TAP creation. The gate used to test only `ip tuntap add`, which passes on
-# ubuntu-latest — the device is created but `ip link set ... up` / `ip addr
-# replace` are the steps that decide whether a tunnel can actually run. A
-# partial grant here made the gate report "capable" and then let the server
-# die before it ever bound its port, surfacing only as "server did not start".
-# Test the create+up+address sequence instead, so an environment that cannot
-# run a tunnel SKIPs instead of failing inside the server.
+# Capability gate: a valid benchmark needs root, netns/veth, and the whole
+# TAP/RTNL path. Probe those exact primitives before building the topology so
+# an incapable runner SKIPs instead of producing a partial or misleading test.
 # ---------------------------------------------------------------------------
 skip_reason=""
+CAP_NS="tlsvpn-cap-$$"
+CAP_VETH_A="tca$$"
+CAP_VETH_B="tcb$$"
 if [[ $EUID -ne 0 ]]; then
   skip_reason="not running as root"
 elif [[ ! -c /dev/net/tun ]]; then
   skip_reason="/dev/net/tun not available"
 else
-  if ! ip tuntap add dev tap_capchk mode tap 2>/dev/null; then
-    skip_reason="cannot create TAP (no CAP_NET_ADMIN, e.g. GitHub-hosted runner)"
-  elif ! ip link set dev tap_capchk up 2>/dev/null; then
-    skip_reason="TAP created but cannot bring the link up (TUNSETIFF allowed, RTNL refused)"
-  elif ! ip addr replace 10.77.99.1/24 dev tap_capchk 2>/dev/null; then
+  # Probe the exact primitives required by the isolated real-TAP test.
+  if ! ip netns add "$CAP_NS" 2>/dev/null; then
+    skip_reason="cannot create network namespace (netns unavailable)"
+  elif ! ip link add "$CAP_VETH_A" type veth peer name "$CAP_VETH_B" 2>/dev/null; then
+    skip_reason="cannot create veth pair (CAP_NET_ADMIN unavailable)"
+  elif ! ip link set "$CAP_VETH_B" netns "$CAP_NS" 2>/dev/null; then
+    skip_reason="cannot move veth into network namespace"
+  elif ! ip netns exec "$CAP_NS" ip link set lo up 2>/dev/null; then
+    skip_reason="cannot configure loopback inside network namespace"
+  elif ! ip netns exec "$CAP_NS" ip tuntap add dev tap_capchk mode tap 2>/dev/null; then
+    skip_reason="cannot create TAP inside network namespace"
+  elif ! ip netns exec "$CAP_NS" ip link set dev tap_capchk up 2>/dev/null; then
+    skip_reason="TAP created but cannot bring the link up (RTNL refused)"
+  elif ! ip netns exec "$CAP_NS" ip addr replace 10.77.99.1/24 dev tap_capchk 2>/dev/null; then
     skip_reason="TAP created but cannot assign an address (RTNL refused)"
   fi
-  ip link del tap_capchk 2>/dev/null || true
+  ip link del "$CAP_VETH_A" 2>/dev/null || true
+  ip netns del "$CAP_NS" 2>/dev/null || true
 fi
 if [[ -n "$skip_reason" ]]; then
   log "SKIP: $skip_reason"
-  log "Run this on a privileged/self-hosted runner (or a server) for real results."
+  log "Run this on a runner/server with network namespaces + CAP_NET_ADMIN for real results."
   exit 0
 fi
-
 if [[ -z "${BIN_SRV:-}" || -z "${BIN_CLI:-}" ]]; then
   log "SKIP: BIN_SRV / BIN_CLI not provided"
   exit 0
@@ -132,33 +148,83 @@ impl_config() {
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   sleep 0.5
-  ip link del "$TAP_SRV" 2>/dev/null || true
-  ip link del "$TAP_CLI" 2>/dev/null || true
+  ip netns del "$NS_SRV" 2>/dev/null || true
+  ip netns del "$NS_CLI" 2>/dev/null || true
+  # Cover partial setup failures before the veths were moved.
+  ip link del "$VETH_SRV" 2>/dev/null || true
+  ip link del "$VETH_CLI" 2>/dev/null || true
   [[ -n "$SRV_DIR" && -d "$SRV_DIR" ]] && rm -rf "$SRV_DIR"
   return 0
 }
 trap cleanup EXIT
 
+setup_namespaces() {
+  ip netns add "$NS_SRV" || return 1
+  ip netns add "$NS_CLI" || return 1
+  ip link add "$VETH_SRV" type veth peer name "$VETH_CLI" || return 1
+  ip link set "$VETH_SRV" netns "$NS_SRV" || return 1
+  ip link set "$VETH_CLI" netns "$NS_CLI" || return 1
+
+  ip netns exec "$NS_SRV" ip link set lo up || return 1
+  ip netns exec "$NS_CLI" ip link set lo up || return 1
+  ip netns exec "$NS_SRV" ip link set "$VETH_SRV" name underlay0 || return 1
+  ip netns exec "$NS_CLI" ip link set "$VETH_CLI" name underlay0 || return 1
+  ip netns exec "$NS_SRV" ip addr add "$UNDERLAY_SRV/$UNDERLAY_PREFIX" dev underlay0 || return 1
+  ip netns exec "$NS_CLI" ip addr add "$UNDERLAY_CLI/$UNDERLAY_PREFIX" dev underlay0 || return 1
+  ip netns exec "$NS_SRV" ip link set underlay0 up || return 1
+  ip netns exec "$NS_CLI" ip link set underlay0 up || return 1
+}
+
+if ! setup_namespaces; then
+  fail "failed to create isolated server/client network namespaces"
+  exit 1
+fi
+
 wait_for_port() {
-  local host="$1" port="$2" deadline=$(( $(date +%s) + ${3:-20} ))
-  while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+  local ns="$1" host="$2" port="$3" timeout="${4:-20}"
+  local deadline=$(( $(date +%s) + timeout ))
+  while ! ip netns exec "$ns" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; do
     [[ $(date +%s) -lt $deadline ]] || return 1
     sleep 0.3
   done
-  exec 3>&- 2>/dev/null || true
   return 0
 }
 
-# Wait until the client's tunnel IP shows up on its TAP (handshake done).
+# Wait until the client tunnel IP shows up inside its namespace (handshake done).
 wait_for_client_ip() {
   local deadline=$(( $(date +%s) + 30 ))
   while [[ $(date +%s) -lt $deadline ]]; do
-    if ip -4 addr show "$TAP_CLI" 2>/dev/null | grep -q "$CLI_V4"; then
+    if ip netns exec "$NS_CLI" ip -4 addr show "$TAP_CLI" 2>/dev/null | grep -q "$CLI_V4"; then
       return 0
     fi
     sleep 0.5
   done
   return 1
+}
+
+# Prove that benchmark traffic cannot take a table-local/loopback shortcut.
+route_path_check() {
+  local croute sroute
+  croute=$(ip netns exec "$NS_CLI" ip -4 route get "$GW_V4" 2>&1) || {
+    fail "client route lookup to $GW_V4 failed"; return 1;
+  }
+  sroute=$(ip netns exec "$NS_SRV" ip -4 route get "$CLI_V4" 2>&1) || {
+    fail "server route lookup to $CLI_V4 failed"; return 1;
+  }
+  log "client route: $croute"
+  log "server route: $sroute"
+  if [[ "$croute" == *"dev $TAP_CLI"* ]]; then
+    ok "client route to server tunnel IP uses $TAP_CLI"
+  else
+    fail "client route bypasses $TAP_CLI (benchmark would be invalid)"
+    return 1
+  fi
+  if [[ "$sroute" == *"dev $TAP_SRV"* ]]; then
+    ok "server route to client tunnel IP uses $TAP_SRV"
+  else
+    fail "server route bypasses $TAP_SRV (benchmark would be invalid)"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -168,9 +234,9 @@ ping_check() {
   local label="$1" target="$2" v6="$3"
   local out loss avg
   if [[ "$v6" == "v6" ]]; then
-    out=$(ping -6 -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" ping -6 -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
   else
-    out=$(ping -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" ping -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
   fi
   loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+(\.[0-9]+)?')
   avg=$(echo "$out" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+' | head -1 | cut -d/ -f2)
@@ -192,9 +258,9 @@ traceroute_check() {
   fi
   local out
   if [[ "$v6" == "v6" ]]; then
-    out=$(traceroute -6 -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" traceroute -6 -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
   else
-    out=$(traceroute -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" traceroute -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
   fi
   log "traceroute $label:"
   echo "$out" | sed 's/^/[netperf]     /'
@@ -207,12 +273,12 @@ traceroute_check() {
 
 # ---------------------------------------------------------------------------
 # iperf3: server binds the tunnel gateway IP; client tests through tunnel.
-# Loopback endpoints → measures the tunnel stack overhead itself.
+# Namespace-isolated tunnel endpoints measure the tunnel stack overhead itself.
 # ---------------------------------------------------------------------------
 iperf_one_way() {
   local label="$1" extra="${2:-}"
   local json mbps
-  json=$(iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
+  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
   }
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
@@ -238,6 +304,10 @@ iperf_one_way() {
     ok "iperf3 $label: ${mbps} Mbps (>= ${IPERF_MIN_MBPS})"
   else
     fail "iperf3 $label: ${mbps} Mbps < ${IPERF_MIN_MBPS} threshold"
+    log "iperf3 $label end-summary diagnostics:"
+    printf "%s\n" "$json" |
+      grep -E '"(error|bytes|bits_per_second|retransmits)"' | tail -24 |
+      sed 's/^/[netperf]     /' || true
   fi
 }
 
@@ -246,7 +316,7 @@ iperf_check() {
     skip "iperf3 not installed — throughput test skipped"
     return 0
   fi
-  iperf3 -s -B "$GW_V4" -p "$((PORT + 1))" >/dev/null 2>&1 &
+  ip netns exec "$NS_SRV" iperf3 -s -B "$GW_V4" -p "$((PORT + 1))" >/dev/null 2>&1 &
   PIDS+=($!)
   sleep 0.5
   iperf_one_way "upload (cli→srv)"
@@ -268,7 +338,7 @@ librespeed_check() {
     return 0
   fi
   local dir; dir=$(mktemp -d)
-  "$srv_bin" >/dev/null 2>&1 &
+  ip netns exec "$NS_SRV" "$srv_bin" >/dev/null 2>&1 &
   local srv_pid=$!
   PIDS+=($srv_pid)
   sleep 1
@@ -277,7 +347,7 @@ librespeed_check() {
 JSONEOF
   sed -i "s|SERVERURL|${GW_V4}:8080|" "$dir/servers.json"
   local out
-  out=$("$cli" --server-json "$dir/servers.json" --json 2>/dev/null) || true
+  out=$(ip netns exec "$NS_CLI" "$cli" --server-json "$dir/servers.json" --json 2>/dev/null) || true
   kill "$srv_pid" 2>/dev/null || true
   PIDS=("${PIDS[@]:0:${#PIDS[@]}-1}")
   rm -rf "$dir"
@@ -300,7 +370,7 @@ run_group() {
 
   # 两实现 flags 均已移除（2026-09-19）：键名两边一致，服务端配置共用一份
   local scfg="$SRV_DIR/srv.json"
-  impl_config "$scfg" server "127.0.0.1:$PORT" \
+  impl_config "$scfg" server "$UNDERLAY_SRV:$PORT" \
     '"encrypt": true' \
     '"log_level": "debug"' \
     "\"tap\": \"$TAP_SRV\"" \
@@ -317,11 +387,11 @@ run_group() {
     return 1
   fi
 
-  "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
+  ip netns exec "$NS_SRV" "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
   local srv_pid=$!
   PIDS+=($srv_pid)
-  if ! wait_for_port 127.0.0.1 "$PORT" 20; then
-    fail "server did not start (127.0.0.1:$PORT never opened within 20s)"
+  if ! wait_for_port "$NS_CLI" "$UNDERLAY_SRV" "$PORT" 20; then
+    fail "server did not start ($UNDERLAY_SRV:$PORT never opened/reached within 20s)"
     log "server process: $(kill -0 "$srv_pid" 2>/dev/null && echo 'still alive (hangs before binding)' || echo 'already exited (see log)')"
     log "--- server log ---"; sed 's/^/[netperf]     /' "$SRV_DIR/srv.log" | tail -25 || true
     log "--- server config ---"; sed 's/^/[netperf]     /' "$scfg" || true
@@ -339,19 +409,19 @@ run_group() {
   # 走 dangerous() 完整替换验证器，无需也不应叠加 insecure。
   local ccfg="$SRV_DIR/cli.json"
   if [[ "$FLAVOR_CLI" == "go" ]]; then
-    impl_config "$ccfg" client "127.0.0.1:$PORT" \
+    impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"tap\": \"$TAP_CLI\"" \
       "\"client\": {\"cert_sha256\": \"$fp\", \"insecure\": true}"
   else
-    impl_config "$ccfg" client "127.0.0.1:$PORT" \
+    impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"tap\": \"$TAP_CLI\"" \
       "\"client\": {\"cert_sha256\": \"$fp\"}"
   fi
-  "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
+  ip netns exec "$NS_CLI" "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
 
   if ! wait_for_client_ip; then
@@ -362,11 +432,23 @@ run_group() {
   fi
   sleep 1  # let the vswitch learn MACs via first ARPs
 
+  route_path_check || return 1
   ping_check "v4 cli→gw" "$GW_V4" v4
   ping_check "v6 cli→gw" "$GW_V6" v6
   traceroute_check "v4" "$GW_V4" v4
   traceroute_check "v6" "$GW_V6" v6
+  local fail_before_iperf=$FAIL
   iperf_check
+  if (( FAIL > fail_before_iperf )); then
+    log "--- client TAP counters after iperf failure ---"
+    ip netns exec "$NS_CLI" ip -s link show "$TAP_CLI" 2>&1 | sed 's/^/[netperf]     /' || true
+    log "--- server TAP counters after iperf failure ---"
+    ip netns exec "$NS_SRV" ip -s link show "$TAP_SRV" 2>&1 | sed 's/^/[netperf]     /' || true
+    log "--- client log tail after iperf failure ---"
+    tail -80 "$SRV_DIR/cli.log" 2>/dev/null | sed 's/^/[netperf]     /' || true
+    log "--- server log tail after iperf failure ---"
+    tail -80 "$SRV_DIR/srv.log" 2>/dev/null | sed 's/^/[netperf]     /' || true
+  fi
   librespeed_check
   return 0
 }
