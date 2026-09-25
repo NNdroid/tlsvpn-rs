@@ -10,12 +10,11 @@
 # bring the link up, and assign addresses. Anything short of that prints
 # SKIP with the precise missing step and exits 0, keeping CI green.
 #
-# Note the gate is deliberately stricter than "can I create a TAP?": that
-# alone passes on ubuntu-latest, where TUNSETIFF is allowed but RTNL is not,
-# so the job would proceed and the server would die before binding its port,
-# which looked like "server did not start". Both endpoints run on the same
-# machine, so the measured throughput reflects the tunnel stack itself
-# (TLS + inner crypto + vswitch), not the physical network.
+# Server and client run in separate network namespaces connected only by a
+# veth underlay. Their 10.77.0.x / fd77:: tunnel addresses therefore cannot
+# become local addresses in the same namespace and bypass the TAP/tunnel path.
+# The measured throughput is local-machine tunnel-stack throughput
+# (TAP + TLS + inner crypto + vswitch), not physical-network throughput.
 #
 # Env:
 #   BIN_SRV / BIN_CLI       server/client binary paths (required)
@@ -45,13 +44,13 @@ TAP_CLI="tap_t1"
 
 # Keep tunnel endpoints in separate network namespaces. If both tunnel IPs
 # live in one namespace, Linux table local can satisfy ping/iperf without TAP.
-NS_SRV="tlsvpn-srv-$"
-NS_CLI="tlsvpn-cli-$"
+NS_SRV="tlsvpn-srv-$$"
+NS_CLI="tlsvpn-cli-$$"
 UNDERLAY_SRV="192.0.2.1"
 UNDERLAY_CLI="192.0.2.2"
 UNDERLAY_PREFIX=30
-VETH_SRV="tvs$"
-VETH_CLI="tvc$"
+VETH_SRV="tvs$$"
+VETH_CLI="tvc$$"
 
 PASS=0; FAIL=0; SKIPPED=0
 log()  { echo "[netperf] $*"; }
@@ -60,14 +59,9 @@ fail() { echo "[netperf] ❌ $*"; FAIL=$((FAIL+1)); }
 skip() { echo "[netperf] ⏭️  $*"; SKIPPED=$((SKIPPED+1)); }
 
 # ---------------------------------------------------------------------------
-# Capability gate: a real tunnel needs root + the whole RTNL path, not just
-# TAP creation. The gate used to test only `ip tuntap add`, which passes on
-# ubuntu-latest — the device is created but `ip link set ... up` / `ip addr
-# replace` are the steps that decide whether a tunnel can actually run. A
-# partial grant here made the gate report "capable" and then let the server
-# die before it ever bound its port, surfacing only as "server did not start".
-# Test the create+up+address sequence instead, so an environment that cannot
-# run a tunnel SKIPs instead of failing inside the server.
+# Capability gate: a valid benchmark needs root, netns/veth, and the whole
+# TAP/RTNL path. Probe those exact primitives before building the topology so
+# an incapable runner SKIPs instead of producing a partial or misleading test.
 # ---------------------------------------------------------------------------
 skip_reason=""
 CAP_NS="tlsvpn-cap-$$"
@@ -279,7 +273,7 @@ traceroute_check() {
 
 # ---------------------------------------------------------------------------
 # iperf3: server binds the tunnel gateway IP; client tests through tunnel.
-# Loopback endpoints → measures the tunnel stack overhead itself.
+# Namespace-isolated tunnel endpoints measure the tunnel stack overhead itself.
 # ---------------------------------------------------------------------------
 iperf_one_way() {
   local label="$1" extra="${2:-}"
