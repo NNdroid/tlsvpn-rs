@@ -6,13 +6,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HOT_FRAME_CLASS: usize = 2048;
-const HOT_FRAME_POOL_ITEMS_PER_THREAD: usize = 64;
+const FRAME_CLASSES: [usize; 7] = [
+    2 * 1024,
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+];
+// Keep standard-MTU frames hottest while sharply limiting retained jumbo
+// buffers. Worst-case retained capacity is ~384 KiB per active thread.
+const FRAME_CLASS_LIMITS: [usize; 7] = [32, 8, 4, 2, 1, 1, 1];
+
+#[inline]
+fn frame_class_index(len: usize) -> Option<usize> {
+    match len {
+        1..=2048 => Some(0),
+        2049..=4096 => Some(1),
+        4097..=8192 => Some(2),
+        8193..=16384 => Some(3),
+        16385..=32768 => Some(4),
+        32769..=65536 => Some(5),
+        65537..=131072 => Some(6),
+        _ => None,
+    }
+}
+
+#[inline]
+fn frame_capacity_class(capacity: usize) -> Option<usize> {
+    FRAME_CLASSES.iter().position(|&class| class == capacity)
+}
 
 thread_local! {
-    // FrameScanner/连接 worker 的 acquire/release 几乎都发生在同一线程。
-    // 用 TLS 小栈避免全局 ArrayQueue 每帧做原子同步；每线程最多保留
-    // 64 * 2KB = 128KB，线程退出时自动释放。
-    static HOT_FRAME_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    // FrameScanner/TAP/connection workers usually acquire and release on the
+    // same thread. Per-thread size classes avoid allocator + global atomic
+    // traffic while keeping large-frame retention explicitly bounded.
+    static FRAME_POOLS: RefCell<[Vec<Vec<u8>>; FRAME_CLASSES.len()]> =
+        RefCell::new(std::array::from_fn(|_| Vec::new()));
 }
 
 #[inline]
@@ -20,26 +51,27 @@ pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
-    if len <= HOT_FRAME_CLASS {
-        let mut buf = HOT_FRAME_POOL
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_else(|| Vec::with_capacity(HOT_FRAME_CLASS));
-        buf.resize(len, 0);
-        return buf;
-    }
-    vec![0u8; len]
+    let Some(idx) = frame_class_index(len) else {
+        return vec![0u8; len];
+    };
+    let class = FRAME_CLASSES[idx];
+    let mut buf = FRAME_POOLS
+        .with(|pools| pools.borrow_mut()[idx].pop())
+        .unwrap_or_else(|| Vec::with_capacity(class));
+    buf.resize(len, 0);
+    buf
 }
 
 #[inline]
 pub fn release_frame_vec(mut buf: Vec<u8>) {
-    if buf.capacity() != HOT_FRAME_CLASS {
+    let Some(idx) = frame_capacity_class(buf.capacity()) else {
         return;
-    }
+    };
     buf.clear();
-    HOT_FRAME_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < HOT_FRAME_POOL_ITEMS_PER_THREAD {
-            pool.push(buf);
+    FRAME_POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        if pools[idx].len() < FRAME_CLASS_LIMITS[idx] {
+            pools[idx].push(buf);
         }
     });
 }
@@ -281,6 +313,34 @@ mod tests {
         assert_eq!(buf.len(), 1500);
         assert_eq!(buf.capacity(), HOT_FRAME_CLASS);
         release_frame_vec(buf);
+    }
+
+    #[test]
+    fn frame_pool_uses_bounded_size_classes() {
+        for &(len, want_cap) in &[
+            (1514usize, 2048usize),
+            (3000, 4096),
+            (9000, 16384),
+            (40_000, 65536),
+            (100_000, 131072),
+        ] {
+            let mut buf = acquire_frame_vec(len);
+            assert_eq!(buf.len(), len);
+            assert_eq!(buf.capacity(), want_cap, "len={len}");
+            buf[0] = 0xa5;
+            release_frame_vec(buf);
+
+            let buf2 = acquire_frame_vec(len);
+            assert_eq!(buf2.capacity(), want_cap, "reacquire len={len}");
+            release_frame_vec(buf2);
+        }
+
+        // Beyond the protocol frame pool classes: allocate exactly and do not
+        // retain it in the thread-local cache.
+        let big = acquire_frame_vec(140_000);
+        assert_eq!(big.len(), 140_000);
+        assert!(big.capacity() >= 140_000);
+        release_frame_vec(big);
     }
 
     #[test]
