@@ -1545,8 +1545,9 @@ impl VSwitch {
                 // 避免握手线程与动态学习线程竞态时覆盖 static mapping。
                 match self.mac_table.entry(src_mac) {
                     Entry::Occupied(mut occupied) => {
-                        let current = occupied.get();
-                        if current.static_entry && current.port_id != src_port_id {
+                        let was_static = occupied.get().static_entry;
+                        let different_port = occupied.get().port_id != src_port_id;
+                        if was_static && different_port {
                             if src_port_id != self.trusted_port {
                                 self.spoof_drops.fetch_add(1, Ordering::Relaxed);
                                 return;
@@ -1555,7 +1556,7 @@ impl VSwitch {
                             occupied.insert(MacEntry {
                                 port_id: src_port_id.to_string(),
                                 updated_at: Instant::now(),
-                                static_entry: current.static_entry,
+                                static_entry: was_static,
                             });
                         }
                     }
