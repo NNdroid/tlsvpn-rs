@@ -22,7 +22,7 @@ hmac = "0.12"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-aes-gcm = "0.10"
+ring = "0.17"
 getrandom = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 # ssl-rustls：面板 HTTPS（web.cert / web.key）。不启用该 feature 时
