@@ -240,9 +240,9 @@ ping_check() {
   local label="$1" target="$2" v6="$3"
   local out loss avg
   if [[ "$v6" == "v6" ]]; then
-    out=$(ping -6 -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" ping -6 -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
   else
-    out=$(ping -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" ping -c 10 -i 0.2 -W 1 "$target" 2>&1) || true
   fi
   loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+(\.[0-9]+)?')
   avg=$(echo "$out" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+' | head -1 | cut -d/ -f2)
@@ -264,9 +264,9 @@ traceroute_check() {
   fi
   local out
   if [[ "$v6" == "v6" ]]; then
-    out=$(traceroute -6 -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" traceroute -6 -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
   else
-    out=$(traceroute -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
+    out=$(ip netns exec "$NS_CLI" traceroute -n -w 1 -q 1 -m 3 "$target" 2>&1) || true
   fi
   log "traceroute $label:"
   echo "$out" | sed 's/^/[netperf]     /'
@@ -284,7 +284,7 @@ traceroute_check() {
 iperf_one_way() {
   local label="$1" extra="${2:-}"
   local json mbps
-  json=$(iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
+  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
   }
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
@@ -318,7 +318,7 @@ iperf_check() {
     skip "iperf3 not installed — throughput test skipped"
     return 0
   fi
-  iperf3 -s -B "$GW_V4" -p "$((PORT + 1))" >/dev/null 2>&1 &
+  ip netns exec "$NS_SRV" iperf3 -s -B "$GW_V4" -p "$((PORT + 1))" >/dev/null 2>&1 &
   PIDS+=($!)
   sleep 0.5
   iperf_one_way "upload (cli→srv)"
@@ -340,7 +340,7 @@ librespeed_check() {
     return 0
   fi
   local dir; dir=$(mktemp -d)
-  "$srv_bin" >/dev/null 2>&1 &
+  ip netns exec "$NS_SRV" "$srv_bin" >/dev/null 2>&1 &
   local srv_pid=$!
   PIDS+=($srv_pid)
   sleep 1
@@ -349,7 +349,7 @@ librespeed_check() {
 JSONEOF
   sed -i "s|SERVERURL|${GW_V4}:8080|" "$dir/servers.json"
   local out
-  out=$("$cli" --server-json "$dir/servers.json" --json 2>/dev/null) || true
+  out=$(ip netns exec "$NS_CLI" "$cli" --server-json "$dir/servers.json" --json 2>/dev/null) || true
   kill "$srv_pid" 2>/dev/null || true
   PIDS=("${PIDS[@]:0:${#PIDS[@]}-1}")
   rm -rf "$dir"
