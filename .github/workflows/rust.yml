@@ -182,6 +182,8 @@ jobs:
       run: (cd go-impl && bash scripts/build.sh)
 
     - name: rs_srv <- rs_cli (ping / traceroute / throughput)
+      id: netperf_rs_rs
+      continue-on-error: true
       env:
         BIN_SRV: ${{ github.workspace }}/dist/tlsvpn
         BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
@@ -190,6 +192,8 @@ jobs:
       run: sudo -E bash scripts/net_perf_test.sh
 
     - name: rs_srv <- go_cli (cross-language)
+      id: netperf_rs_go
+      continue-on-error: true
       env:
         BIN_SRV: ${{ github.workspace }}/dist/tlsvpn
         BIN_CLI: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
@@ -198,9 +202,21 @@ jobs:
       run: sudo -E bash scripts/net_perf_test.sh
 
     - name: go_srv <- rs_cli (cross-language)
+      id: netperf_go_rs
+      continue-on-error: true
       env:
         BIN_SRV: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
         BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
         FLAVOR_SRV: go
         FLAVOR_CLI: rs
       run: sudo -E bash scripts/net_perf_test.sh
+
+    - name: Require every real-TAP matrix group
+      if: always()
+      run: |
+        echo "rs/rs: ${{ steps.netperf_rs_rs.outcome }}"
+        echo "rs/go: ${{ steps.netperf_rs_go.outcome }}"
+        echo "go/rs: ${{ steps.netperf_go_rs.outcome }}"
+        test "${{ steps.netperf_rs_rs.outcome }}" = success
+        test "${{ steps.netperf_rs_go.outcome }}" = success
+        test "${{ steps.netperf_go_rs.outcome }}" = success
