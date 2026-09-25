@@ -1331,6 +1331,9 @@ impl AsyncPort {
 
 struct MacEntry {
     port_id: String,
+    // 已解析目标端口。命中单播时省掉第二次 ports DashMap 查找和 String clone。
+    // Arc 由 MAC entry 持有到 remove_port/老化删除，生命周期天然安全。
+    port: Option<Arc<AsyncPort>>,
     updated_at: Instant,
     static_entry: bool,
 }
@@ -1405,10 +1408,14 @@ impl VSwitch {
         if mac == [0u8; 6] {
             return;
         }
+        // 先解析端口再写 MAC 表，避免在 mac_table shard guard 内再进入 ports
+        // DashMap。未注册/测试端口允许 None，转发时回退旧 lookup。
+        let port = self.ports.get(&port_id).map(|p| p.value().clone());
         self.mac_table.insert(
             mac,
             MacEntry {
                 port_id,
+                port,
                 updated_at: Instant::now(),
                 static_entry: true,
             },
@@ -1553,16 +1560,20 @@ impl VSwitch {
                                 return;
                             }
                         } else {
+                            let learned_port = self.ports.get(src_port_id).map(|p| p.value().clone());
                             occupied.insert(MacEntry {
                                 port_id: src_port_id.to_string(),
+                                port: learned_port,
                                 updated_at: Instant::now(),
                                 static_entry: was_static,
                             });
                         }
                     }
                     Entry::Vacant(vacant) => {
+                        let learned_port = self.ports.get(src_port_id).map(|p| p.value().clone());
                         vacant.insert(MacEntry {
                             port_id: src_port_id.to_string(),
+                            port: learned_port,
                             updated_at: Instant::now(),
                             static_entry: false,
                         });
@@ -1571,18 +1582,26 @@ impl VSwitch {
             }
         }
 
-        let mut target_port_id = None;
+        let mut fallback_target = None;
         if (dst_mac[0] & 1) == 0 {
             if let Some(entry) = self.mac_table.get(&dst_mac) {
-                target_port_id = Some(entry.port_id.clone());
+                if entry.port_id == src_port_id {
+                    return;
+                }
+                if let Some(port) = entry.port.as_ref() {
+                    // write_frame 是有界非阻塞入队；持 mac_table shard 读 guard 到
+                    // 本次发送完成，使 remove_port/retain 等待这一小段临界区。
+                    port.write_frame(frame);
+                    return;
+                }
+                // 兼容历史/测试 entry：只有没缓存端口时才 clone id + 二次 lookup。
+                fallback_target = Some(entry.port_id.clone());
             }
         }
 
-        if let Some(target) = target_port_id {
-            if target != src_port_id {
-                if let Some(port) = self.ports.get(&target) {
-                    port.write_frame(frame);
-                }
+        if let Some(target) = fallback_target {
+            if let Some(port) = self.ports.get(&target) {
+                port.write_frame(frame);
             }
         } else {
             self.flood(src_port_id, frame);
