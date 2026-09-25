@@ -1,5 +1,4 @@
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Tag};
+use ring::aead::{self, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -259,16 +258,14 @@ pub fn new_random_salt() -> [u8; ENC_SALT_SIZE] {
 /// 显式协商后启用。nonce/AAD/tag/frame wire format 对两者完全相同。
 pub enum InnerCipher {
     Gcm256 {
-        aead: Aes256Gcm,
+        aead: LessSafeKey,
         salt: [u8; ENC_SALT_SIZE],
     },
     Gcm128 {
-        aead: Aes128Gcm,
+        aead: LessSafeKey,
         salt: [u8; ENC_SALT_SIZE],
     },
 }
-
-type GcmNonce = aes_gcm::Nonce<aes_gcm::aead::consts::U12>;
 
 impl InnerCipher {
     /// 历史 API：固定 AES-256-GCM。
@@ -318,14 +315,20 @@ impl InnerCipher {
 
         match algo {
             ENC_ALGO_GCM => {
-                let aead = Aes256Gcm::new_from_slice(&key)
+                let key = UnboundKey::new(&aead::AES_256_GCM, &key)
                     .map_err(|_| "invalid AES-256-GCM key".to_string())?;
-                Ok(InnerCipher::Gcm256 { aead, salt: s })
+                Ok(InnerCipher::Gcm256 {
+                    aead: LessSafeKey::new(key),
+                    salt: s,
+                })
             }
             ENC_ALGO_GCM128 => {
-                let aead = Aes128Gcm::new_from_slice(&key[..16])
+                let key = UnboundKey::new(&aead::AES_128_GCM, &key[..16])
                     .map_err(|_| "invalid AES-128-GCM key".to_string())?;
-                Ok(InnerCipher::Gcm128 { aead, salt: s })
+                Ok(InnerCipher::Gcm128 {
+                    aead: LessSafeKey::new(key),
+                    salt: s,
+                })
             }
             _ => unreachable!(),
         }
@@ -339,14 +342,14 @@ impl InnerCipher {
         GCM_TAG_SIZE
     }
 
-    fn gcm_nonce(&self, seq: u32) -> GcmNonce {
+    fn gcm_nonce(&self, seq: u32) -> Nonce {
         let salt = match self {
             InnerCipher::Gcm256 { salt, .. } | InnerCipher::Gcm128 { salt, .. } => salt,
         };
         let mut nonce = [0u8; GCM_NONCE_SIZE];
         nonce[0..4].copy_from_slice(&seq.to_be_bytes());
         nonce[4..].copy_from_slice(salt);
-        *Nonce::from_slice(&nonce)
+        Nonce::assume_unique_for_key(nonce)
     }
 }
 
@@ -366,14 +369,11 @@ impl InnerCipher {
         let aad = gcm_aad(wire_len, seq);
         let (ct, tag_space) = region.split_at_mut(pt_len);
         let tag = match self {
-            InnerCipher::Gcm256 { aead, .. } => aead
-                .encrypt_in_place_detached(&nonce, &aad, ct)
-                .expect("GCM encryption cannot fail"),
-            InnerCipher::Gcm128 { aead, .. } => aead
-                .encrypt_in_place_detached(&nonce, &aad, ct)
+            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => aead
+                .seal_in_place_separate_tag(nonce, Aad::from(aad), ct)
                 .expect("GCM encryption cannot fail"),
         };
-        tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
+        tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_ref());
     }
 
     pub fn open_in_place<'a>(
@@ -391,14 +391,12 @@ impl InnerCipher {
         let nonce = self.gcm_nonce(seq);
         let aad = gcm_aad(wire_len, seq);
         let (ct, tag) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
-        let tag_arr = Tag::from_slice(tag);
+        let tag = Tag::try_from(&tag[..]).map_err(|_| ())?;
         match self {
-            InnerCipher::Gcm256 { aead, .. } => aead
-                .decrypt_in_place_detached(&nonce, &aad, ct, tag_arr)
-                .map_err(|_| ())?,
-            InnerCipher::Gcm128 { aead, .. } => aead
-                .decrypt_in_place_detached(&nonce, &aad, ct, tag_arr)
-                .map_err(|_| ())?,
+            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => {
+                aead.open_in_place_separate_tag(nonce, Aad::from(aad), tag, ct, 0..)
+                    .map_err(|_| ())?;
+            }
         }
         Ok(ct)
     }
@@ -420,14 +418,12 @@ impl InnerCipher {
         let out = &mut dst[..ct.len()];
         out.copy_from_slice(ct);
         let nonce = self.gcm_nonce(seq);
-        let tag_arr = Tag::from_slice(tag);
+        let tag = Tag::try_from(tag).map_err(|_| ())?;
         match self {
-            InnerCipher::Gcm256 { aead, .. } => aead
-                .decrypt_in_place_detached(&nonce, aad, out, tag_arr)
-                .map_err(|_| ())?,
-            InnerCipher::Gcm128 { aead, .. } => aead
-                .decrypt_in_place_detached(&nonce, aad, out, tag_arr)
-                .map_err(|_| ())?,
+            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => {
+                aead.open_in_place_separate_tag(nonce, Aad::from(aad), tag, out, 0..)
+                    .map_err(|_| ())?;
+            }
         }
         Ok(out)
     }
