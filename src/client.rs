@@ -249,6 +249,8 @@ pub struct Client {
     pub fec_mode: bool,
     pub fec_group_req: usize,
     pub encrypt: bool,
+    // 显式配置的内层算法：AES-256-GCM（默认）或 AES-128-GCM（性能模式）
+    pub enc_algo: i64,
     // 内层加密强度下限（ENC_RANK_* 值，0 = 不限）
     pub min_enc: i64,
     pub tap: Arc<dyn TapDevice>,
@@ -328,7 +330,7 @@ impl WebStatsProvider for Client {
             .enumerate()
             .map(|(i, c)| c.snapshot(i))
             .collect();
-        // 发射前已归一化成 0/2，这里直接透传
+        // 发射前已归一化成 0/2/4，这里直接透传
         let enc = self.enc_algo_display.load(Ordering::Relaxed);
         let fec_status = self.fec_status.lock().clone();
         let sess = self.session.lock();
@@ -348,7 +350,7 @@ impl WebStatsProvider for Client {
             "session_id": session_id,
             "session_epoch": session_epoch,
             "session_token": session_token,
-            "session_encrypt": enc == ENC_ALGO_GCM,
+            "session_encrypt": is_gcm_algo(enc),
             "active_conns": self.live_conns.load(Ordering::Relaxed),
             "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
             "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
@@ -826,6 +828,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         fec_mode: args.fec,
         fec_group_req,
         encrypt: args.encrypt,
+        enc_algo: enc_algo_from_config(&args.enc_algo),
         // 强度下限解析一次，协商热路径只读整数
         min_enc: min_enc_rank(&args.min_enc),
         tap: device.clone(),
@@ -887,8 +890,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     if args.conns < 2 && args.fec {
         warn!(
-            "FEC is enabled but conns < 2. Multipath redundancy needs conns >= 2; \
-               FEC will only guard against queue-overflow drops on the single link."
+            "FEC is enabled but conns < 2. XOR parity is suppressed on a single TCP path because \
+             TCP head-of-line blocking prevents parity from overtaking missing data; parity resumes when a second path is active."
         );
     }
 
@@ -1188,7 +1191,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         brutal_conns: cl.conns_count as i64,
         brutal_conn_index: conn_index as i64,
         encrypt: cl.encrypt,
-        enc_algo: CLIENT_ENC_ALGO_SUPPORT,
+        enc_algo: if cl.encrypt { cl.enc_algo } else { ENC_ALGO_NONE },
         session_token,
     };
     let req_json = serde_json::to_vec(&req).unwrap();
@@ -1243,19 +1246,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         return Duration::ZERO;
     }
 
-    // 唯一算法 GCM：会话盐由服务端生成、通过响应下发，服务端重启或会话重建
-    // 即换盐，密钥流不再跨会话重用。旧版 AES-CTR 回退路径已移除——协商不出
-    // GCM 说明对端不再受支持，直接拒连。
+    // 内层算法由配置显式固定。gcm256 保持兼容默认；gcm128 是 opt-in 性能模式。
+    // 服务端响应必须完全一致，禁止自动降级或升级。
     let mut enc_algo = ENC_ALGO_NONE;
     let mut ic_tx: Option<Arc<InnerCipher>> = None;
     let mut ic_rx: Option<Arc<InnerCipher>> = None;
     let mut fec_tx: Option<Arc<InnerCipher>> = None;
     let mut fec_rx: Option<Arc<InnerCipher>> = None;
     if cl.encrypt {
-        if resp.enc_algo != ENC_ALGO_GCM {
+        if resp.enc_algo != cl.enc_algo {
             *ci.last_error.lock() = format!(
-                "server negotiated inner cipher {}, GCM ({}) is required",
-                resp.enc_algo, ENC_ALGO_GCM
+                "server negotiated inner cipher {} ({}), want {} ({})",
+                resp.enc_algo,
+                enc_algo_label(resp.enc_algo),
+                cl.enc_algo,
+                enc_algo_label(cl.enc_algo)
             );
             warn!("[Conn {}] {}", conn_index, *ci.last_error.lock());
             return Duration::ZERO;
@@ -1268,7 +1273,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 return Duration::ZERO;
             }
         };
-        match (InnerCipher::gcm(&cl.psk, &stx), InnerCipher::gcm(&cl.psk, &srx)) {
+        match (
+            InnerCipher::gcm_for_algo(&cl.psk, &stx, resp.enc_algo),
+            InnerCipher::gcm_for_algo(&cl.psk, &srx, resp.enc_algo),
+        ) {
             (Ok(tx), Ok(rx)) => {
                 ic_tx = Some(Arc::new(tx));
                 ic_rx = Some(Arc::new(rx));
@@ -1280,14 +1288,17 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 return Duration::ZERO;
             }
         }
-        fec_tx = InnerCipher::gcm_domain(&cl.psk, &stx, "fec").ok().map(Arc::new);
-        fec_rx = InnerCipher::gcm_domain(&cl.psk, &srx, "fec").ok().map(Arc::new);
+        fec_tx = InnerCipher::gcm_domain_for_algo(&cl.psk, &stx, "fec", resp.enc_algo)
+            .ok()
+            .map(Arc::new);
+        fec_rx = InnerCipher::gcm_domain_for_algo(&cl.psk, &srx, "fec", resp.enc_algo)
+            .ok()
+            .map(Arc::new);
         enc_algo = resp.enc_algo;
     }
 
-    // 强度下限：协商结果低于本地要求时拒绝这条连接（服务端可能跑的是旧版，
-    // 或中间被降级）。这是运维显式声明的硬要求，不能静默降级。
-    if cl.min_enc > 0 && enc_algo != ENC_ALGO_GCM {
+    // min_enc=gcm 接受任一种认证 GCM；具体 key size 由 enc_algo 精确固定。
+    if cl.min_enc > 0 && !is_gcm_algo(enc_algo) {
         *ci.state.lock() = "retrying".into();
         *ci.last_error.lock() = format!(
             "server negotiated inner cipher {} is below min_enc {:?}",
@@ -1369,7 +1380,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         );
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
-        // 只有两种取值：0=明文，2=GCM。面板按此映射即可，无需归一化。
+        // 取值：0=明文，2=AES-256-GCM，4=AES-128-GCM。
         cl.enc_algo_display.store(enc_algo, Ordering::Relaxed);
 
         if is_new_session {
