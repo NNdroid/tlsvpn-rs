@@ -1241,7 +1241,7 @@ impl AsyncPort {
         if let Some(par) = parity {
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
             let par = Arc::new(par);
-            if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
+            if let Some(idx) = self.parity_backend_index(&backends, Some(data_idx)) {
                 self.send_frame_to(&backends[idx], 0, &par);
             } else {
                 self.drop_n(1);
