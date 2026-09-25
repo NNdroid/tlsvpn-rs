@@ -1502,9 +1502,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut conn_closed = false;
     let mut close_reason = String::new();
 
-    // 发送聚合缓冲永久复用，并扩大到 256KiB：rustls 仍会自行切 TLS record，
-    // 但减少 writer()/write_tls 调用和 socket syscall，吞吐优先。
-    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
+    // Keep one plaintext batch below rustls' bounded outgoing plaintext
+    // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
+    // buffer") before write_tls() gets a chance to drain ciphertext.
+    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
@@ -1579,31 +1580,28 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // ---- 下行读取（仅 socket 可读时）----
         let mut got_rx = false;
         if readable {
-            loop {
-                match tls.read_tls(&mut sock) {
-                    Ok(0) => {
-                        close_reason = "tls.read_tls returned EOF".into();
+            // Do not drain the raw socket to WouldBlock before processing TLS.
+            // rustls bounds its encrypted-message buffer; a high-rate socket can
+            // fill it if read_tls() is called repeatedly without interleaving
+            // process_new_packets() + plaintext consumption.
+            match tls.read_tls(&mut sock) {
+                Ok(0) => {
+                    close_reason = "tls.read_tls returned EOF".into();
+                    conn_closed = true;
+                }
+                Ok(_) => {
+                    got_rx = true;
+                    last_rx = Instant::now();
+                    if let Err(e) = tls.process_new_packets() {
+                        close_reason = format!("tls.process_new_packets failed: {e}");
                         conn_closed = true;
-                        break;
-                    }
-                    Ok(_) => got_rx = true,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break
-                    }
-                    Err(e) => {
-                        close_reason = format!("tls.read_tls failed: {e}");
-                        conn_closed = true;
-                        break;
                     }
                 }
-            }
-            if got_rx {
-                last_rx = Instant::now();
-                if let Err(e) = tls.process_new_packets() {
-                    close_reason = format!("tls.process_new_packets failed: {e}");
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    close_reason = format!("tls.read_tls failed: {e}");
                     conn_closed = true;
                 }
             }
@@ -1695,9 +1693,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
-        if woken {
+        if !tls.wants_write() && (woken || !rx.is_empty()) {
             if let Some(n) = &backend.notify {
-                // 在 drain 前清 pending；并发的新生产者会重新触发 wake。
+                // Only clear pending when we are actually going to drain the
+                // backend queue. If TLS is socket-backpressured, leave pending
+                // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
             while let Ok(f) = rx.try_recv() {
@@ -1711,7 +1711,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
-        if send_buf.is_empty() && last_keepalive.elapsed() > Duration::from_secs(4) {
+        if send_buf.is_empty()
+            && !tls.wants_write()
+            && last_keepalive.elapsed() > Duration::from_secs(4)
+        {
             append_padded_frame(&mut send_buf, 0, &[], None);
         }
         if !send_buf.is_empty() {
