@@ -1486,7 +1486,15 @@ fn worker_loop(
                 .lock()
                 .flush_timeout_into(&mut reorder_ready);
             for ordered in reorder_ready.drain(..) {
-                core.vswitch.process_frame(&session.stat.client_id, ordered);
+                if session.mac_bin != [0u8; 6] {
+                    core.vswitch.process_session_frame(
+                        &session.stat.client_id,
+                        session.mac_bin,
+                        ordered,
+                    );
+                } else {
+                    core.vswitch.process_frame(&session.stat.client_id, ordered);
+                }
             }
         }
 
@@ -1659,8 +1667,15 @@ fn deliver_to_vswitch(
         .lock()
         .insert_into(seq, frame, ready);
     for ordered in ready.drain(..) {
-        core.vswitch
-            .process_frame(&c_sess.stat.client_id, ordered);
+        if c_sess.mac_bin != [0u8; 6] {
+            core.vswitch.process_session_frame(
+                &c_sess.stat.client_id,
+                c_sess.mac_bin,
+                ordered,
+            );
+        } else {
+            core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
+        }
     }
 }
 
@@ -2169,7 +2184,9 @@ fn handle_handshake(
                 }
             };
 
+            let mac_bin = parse_mac_key(&mac).unwrap_or_default();
             core.vswitch.add_port(client_id.clone(), port.clone());
+            core.vswitch.add_static_mac(client_id.clone(), mac_bin);
             if !mac.is_empty() {
                 core.pool
                     .lock()
@@ -2186,8 +2203,7 @@ fn handle_handshake(
             );
 
             let sess = Arc::new(ClientSession {
-                // 握手已保证格式合法（为空则解析失败），这里只解析一次
-                mac_bin: parse_mac_key(&mac).unwrap_or_default(),
+                mac_bin,
                 session_id: gen_session_id(),
                 stat,
                 port,
