@@ -563,6 +563,7 @@ impl RuntimeCtx {
         let mut cfg = serde_json::json!({
                 "mode": args.mode,
                 "encrypt": args.encrypt,
+                "enc_algo": args.enc_algo,
                 "min_enc": args.min_enc,
                 "pad_mode": pad_actual,
                 "brutal": args.brutal,
@@ -916,8 +917,8 @@ function fmtDur(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86
   if(d>0)return d+'天'+h+'时';if(h>0)return h+'时'+m+'分';if(m>0)return m+'分'+(s%60)+'秒';return s+'秒';}
 function badge(f){if(!f||f==='off')return '<span class="badge b-off">关闭</span>';
   return '<span class="badge b-on">'+f+'</span>';}
-// 内层只有一种算法（GCM），没有按算法编号切换的余地；0 = 明文
-function encBadge(a){if(a===2)return '<span class="badge b-on">GCM</span>';
+function encBadge(a){if(a===2)return '<span class="badge b-on">AES-256-GCM</span>';
+  if(a===4)return '<span class="badge b-on">AES-128-GCM</span>';
   return '<span class="badge b-off">明文</span>';}
 function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
 // kvRows 的单元格值按 HTML 原样输出，徽章行需要标签；来自 ip stderr 的报错
@@ -1026,7 +1027,7 @@ async function fetchStats(){
       document.getElementById('ippool-kpi').innerHTML=data.ip_pool.v4_used+'<small style="font-size:.55em;color:var(--muted)"> / '+data.ip_pool.v4_total+'</small>';
       document.getElementById('v6used').innerText=data.ip_pool.v6_used;}
 
-    const meta=[];if(data.enc_algo===2)meta.push('GCM 加密');
+    const meta=[];if(data.enc_algo===2)meta.push('AES-256-GCM');else if(data.enc_algo===4)meta.push('AES-128-GCM');
     if(data.fec_mode&&data.fec_mode!=='off')meta.push('FEC '+data.fec_mode);
     const neg0=data.negotiate||{};if(neg0.protocol_version)meta.push('协议 v'+neg0.protocol_version);
     document.getElementById('meta').innerText=meta.join(' · ');
@@ -1067,6 +1068,7 @@ function renderStatus(data){
 
   document.getElementById('st-cfg').innerHTML=kvRows([
     ['内层加密 encrypt',c.encrypt?'开启':'关闭'],
+    ['内层算法 enc_algo',c.enc_algo||'-'],
     ['加密下限 min_enc',c.min_enc||'不限'],
     ['混淆填充 pad_mode',c.pad_mode||'-'],
     ['TCP Brutal',c.brutal?'开启':'关闭'],
