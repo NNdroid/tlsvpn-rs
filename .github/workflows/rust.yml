@@ -37,6 +37,13 @@ jobs:
         # is insufficient without the target libc headers (stdint.h -> bits/*).
         cargo check --target aarch64-unknown-linux-gnu --verbose
 
+    - name: Check Cortex-A55 tuned ARM64 build
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        RUSTFLAGS: "-C target-cpu=cortex-a55"
+      run: cargo check --target aarch64-unknown-linux-gnu --verbose
+
     - name: Verify protocol golden vectors (cross-language contract)
       env:
         TLSVPN_GOLDEN: "testdata/protocol_golden.json"
