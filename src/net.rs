@@ -1513,6 +1513,7 @@ pub type SharedFlag = Arc<AtomicBool>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::release_shared_frame;
     use std::sync::atomic::AtomicU32;
 
     /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
