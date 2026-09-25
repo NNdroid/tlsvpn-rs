@@ -1649,6 +1649,23 @@ mod tests {
         }
         assert!(seen_a && seen_b, "both low-RTT paths must participate");
 
+        // 真实生产入口：当前 A 队列积压到阈值，且到 16-frame burst 边界时，
+        // selected_backend_index 必须能切到 B，而不是 helper 永远没人调用。
+        for i in 0..Self::MULTIPATH_STRIPE_QUEUE {
+            a.ch.try_send(VPNFrame {
+                seq: 100 + i as u32,
+                data: Arc::new(vec![0u8; 64]),
+            }).unwrap();
+        }
+        port.preferred.store(0, Ordering::Relaxed);
+        port.schedule_tick.store(16, Ordering::Relaxed);
+        port.data_cursor.store(1, Ordering::Relaxed);
+        assert_eq!(
+            port.selected_backend_index(&backends),
+            Some(1),
+            "queued preferred path must trigger burst striping"
+        );
+
         // 即使 RTT 接近，明显积压的 B 也必须退出候选集。
         for i in 0..20u32 {
             b.ch.try_send(VPNFrame {
