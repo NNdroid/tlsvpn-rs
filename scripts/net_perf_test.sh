@@ -222,7 +222,7 @@ import json,sys
 d=json.load(sys.stdin)
 end=d.get("end",{})
 s=end.get("sum_received") or end.get("sum_sent") or {}
-print(f"{s.get(\"bits_per_second\",0)/1e6:.1f}")' 2>/dev/null || echo "?")
+print("{:.1f}".format(s.get("bits_per_second", 0) / 1e6))' 2>/dev/null || echo "?")
     # python3 存在但解析不出数字时 mbps 是空串：Windows Store 的占位程序会
     # 静默以 0 退出而不打印任何内容。空串必须当成"没解析出来"，否则下一步会
     # 拿 0 去比阈值，把一个跑通的传输判成未达标。
@@ -231,7 +231,7 @@ print(f"{s.get(\"bits_per_second\",0)/1e6:.1f}")' 2>/dev/null || echo "?")
     mbps="?"
   fi
   if [[ "$mbps" == "?" ]]; then
-    ok "iperf3 $label: transfer ok (install python3 for Mbps parsing)"
+    ok "iperf3 $label: transfer ok (Mbps parser unavailable)"
     return 0
   fi
   # awk 做浮点比较：POSIX 且每个 runner 都有。此前用 bc，而 bc 缺失时
