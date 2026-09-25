@@ -1107,6 +1107,7 @@ dependencies = [
 name = "tlsvpn"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64ct",
  "byteorder",
  "crossbeam-channel",
