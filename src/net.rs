@@ -1638,6 +1638,61 @@ mod tests {
     }
 
     #[test]
+    fn async_port_stripes_only_under_sustained_backend_pressure() {
+        let port = AsyncPort::new("bulk-stripe".into());
+        let (b0, r0) = make_backend();
+        let (b1, r1) = make_backend();
+        let (b2, r2) = make_backend();
+        b0.rtt_cache.store(20_000, Ordering::Relaxed);
+        b1.rtt_cache.store(21_000, Ordering::Relaxed);
+        b2.rtt_cache.store(22_000, Ordering::Relaxed);
+        port.register_backend(b0.clone());
+        port.register_backend(b1.clone());
+        port.register_backend(b2.clone());
+
+        // 低负载应保持 sticky MinRTT，不主动制造跨 TCP 乱序。
+        for _ in 0..12 {
+            port.write_frame(Arc::new(vec![0x11; 1400]));
+        }
+        assert!(r0.len() > 0);
+        assert_eq!(r1.len(), 0);
+        assert_eq!(r2.len(), 0);
+        while let Ok(f) = r0.try_recv() {
+            release_shared_frame(f.data);
+        }
+
+        // 给三条相近 RTT 路径制造相同的持续 backlog；之后 bulk 流量应该
+        // 在候选路径间轮转，而不是仍把所有帧压到 preferred。
+        for b in [&b0, &b1, &b2] {
+            for _ in 0..(AsyncPort::MULTIPATH_STRIPE_BACKLOG + 4) {
+                b.ch.try_send(VPNFrame {
+                    seq: 0,
+                    data: Arc::new(Vec::new()),
+                })
+                .unwrap();
+            }
+        }
+        let before = [r0.len(), r1.len(), r2.len()];
+        for _ in 0..24 {
+            port.write_frame(Arc::new(vec![0x22; 1400]));
+        }
+        let after = [r0.len(), r1.len(), r2.len()];
+        let used = (0..3)
+            .filter(|&i| after[i] > before[i])
+            .count();
+        assert!(
+            used >= 2,
+            "bulk pressure should use multiple comparable paths: before={before:?} after={after:?}"
+        );
+
+        for rx in [&r0, &r1, &r2] {
+            while let Ok(f) = rx.try_recv() {
+                release_shared_frame(f.data);
+            }
+        }
+    }
+
+    #[test]
     fn backend_notify_coalesces_until_consumed() {
         let mut poll = mio::Poll::new().unwrap();
         let dirty = Arc::new(ArrayQueue::new(8));
