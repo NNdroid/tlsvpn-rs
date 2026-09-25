@@ -2020,6 +2020,44 @@ mod tests {
     }
 
     #[test]
+    fn cached_destination_port_is_used_and_removed_with_mac_entry() {
+        let vs = VSwitch::new();
+        let (backend_a, _rx_a) = make_backend();
+        let (backend_b, rx_b) = make_backend();
+        let port_a = Arc::new(AsyncPort::new("A".into()));
+        let port_b = Arc::new(AsyncPort::new("B".into()));
+        port_a.register_backend(backend_a);
+        port_b.register_backend(backend_b);
+        vs.add_port("A".into(), port_a.clone());
+        vs.add_port("B".into(), port_b.clone());
+
+        let mac_a = [0x02, 0, 0, 0, 0, 0x51];
+        let mac_b = [0x02, 0, 0, 0, 0, 0x52];
+        vs.add_static_mac("A".into(), mac_a);
+        vs.add_static_mac("B".into(), mac_b);
+
+        {
+            let entry = vs.mac_table.get(&mac_b).expect("destination MAC entry");
+            let cached = entry.port.as_ref().expect("cached destination port");
+            assert!(
+                Arc::ptr_eq(cached, &port_b),
+                "MAC entry must retain the registered AsyncPort"
+            );
+        }
+
+        vs.process_session_frame("A", mac_a, eth_frame(&mac_b, &mac_a, &[0x5a]));
+        let delivered = rx_b.try_recv().expect("cached unicast must reach B");
+        assert_eq!(delivered.data[delivered.data.len() - 1], 0x5a);
+        release_shared_frame(delivered.data);
+
+        vs.remove_port("B");
+        assert!(
+            vs.mac_table.get(&mac_b).is_none(),
+            "remove_port must remove cached destination entry"
+        );
+    }
+
+    #[test]
     fn static_session_mac_fast_path_skips_validator_and_aging() {
         let vs = VSwitch::new();
         let port_a = Arc::new(AsyncPort::new("A".into()));
