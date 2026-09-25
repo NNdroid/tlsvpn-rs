@@ -154,33 +154,83 @@ impl_config() {
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   sleep 0.5
-  ip link del "$TAP_SRV" 2>/dev/null || true
-  ip link del "$TAP_CLI" 2>/dev/null || true
+  ip netns del "$NS_SRV" 2>/dev/null || true
+  ip netns del "$NS_CLI" 2>/dev/null || true
+  # Cover partial setup failures before the veths were moved.
+  ip link del "$VETH_SRV" 2>/dev/null || true
+  ip link del "$VETH_CLI" 2>/dev/null || true
   [[ -n "$SRV_DIR" && -d "$SRV_DIR" ]] && rm -rf "$SRV_DIR"
   return 0
 }
 trap cleanup EXIT
 
+setup_namespaces() {
+  ip netns add "$NS_SRV" || return 1
+  ip netns add "$NS_CLI" || return 1
+  ip link add "$VETH_SRV" type veth peer name "$VETH_CLI" || return 1
+  ip link set "$VETH_SRV" netns "$NS_SRV" || return 1
+  ip link set "$VETH_CLI" netns "$NS_CLI" || return 1
+
+  ip netns exec "$NS_SRV" ip link set lo up || return 1
+  ip netns exec "$NS_CLI" ip link set lo up || return 1
+  ip netns exec "$NS_SRV" ip link set "$VETH_SRV" name underlay0 || return 1
+  ip netns exec "$NS_CLI" ip link set "$VETH_CLI" name underlay0 || return 1
+  ip netns exec "$NS_SRV" ip addr add "$UNDERLAY_SRV/$UNDERLAY_PREFIX" dev underlay0 || return 1
+  ip netns exec "$NS_CLI" ip addr add "$UNDERLAY_CLI/$UNDERLAY_PREFIX" dev underlay0 || return 1
+  ip netns exec "$NS_SRV" ip link set underlay0 up || return 1
+  ip netns exec "$NS_CLI" ip link set underlay0 up || return 1
+}
+
+if ! setup_namespaces; then
+  fail "failed to create isolated server/client network namespaces"
+  exit 1
+fi
+
 wait_for_port() {
-  local host="$1" port="$2" deadline=$(( $(date +%s) + ${3:-20} ))
-  while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+  local ns="$1" host="$2" port="$3" timeout="${4:-20}"
+  local deadline=$(( $(date +%s) + timeout ))
+  while ! ip netns exec "$ns" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; do
     [[ $(date +%s) -lt $deadline ]] || return 1
     sleep 0.3
   done
-  exec 3>&- 2>/dev/null || true
   return 0
 }
 
-# Wait until the client's tunnel IP shows up on its TAP (handshake done).
+# Wait until the client tunnel IP shows up inside its namespace (handshake done).
 wait_for_client_ip() {
   local deadline=$(( $(date +%s) + 30 ))
   while [[ $(date +%s) -lt $deadline ]]; do
-    if ip -4 addr show "$TAP_CLI" 2>/dev/null | grep -q "$CLI_V4"; then
+    if ip netns exec "$NS_CLI" ip -4 addr show "$TAP_CLI" 2>/dev/null | grep -q "$CLI_V4"; then
       return 0
     fi
     sleep 0.5
   done
   return 1
+}
+
+# Prove that benchmark traffic cannot take a table-local/loopback shortcut.
+route_path_check() {
+  local croute sroute
+  croute=$(ip netns exec "$NS_CLI" ip -4 route get "$GW_V4" 2>&1) || {
+    fail "client route lookup to $GW_V4 failed"; return 1;
+  }
+  sroute=$(ip netns exec "$NS_SRV" ip -4 route get "$CLI_V4" 2>&1) || {
+    fail "server route lookup to $CLI_V4 failed"; return 1;
+  }
+  log "client route: $croute"
+  log "server route: $sroute"
+  if [[ "$croute" == *"dev $TAP_CLI"* ]]; then
+    ok "client route to server tunnel IP uses $TAP_CLI"
+  else
+    fail "client route bypasses $TAP_CLI (benchmark would be invalid)"
+    return 1
+  fi
+  if [[ "$sroute" == *"dev $TAP_SRV"* ]]; then
+    ok "server route to client tunnel IP uses $TAP_SRV"
+  else
+    fail "server route bypasses $TAP_SRV (benchmark would be invalid)"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
