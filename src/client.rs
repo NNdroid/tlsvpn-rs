@@ -1577,38 +1577,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             release_shared_frame(ordered);
         }
 
-        // ---- 下行读取（仅 socket 可读时）----
-        let mut got_rx = false;
-        if readable {
-            // Do not drain the raw socket to WouldBlock before processing TLS.
-            // rustls bounds its encrypted-message buffer; a high-rate socket can
-            // fill it if read_tls() is called repeatedly without interleaving
-            // process_new_packets() + plaintext consumption.
-            match tls.read_tls(&mut sock) {
-                Ok(0) => {
-                    close_reason = "tls.read_tls returned EOF".into();
-                    conn_closed = true;
-                }
-                Ok(_) => {
-                    got_rx = true;
-                    last_rx = Instant::now();
-                    if let Err(e) = tls.process_new_packets() {
-                        close_reason = format!("tls.process_new_packets failed: {e}");
-                        conn_closed = true;
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    close_reason = format!("tls.read_tls failed: {e}");
-                    conn_closed = true;
-                }
-            }
-        }
-
-        // ---- 帧处理：解密 → FEC/去重/重排 → TAP ----
-        // 统计先在线程本地累加，一轮 parser drain 结束后再写共享原子。
+        // ---- 下行读取：mio 是边沿触发，必须真正 drain socket 到 WouldBlock。----
+        // 每次 read_tls 后立即 process_new_packets + drain plaintext，避免 rustls
+        // 的 bounded encrypted/plaintext buffers 在高速流量下先填满，从而留下
+        // 一个仍 readable 但再也没有新 edge 的 socket。
         let mut rx_bytes_batch = 0u64;
         let mut rx_packets_batch = 0u64;
         let fec_dec = if use_xor_fec {
@@ -1617,71 +1589,112 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             None
         };
 
-        loop {
-            match scanner.read_frame(&mut tls.reader()) {
-                Ok(Some((raw, seq))) => {
-                    if raw.is_empty() {
-                        continue;
+        if readable {
+            'socket_read: loop {
+                match tls.read_tls(&mut sock) {
+                    Ok(0) => {
+                        close_reason = "tls.read_tls returned EOF".into();
+                        conn_closed = true;
+                        break 'socket_read;
                     }
-                    let mut data = raw;
-                    rx_bytes_batch = rx_bytes_batch.saturating_add((data.len() + 10) as u64);
-                    rx_packets_batch = rx_packets_batch.saturating_add(1);
-
-                    if seq != 0 {
-                        if let Some(ic) = &ic_rx {
-                            let wire_len = data.len() as u32;
-                            match ic.open_in_place(&mut data, seq, wire_len) {
-                                Ok(plain) => {
-                                    let n = plain.len();
-                                    data.truncate(n);
-                                }
-                                Err(_) => {
-                                    debug!("dropped tampered/foreign frame (seq={})", seq);
-                                    release_frame_vec(data);
-                                    continue;
-                                }
-                            }
+                    Ok(_) => {
+                        last_rx = Instant::now();
+                        if let Err(e) = tls.process_new_packets() {
+                            close_reason = format!("tls.process_new_packets failed: {e}");
+                            conn_closed = true;
+                            break 'socket_read;
                         }
                     }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break 'socket_read;
+                    }
+                    Err(e) => {
+                        close_reason = format!("tls.read_tls failed: {e}");
+                        conn_closed = true;
+                        break 'socket_read;
+                    }
+                }
 
-                    let data = Arc::new(data);
-                    if seq == 0 {
-                        if let Some(dec) = &fec_dec {
-                            if fec::is_parity_frame(&data) {
+                // Drain all plaintext made available by this TLS read before
+                // attempting another socket read. This keeps rustls buffers bounded
+                // while still draining the edge-triggered fd all the way to EAGAIN.
+                loop {
+                    match scanner.read_frame(&mut tls.reader()) {
+                        Ok(Some((raw, seq))) => {
+                            if raw.is_empty() {
+                                continue;
+                            }
+                            let mut data = raw;
+                            rx_bytes_batch =
+                                rx_bytes_batch.saturating_add((data.len() + 10) as u64);
+                            rx_packets_batch = rx_packets_batch.saturating_add(1);
+
+                            if seq != 0 {
+                                if let Some(ic) = &ic_rx {
+                                    let wire_len = data.len() as u32;
+                                    match ic.open_in_place(&mut data, seq, wire_len) {
+                                        Ok(plain) => {
+                                            let n = plain.len();
+                                            data.truncate(n);
+                                        }
+                                        Err(_) => {
+                                            debug!(
+                                                "dropped tampered/foreign frame (seq={})",
+                                                seq
+                                            );
+                                            release_frame_vec(data);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            let data = Arc::new(data);
+                            if seq == 0 {
+                                if let Some(dec) = &fec_dec {
+                                    if fec::is_parity_frame(&data) {
+                                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                            deliver_to_tap(
+                                                &cl,
+                                                s,
+                                                f,
+                                                &mut reorder_ready,
+                                            );
+                                        };
+                                        dec.on_parity(&data, &mut sink);
+                                        release_shared_frame(data);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if let Some(dec) = &fec_dec {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
                                     deliver_to_tap(&cl, s, f, &mut reorder_ready);
                                 };
-                                dec.on_parity(&data, &mut sink);
+                                dec.on_data(seq, &data, &mut sink);
+                            }
+
+                            if !cl.dedup.lock().is_duplicate(seq) {
+                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);
+                            } else {
                                 release_shared_frame(data);
-                                continue;
                             }
                         }
+                        Ok(None) => break,
+                        Err(e) => {
+                            close_reason = format!("frame scanner failed: {e}");
+                            conn_closed = true;
+                            break 'socket_read;
+                        }
                     }
-
-                    // 数据帧同时进入 FEC 累加器和正常交付路径。旧实现这里
-                    // dec.on_data 后 continue，导致启用 XOR FEC 时原始数据帧
-                    // 根本不进入 TAP；服务端一直是正确的“双路径”语义。
-                    if let Some(dec) = &fec_dec {
-                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                            deliver_to_tap(&cl, s, f, &mut reorder_ready);
-                        };
-                        dec.on_data(seq, &data, &mut sink);
-                    }
-
-                    if !cl.dedup.lock().is_duplicate(seq) {
-                        deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-                    } else {
-                        release_shared_frame(data);
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    close_reason = format!("frame scanner failed: {e}");
-                    conn_closed = true;
-                    break;
                 }
             }
         }
+
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
             cl.rx_packets
