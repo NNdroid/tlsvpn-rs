@@ -1639,6 +1639,49 @@ mod tests {
     }
 
     #[test]
+    fn owned_arc_falls_back_without_payload_copy() {
+        let port = AsyncPort::new("owned-fallback".into());
+
+        let (tx0, rx0) = crossbeam_channel::bounded(4);
+        let b0 = Arc::new(Backend {
+            ch: tx0.clone(),
+            rtt_cache: Arc::new(AtomicU32::new(1_000)),
+            notify: None,
+        });
+        let (tx1, rx1) = crossbeam_channel::bounded(8);
+        let b1 = Arc::new(Backend {
+            ch: tx1,
+            rtt_cache: Arc::new(AtomicU32::new(2_000)),
+            notify: None,
+        });
+        port.register_backend(b0);
+        port.register_backend(b1);
+
+        // backend_score reserves two slots, so two queued items make b0 unavailable.
+        tx0.try_send(VPNFrame { seq: 0, data: Arc::new(vec![1]) }).unwrap();
+        tx0.try_send(VPNFrame { seq: 0, data: Arc::new(vec![2]) }).unwrap();
+
+        let data = Arc::new(vec![0x5a; 1400]);
+        let ptr = Arc::as_ptr(&data);
+        port.write_frame(data);
+
+        let sent = rx1
+            .try_iter()
+            .find(|f| f.seq != 0)
+            .expect("frame must fall back to second backend");
+        assert_eq!(Arc::as_ptr(&sent.data), ptr, "fallback must keep the same Arc payload");
+        assert_eq!(sent.seq, 1);
+        release_shared_frame(sent.data);
+
+        for f in rx0.try_iter() {
+            release_shared_frame(f.data);
+        }
+        for f in rx1.try_iter() {
+            release_shared_frame(f.data);
+        }
+    }
+
+    #[test]
     fn async_port_keeps_sticky_path_until_backpressure() {
         let port = AsyncPort::new("sticky".into());
         let (tx_a, _rx_a) = crossbeam_channel::bounded(32);
