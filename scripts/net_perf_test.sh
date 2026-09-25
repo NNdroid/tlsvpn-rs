@@ -372,7 +372,7 @@ run_group() {
 
   # 两实现 flags 均已移除（2026-09-19）：键名两边一致，服务端配置共用一份
   local scfg="$SRV_DIR/srv.json"
-  impl_config "$scfg" server "127.0.0.1:$PORT" \
+  impl_config "$scfg" server "$UNDERLAY_SRV:$PORT" \
     '"encrypt": true' \
     '"log_level": "debug"' \
     "\"tap\": \"$TAP_SRV\"" \
@@ -389,11 +389,11 @@ run_group() {
     return 1
   fi
 
-  "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
+  ip netns exec "$NS_SRV" "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
   local srv_pid=$!
   PIDS+=($srv_pid)
-  if ! wait_for_port 127.0.0.1 "$PORT" 20; then
-    fail "server did not start (127.0.0.1:$PORT never opened within 20s)"
+  if ! wait_for_port "$NS_CLI" "$UNDERLAY_SRV" "$PORT" 20; then
+    fail "server did not start ($UNDERLAY_SRV:$PORT never opened/reached within 20s)"
     log "server process: $(kill -0 "$srv_pid" 2>/dev/null && echo 'still alive (hangs before binding)' || echo 'already exited (see log)')"
     log "--- server log ---"; sed 's/^/[netperf]     /' "$SRV_DIR/srv.log" | tail -25 || true
     log "--- server config ---"; sed 's/^/[netperf]     /' "$scfg" || true
@@ -411,19 +411,19 @@ run_group() {
   # 走 dangerous() 完整替换验证器，无需也不应叠加 insecure。
   local ccfg="$SRV_DIR/cli.json"
   if [[ "$FLAVOR_CLI" == "go" ]]; then
-    impl_config "$ccfg" client "127.0.0.1:$PORT" \
+    impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"tap\": \"$TAP_CLI\"" \
       "\"client\": {\"cert_sha256\": \"$fp\", \"insecure\": true}"
   else
-    impl_config "$ccfg" client "127.0.0.1:$PORT" \
+    impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
       "\"tap\": \"$TAP_CLI\"" \
       "\"client\": {\"cert_sha256\": \"$fp\"}"
   fi
-  "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
+  ip netns exec "$NS_CLI" "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
 
   if ! wait_for_client_ip; then
@@ -434,6 +434,7 @@ run_group() {
   fi
   sleep 1  # let the vswitch learn MACs via first ARPs
 
+  route_path_check || return 1
   ping_check "v4 cli→gw" "$GW_V4" v4
   ping_check "v6 cli→gw" "$GW_V6" v6
   traceroute_check "v4" "$GW_V4" v4
