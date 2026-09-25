@@ -365,6 +365,7 @@ pub struct ServerCore {
     pub psk: String,
     pub psk_hash: String,
     pub encrypt: bool,
+    pub enc_algo: i64,
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
@@ -470,7 +471,7 @@ impl WebStatsProvider for ServerCore {
                     "ipv4": s.ipv4, "ipv6": s.ipv6, "mac": s.mac,
                     "session_id": s.session_id,
                     "session_epoch": epoch.epoch,
-                    "session_encrypt": epoch.enc_algo == ENC_ALGO_GCM,
+                    "session_encrypt": is_gcm_algo(epoch.enc_algo),
                     "active_conns": s.stat.active_conns.load(Ordering::Relaxed),
                     "tx_bytes": s.stat.tx_bytes.load(Ordering::Relaxed),
                     "rx_bytes": s.stat.rx_bytes.load(Ordering::Relaxed),
@@ -538,7 +539,7 @@ impl WebStatsProvider for ServerCore {
             "protocol_version": 2,
             "fec": true,
             "fec_group": 4,
-            "enc_algo": if self.encrypt { ENC_ALGO_GCM } else { ENC_ALGO_NONE },
+            "enc_algo": if self.encrypt { self.enc_algo } else { ENC_ALGO_NONE },
             "pad_mode": pad_mode_name(),
             "min_enc": min_enc_label(self.min_enc),
             "session_token": true,
@@ -858,6 +859,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         psk: args.psk.clone(),
         psk_hash: hash_psk(&args.psk),
         encrypt: args.encrypt,
+        enc_algo: enc_algo_from_config(&args.enc_algo),
         // 强度下限解析一次，握手热路径只读整数
         min_enc: min_enc_rank(&args.min_enc),
         // 0 = 默认 1024：直接跑 --max-sessions 0 也不该变成"无上限"，否则
@@ -1794,11 +1796,12 @@ fn rotate_session_epoch(
     let salt_a = new_random_salt();
     let salt_b = new_random_salt();
     let (ic_tx, ic_rx, fec_tx, fec_rx) = if core.encrypt {
+        let algo = epoch.enc_algo;
         (
-            Some(Arc::new(InnerCipher::gcm(&core.psk, &salt_b)?)),
-            Some(Arc::new(InnerCipher::gcm(&core.psk, &salt_a)?)),
-            Some(Arc::new(InnerCipher::gcm_domain(&core.psk, &salt_b, "fec")?)),
-            Some(Arc::new(InnerCipher::gcm_domain(&core.psk, &salt_a, "fec")?)),
+            Some(Arc::new(InnerCipher::gcm_for_algo(&core.psk, &salt_b, algo)?)),
+            Some(Arc::new(InnerCipher::gcm_for_algo(&core.psk, &salt_a, algo)?)),
+            Some(Arc::new(InnerCipher::gcm_domain_for_algo(&core.psk, &salt_b, "fec", algo)?)),
+            Some(Arc::new(InnerCipher::gcm_domain_for_algo(&core.psk, &salt_a, "fec", algo)?)),
         )
     } else {
         (None, None, None, None)
@@ -1871,12 +1874,20 @@ fn handle_handshake(
     // 强度下限：运维强制 GCM 时拒绝能力不足的客户端。这里刻意**不**走焦油坑——
     // 这是运维侧的期望结果（客户端版本过旧），需要一条明确可查的失败记录。
     // 位置在会话查找之前：能力不足的客户端连接管既有会话都不该被允许。
-    if core.encrypt && core.min_enc > 0 && req.enc_algo != ENC_ALGO_GCM {
-        // 此时还没有 client_id（它在下面才算出），algo 是唯一定位线索。
-        // mio 的流取对端地址需要消费 socket，不为此改结构体。
+    if core.encrypt && core.min_enc > 0 && !is_gcm_algo(req.enc_algo) {
         warn!(
             "connection refused: client cipher capability (algo={}) is below the min_enc floor (requires {})",
             req.enc_algo, core.min_enc
+        );
+        return HandshakeOutcome::Close;
+    }
+    if core.encrypt && req.enc_algo != core.enc_algo {
+        warn!(
+            "connection refused: client inner cipher {} ({}) does not match server enc_algo {} ({})",
+            req.enc_algo,
+            enc_algo_label(req.enc_algo),
+            core.enc_algo,
+            enc_algo_label(core.enc_algo)
         );
         return HandshakeOutcome::Close;
     }
@@ -1951,6 +1962,18 @@ fn handle_handshake(
                 warn!("[{}] connection refused: MAC mismatch", client_id);
                 *tarpit_flag = true;
                 return HandshakeOutcome::TarpitClose;
+            }
+            let existing_algo = existing.epoch_state.read().enc_algo;
+            if existing_algo != req.enc_algo {
+                warn!(
+                    "[{}] existing session uses inner cipher {} ({}), request wants {} ({}); rebuild/restart required",
+                    client_id,
+                    existing_algo,
+                    enc_algo_label(existing_algo),
+                    req.enc_algo,
+                    enc_algo_label(req.enc_algo)
+                );
+                return HandshakeOutcome::Close;
             }
             let needs_rotation = existing.epoch_state.read().instance_id != req.client_instance;
             if needs_rotation {
@@ -2034,32 +2057,32 @@ fn handle_handshake(
             } else {
                 0
             };
-            // 内层加密协商：只有一种算法。双方都声明 GCM 才启用；否则退回
-            // 仅 TLS 一层（对齐 Go：不做弱降级，宁明不给降级）
+            // 内层算法在前置闸门已按服务端 enc_algo 精确匹配；这里不再做降级。
             let salt_a = new_random_salt();
             let salt_b = new_random_salt();
-            let (enc_algo, ic_tx, ic_rx) = if core.encrypt
-                && enc_algo_supported(req.enc_algo, ENC_ALGO_GCM)
-            {
+            let (enc_algo, ic_tx, ic_rx) = if core.encrypt {
+                let algo = core.enc_algo;
                 (
-                    ENC_ALGO_GCM,
+                    algo,
                     Some(Arc::new(
-                        InnerCipher::gcm(&core.psk, &salt_b).expect("GCM init"),
+                        InnerCipher::gcm_for_algo(&core.psk, &salt_b, algo).expect("GCM init"),
                     )),
                     Some(Arc::new(
-                        InnerCipher::gcm(&core.psk, &salt_a).expect("GCM init"),
+                        InnerCipher::gcm_for_algo(&core.psk, &salt_a, algo).expect("GCM init"),
                     )),
                 )
             } else {
                 (ENC_ALGO_NONE, None, None)
             };
-            let (fec_tx, fec_rx) = if enc_algo == ENC_ALGO_GCM {
+            let (fec_tx, fec_rx) = if is_gcm_algo(enc_algo) {
                 (
                     Some(Arc::new(
-                        InnerCipher::gcm_domain(&core.psk, &salt_b, "fec").expect("FEC GCM init"),
+                        InnerCipher::gcm_domain_for_algo(&core.psk, &salt_b, "fec", enc_algo)
+                            .expect("FEC GCM init"),
                     )),
                     Some(Arc::new(
-                        InnerCipher::gcm_domain(&core.psk, &salt_a, "fec").expect("FEC GCM init"),
+                        InnerCipher::gcm_domain_for_algo(&core.psk, &salt_a, "fec", enc_algo)
+                            .expect("FEC GCM init"),
                     )),
                 )
             } else {
