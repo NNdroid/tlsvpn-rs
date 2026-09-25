@@ -1683,8 +1683,10 @@ mod tests {
     #[test]
     fn parity_counter_survives_epoch_reset() {
         let port = AsyncPort::new("parity".into());
-        let (backend, _rx) = make_backend();
-        port.register_backend(backend);
+        let (backend0, _rx0) = make_backend();
+        let (backend1, _rx1) = make_backend();
+        port.register_backend(backend0);
+        port.register_backend(backend1);
         port.reset_epoch(4, None);
         for i in 0..4 {
             port.write_frame(Arc::new(vec![i]));
