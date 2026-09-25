@@ -102,7 +102,6 @@ if ! command -v iperf3 >/dev/null 2>&1 || ! command -v traceroute >/dev/null 2>&
 fi
 HAVE_IPERF=$(command -v iperf3 || true)
 HAVE_TRACEROUTE=$(command -v traceroute || true)
-HAVE_PY3=$(command -v python3 || true)
 HAVE_AWK=$(command -v awk || true)
 
 SRV_DIR=""
@@ -216,31 +215,25 @@ iperf_one_way() {
   json=$(iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
   }
-  if [[ -n "$HAVE_PY3" ]]; then
-    mbps=$(printf '%s' "$json" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-end=d.get("end",{})
-s=end.get("sum_received") or end.get("sum_sent") or {}
-print(f"{s.get(\"bits_per_second\",0)/1e6:.1f}")' 2>/dev/null || echo "?")
-    # python3 存在但解析不出数字时 mbps 是空串：Windows Store 的占位程序会
-    # 静默以 0 退出而不打印任何内容。空串必须当成"没解析出来"，否则下一步会
-    # 拿 0 去比阈值，把一个跑通的传输判成未达标。
+  # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
+  # 最后一个 bits_per_second 就是最终汇总速率。用 grep+awk 解析，避免
+  # hosted runner / 极简 rootfs 缺 Python 时把吞吐断言静默降级成“transfer ok”。
+  if [[ -n "$HAVE_AWK" ]]; then
+    mbps=$(printf '%s' "$json" |
+      grep -oE '"bits_per_second"[[:space:]]*:[[:space:]]*[0-9.eE+-]+' |
+      tail -1 |
+      "$HAVE_AWK" -F: '{gsub(/[[:space:]]/,"",$2); printf "%.1f", ($2+0)/1000000}')
     [[ "$mbps" =~ ^[0-9]+([.][0-9]+)?$ ]] || mbps="?"
   else
     mbps="?"
   fi
   if [[ "$mbps" == "?" ]]; then
-    ok "iperf3 $label: transfer ok (install python3 for Mbps parsing)"
-    return 0
+    fail "iperf3 $label: transfer completed but Mbps result could not be parsed"
+    return 1
   fi
   # awk 做浮点比较：POSIX 且每个 runner 都有。此前用 bc，而 bc 缺失时
   # `… | bc -l 2>/dev/null || echo 1` 把失败的比较替换成字面量 1，
   # `(( 1 ))` 为真 —— 吞吐断言静默通过，等于没断言。
-  if [[ -z "$HAVE_AWK" ]]; then
-    ok "iperf3 $label: transfer ok (no awk — Mbps assertion skipped)"
-    return 0
-  fi
   if "$HAVE_AWK" -v a="$mbps" -v b="$IPERF_MIN_MBPS" 'BEGIN { exit !(a + 0 >= b + 0) }'; then
     ok "iperf3 $label: ${mbps} Mbps (>= ${IPERF_MIN_MBPS})"
   else
