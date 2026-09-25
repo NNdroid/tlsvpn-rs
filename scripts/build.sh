@@ -153,6 +153,7 @@ case "$MODE" in
     native) build_native ;;
     musl)   build_musl ;;
     gnu)    build_gnu ;;
+    a55)    build_a55 ;;
     all)    build_musl; build_gnu ;;
 esac
 
