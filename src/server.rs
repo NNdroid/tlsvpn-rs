@@ -1498,6 +1498,7 @@ fn worker_loop(
                             drain_tls(sess, &mut close);
                         }
                     }
+                }
 
                 if close {
                     if let Some(mut s) = mio_sessions.remove(&token) {
