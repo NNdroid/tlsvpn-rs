@@ -1250,6 +1250,17 @@ impl AsyncPort {
             return;
         }
 
+        // 所有后端都达到高水位时，在消耗线路 seq/FEC 槽位之前直接丢弃。
+        // 否则一次本地背压丢包会在接收端表现成不存在的 sequence hole，
+        // 触发 50ms reorder timeout，反而进一步放大吞吐抖动。
+        if !backends
+            .iter()
+            .any(|b| Self::backend_score(b).is_some())
+        {
+            self.drop_n(1);
+            return;
+        }
+
         let Some(seq) = self.next_seq() else {
             self.drop_n(1);
             return;
@@ -1573,6 +1584,41 @@ mod tests {
         port.reset_epoch(0, None);
         assert_eq!(port.next_seq(), Some(1));
         assert!(!port.is_sequence_exhausted());
+    }
+
+    #[test]
+    fn saturated_backends_do_not_consume_sequence() {
+        let port = AsyncPort::new("pre-seq-backpressure".into());
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let backend = Arc::new(Backend {
+            ch: tx.clone(),
+            rtt_cache: Arc::new(AtomicU32::new(1_000)),
+            notify: None,
+        });
+        // backend_score reserves two slots as the high-water mark.
+        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![1]) }).unwrap();
+        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![2]) }).unwrap();
+        port.register_backend(backend);
+
+        port.write_frame(Arc::new(vec![0x5a; 1400]));
+        assert_eq!(
+            port.tx_seq.load(Ordering::Acquire),
+            0,
+            "saturated backend must drop before consuming a wire sequence"
+        );
+
+        let _ = rx.try_recv();
+        port.write_frame(Arc::new(vec![0x6b; 1400]));
+        assert_eq!(port.tx_seq.load(Ordering::Acquire), 1);
+        let sent = rx
+            .try_iter()
+            .find(|f| f.seq != 0)
+            .expect("frame should dispatch once backend has capacity");
+        assert_eq!(sent.seq, 1);
+        release_shared_frame(sent.data);
+        for f in rx.try_iter() {
+            release_shared_frame(f.data);
+        }
     }
 
     #[test]
