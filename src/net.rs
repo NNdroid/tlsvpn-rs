@@ -1097,10 +1097,10 @@ impl AsyncPort {
         }
     }
 
-    /// 以 Arc 共享帧投递给单个后端（零拷贝：引用计数 +1）；队列满时丢弃。
-    /// 投递成功即唤醒后端 poller（事件驱动，替代轮询）。
-    /// 返回 0（成功）或 1（丢弃），用于丢帧统计。
-    fn send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> u64 {
+    /// 以 Arc 共享帧投递给单个后端（零拷贝：引用计数 +1）。
+    /// 返回是否成功；失败时由调用方决定尝试其它路径还是记丢帧。
+    #[inline]
+    fn try_send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> bool {
         if b.ch
             .try_send(VPNFrame {
                 seq,
@@ -1108,13 +1108,48 @@ impl AsyncPort {
             })
             .is_err()
         {
-            self.drop_n(1);
-            return 1;
+            return false;
         }
         if let Some(n) = &b.notify {
             n.wake();
         }
-        0
+        true
+    }
+
+    fn send_frame_to(&self, b: &Backend, seq: u32, data: &Arc<Vec<u8>>) -> u64 {
+        if self.try_send_frame_to(b, seq, data) {
+            0
+        } else {
+            self.drop_n(1);
+            1
+        }
+    }
+
+    /// 数据帧优先走选中的 MinRTT/striping 路径；若该队列在评分后瞬时变满，
+    /// 无阻塞尝试其它健康后端。这样不会因为一个短暂 full queue 立刻制造 seq hole。
+    fn send_data_frame_to_any(
+        &self,
+        backends: &[Arc<Backend>],
+        preferred: usize,
+        seq: u32,
+        data: &Arc<Vec<u8>>,
+    ) -> u64 {
+        if preferred < backends.len()
+            && self.try_send_frame_to(&backends[preferred], seq, data)
+        {
+            return 0;
+        }
+        for (idx, backend) in backends.iter().enumerate() {
+            if idx == preferred || Self::backend_score(backend).is_none() {
+                continue;
+            }
+            if self.try_send_frame_to(backend, seq, data) {
+                self.preferred.store(idx, Ordering::Relaxed);
+                return 0;
+            }
+        }
+        self.drop_n(1);
+        1
     }
 
     fn backend_score(b: &Backend) -> Option<u32> {
@@ -1281,7 +1316,7 @@ impl AsyncPort {
 
         let data_idx = self.selected_backend_index(&backends);
         if let Some(idx) = data_idx {
-            self.send_frame_to(&backends[idx], seq, &frame);
+            self.send_data_frame_to_any(&backends, idx, seq, &frame);
         } else {
             self.drop_n(1);
         }
@@ -1733,6 +1768,37 @@ mod tests {
         assert!(na > 0 && nb > 0, "bulk data did not use both close paths: {na}/{nb}");
         assert_eq!(ns, 0, "slow path unexpectedly carried bulk data");
         assert_eq!(na + nb, 256);
+    }
+
+    #[test]
+    fn data_send_falls_back_when_selected_queue_fills() {
+        let port = AsyncPort::new("fallback".into());
+
+        let (tx0, rx0) = crossbeam_channel::bounded(1);
+        let (tx1, rx1) = crossbeam_channel::bounded(8);
+        let b0 = Arc::new(Backend {
+            ch: tx0.clone(),
+            rtt_cache: Arc::new(AtomicU32::new(1_000)),
+            notify: None,
+        });
+        let b1 = Arc::new(Backend {
+            ch: tx1,
+            rtt_cache: Arc::new(AtomicU32::new(2_000)),
+            notify: None,
+        });
+        port.register_backend(b0);
+        port.register_backend(b1);
+
+        // Fill the preferred queue after path choice would normally favor it.
+        tx0.try_send(VPNFrame { seq: 999, data: Arc::new(vec![0]) }).unwrap();
+        port.write_frame(Arc::new(vec![0x55; 1400]));
+
+        let f = rx1.try_recv().expect("frame should fall back to second backend");
+        assert_ne!(f.seq, 0);
+        release_shared_frame(f.data);
+        let filler = rx0.try_recv().unwrap();
+        release_shared_frame(filler.data);
+        assert_eq!(port.dropped(), 0);
     }
 
     #[test]
