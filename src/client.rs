@@ -746,7 +746,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         let dev = device.clone();
         let port = tx_port.clone();
         // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
-        let tap_read_size = (args.mtu.max(576) as usize + 64).max(2048);
+        let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
             loop {
                 if EXIT.load(Ordering::Relaxed) {
