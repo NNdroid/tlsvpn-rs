@@ -43,6 +43,16 @@ FLAVOR_CLI="${FLAVOR_CLI:-rs}"
 TAP_SRV="tap_t0"
 TAP_CLI="tap_t1"
 
+# Keep tunnel endpoints in separate network namespaces. If both tunnel IPs
+# live in one namespace, Linux table local can satisfy ping/iperf without TAP.
+NS_SRV="tlsvpn-srv-$"
+NS_CLI="tlsvpn-cli-$"
+UNDERLAY_SRV="192.0.2.1"
+UNDERLAY_CLI="192.0.2.2"
+UNDERLAY_PREFIX=30
+VETH_SRV="tvs$"
+VETH_CLI="tvc$"
+
 PASS=0; FAIL=0; SKIPPED=0
 log()  { echo "[netperf] $*"; }
 ok()   { echo "[netperf] ✅ $*"; PASS=$((PASS+1)); }
@@ -60,26 +70,38 @@ skip() { echo "[netperf] ⏭️  $*"; SKIPPED=$((SKIPPED+1)); }
 # run a tunnel SKIPs instead of failing inside the server.
 # ---------------------------------------------------------------------------
 skip_reason=""
+CAP_NS="tlsvpn-cap-$$"
+CAP_VETH_A="tca$$"
+CAP_VETH_B="tcb$$"
 if [[ $EUID -ne 0 ]]; then
   skip_reason="not running as root"
 elif [[ ! -c /dev/net/tun ]]; then
   skip_reason="/dev/net/tun not available"
 else
-  if ! ip tuntap add dev tap_capchk mode tap 2>/dev/null; then
-    skip_reason="cannot create TAP (no CAP_NET_ADMIN, e.g. GitHub-hosted runner)"
-  elif ! ip link set dev tap_capchk up 2>/dev/null; then
-    skip_reason="TAP created but cannot bring the link up (TUNSETIFF allowed, RTNL refused)"
-  elif ! ip addr replace 10.77.99.1/24 dev tap_capchk 2>/dev/null; then
+  # Probe the exact primitives required by the isolated real-TAP test.
+  if ! ip netns add "$CAP_NS" 2>/dev/null; then
+    skip_reason="cannot create network namespace (netns unavailable)"
+  elif ! ip link add "$CAP_VETH_A" type veth peer name "$CAP_VETH_B" 2>/dev/null; then
+    skip_reason="cannot create veth pair (CAP_NET_ADMIN unavailable)"
+  elif ! ip link set "$CAP_VETH_B" netns "$CAP_NS" 2>/dev/null; then
+    skip_reason="cannot move veth into network namespace"
+  elif ! ip netns exec "$CAP_NS" ip link set lo up 2>/dev/null; then
+    skip_reason="cannot configure loopback inside network namespace"
+  elif ! ip netns exec "$CAP_NS" ip tuntap add dev tap_capchk mode tap 2>/dev/null; then
+    skip_reason="cannot create TAP inside network namespace"
+  elif ! ip netns exec "$CAP_NS" ip link set dev tap_capchk up 2>/dev/null; then
+    skip_reason="TAP created but cannot bring the link up (RTNL refused)"
+  elif ! ip netns exec "$CAP_NS" ip addr replace 10.77.99.1/24 dev tap_capchk 2>/dev/null; then
     skip_reason="TAP created but cannot assign an address (RTNL refused)"
   fi
-  ip link del tap_capchk 2>/dev/null || true
+  ip link del "$CAP_VETH_A" 2>/dev/null || true
+  ip netns del "$CAP_NS" 2>/dev/null || true
 fi
 if [[ -n "$skip_reason" ]]; then
   log "SKIP: $skip_reason"
-  log "Run this on a privileged/self-hosted runner (or a server) for real results."
+  log "Run this on a runner/server with network namespaces + CAP_NET_ADMIN for real results."
   exit 0
 fi
-
 if [[ -z "${BIN_SRV:-}" || -z "${BIN_CLI:-}" ]]; then
   log "SKIP: BIN_SRV / BIN_CLI not provided"
   exit 0
