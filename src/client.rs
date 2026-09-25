@@ -1500,6 +1500,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut next_rtt_refresh = Instant::now();
     let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
+    let mut close_reason = String::new();
 
     // 发送聚合缓冲永久复用，并扩大到 256KiB：rustls 仍会自行切 TLS record，
     // 但减少 writer()/write_tls 调用和 socket syscall，吞吐优先。
@@ -1510,6 +1511,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
         if cl.tx_port.is_sequence_exhausted() {
+            close_reason = "sequence space exhausted".into();
             if cl
                 .sequence_rekeying
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1522,6 +1524,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             break;
         }
         if cl.force_generation.load(Ordering::Acquire) != reconnect_generation {
+            close_reason = "forced reconnect generation changed".into();
             break;
         }
 
@@ -1535,7 +1538,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
             poll_timeout = poll_timeout.min(wait);
         }
-        if poll.poll(&mut events, Some(poll_timeout)).is_err() {
+        if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
+            close_reason = format!("mio poll failed: {e}");
             break;
         }
 
@@ -1578,6 +1582,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             loop {
                 match tls.read_tls(&mut sock) {
                     Ok(0) => {
+                        close_reason = "tls.read_tls returned EOF".into();
                         conn_closed = true;
                         break;
                     }
@@ -1588,7 +1593,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     {
                         break
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        close_reason = format!("tls.read_tls failed: {e}");
                         conn_closed = true;
                         break;
                     }
@@ -1596,7 +1602,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             if got_rx {
                 last_rx = Instant::now();
-                if tls.process_new_packets().is_err() {
+                if let Err(e) = tls.process_new_packets() {
+                    close_reason = format!("tls.process_new_packets failed: {e}");
                     conn_closed = true;
                 }
             }
@@ -1670,7 +1677,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     }
                 }
                 Ok(None) => break,
-                Err(_) => {
+                Err(e) => {
+                    close_reason = format!("frame scanner failed: {e}");
                     conn_closed = true;
                     break;
                 }
@@ -1708,7 +1716,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         if !send_buf.is_empty() {
             let wire_bytes = send_buf.len() as u64;
-            if tls.writer().write_all(&send_buf).is_err() {
+            if let Err(e) = tls.writer().write_all(&send_buf) {
+                close_reason = format!("tls plaintext writer failed: {e}");
                 break;
             }
             if tx_packets_batch != 0 {
@@ -1726,6 +1735,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         while tls.wants_write() {
             match tls.write_tls(&mut sock) {
                 Ok(0) => {
+                    close_reason = "tls.write_tls returned zero".into();
                     conn_closed = true;
                     break;
                 }
@@ -1738,7 +1748,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 {
                     break
                 }
-                Err(_) => {
+                Err(e) => {
+                    close_reason = format!("tls.write_tls failed: {e}");
                     conn_closed = true;
                     break;
                 }
@@ -1746,13 +1757,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         if last_write_progress.elapsed() > Duration::from_secs(10) {
+            close_reason = "write stalled for >10s".into();
             warn!("write stalled for >10s; closing the connection");
             conn_closed = true;
         }
         if last_rx.elapsed() > Duration::from_secs(15) {
+            close_reason = "no TLS receive progress for >15s".into();
             conn_closed = true;
         }
     }
+
+    if close_reason.is_empty() {
+        close_reason = "connection loop ended without an explicit reason".into();
+    }
+    warn!("[Conn {}] data loop closing: {}", conn_index, close_reason);
 
     tls.send_close_notify();
     while tls.wants_write() {
