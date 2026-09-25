@@ -827,6 +827,28 @@ mod tests {
     }
 
     #[test]
+    fn gcm128_cross_language_golden_vector() {
+        let psk = "interop-gcm128-psk";
+        let salt = hex::decode("0102030405060708").unwrap();
+        let plain = hex::decode(
+            "746c7376706e2d67636d3132382d63726f73732d6c616e67756167652d766563746f72",
+        )
+        .unwrap();
+        let want = hex::decode(
+            "fad2a4db0a2a0d73db601949351e36d354bb4698df7c2f27040f8229960d93d67066fe116d875cb38daa0877f281a3d5fbab9e",
+        )
+        .unwrap();
+        let seq = 0x0102_0304u32;
+        let wire_len = (plain.len() + GCM_TAG_SIZE) as u32;
+
+        let cipher = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
+        let mut wire = vec![0u8; wire_len as usize];
+        wire[..plain.len()].copy_from_slice(&plain);
+        cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len);
+        assert_eq!(wire, want);
+    }
+
+    #[test]
     fn gcm128_roundtrip_and_algorithm_domain_separation() {
         let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let psk = "same_psk";
