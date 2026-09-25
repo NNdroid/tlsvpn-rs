@@ -127,8 +127,8 @@ impl DeDuplicator {
     }
 }
 
-const REORDER_WINDOW: u32 = 2048;
-const BITMAP_WORDS: usize = (REORDER_WINDOW / 64) as usize;
+const REORDER_INITIAL_WINDOW: u32 = 2048;
+const REORDER_MAX_WINDOW: u32 = 65536;
 const REORDER_SKIP_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -148,21 +148,24 @@ pub struct ReorderStats {
 pub struct ReorderBuffer {
     expected_seq: u32,
     ring: Vec<Option<Arc<Vec<u8>>>>,
-    bitmap: [u64; BITMAP_WORDS],
+    seq_slots: Vec<u32>,
+    bitmap: Vec<u64>,
+    window_mask: u32,
     gap_since: Option<Instant>,
     stats: ReorderStats,
 }
 
 impl ReorderBuffer {
     pub fn new() -> Self {
-        let mut ring = Vec::with_capacity(REORDER_WINDOW as usize);
-        for _ in 0..REORDER_WINDOW {
-            ring.push(None);
-        }
+        let size = REORDER_INITIAL_WINDOW as usize;
+        let mut ring = Vec::with_capacity(size);
+        ring.resize_with(size, || None);
         Self {
             expected_seq: 0,
             ring,
-            bitmap: [0; BITMAP_WORDS],
+            seq_slots: vec![0; size],
+            bitmap: vec![0; size / 64],
+            window_mask: REORDER_INITIAL_WINDOW - 1,
             gap_since: None,
             stats: ReorderStats::default(),
         }
@@ -189,17 +192,28 @@ impl ReorderBuffer {
 
         // 丢弃太老的包（int32 语义比较，对齐 Go）
         let diff = seq.wrapping_sub(self.expected_seq) as i32;
-        if diff < 0 || diff as u32 >= REORDER_WINDOW {
+        if diff < 0 {
             return;
         }
 
-        let idx = (seq % REORDER_WINDOW) as usize;
-        // 去重：如果坑里已经有包了，保留先到者，丢弃后到者
+        let distance = diff as u32;
+        if distance >= self.ring.len() as u32 {
+            if distance >= REORDER_MAX_WINDOW || !self.grow_window(distance + 1) {
+                return;
+            }
+        }
+
+        let idx = (seq & self.window_mask) as usize;
+        // 动态扩容后用真实 seq 校验槽位，避免窗口变大时错误碰撞。
         if self.ring[idx].is_some() {
+            if self.seq_slots[idx] == seq {
+                return;
+            }
             return;
         }
 
         self.ring[idx] = Some(data);
+        self.seq_slots[idx] = seq;
         self.bitmap[idx / 64] |= 1u64 << (idx % 64);
 
         if seq == self.expected_seq {
@@ -216,10 +230,49 @@ impl ReorderBuffer {
         ready
     }
 
+    fn grow_window(&mut self, required_distance: u32) -> bool {
+        let old_size = self.ring.len();
+        if old_size >= REORDER_MAX_WINDOW as usize {
+            return false;
+        }
+
+        let mut new_size = old_size;
+        while (new_size as u32) <= required_distance && new_size < REORDER_MAX_WINDOW as usize {
+            new_size <<= 1;
+        }
+        new_size = new_size.min(REORDER_MAX_WINDOW as usize);
+        if (new_size as u32) <= required_distance {
+            return false;
+        }
+
+        let new_mask = (new_size - 1) as u32;
+        let mut new_ring = Vec::with_capacity(new_size);
+        new_ring.resize_with(new_size, || None);
+        let mut new_seq_slots = vec![0u32; new_size];
+        let mut new_bitmap = vec![0u64; new_size / 64];
+
+        for idx in 0..old_size {
+            let Some(frame) = self.ring[idx].take() else { continue };
+            let seq = self.seq_slots[idx];
+            let new_idx = (seq & new_mask) as usize;
+            new_ring[new_idx] = Some(frame);
+            new_seq_slots[new_idx] = seq;
+            new_bitmap[new_idx / 64] |= 1u64 << (new_idx % 64);
+        }
+
+        self.ring = new_ring;
+        self.seq_slots = new_seq_slots;
+        self.bitmap = new_bitmap;
+        self.window_mask = new_mask;
+        true
+    }
+
     fn flush_locked_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
         self.gap_since = None;
-        while let Some(frame) = self.ring[(self.expected_seq % REORDER_WINDOW) as usize].take() {
-            let idx = (self.expected_seq % REORDER_WINDOW) as usize;
+        loop {
+            let idx = (self.expected_seq & self.window_mask) as usize;
+            let Some(frame) = self.ring[idx].take() else { break };
+            self.seq_slots[idx] = 0;
             self.bitmap[idx / 64] &= !(1u64 << (idx % 64));
             if !frame.is_empty() {
                 ready.push(frame);
@@ -231,7 +284,7 @@ impl ReorderBuffer {
 
     fn has_gap(&self) -> bool {
         self.expected_seq != 0
-            && self.ring[(self.expected_seq % REORDER_WINDOW) as usize].is_none()
+            && self.ring[(self.expected_seq & self.window_mask) as usize].is_none()
             && self.bitmap.iter().any(|word| *word != 0)
     }
 
@@ -251,7 +304,8 @@ impl ReorderBuffer {
         for slot in self.ring.iter_mut() {
             *slot = None;
         }
-        self.bitmap = [0; BITMAP_WORDS];
+        self.seq_slots.fill(0);
+        self.bitmap.fill(0);
         self.gap_since = None;
     }
 
@@ -273,9 +327,9 @@ impl ReorderBuffer {
         }
         // 超时才会扫描，O(窗口) 不进入正常数据热路径，并且正确覆盖环形首字
         // 低位（旧位图扫描在 expected 位于字中部时会漏掉该区域）。
-        for delta in 1..REORDER_WINDOW {
+        for delta in 1..self.ring.len() as u32 {
             let seq = self.expected_seq.wrapping_add(delta);
-            if self.ring[(seq % REORDER_WINDOW) as usize].is_some() {
+            if self.ring[(seq & self.window_mask) as usize].is_some() {
                 self.expected_seq = seq;
                 self.gap_since = None;
                 self.stats.timeout_flushes = self.stats.timeout_flushes.saturating_add(1);
@@ -391,6 +445,24 @@ mod tests {
         assert_eq!(ready[0].as_slice(), &[3]);
         assert_eq!(rb.stats(), ReorderStats { gap_events: 1, timeout_flushes: 1, skipped_frames: 1 });
     }
+
+    #[test]
+    fn reorder_window_grows_for_large_multipath_skew() {
+        let mut rb = ReorderBuffer::new();
+        assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);
+
+        // 4096 is outside the initial 2048-frame window but well within the
+        // adaptive maximum. It must be retained instead of silently dropped.
+        assert!(rb.insert(4096, Arc::new(vec![0x5a])).is_empty());
+        assert!(rb.ring.len() >= 4096);
+
+        std::thread::sleep(REORDER_SKIP_DELAY + Duration::from_millis(5));
+        let ready = rb.flush_timeout();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].as_slice(), &[0x5a]);
+        assert_eq!(rb.stats().skipped_frames, 4094);
+    }
+
 
     #[test]
     fn timeout_scan_wraps_into_lower_bits_of_the_same_bitmap_word() {
