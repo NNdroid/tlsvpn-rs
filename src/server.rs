@@ -1294,6 +1294,7 @@ fn worker_loop(
             // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
             // "connection lost: timeout" 窗口。
             if idle_time > 15 {
+                debug!("closing token {:?}: no TLS receive progress for {}s", token, idle_time);
                 closed_tokens.push(*token);
                 continue;
             }
@@ -1334,14 +1335,17 @@ fn worker_loop(
                             c_sess.stat.client_id
                         );
                     }
+                    debug!("closing token {:?}: sequence space exhausted", token);
                     closed_tokens.push(*token);
                     continue;
                 }
                 if c_sess.epoch_state.read().epoch != sess.session_epoch {
+                    debug!("closing token {:?}: session epoch mismatch", token);
                     closed_tokens.push(*token);
                     continue;
                 }
                 if c_sess.stat.force_disconnect.load(Ordering::Relaxed) {
+                    debug!("closing token {:?}: forced disconnect", token);
                     closed_tokens.push(*token);
                     continue;
                 }
@@ -1350,6 +1354,7 @@ fn worker_loop(
             // 写积压超过 10s 视为对端卡死（对齐 Go SetWriteDeadline(10s)）
             if let Some(stalled_at) = sess.write_stalled {
                 if stalled_at.elapsed() > Duration::from_secs(10) {
+                    debug!("closing token {:?}: TLS write stalled for >10s", token);
                     closed_tokens.push(*token);
                     continue;
                 }
@@ -1403,6 +1408,7 @@ fn worker_loop(
                         loop {
                             match sess.tls.read_tls(&mut sess.socket) {
                                 Ok(0) => {
+                                    debug!("closing token {:?}: tls.read_tls returned EOF", token);
                                     close = true;
                                     break;
                                 }
@@ -1410,7 +1416,8 @@ fn worker_loop(
                                     progress = true;
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(_) => {
+                                Err(e) => {
+                                    debug!("closing token {:?}: tls.read_tls failed: {}", token, e);
                                     close = true;
                                     break;
                                 }
@@ -1445,6 +1452,7 @@ fn worker_loop(
                                     );
                                 }
                             } else {
+                                debug!("closing token {:?}: tls.process_new_packets failed", token);
                                 if !sess.handshake_done {
                                     serve_fallback_http(&mut sess.socket, false);
                                 }
@@ -1586,6 +1594,7 @@ fn process_plain_frames(
                     };
                     let epoch = c_sess.epoch_state.read();
                     if sess.session_epoch != epoch.epoch {
+                        debug!("closing session plaintext path: epoch mismatch");
                         drop(epoch);
                         release_frame_vec(data);
                         *close = true;
@@ -1629,7 +1638,8 @@ fn process_plain_frames(
                 }
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(e) => {
+                debug!("closing session plaintext path: frame scanner failed: {}", e);
                 if !sess.handshake_done {
                     let is_h2 = sess.tls.alpn_protocol() == Some(b"h2");
                     serve_fallback_http(&mut sess.tls.writer(), is_h2);
@@ -1730,7 +1740,8 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
                 .tx_bytes
                 .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
         }
-        if sess.tls.writer().write_all(&sess.send_buf).is_err() {
+        if let Err(e) = sess.tls.writer().write_all(&sess.send_buf) {
+            debug!("closing session: tls plaintext writer failed: {}", e);
             *close = true;
             return;
         }
@@ -1744,6 +1755,7 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
     while sess.tls.wants_write() {
         match sess.tls.write_tls(&mut sess.socket) {
             Ok(0) => {
+                debug!("closing session: tls.write_tls returned zero");
                 *close = true;
                 break;
             }
@@ -1754,7 +1766,8 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
                 }
                 break;
             }
-            Err(_) => {
+            Err(e) => {
+                debug!("closing session: tls.write_tls failed: {}", e);
                 *close = true;
                 break;
             }
