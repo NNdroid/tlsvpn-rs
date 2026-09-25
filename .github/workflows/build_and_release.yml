@@ -43,10 +43,36 @@ jobs:
           name: tlsvpn-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/tlsvpn-${{ matrix.target }}
 
+  build-cortex-a55:
+    name: Build Cortex-A55 optimized ARM64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build optimized aarch64 musl binary
+        uses: houseabsolute/actions-rust-cross@v0
+        env:
+          RUSTFLAGS: "-C target-cpu=cortex-a55"
+        with:
+          target: aarch64-unknown-linux-musl
+          args: "--release"
+          strip: true
+
+      - name: Rename tuned artifact
+        run: |
+          mv target/aarch64-unknown-linux-musl/release/tlsvpn \
+             target/aarch64-unknown-linux-musl/release/tlsvpn-aarch64-unknown-linux-musl-cortex-a55
+
+      - name: Upload tuned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlsvpn-aarch64-unknown-linux-musl-cortex-a55
+          path: target/aarch64-unknown-linux-musl/release/tlsvpn-aarch64-unknown-linux-musl-cortex-a55
+
   # 发布任务：等待所有 build 任务完成后执行
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-cortex-a55]
     runs-on: ubuntu-latest
     permissions:
       contents: write # 必须赋予写入权限以创建 release
