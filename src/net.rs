@@ -1569,9 +1569,9 @@ mod tests {
             .find(|f| f.seq != 0)
             .expect("frame should be dispatched once backend has capacity");
         assert_eq!(sent.seq, 1);
-        release_shared_frame(sent.data);
+        drop(sent.data);
         for f in rx.try_iter() {
-            release_shared_frame(f.data);
+            drop(f.data);
         }
     }
 
