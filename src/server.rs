@@ -1316,11 +1316,15 @@ fn worker_loop(
                 sess.rtt_timer = Instant::now();
             }
 
-            if sess.last_keepalive.elapsed() > Duration::from_secs(4) {
+            if sess.last_keepalive.elapsed() > Duration::from_secs(4)
+                && sess.write_stalled.is_none()
+                && !sess.tls.wants_write()
+            {
                 sess.send_buf.clear();
                 append_padded_frame(&mut sess.send_buf, 0, &[], None);
-                let _ = sess.tls.writer().write_all(&sess.send_buf);
-                sess.last_keepalive = Instant::now();
+                if sess.tls.writer().write_all(&sess.send_buf).is_ok() {
+                    sess.last_keepalive = Instant::now();
+                }
             }
 
             if let Some(c_sess) = &sess.client_session {
@@ -1405,26 +1409,23 @@ fn worker_loop(
 
                     if !close {
                         let mut progress = false;
-                        loop {
-                            match sess.tls.read_tls(&mut sess.socket) {
-                                Ok(0) => {
-                                    debug!("closing token {:?}: tls.read_tls returned EOF", token);
-                                    close = true;
-                                    break;
-                                }
-                                Ok(_) => {
-                                    progress = true;
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(e) => {
-                                    debug!("closing token {:?}: tls.read_tls failed: {}", token, e);
-                                    close = true;
-                                    break;
-                                }
+                        // Process one socket read at a time. Draining read_tls()
+                        // to WouldBlock before process_new_packets() can fill
+                        // rustls' bounded encrypted-message buffer under load.
+                        match sess.tls.read_tls(&mut sess.socket) {
+                            Ok(0) => {
+                                debug!("closing token {:?}: tls.read_tls returned EOF", token);
+                                close = true;
                             }
-                        }
-                        if progress {
-                            sess.last_rx = Instant::now();
+                            Ok(_) => {
+                                progress = true;
+                                sess.last_rx = Instant::now();
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => {
+                                debug!("closing token {:?}: tls.read_tls failed: {}", token, e);
+                                close = true;
+                            }
                         }
 
                         if progress && !close {
@@ -1698,9 +1699,11 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
-    if sess.write_stalled.is_some() {
+    if sess.write_stalled.is_some() || sess.tls.wants_write() {
         drain_tls(sess, close);
-        return;
+        if *close || sess.tls.wants_write() {
+            return;
+        }
     }
 
     let ic_tx = sess.client_session.as_ref().and_then(|s| {
@@ -1718,7 +1721,9 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
-    const TLS_WRITE_BATCH_BYTES: usize = 256 * 1024;
+    // Stay below rustls' bounded outgoing plaintext buffer. A 256KiB
+    // write_all() can fail with WriteZero before ciphertext is drained.
+    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     let mut pulled = 0u64;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
