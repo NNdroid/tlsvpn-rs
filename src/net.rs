@@ -1603,6 +1603,50 @@ mod tests {
     }
 
     #[test]
+    fn fec_parity_is_suppressed_until_second_path_exists() {
+        let port = AsyncPort::new("single-path-no-parity".into());
+        let (b0, r0) = make_backend();
+        b0.rtt_cache.store(1_000, Ordering::Relaxed);
+        port.register_backend(b0);
+        port.reset_epoch(2, None);
+
+        port.write_frame(Arc::new(vec![0x11; 1400]));
+        port.write_frame(Arc::new(vec![0x22; 1400]));
+
+        let mut data = 0usize;
+        let mut parity = 0usize;
+        while let Ok(f) = r0.try_recv() {
+            if f.seq == 0 {
+                parity += 1;
+            } else {
+                data += 1;
+            }
+            release_shared_frame(f.data);
+        }
+        assert_eq!(data, 2);
+        assert_eq!(parity, 0);
+        assert_eq!(port.parity_sent(), 0);
+
+        let (b1, r1) = make_backend();
+        b1.rtt_cache.store(2_000, Ordering::Relaxed);
+        port.register_backend(b1);
+        port.write_frame(Arc::new(vec![0x33; 1400]));
+        port.write_frame(Arc::new(vec![0x44; 1400]));
+
+        parity = 0;
+        for rx in [&r0, &r1] {
+            while let Ok(f) = rx.try_recv() {
+                if f.seq == 0 {
+                    parity += 1;
+                }
+                release_shared_frame(f.data);
+            }
+        }
+        assert_eq!(parity, 1);
+        assert_eq!(port.parity_sent(), 1);
+    }
+
+    #[test]
     fn fec_parity_is_sent_once_across_multiple_backends() {
         let port = AsyncPort::new("single-parity".into());
         let (b0, r0) = make_backend();
