@@ -1132,7 +1132,8 @@ fn acceptor_loop(mut listener: TcpListener, queues: Vec<Sender<MioTcpStream>>) {
                     continue;
                 }
                 apply_tcp_keepalive(&socket);
-                apply_socket_buffers(&socket);
+                // Keep SO_RCVBUF/SO_SNDBUF untouched so Linux can autotune
+                // high-BDP tunnel connections via tcp_rmem/tcp_wmem.
                 let w = rr % queues.len();
                 rr += 1;
                 if queues[w].try_send(socket).is_err() {
