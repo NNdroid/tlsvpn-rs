@@ -1112,7 +1112,8 @@ fn acceptor_loop(mut listener: TcpListener, queues: Vec<Sender<MioTcpStream>>) {
                     continue;
                 }
                 apply_tcp_keepalive(&socket);
-                apply_socket_buffers(&socket);
+                // 保留 Linux TCP socket buffer autotuning：不要固定
+                // SO_RCVBUF/SO_SNDBUF，否则高 BDP WAN 可能被人为封顶。
                 let w = rr % queues.len();
                 rr += 1;
                 if queues[w].try_send(socket).is_err() {
