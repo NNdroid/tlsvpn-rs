@@ -357,32 +357,6 @@ pub fn apply_tcp_keepalive<S: AsRawFd>(_stream: &S) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn apply_socket_buffers<S: AsRawFd>(stream: &S) {
-    // 对齐 Go SetReadBuffer/SetWriteBuffer(4MB)
-    let fd = stream.as_raw_fd();
-    unsafe {
-        let buf: libc::c_int = 4 * 1024 * 1024;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf as *const _ as *const _,
-            std::mem::size_of_val(&buf) as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf as *const _ as *const _,
-            std::mem::size_of_val(&buf) as libc::socklen_t,
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn apply_socket_buffers<S: AsRawFd>(_stream: &S) {}
-
-#[cfg(target_os = "linux")]
 pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> u32 {
     let fd = stream.as_raw_fd();
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
