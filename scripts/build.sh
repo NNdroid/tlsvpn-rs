@@ -14,6 +14,9 @@
 #                     toolchain (installs the aarch64 cross-gcc if missing).
 #                     Static musl is preferred for distribution; gnu is for
 #                     local-use fallback when cross/docker is unavailable.
+#   a55               Build an additional aarch64 GNU binary tuned for
+#                     Cortex-A55 (e.g. RK3568/R5S). The generic ARM64 binary
+#                     remains the compatibility default.
 #   all               musl + gnu.
 #
 # Artifacts are copied to OUTPUT_DIR (default: dist/) as
@@ -47,7 +50,7 @@ usage() {
 
 case "$MODE" in
     -h|--help|help) usage 0 ;;
-    native|musl|gnu|all) ;;
+    native|musl|gnu|a55|all) ;;
     *) echo "❌ unknown mode: $MODE" >&2; usage 1 ;;
 esac
 
@@ -102,7 +105,7 @@ build_musl() {
     done
 }
 
-build_gnu() {
+ensure_aarch64_gnu_toolchain() {
     require_c_compiler
     if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
         echo "📦 installing aarch64 cross toolchain..."
@@ -123,12 +126,26 @@ build_gnu() {
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
     export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
     export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-    rustup target add "${GNU_TARGETS[@]}"
+    rustup target add aarch64-unknown-linux-gnu
+}
+
+build_gnu() {
+    ensure_aarch64_gnu_toolchain
+    rustup target add x86_64-unknown-linux-gnu
     for t in "${GNU_TARGETS[@]}"; do
         echo "🔨 cargo build --release --target $t"
         cargo build --release --target "$t" ${CARGO_ARGS:-}
         copy_artifact "$t" "tlsvpn-$t"
     done
+}
+
+build_a55() {
+    ensure_aarch64_gnu_toolchain
+    local target="aarch64-unknown-linux-gnu"
+    echo "🔨 cargo build --release --target $target -C target-cpu=cortex-a55"
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a55" \
+        cargo build --release --target "$target" ${CARGO_ARGS:-}
+    copy_artifact "$target" "tlsvpn-$target-cortex-a55"
 }
 
 echo "🦀 tlsvpn-rs build — mode: $MODE, output: $OUT_DIR/"
