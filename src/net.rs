@@ -1015,6 +1015,7 @@ pub struct AsyncPort {
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
     schedule_tick: AtomicU32,
+    data_cursor: AtomicUsize,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
@@ -1030,6 +1031,7 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
             schedule_tick: AtomicU32::new(0),
+            data_cursor: AtomicUsize::new(0),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1046,6 +1048,7 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
+        self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
         *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
             Some(FecEncoder::new(k, ic))
@@ -1146,6 +1149,32 @@ impl AsyncPort {
         Some(selected)
     }
 
+    const MULTIPATH_STRIPE_QUEUE: usize = 4;
+    const MULTIPATH_STRIPE_MASK: u32 = 0x0f; // 16-frame bursts
+
+    /// 高负载 striping：以当前 MinRTT/queue 最优路径为基准，只允许 RTT 和
+    /// score 都落在小窗口内的健康路径参加轮转。每次调用返回一个 burst 目标。
+    fn bulk_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
+        let best = self.pick_backend_index(backends)?;
+        let best_rtt = backends[best].rtt_cache.load(Ordering::Relaxed);
+        let slack = 5_000u32.max(best_rtt / 4);
+        let max_rtt = best_rtt as u64 + slack as u64;
+        let best_score = Self::backend_score(&backends[best]).unwrap_or(best_rtt);
+        let max_score = best_score as u64 + slack as u64;
+
+        let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        for offset in 0..backends.len() {
+            let idx = (start + offset) % backends.len();
+            let Some(score) = Self::backend_score(&backends[idx]) else { continue };
+            let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
+            if rtt as u64 <= max_rtt && score as u64 <= max_score {
+                self.preferred.store(idx, Ordering::Relaxed);
+                return Some(idx);
+            }
+        }
+        Some(best)
+    }
+
     /// 数据帧热路径。路径 RTT/队列不会在相邻几个以太帧之间发生有意义的变化，
     /// 因此正常情况下复用 16 帧当前后端；当前队列接近满时立即重新评分。
     /// 这把 backends 扫描从“每包”降低到约“每 16 包一次”，同时保留快速故障切换。
@@ -1160,7 +1189,17 @@ impl AsyncPort {
 
         let current = self.preferred.load(Ordering::Relaxed);
         let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
-        if (tick & 0x0f) != 0
+
+        // 只有当前路径已经开始积压，并且到了 16 帧 burst 边界，才主动把
+        // bulk 流量轮转到其它相近 RTT 路径。低负载仍完全沿用 MinRTT。
+        if current < backends.len()
+            && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_QUEUE
+            && (tick & Self::MULTIPATH_STRIPE_MASK) == 0
+        {
+            return self.bulk_backend_index(backends);
+        }
+
+        if (tick & Self::MULTIPATH_STRIPE_MASK) != 0
             && current < backends.len()
             && Self::backend_score(&backends[current]).is_some()
         {
