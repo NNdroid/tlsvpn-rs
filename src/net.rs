@@ -1130,7 +1130,7 @@ impl AsyncPort {
             }
         }
 
-        let mut selected = best_idx.or_else(|| (!backends.is_empty()).then_some(0))?;
+        let mut selected = best_idx?;
         let current = self.preferred.load(Ordering::Relaxed);
         if current < backends.len() && current != selected {
             if let Some(current_score) = Self::backend_score(&backends[current]) {
@@ -1153,8 +1153,11 @@ impl AsyncPort {
             return None;
         }
         if backends.len() == 1 {
-            self.preferred.store(0, Ordering::Relaxed);
-            return Some(0);
+            if Self::backend_score(&backends[0]).is_some() {
+                self.preferred.store(0, Ordering::Relaxed);
+                return Some(0);
+            }
+            return None;
         }
 
         let current = self.preferred.load(Ordering::Relaxed);
@@ -1214,6 +1217,13 @@ impl AsyncPort {
             return;
         }
 
+        // 先确认至少有一个健康 backend slot，再消耗线路 seq/FEC 槽位。
+        // 极端背压时直接在发送入口丢弃，不给接收端制造并不存在的序号洞。
+        let Some(data_idx) = self.selected_backend_index(&backends) else {
+            self.drop_n(1);
+            return;
+        };
+
         let Some(seq) = self.next_seq() else {
             self.drop_n(1);
             return;
@@ -1226,12 +1236,7 @@ impl AsyncPort {
             .as_mut()
             .and_then(|enc| enc.add(seq, &frame));
 
-        let data_idx = self.selected_backend_index(&backends);
-        if let Some(idx) = data_idx {
-            self.send_frame_to(&backends[idx], seq, &frame);
-        } else {
-            self.drop_n(1);
-        }
+        self.send_frame_to(&backends[data_idx], seq, &frame);
 
         if let Some(par) = parity {
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
@@ -1533,6 +1538,41 @@ mod tests {
         port.reset_epoch(0, None);
         assert_eq!(port.next_seq(), Some(1));
         assert!(!port.is_sequence_exhausted());
+    }
+
+    #[test]
+    fn saturated_backend_does_not_consume_sequence() {
+        let port = AsyncPort::new("pre-seq-backpressure".into());
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let backend = Arc::new(Backend {
+            ch: tx.clone(),
+            rtt_cache: Arc::new(AtomicU32::new(1_000)),
+            notify: None,
+        });
+        // backend_score reserves two slots as the high-water mark; fill to it.
+        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![1]) }).unwrap();
+        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![2]) }).unwrap();
+        port.register_backend(backend);
+
+        port.write_frame(Arc::new(vec![0x5a; 1400]));
+        assert_eq!(
+            port.tx_seq.load(Ordering::Acquire),
+            0,
+            "saturated backend must drop before consuming a wire sequence"
+        );
+
+        let _ = rx.try_recv();
+        port.write_frame(Arc::new(vec![0x6b; 1400]));
+        assert_eq!(port.tx_seq.load(Ordering::Acquire), 1);
+        let sent = rx
+            .try_iter()
+            .find(|f| f.seq != 0)
+            .expect("frame should be dispatched once backend has capacity");
+        assert_eq!(sent.seq, 1);
+        release_shared_frame(sent.data);
+        for f in rx.try_iter() {
+            release_shared_frame(f.data);
+        }
     }
 
     #[test]
