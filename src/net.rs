@@ -1700,7 +1700,10 @@ mod tests {
 
         let (a, ra) = mk(10_000);
         let (b, rb) = mk(11_000);
-        let (slow, rs) = mk(30_000);
+        // Deliberately much slower than any queue penalty this synthetic test
+        // can build without consumers. A 30ms path can legitimately become the
+        // best fallback once A/B queues are deliberately allowed to accumulate.
+        let (slow, rs) = mk(1_000_000);
         port.register_backend(a);
         port.register_backend(b);
         port.register_backend(slow);
