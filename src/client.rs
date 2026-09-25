@@ -1247,7 +1247,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
 
     // 内层算法由配置显式固定。gcm256 保持兼容默认；gcm128 是 opt-in 性能模式。
-    // 服务端响应必须完全一致，禁止自动降级或升级。
+    // 内层加密算法由配置显式选择：gcm256 是兼容默认，gcm128 是性能模式。
+    // 两者 wire format 相同但 KDF label 隔离；服务端响应必须与请求完全一致。
     let mut enc_algo = ENC_ALGO_NONE;
     let mut ic_tx: Option<Arc<InnerCipher>> = None;
     let mut ic_rx: Option<Arc<InnerCipher>> = None;
@@ -1297,7 +1298,6 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         enc_algo = resp.enc_algo;
     }
 
-    // min_enc=gcm 接受任一种认证 GCM；具体 key size 由 enc_algo 精确固定。
     if cl.min_enc > 0 && !is_gcm_algo(enc_algo) {
         *ci.state.lock() = "retrying".into();
         *ci.last_error.lock() = format!(
