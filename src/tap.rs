@@ -8,8 +8,8 @@ use tun_rs::SyncDevice;
 /// TAP MTU excludes the Ethernet header. Reserve enough L2/VLAN headroom and
 /// keep the common 1500-MTU case inside the 2 KiB hot-frame pool.
 #[inline]
-pub fn tap_read_buffer_size(mtu: i32) -> usize {
-    ((mtu.max(576) as usize) + 64).max(2048)
+pub fn tap_read_buffer_size(mtu: u16) -> usize {
+    (usize::from(mtu.max(576)) + 64).max(2048)
 }
 
 pub trait TapDevice: Send + Sync {
