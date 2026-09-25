@@ -973,14 +973,21 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     });
 
     let vs_for_tap = core.vswitch.clone();
+    let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
     std::thread::spawn(move || {
-        let mut buf = [0u8; 65536];
         loop {
-            if let Ok(n) = dev_reader.recv(&mut buf) {
-                if n > 0 {
-                    let mut frame = acquire_frame_vec(n);
-                    frame.copy_from_slice(&buf[..n]);
+            let mut frame = acquire_frame_vec(tap_read_size);
+            match dev_reader.recv(&mut frame) {
+                Ok(n) if n > 0 => {
+                    frame.truncate(n);
+                    // VSwitch 本身用 Arc<Vec<u8>> 传递所有权/共享洪泛；直接让
+                    // TAP 填充 pooled Vec，消除 temp-buffer -> pool memcpy。
                     vs_for_tap.process_frame(TAP_PORT_ID, Arc::new(frame));
+                }
+                Ok(_) => release_frame_vec(frame),
+                Err(_) => {
+                    release_frame_vec(frame);
+                    break;
                 }
             }
         }

@@ -745,20 +745,24 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     {
         let dev = device.clone();
         let port = tx_port.clone();
+        // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
+        let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
             loop {
                 if EXIT.load(Ordering::Relaxed) {
                     return;
                 }
-                match dev.recv(&mut buf) {
+                let mut frame = acquire_frame_vec(tap_read_size);
+                match dev.recv(&mut frame) {
                     Ok(n) if n > 0 => {
-                        let mut frame = acquire_frame_vec(n);
-                        frame.copy_from_slice(&buf[..n]);
+                        frame.truncate(n);
+                        // AsyncPort/Arc 直接接管 TAP 填充的 pooled Vec；不再
+                        // temp [u8; 65536] -> Vec 做逐帧 memcpy。
                         port.write_frame(Arc::new(frame));
                     }
-                    Ok(_) => {}
+                    Ok(_) => release_frame_vec(frame),
                     Err(_) => {
+                        release_frame_vec(frame);
                         if EXIT.load(Ordering::Relaxed) {
                             return;
                         }
