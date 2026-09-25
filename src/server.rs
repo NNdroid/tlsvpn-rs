@@ -353,6 +353,17 @@ fn src_mac_allowed(registered: Option<&[u8; 6]>, mac: &[u8; 6]) -> bool {
 
 /// 归一会话上限：0 = 默认 1024（对齐 Go applyDefaults）。配置文件路径在
 /// load_config_file 已归一；这里兜住绕过它的调用方。
+fn response_enc_salts(
+    enc_algo: i64,
+    salt_a: &[u8; ENC_SALT_SIZE],
+    salt_b: &[u8; ENC_SALT_SIZE],
+) -> (String, String) {
+    if !is_gcm_algo(enc_algo) {
+        return (String::new(), String::new());
+    }
+    (hex::encode(salt_a), hex::encode(salt_b))
+}
+
 fn normalize_max_sessions(n: i32) -> i32 {
     if n == 0 {
         1024
@@ -2211,14 +2222,7 @@ fn handle_handshake(
     let response_enc_algo = epoch_snapshot.enc_algo;
     let response_token = response_resume_token(&epoch_snapshot);
     let (response_enc_salt, response_enc_salt2) =
-        if response_enc_algo == ENC_ALGO_GCM {
-            (
-                hex::encode(epoch_snapshot.salt_a),
-                hex::encode(epoch_snapshot.salt_b),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+        response_enc_salts(response_enc_algo, &epoch_snapshot.salt_a, &epoch_snapshot.salt_b);
     drop(epoch_snapshot);
     if let Some(b) = &sess.tx_backend {
         b.rtt_cache.store(50000, Ordering::Relaxed);
@@ -2362,6 +2366,21 @@ mod tests {
             ic_rx: None,
             fec_dec: None,
         }
+    }
+
+    #[test]
+    fn handshake_response_carries_salts_for_both_gcm_key_sizes() {
+        let salt_a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let salt_b = [8u8, 7, 6, 5, 4, 3, 2, 1];
+
+        for algo in [ENC_ALGO_GCM, ENC_ALGO_GCM128] {
+            let (a, b) = response_enc_salts(algo, &salt_a, &salt_b);
+            assert_eq!(a, hex::encode(salt_a));
+            assert_eq!(b, hex::encode(salt_b));
+        }
+
+        let (a, b) = response_enc_salts(ENC_ALGO_NONE, &salt_a, &salt_b);
+        assert!(a.is_empty() && b.is_empty());
     }
 
     #[test]
