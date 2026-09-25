@@ -1004,9 +1004,16 @@ pub struct Backend {
     pub notify: Option<Arc<BackendNotify>>,
 }
 
+const DATA_STRIPE_CHUNK: u32 = 16;
+// 16 Ethernet frames inside 2ms is already ~90 Mbps at 1400B payload.
+// Only then do we trade a little cross-TCP reordering for aggregate throughput.
+const DATA_STRIPE_BULK_GAP: Duration = Duration::from_millis(2);
+
+
 /// 异步聚合端口，分发行为对齐 Go AsyncPort.dispatchBatch：
-/// - 挂载 XOR FEC 编码器时：数据帧 MinRTT 单路发送，校验帧只发一份并在健康连接间轮转；
-/// - 普通模式：MinRTT 单路发送。
+/// - 低负载：数据帧固定走 MinRTT，避免交互流量跨 TCP 乱序；
+/// - 持续 bulk：在 RTT/queue score 接近最佳的健康路径间按 chunk striping；
+/// - XOR FEC parity 只发一份，并优先走与当前 data chunk 不同的健康路径。
 pub struct AsyncPort {
     pub id: String,
     tx_seq: AtomicU32,
@@ -1015,6 +1022,8 @@ pub struct AsyncPort {
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
     schedule_tick: AtomicU32,
+    data_cursor: AtomicUsize,
+    bulk_eval_at: Mutex<Option<Instant>>,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
@@ -1030,6 +1039,8 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
             schedule_tick: AtomicU32::new(0),
+            data_cursor: AtomicUsize::new(0),
+            bulk_eval_at: Mutex::new(None),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1046,6 +1057,9 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
+        self.schedule_tick.store(0, Ordering::Release);
+        self.data_cursor.store(0, Ordering::Release);
+        *self.bulk_eval_at.lock() = None;
         self.parity_cursor.store(0, Ordering::Release);
         *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
             Some(FecEncoder::new(k, ic))
@@ -1146,9 +1160,12 @@ impl AsyncPort {
         Some(selected)
     }
 
-    /// 数据帧热路径。路径 RTT/队列不会在相邻几个以太帧之间发生有意义的变化，
-    /// 因此正常情况下复用 16 帧当前后端；当前队列接近满时立即重新评分。
-    /// 这把 backends 扫描从“每包”降低到约“每 16 包一次”，同时保留快速故障切换。
+    /// 数据帧热路径：低负载坚持 MinRTT；只有持续 bulk 才在 RTT/queue score
+    /// 接近最佳值的健康路径间按 16-frame chunk 轮转。
+    ///
+    /// Rust TAP 是直接调用 write_frame，没有 Go 那层 ingress queue，因此用
+    /// “连续两个 16-frame 评估点的时间间隔”识别 bulk。这样交互流量不会为了
+    /// 聚合带宽制造额外乱序，而高 PPS 流量可以真正并行使用多条 TCP 连接。
     fn selected_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
         if backends.is_empty() {
             return None;
@@ -1160,13 +1177,48 @@ impl AsyncPort {
 
         let current = self.preferred.load(Ordering::Relaxed);
         let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
-        if (tick & 0x0f) != 0
+        if tick % DATA_STRIPE_CHUNK != 0
             && current < backends.len()
             && Self::backend_score(&backends[current]).is_some()
         {
             return Some(current);
         }
-        self.pick_backend_index(backends)
+
+        let now = Instant::now();
+        let bulk = {
+            let mut last = self.bulk_eval_at.lock();
+            let bulk = last
+                .map(|t| now.saturating_duration_since(t) <= DATA_STRIPE_BULK_GAP)
+                .unwrap_or(false);
+            *last = Some(now);
+            bulk
+        };
+
+        let best = self.pick_backend_index(backends)?;
+        if !bulk {
+            return Some(best);
+        }
+
+        let best_rtt = backends[best].rtt_cache.load(Ordering::Relaxed);
+        let slack = 5_000u32.max(best_rtt / 4);
+        let max_rtt = best_rtt as u64 + slack as u64;
+        let best_score = Self::backend_score(&backends[best]).unwrap_or(best_rtt);
+        let max_score = best_score as u64 + slack as u64;
+
+        let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        for offset in 0..backends.len() {
+            let idx = (start + offset) % backends.len();
+            let Some(score) = Self::backend_score(&backends[idx]) else {
+                continue;
+            };
+            let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
+            if rtt as u64 <= max_rtt && score as u64 <= max_score {
+                // 下一 chunk 固定走该路径，避免逐帧跨流乱序。
+                self.preferred.store(idx, Ordering::Relaxed);
+                return Some(idx);
+            }
+        }
+        Some(best)
     }
 
     /// parity 只需被会话级 decoder 收到一份。多连接时从轮转游标开始，
