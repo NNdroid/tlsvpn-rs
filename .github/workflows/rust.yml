@@ -211,12 +211,27 @@ jobs:
         FLAVOR_CLI: rs
       run: sudo -E bash scripts/net_perf_test.sh
 
+    # Runner control: neither endpoint contains Rust. This gives each run a
+    # same-machine reference for hosted-runner CPU/network scheduling noise,
+    # so Rust A/B results are not judged only by absolute Mbps.
+    - name: go_srv <- go_cli (runner control)
+      id: netperf_go_go
+      continue-on-error: true
+      env:
+        BIN_SRV: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+        BIN_CLI: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+        FLAVOR_SRV: go
+        FLAVOR_CLI: go
+      run: sudo -E bash scripts/net_perf_test.sh
+
     - name: Require every real-TAP matrix group
       if: always()
       run: |
         echo "rs/rs: ${{ steps.netperf_rs_rs.outcome }}"
         echo "rs/go: ${{ steps.netperf_rs_go.outcome }}"
         echo "go/rs: ${{ steps.netperf_go_rs.outcome }}"
+        echo "go/go control: ${{ steps.netperf_go_go.outcome }}"
         test "${{ steps.netperf_rs_rs.outcome }}" = success
         test "${{ steps.netperf_rs_go.outcome }}" = success
         test "${{ steps.netperf_go_rs.outcome }}" = success
+        test "${{ steps.netperf_go_go.outcome }}" = success
