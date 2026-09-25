@@ -33,6 +33,9 @@ base64ct = { version = "1.6", features = ["alloc"] }
 ctrlc = "3"
 dashmap = "5.5"
 
+[dev-dependencies]
+aes-gcm = "0.10"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
