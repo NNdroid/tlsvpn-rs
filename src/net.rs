@@ -1683,6 +1683,54 @@ mod tests {
     }
 
     #[test]
+    fn write_frame_bulk_uses_multiple_close_data_paths() {
+        let port = AsyncPort::new("bulk-write".into());
+
+        let mk = |rtt: u32| {
+            let (tx, rx) = crossbeam_channel::bounded(4096);
+            (
+                Arc::new(Backend {
+                    ch: tx,
+                    rtt_cache: Arc::new(AtomicU32::new(rtt)),
+                    notify: None,
+                }),
+                rx,
+            )
+        };
+
+        let (a, ra) = mk(10_000);
+        let (b, rb) = mk(11_000);
+        let (slow, rs) = mk(30_000);
+        port.register_backend(a);
+        port.register_backend(b);
+        port.register_backend(slow);
+
+        // No FEC: seq=0 cannot appear, so anything observed is real data traffic.
+        // Keep pressure high enough that the preferred backend queue crosses the
+        // production striping threshold while still staying far from capacity.
+        for i in 0..256u32 {
+            port.write_frame(Arc::new(vec![(i & 0xff) as u8; 1400]));
+        }
+
+        let drain = |rx: &crossbeam_channel::Receiver<VPNFrame>| -> usize {
+            let mut n = 0usize;
+            while let Ok(f) = rx.try_recv() {
+                assert_ne!(f.seq, 0);
+                n += 1;
+                release_shared_frame(f.data);
+            }
+            n
+        };
+
+        let na = drain(&ra);
+        let nb = drain(&rb);
+        let ns = drain(&rs);
+        assert!(na > 0 && nb > 0, "bulk data did not use both close paths: {na}/{nb}");
+        assert_eq!(ns, 0, "slow path unexpectedly carried bulk data");
+        assert_eq!(na + nb, 256);
+    }
+
+    #[test]
     fn backend_notify_coalesces_until_consumed() {
         let mut poll = mio::Poll::new().unwrap();
         let dirty = Arc::new(ArrayQueue::new(8));
