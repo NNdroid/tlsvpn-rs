@@ -1015,6 +1015,7 @@ pub struct AsyncPort {
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
     schedule_tick: AtomicU32,
+    data_cursor: AtomicUsize,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     dropped: AtomicU64,
@@ -1030,6 +1031,7 @@ impl AsyncPort {
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
             schedule_tick: AtomicU32::new(0),
+            data_cursor: AtomicUsize::new(0),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1046,6 +1048,7 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
+        self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
         *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
             Some(FecEncoder::new(k, ic))
@@ -1146,6 +1149,32 @@ impl AsyncPort {
         Some(selected)
     }
 
+    const MULTIPATH_STRIPE_QUEUE: usize = 4;
+    const MULTIPATH_STRIPE_MASK: u32 = 0x0f; // 16-frame bursts
+
+    /// 高负载 striping：以当前 MinRTT/queue 最优路径为基准，只允许 RTT 和
+    /// score 都落在小窗口内的健康路径参加轮转。每次调用返回一个 burst 目标。
+    fn bulk_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
+        let best = self.pick_backend_index(backends)?;
+        let best_rtt = backends[best].rtt_cache.load(Ordering::Relaxed);
+        let slack = 5_000u32.max(best_rtt / 4);
+        let max_rtt = best_rtt as u64 + slack as u64;
+        let best_score = Self::backend_score(&backends[best]).unwrap_or(best_rtt);
+        let max_score = best_score as u64 + slack as u64;
+
+        let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        for offset in 0..backends.len() {
+            let idx = (start + offset) % backends.len();
+            let Some(score) = Self::backend_score(&backends[idx]) else { continue };
+            let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
+            if rtt as u64 <= max_rtt && score as u64 <= max_score {
+                self.preferred.store(idx, Ordering::Relaxed);
+                return Some(idx);
+            }
+        }
+        Some(best)
+    }
+
     /// 数据帧热路径。路径 RTT/队列不会在相邻几个以太帧之间发生有意义的变化，
     /// 因此正常情况下复用 16 帧当前后端；当前队列接近满时立即重新评分。
     /// 这把 backends 扫描从“每包”降低到约“每 16 包一次”，同时保留快速故障切换。
@@ -1160,7 +1189,17 @@ impl AsyncPort {
 
         let current = self.preferred.load(Ordering::Relaxed);
         let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
-        if (tick & 0x0f) != 0
+
+        // 只有当前路径已经开始积压，并且到了 16 帧 burst 边界，才主动把
+        // bulk 流量轮转到其它相近 RTT 路径。低负载仍完全沿用 MinRTT。
+        if current < backends.len()
+            && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_QUEUE
+            && (tick & Self::MULTIPATH_STRIPE_MASK) == 0
+        {
+            return self.bulk_backend_index(backends);
+        }
+
+        if (tick & Self::MULTIPATH_STRIPE_MASK) != 0
             && current < backends.len()
             && Self::backend_score(&backends[current]).is_some()
         {
@@ -1578,6 +1617,120 @@ mod tests {
             Some(0),
             "near-full preferred queue must trigger an immediate switch"
         );
+    }
+
+    #[test]
+    fn bulk_striping_uses_only_low_rtt_uncongested_paths() {
+        let port = AsyncPort::new("bulk-striping".into());
+
+        let (a, _ra) = make_backend();
+        let (b, _rb) = make_backend();
+        let (slow, _rs) = make_backend();
+        a.rtt_cache.store(10_000, Ordering::Relaxed);
+        b.rtt_cache.store(11_000, Ordering::Relaxed);
+        slow.rtt_cache.store(30_000, Ordering::Relaxed);
+        let backends = vec![a.clone(), b.clone(), slow.clone()];
+
+        // 轻载：仍然使用 MinRTT。
+        for _ in 0..8 {
+            assert_eq!(port.selected_backend_index(&backends), Some(0));
+        }
+
+        // bulk helper 本身只允许 A/B 参加，30ms 路径不能被轮转到。
+        let mut seen_a = false;
+        let mut seen_b = false;
+        for _ in 0..24 {
+            match port.bulk_backend_index(&backends) {
+                Some(0) => seen_a = true,
+                Some(1) => seen_b = true,
+                Some(2) => panic!("high-RTT backend participated in striping"),
+                other => panic!("unexpected backend selection: {:?}", other),
+            }
+        }
+        assert!(seen_a && seen_b, "both low-RTT paths must participate");
+
+        // 真实生产入口：当前 A 队列积压到阈值，且到 16-frame burst 边界时，
+        // selected_backend_index 必须能切到 B，而不是 helper 永远没人调用。
+        for i in 0..AsyncPort::MULTIPATH_STRIPE_QUEUE {
+            a.ch.try_send(VPNFrame {
+                seq: 100 + i as u32,
+                data: Arc::new(vec![0u8; 64]),
+            }).unwrap();
+        }
+        port.preferred.store(0, Ordering::Relaxed);
+        port.schedule_tick.store(16, Ordering::Relaxed);
+        port.data_cursor.store(1, Ordering::Relaxed);
+        assert_eq!(
+            port.selected_backend_index(&backends),
+            Some(1),
+            "queued preferred path must trigger burst striping"
+        );
+
+        // 即使 RTT 接近，明显积压的 B 也必须退出候选集。
+        for i in 0..20u32 {
+            b.ch.try_send(VPNFrame {
+                seq: i + 1,
+                data: Arc::new(vec![0u8; 64]),
+            }).unwrap();
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                port.bulk_backend_index(&backends),
+                Some(0),
+                "queued backend must not participate in striping"
+            );
+        }
+    }
+
+    #[test]
+    fn write_frame_bulk_uses_multiple_close_data_paths() {
+        let port = AsyncPort::new("bulk-write".into());
+
+        let mk = |rtt: u32| {
+            let (tx, rx) = crossbeam_channel::bounded(4096);
+            (
+                Arc::new(Backend {
+                    ch: tx,
+                    rtt_cache: Arc::new(AtomicU32::new(rtt)),
+                    notify: None,
+                }),
+                rx,
+            )
+        };
+
+        let (a, ra) = mk(10_000);
+        let (b, rb) = mk(11_000);
+        // Deliberately much slower than any queue penalty this synthetic test
+        // can build without consumers. A 30ms path can legitimately become the
+        // best fallback once A/B queues are deliberately allowed to accumulate.
+        let (slow, rs) = mk(1_000_000);
+        port.register_backend(a);
+        port.register_backend(b);
+        port.register_backend(slow);
+
+        // No FEC: seq=0 cannot appear, so anything observed is real data traffic.
+        // Keep pressure high enough that the preferred backend queue crosses the
+        // production striping threshold while still staying far from capacity.
+        for i in 0..256u32 {
+            port.write_frame(Arc::new(vec![(i & 0xff) as u8; 1400]));
+        }
+
+        let drain = |rx: &crossbeam_channel::Receiver<VPNFrame>| -> usize {
+            let mut n = 0usize;
+            while let Ok(f) = rx.try_recv() {
+                assert_ne!(f.seq, 0);
+                n += 1;
+                release_shared_frame(f.data);
+            }
+            n
+        };
+
+        let na = drain(&ra);
+        let nb = drain(&rb);
+        let ns = drain(&rs);
+        assert!(na > 0 && nb > 0, "bulk data did not use both close paths: {na}/{nb}");
+        assert_eq!(ns, 0, "slow path unexpectedly carried bulk data");
+        assert_eq!(na + nb, 256);
     }
 
     #[test]
