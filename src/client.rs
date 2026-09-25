@@ -1042,13 +1042,13 @@ fn dial_target(cl: &Arc<Client>, target: &str) -> std::io::Result<std::net::TcpS
     } else {
         dial_with_mark_host(target, cl.fwmark)?
     };
-    // SOCKS 握手使用有界阻塞超时；进入隧道数据面前清除它们，再统一安装
-    // 低延迟、保活和 socket buffer 参数。此前代理路径漏掉了整组调优。
+    // SOCKS 握手使用有界阻塞超时；进入隧道数据面前清除它们，再安装
+    // TCP_NODELAY 与 keepalive。不要固定 SO_RCVBUF/SO_SNDBUF：Linux TCP
+    // autotuning 会按路径 BDP 扩张，显式 setsockopt 反而会关闭自动调节。
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     stream.set_nodelay(true)?;
     apply_tcp_keepalive(&stream);
-    apply_socket_buffers(&stream);
     Ok(stream)
 }
 
