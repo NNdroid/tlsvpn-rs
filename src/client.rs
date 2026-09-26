@@ -1584,6 +1584,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
     // buffer") before write_tls() gets a chance to drain ciphertext.
     const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    // Keep each rustls plaintext write at the proven-safe 32 KiB ceiling.
+    // At most two fully-drained data chunks may be serviced in one event-loop
+    // turn, avoiding a redundant poll(0) round between immediately-sendable work.
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
@@ -1780,107 +1783,134 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         // ---- 上行：端口唤醒时拉帧成批发送 ----
+        // A single rustls plaintext write stays capped at 32 KiB (the rejected
+        // 64 KiB single-write experiment exceeded rustls' bounded plaintext
+        // capacity). If one data chunk fully drains to the socket and backend
+        // data is still queued, service one more chunk in this same event-loop
+        // turn instead of paying another poll(0) + event-scan round trip.
         let ic_tx_ref = ic_tx.as_deref();
-        send_buf.clear();
-        let mut tx_packets_batch = 0u64;
-        if !tls.wants_write() && (woken || !rx.is_empty()) {
-            if let Some(n) = &backend.notify {
-                // Only clear pending when we are actually going to drain the
-                // backend queue. If TLS is socket-backpressured, leave pending
-                // set and retry from the periodic poll loop once ciphertext drains.
-                n.consume_wake();
-            }
-            while let Ok(f) = rx.try_recv() {
-                let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);
-                f.data.release();
-                tx_packets_batch += 1;
-                if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
-                    break;
+        let mut tx_chunks_sent = 0usize;
+        let mut wake_consumed = false;
+        loop {
+            send_buf.clear();
+            let mut tx_packets_batch = 0u64;
+            if !tls.wants_write() && (woken || !rx.is_empty()) {
+                if !wake_consumed {
+                    if let Some(n) = &backend.notify {
+                        // One coalesced wake may cover both chunks. Consume it only
+                        // once, when this turn actually begins draining the queue.
+                        n.consume_wake();
+                    }
+                    wake_consumed = true;
+                }
+                while let Ok(f) = rx.try_recv() {
+                    let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
+                    append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);
+                    f.data.release();
+                    tx_packets_batch += 1;
+                    if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
+                        break;
+                    }
                 }
             }
-        }
 
-        if send_buf.is_empty()
-            && !tls.wants_write()
-            && last_keepalive.elapsed() > Duration::from_secs(4)
-        {
-            append_padded_frame(&mut send_buf, 0, &[], None);
-        }
-        if !send_buf.is_empty() {
-            let wire_bytes = send_buf.len() as u64;
-            if let Err(e) = tls.writer().write_all(&send_buf) {
-                close_reason = format!("tls plaintext writer failed: {e}");
+            // Keepalive remains a one-shot cold path. Never inject one between
+            // two data chunks in the same TX turn.
+            if send_buf.is_empty()
+                && tx_chunks_sent == 0
+                && !tls.wants_write()
+                && last_keepalive.elapsed() > Duration::from_secs(4)
+            {
+                append_padded_frame(&mut send_buf, 0, &[], None);
+            }
+
+            let sent_data_chunk = tx_packets_batch != 0;
+            if !send_buf.is_empty() {
+                let wire_bytes = send_buf.len() as u64;
+                if let Err(e) = tls.writer().write_all(&send_buf) {
+                    close_reason = format!("tls plaintext writer failed: {e}");
+                    conn_closed = true;
+                    break;
+                }
+                if tx_packets_batch != 0 {
+                    cl.tx_packets
+                        .fetch_add(tx_packets_batch, Ordering::Relaxed);
+                    tx_chunks_sent += 1;
+                }
+                cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+                ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+                last_keepalive = Instant::now();
+                // Only clear length; retain capacity for the next <=32 KiB chunk.
+                send_buf.clear();
+            }
+
+            // Drain ciphertext after every plaintext chunk. The next chunk is not
+            // handed to rustls until the current chunk is fully drained or the
+            // kernel reports write backpressure.
+            while tls.wants_write() {
+                match tls.write_tls(&mut sock) {
+                    Ok(0) => {
+                        close_reason = "tls.write_tls returned zero".into();
+                        conn_closed = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        last_write_progress = Instant::now();
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if !write_blocked {
+                            if let Err(reg_err) = poll.registry().reregister(
+                                &mut sock,
+                                TOKEN_CONN,
+                                client_socket_interest(true),
+                            ) {
+                                close_reason = format!(
+                                    "mio reregister writable after TLS backpressure failed: {reg_err}"
+                                );
+                                conn_closed = true;
+                            } else {
+                                write_blocked = true;
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        close_reason = format!("tls.write_tls failed: {e}");
+                        conn_closed = true;
+                        break;
+                    }
+                }
+            }
+
+            if write_blocked && !tls.wants_write() && !conn_closed {
+                if let Err(reg_err) = poll.registry().reregister(
+                    &mut sock,
+                    TOKEN_CONN,
+                    client_socket_interest(false),
+                ) {
+                    close_reason = format!(
+                        "mio restore read-only interest after TLS drain failed: {reg_err}"
+                    );
+                    conn_closed = true;
+                } else {
+                    write_blocked = false;
+                }
+            }
+
+            if !sent_data_chunk
+                || !client_can_continue_tx_round(
+                    tx_chunks_sent,
+                    !rx.is_empty(),
+                    tls.wants_write(),
+                    conn_closed,
+                )
+            {
                 break;
             }
-            if tx_packets_batch != 0 {
-                cl.tx_packets
-                    .fetch_add(tx_packets_batch, Ordering::Relaxed);
-            }
-            cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
-            ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
-            last_keepalive = Instant::now();
-            // 仅清长度，保留 capacity 给下一批。
-            send_buf.clear();
         }
-
-        // 冲刷写队列（非阻塞；WouldBlock 等下次 poll 后重试）
-        while tls.wants_write() {
-            match tls.write_tls(&mut sock) {
-                Ok(0) => {
-                    close_reason = "tls.write_tls returned zero".into();
-                    conn_closed = true;
-                    break;
-                }
-                Ok(_) => {
-                    last_write_progress = Instant::now();
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Normally the data loop listens only for READABLE. Once
-                    // the kernel socket backpressures, subscribe to WRITABLE so
-                    // send-buffer recovery wakes us immediately instead of
-                    // waiting for the RTT/reorder timer.
-                    if !write_blocked {
-                        if let Err(reg_err) = poll.registry().reregister(
-                            &mut sock,
-                            TOKEN_CONN,
-                            client_socket_interest(true),
-                        ) {
-                            close_reason = format!(
-                                "mio reregister writable after TLS backpressure failed: {reg_err}"
-                            );
-                            conn_closed = true;
-                        } else {
-                            write_blocked = true;
-                        }
-                    }
-                    break
-                }
-                Err(e) => {
-                    close_reason = format!("tls.write_tls failed: {e}");
-                    conn_closed = true;
-                    break;
-                }
-            }
-        }
-
-        if write_blocked && !tls.wants_write() && !conn_closed {
-    if let Err(reg_err) = poll.registry().reregister(
-        &mut sock,
-        TOKEN_CONN,
-        client_socket_interest(false),
-    ) {
-        close_reason = format!(
-            "mio restore read-only interest after TLS drain failed: {reg_err}"
-        );
-        conn_closed = true;
-    } else {
-        write_blocked = false;
-    }
-}
 
         if last_write_progress.elapsed() > Duration::from_secs(10) {
             close_reason = "write stalled for >10s".into();
@@ -1961,10 +1991,32 @@ fn clamp_poll_for_tx_backlog(
     }
 }
 
+#[inline]
+fn client_can_continue_tx_round(
+    chunks_sent: usize,
+    queue_nonempty: bool,
+    tls_wants_write: bool,
+    conn_closed: bool,
+) -> bool {
+    !conn_closed
+        && !tls_wants_write
+        && queue_nonempty
+        && chunks_sent < 2
+}
+
 #[cfg(test)]
 mod tx_poll_tests {
-    use super::{clamp_poll_for_tx_backlog, client_socket_interest};
+    use super::{client_can_continue_tx_round, clamp_poll_for_tx_backlog, client_socket_interest};
     use std::time::Duration;
+
+    #[test]
+    fn same_loop_tx_continues_only_with_ready_budgeted_work() {
+        assert!(client_can_continue_tx_round(1, true, false, false));
+        assert!(!client_can_continue_tx_round(2, true, false, false));
+        assert!(!client_can_continue_tx_round(1, false, false, false));
+        assert!(!client_can_continue_tx_round(1, true, true, false));
+        assert!(!client_can_continue_tx_round(1, true, false, true));
+    }
 
     #[test]
     fn writable_interest_is_only_enabled_for_real_backpressure() {
