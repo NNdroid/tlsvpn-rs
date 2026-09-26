@@ -8,7 +8,7 @@ on:
 jobs:
   profile:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,11 +22,20 @@ jobs:
           repository: NNdroid/tlsvpn
           path: go-impl
 
-      - name: Build native Rust and Go binaries
+      - name: Build production and profiling binaries
         shell: bash
         run: |
+          set -euo pipefail
           bash scripts/build.sh native
           (cd go-impl && bash scripts/build.sh)
+          # Diagnostic-only binary: keep symbols and frame pointers. This does not
+          # modify Cargo.toml or any production/release artifact in main.
+          CARGO_PROFILE_RELEASE_STRIP=false \
+          CARGO_PROFILE_RELEASE_DEBUG=1 \
+          RUSTFLAGS='-C force-frame-pointers=yes' \
+            cargo build --release
+          cp target/release/tlsvpn dist/tlsvpn-profile
+          file dist/tlsvpn dist/tlsvpn-profile
 
       - name: Probe perf permissions
         id: perfprobe
@@ -41,18 +50,38 @@ jobs:
           sudo perf stat -e task-clock,context-switches,cpu-migrations,page-faults -- sleep 0.2 >/tmp/perf-probe.out 2>&1
           rc=$?
           cat /tmp/perf-probe.out
-          if [[ $rc -eq 0 ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+          [[ $rc -eq 0 ]] && echo "available=true" >> "$GITHUB_OUTPUT" || echo "available=false" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: perf stat Rust client during real TAP traffic
+      - name: perf stat Rust client during iperf traffic
         if: steps.perfprobe.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          find_exe_pid() {
+            local wanted
+            wanted=$(readlink -f "$1")
+            for _ in $(seq 1 600); do
+              for proc in /proc/[0-9]*; do
+                [[ -e "$proc/exe" ]] || continue
+                if [[ "$(readlink -f "$proc/exe" 2>/dev/null || true)" == "$wanted" ]]; then
+                  echo "${proc##*/}"
+                  return 0
+                fi
+              done
+              sleep 0.1
+            done
+            return 1
+          }
+          wait_for_iperf() {
+            local log=$1
+            for _ in $(seq 1 600); do
+              grep -q 'traceroute v6: gateway answered through the tunnel' "$log" 2>/dev/null && return 0
+              sleep 0.1
+            done
+            return 1
+          }
+
           rm -f /tmp/perf-stat.txt /tmp/netperf-stat.log
           sudo -E env \
             BIN_SRV="$GITHUB_WORKSPACE/go-impl/bin/tlsvpn_linux_amd64" \
@@ -61,91 +90,86 @@ jobs:
             bash scripts/net_perf_test.sh >/tmp/netperf-stat.log 2>&1 &
           test_pid=$!
 
-          rust_pid=""
-          for _ in $(seq 1 120); do
-            rust_pid=$(pgrep -n -f "$GITHUB_WORKSPACE/dist/tlsvpn.*-c" || true)
-            [[ -n "$rust_pid" ]] && break
-            sleep 0.1
-          done
-          if [[ -z "$rust_pid" ]]; then
-            cat /tmp/netperf-stat.log
-            echo "Rust client PID not found" >&2
-            exit 1
-          fi
+          rust_pid=$(find_exe_pid "$GITHUB_WORKSPACE/dist/tlsvpn") || {
+            cat /tmp/netperf-stat.log; echo 'Rust client PID not found' >&2; exit 1;
+          }
+          wait_for_iperf /tmp/netperf-stat.log || {
+            cat /tmp/netperf-stat.log; echo 'iperf phase not reached' >&2; exit 1;
+          }
           echo "Rust client pid=$rust_pid"
           sudo perf stat -x, \
             -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions,branches,branch-misses,cache-references,cache-misses \
-            -p "$rust_pid" -o /tmp/perf-stat.txt -- sleep 8 || true
+            -p "$rust_pid" -o /tmp/perf-stat.txt -- sleep 7 || true
+          set +e
           wait "$test_pid"
+          test_rc=$?
+          set -e
           echo '--- netperf ---'
           cat /tmp/netperf-stat.log
           echo '--- perf stat ---'
           cat /tmp/perf-stat.txt || true
+          exit "$test_rc"
 
       - name: perf record Rust client hot functions
         if: steps.perfprobe.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          find_exe_pid() {
+            local wanted
+            wanted=$(readlink -f "$1")
+            for _ in $(seq 1 600); do
+              for proc in /proc/[0-9]*; do
+                [[ -e "$proc/exe" ]] || continue
+                if [[ "$(readlink -f "$proc/exe" 2>/dev/null || true)" == "$wanted" ]]; then
+                  echo "${proc##*/}"
+                  return 0
+                fi
+              done
+              sleep 0.1
+            done
+            return 1
+          }
+          wait_for_iperf() {
+            local log=$1
+            for _ in $(seq 1 600); do
+              grep -q 'traceroute v6: gateway answered through the tunnel' "$log" 2>/dev/null && return 0
+              sleep 0.1
+            done
+            return 1
+          }
+
           rm -f /tmp/perf.data /tmp/perf-report.txt /tmp/netperf-record.log
           sudo -E env \
             BIN_SRV="$GITHUB_WORKSPACE/go-impl/bin/tlsvpn_linux_amd64" \
-            BIN_CLI="$GITHUB_WORKSPACE/dist/tlsvpn" \
+            BIN_CLI="$GITHUB_WORKSPACE/dist/tlsvpn-profile" \
             FLAVOR_SRV=go FLAVOR_CLI=rs \
             bash scripts/net_perf_test.sh >/tmp/netperf-record.log 2>&1 &
           test_pid=$!
 
-          rust_pid=""
-          for _ in $(seq 1 120); do
-            rust_pid=$(pgrep -n -f "$GITHUB_WORKSPACE/dist/tlsvpn.*-c" || true)
-            [[ -n "$rust_pid" ]] && break
-            sleep 0.1
-          done
-          if [[ -z "$rust_pid" ]]; then
-            cat /tmp/netperf-record.log
-            echo "Rust client PID not found" >&2
-            exit 1
-          fi
-          echo "Rust client pid=$rust_pid"
-          sudo perf record -F 199 -g --call-graph dwarf -p "$rust_pid" -o /tmp/perf.data -- sleep 8 || true
+          rust_pid=$(find_exe_pid "$GITHUB_WORKSPACE/dist/tlsvpn-profile") || {
+            cat /tmp/netperf-record.log; echo 'Rust profile client PID not found' >&2; exit 1;
+          }
+          wait_for_iperf /tmp/netperf-record.log || {
+            cat /tmp/netperf-record.log; echo 'iperf phase not reached' >&2; exit 1;
+          }
+          echo "Rust profile client pid=$rust_pid"
+          sudo perf record -F 249 -g --call-graph fp -p "$rust_pid" -o /tmp/perf.data -- sleep 7 || true
+          set +e
           wait "$test_pid"
+          test_rc=$?
+          set -e
           echo '--- netperf ---'
           cat /tmp/netperf-record.log
           echo '--- perf report ---'
           if [[ -s /tmp/perf.data ]]; then
-            sudo perf report --stdio -i /tmp/perf.data --no-children --sort symbol --percent-limit 0.5 > /tmp/perf-report.txt || true
-            sed -n '1,220p' /tmp/perf-report.txt
+            sudo perf report --stdio -i /tmp/perf.data --no-children --sort symbol --percent-limit 0.35 > /tmp/perf-report.txt || true
+            sed -n '1,260p' /tmp/perf-report.txt
           else
             echo 'perf.data unavailable'
           fi
+          exit "$test_rc"
 
       - name: Fallback process counters when perf is blocked
         if: steps.perfprobe.outputs.available != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo -E env \
-            BIN_SRV="$GITHUB_WORKSPACE/go-impl/bin/tlsvpn_linux_amd64" \
-            BIN_CLI="$GITHUB_WORKSPACE/dist/tlsvpn" \
-            FLAVOR_SRV=go FLAVOR_CLI=rs \
-            bash scripts/net_perf_test.sh >/tmp/netperf-fallback.log 2>&1 &
-          test_pid=$!
-          rust_pid=""
-          for _ in $(seq 1 120); do
-            rust_pid=$(pgrep -n -f "$GITHUB_WORKSPACE/dist/tlsvpn.*-c" || true)
-            [[ -n "$rust_pid" ]] && break
-            sleep 0.1
-          done
-          if [[ -n "$rust_pid" ]]; then
-            echo "--- /proc/$rust_pid/status before ---"
-            grep -E 'VmRSS|voluntary_ctxt_switches|nonvoluntary_ctxt_switches' "/proc/$rust_pid/status" || true
-            echo "--- /proc/$rust_pid/stat before ---"
-            cat "/proc/$rust_pid/stat" || true
-            sleep 8
-            echo "--- /proc/$rust_pid/status after ---"
-            grep -E 'VmRSS|voluntary_ctxt_switches|nonvoluntary_ctxt_switches' "/proc/$rust_pid/status" || true
-            echo "--- /proc/$rust_pid/stat after ---"
-            cat "/proc/$rust_pid/stat" || true
-          fi
-          wait "$test_pid"
-          cat /tmp/netperf-fallback.log
+        run: echo 'perf_event_open unavailable on this runner; no production changes were made.'
