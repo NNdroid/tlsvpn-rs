@@ -1,0 +1,285 @@
+name: Apply client port batching experiment
+
+on:
+  push:
+    branches:
+      - perf/client-port-batch-v32
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/client-port-batch-v32
+      - name: Apply focused client batching patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # 1) AsyncPort: add a batch entry point which amortizes backend RLock,
+          # health/path selection and FEC mutex across one TAP burst.
+          p = Path('src/net.rs')
+          s = p.read_text()
+          anchor = '''    /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
+    /// 都为 Arc 控制块做一次 heap allocation/free。
+    pub fn write_owned_frame(&self, frame: Vec<u8>) {
+        self.write_payload(FramePayload::Owned(frame));
+    }
+
+    fn write_payload(&self, frame: FramePayload) {'''
+          replacement = '''    /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
+    /// 都为 Arc 控制块做一次 heap allocation/free。
+    pub fn write_owned_frame(&self, frame: Vec<u8>) {
+        self.write_payload(FramePayload::Owned(frame));
+    }
+
+    /// Client TAP bulk path: process one already-owned burst under one backend
+    /// snapshot/path decision and one FEC encoder lock.  The backend channel is
+    /// intentionally still per-frame in this first experiment, so the A/B only
+    /// measures dispatch-side batching and keeps connection/TLS consumers intact.
+    pub fn write_owned_batch(&self, frames: &mut Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let backends = self.backends.read();
+        if backends.is_empty()
+            || !backends
+                .iter()
+                .any(|b| Self::backend_score(b).is_some())
+        {
+            let mut dropped = 0u64;
+            for frame in frames.drain(..) {
+                if !frame.is_empty() {
+                    dropped += 1;
+                }
+                release_frame_vec(frame);
+            }
+            self.drop_n(dropped);
+            return;
+        }
+
+        // Go chooses the data path once per input batch. Doing the same here
+        // avoids per-packet RwLock/RTT scoring while retaining per-frame fallback
+        // if the chosen physical queue fills during the burst.
+        let selected_idx = self.selected_data_backend_index(&backends);
+        let mut encoder = self.encoder.lock();
+
+        for frame in frames.drain(..) {
+            let frame = FramePayload::Owned(frame);
+            if frame.is_empty() {
+                frame.release();
+                continue;
+            }
+
+            let Some(seq) = self.next_seq() else {
+                self.drop_n(1);
+                frame.release();
+                continue;
+            };
+
+            let parity = encoder
+                .as_mut()
+                .and_then(|enc| enc.add(seq, frame.as_slice()));
+            let data_idx =
+                self.send_data_payload_to_any(&backends, selected_idx, seq, frame);
+
+            if let Some(par) = parity {
+                if backends.len() < 2 {
+                    release_frame_vec(par);
+                    continue;
+                }
+                self.parity_sent.fetch_add(1, Ordering::Relaxed);
+                let par = FramePayload::Owned(par);
+                if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
+                    self.send_payload_to(&backends[idx], 0, par);
+                } else {
+                    self.drop_n(1);
+                    par.release();
+                }
+            }
+        }
+    }
+
+    /// Drop an owned TAP frame before sequence allocation. Used by the client
+    /// input queue when its bounded 4096-frame burst buffer is full.
+    pub fn drop_owned_frame(&self, frame: Vec<u8>) {
+        if !frame.is_empty() {
+            self.drop_n(1);
+        }
+        release_frame_vec(frame);
+    }
+
+    fn write_payload(&self, frame: FramePayload) {'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'net.rs write_owned_frame anchor count={s.count(anchor)}')
+          s = s.replace(anchor, replacement)
+
+          test_anchor = '''    #[test]
+    fn owned_payload_falls_back_without_payload_copy() {'''
+          test_block = '''    #[test]
+    fn owned_batch_preserves_sequence_and_payload_ownership() {
+        let port = AsyncPort::new("owned-batch".into());
+        let (backend, rx) = make_backend();
+        port.register_backend(backend);
+
+        let mut batch = Vec::with_capacity(8);
+        let mut ptrs = Vec::new();
+        for marker in 1u8..=4 {
+            let mut frame = acquire_frame_vec(1400);
+            frame.resize(1400, marker);
+            ptrs.push(frame.as_ptr());
+            batch.push(frame);
+        }
+
+        port.write_owned_batch(&mut batch);
+        assert!(batch.is_empty(), "batch ownership must be consumed");
+        for (idx, expected_ptr) in ptrs.into_iter().enumerate() {
+            let frame = rx.try_recv().expect("batched frame must reach backend");
+            assert_eq!(frame.seq, (idx + 1) as u32);
+            assert_eq!(frame.data.data_ptr(), expected_ptr);
+            assert_eq!(frame.data[frame.data.len() - 1], (idx + 1) as u8);
+            frame.data.release();
+        }
+    }
+
+    #[test]
+    fn owned_payload_falls_back_without_payload_copy() {'''
+          if s.count(test_anchor) != 1:
+              raise SystemExit(f'net.rs test anchor count={s.count(test_anchor)}')
+          s = s.replace(test_anchor, test_block)
+          p.write_text(s)
+
+          # 2) Client TAP reader: one producer channel, one dispatcher thread.
+          # The dispatcher sends the first packet immediately at low load and
+          # opportunistically drains up to the same 64 KiB burst used by Go.
+          p = Path('src/client.rs')
+          s = p.read_text()
+          old = '''    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
+    let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+    {
+        let dev = device.clone();
+        let port = tx_port.clone();
+        // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
+        let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
+        std::thread::spawn(move || {
+            loop {
+                if EXIT.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut frame = acquire_frame_vec(tap_read_size);
+                match dev.recv(&mut frame) {
+                    Ok(n) if n > 0 => {
+                        frame.truncate(n);
+                        // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
+                        // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
+                        port.write_owned_frame(frame);
+                    }
+                    Ok(_) => release_frame_vec(frame),
+                    Err(_) => {
+                        release_frame_vec(frame);
+                        if EXIT.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        });
+    }
+'''
+          new = '''    // TAP 读线程 → 4096 帧有界输入队列 → AsyncPort burst dispatcher。
+    // Go 端也是先把单帧送入输入队列，再由一个 dispatcher 聚合到最多 64 KiB；
+    // 低流量下 dispatcher 收到首帧后立即发送，不引入定时等待。
+    let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+    let (tap_tx, tap_rx) = bounded::<Vec<u8>>(4096);
+    {
+        let dev = device.clone();
+        let port = tx_port.clone();
+        // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
+        let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
+        std::thread::spawn(move || {
+            loop {
+                if EXIT.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut frame = acquire_frame_vec(tap_read_size);
+                match dev.recv(&mut frame) {
+                    Ok(n) if n > 0 => {
+                        frame.truncate(n);
+                        // 入口背压发生在 seq 分配前，队列满时归还 pooled Vec。
+                        match tap_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(frame))
+                            | Err(crossbeam_channel::TrySendError::Disconnected(frame)) => {
+                                port.drop_owned_frame(frame);
+                            }
+                        }
+                    }
+                    Ok(_) => release_frame_vec(frame),
+                    Err(_) => {
+                        release_frame_vec(frame);
+                        if EXIT.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        });
+    }
+    {
+        let port = tx_port.clone();
+        std::thread::spawn(move || {
+            const MAX_BATCH_BYTES: usize = 64 * 1024;
+            const MAX_BATCH_FRAMES: usize = 128;
+            let mut batch = Vec::<Vec<u8>>::with_capacity(MAX_BATCH_FRAMES);
+
+            loop {
+                let first = match tap_rx.recv() {
+                    Ok(frame) => frame,
+                    Err(_) => return,
+                };
+                let mut batch_bytes = first.len();
+                batch.push(first);
+
+                while batch.len() < MAX_BATCH_FRAMES && batch_bytes < MAX_BATCH_BYTES {
+                    match tap_rx.try_recv() {
+                        Ok(frame) => {
+                            batch_bytes = batch_bytes.saturating_add(frame.len());
+                            batch.push(frame);
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                port.write_owned_batch(&mut batch);
+            }
+        });
+    }
+'''
+          if s.count(old) != 1:
+              raise SystemExit(f'client.rs TAP block anchor count={s.count(old)}')
+          s = s.replace(old, new)
+          p.write_text(s)
+          PY
+
+          git diff --check
+          cargo test --quiet owned_batch_preserves_sequence_and_payload_ownership
+          cargo test --quiet owned_payload_falls_back_without_payload_copy
+          cargo test --quiet saturated_backends_do_not_consume_sequence
+          cargo check --quiet
+      - name: Commit experiment
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/net.rs src/client.rs
+          git commit -m 'perf: batch client TAP dispatch into AsyncPort'
+          git push origin HEAD:perf/client-port-batch-v32
