@@ -1166,10 +1166,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
     }
-    // 握手完成后只关注可读（修复写就绪恒触发导致的空转）
+    // 握手完成后默认只关注可读，避免永久 WRITABLE interest 导致空转。
+    // 数据面只有在 write_tls() 真正返回 WouldBlock 时才临时订阅 WRITABLE。
     let _ = poll
         .registry()
-        .reregister(&mut sock, TOKEN_CONN, Interest::READABLE);
+        .reregister(&mut sock, TOKEN_CONN, client_socket_interest(false));
 
     // 3. 握手请求（对齐 Go）
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
@@ -1497,6 +1498,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut last_keepalive = Instant::now();
     let mut last_rx = Instant::now();
     let mut last_write_progress = Instant::now();
+    // Keep WRITABLE disabled on the hot path. Enable it only after the
+    // kernel socket actually backpressures write_tls(), then remove it
+    // again as soon as rustls ciphertext is fully drained.
+    let mut write_blocked = false;
     let mut next_rtt_refresh = Instant::now();
     let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
@@ -1772,6 +1777,24 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    // Normally the data loop listens only for READABLE. Once
+                    // the kernel socket backpressures, subscribe to WRITABLE so
+                    // send-buffer recovery wakes us immediately instead of
+                    // waiting for the RTT/reorder timer.
+                    if !write_blocked {
+                        if let Err(reg_err) = poll.registry().reregister(
+                            &mut sock,
+                            TOKEN_CONN,
+                            client_socket_interest(true),
+                        ) {
+                            close_reason = format!(
+                                "mio reregister writable after TLS backpressure failed: {reg_err}"
+                            );
+                            conn_closed = true;
+                        } else {
+                            write_blocked = true;
+                        }
+                    }
                     break
                 }
                 Err(e) => {
@@ -1781,6 +1804,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 }
             }
         }
+
+        if write_blocked && !tls.wants_write() && !conn_closed {
+    if let Err(reg_err) = poll.registry().reregister(
+        &mut sock,
+        TOKEN_CONN,
+        client_socket_interest(false),
+    ) {
+        close_reason = format!(
+            "mio restore read-only interest after TLS drain failed: {reg_err}"
+        );
+        conn_closed = true;
+    } else {
+        write_blocked = false;
+    }
+}
 
         if last_write_progress.elapsed() > Duration::from_secs(10) {
             close_reason = "write stalled for >10s".into();
@@ -1829,6 +1867,15 @@ fn deliver_to_tap(
 }
 
 #[inline]
+fn client_socket_interest(write_blocked: bool) -> Interest {
+    if write_blocked {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    }
+}
+
+#[inline]
 fn clamp_poll_for_tx_backlog(
     base: Duration,
     tx_backlog: bool,
@@ -1843,8 +1890,19 @@ fn clamp_poll_for_tx_backlog(
 
 #[cfg(test)]
 mod tx_poll_tests {
-    use super::clamp_poll_for_tx_backlog;
+    use super::{clamp_poll_for_tx_backlog, client_socket_interest};
     use std::time::Duration;
+
+    #[test]
+    fn writable_interest_is_only_enabled_for_real_backpressure() {
+        let normal = client_socket_interest(false);
+        assert!(normal.is_readable());
+        assert!(!normal.is_writable());
+
+        let blocked = client_socket_interest(true);
+        assert!(blocked.is_readable());
+        assert!(blocked.is_writable());
+    }
 
     #[test]
     fn queued_tx_without_tls_backpressure_never_sleeps() {
