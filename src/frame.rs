@@ -230,6 +230,14 @@ impl FramePayload {
         }
     }
 
+    #[inline]
+    pub fn into_shared(self) -> std::sync::Arc<Vec<u8>> {
+        match self {
+            Self::Owned(buf) => std::sync::Arc::new(buf),
+            Self::Shared(buf) => buf,
+        }
+    }
+
     #[cfg(test)]
     #[inline]
     pub fn data_ptr(&self) -> *const u8 {

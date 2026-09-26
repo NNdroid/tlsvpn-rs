@@ -1163,7 +1163,7 @@ fn worker_loop(
     let mut mio_sessions: HashMap<Token, MioSession> = HashMap::new();
     let mut unique_token: usize = 2;
     // worker 串行处理事件，可复用同一个重排输出 scratch，避免每包/每 timeout malloc。
-    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
+    let mut reorder_ready: Vec<FramePayload> = Vec::with_capacity(64);
 
     loop {
         if crate::client::EXIT.load(Ordering::Relaxed) {
@@ -1524,8 +1524,9 @@ fn worker_loop(
             session
                 .reorder_buf
                 .lock()
-                .flush_timeout_into(&mut reorder_ready);
+                .flush_payload_timeout_into(&mut reorder_ready);
             for ordered in reorder_ready.drain(..) {
+            let ordered = ordered.into_shared();
                 if session.mac_bin != [0u8; 6] {
                     core.vswitch.process_session_frame(
                         &session.stat.client_id,
@@ -1559,7 +1560,7 @@ fn process_plain_frames(
     core: &Arc<ServerCore>,
     close: &mut bool,
     tarpit: &mut bool,
-    reorder_ready: &mut Vec<Arc<Vec<u8>>>,
+    reorder_ready: &mut Vec<FramePayload>,
 ) {
     // 共享统计按一次 TLS plaintext drain 聚合，降低多 worker 写同一 cache line 的频率。
     let mut rx_bytes_batch = 0u64;
@@ -1634,39 +1635,49 @@ fn process_plain_frames(
                     }
                     let fec_dec = epoch.fec_dec.clone();
                     drop(epoch);
-                    let data = Arc::new(data);
-
                     if seq == 0 {
-                        if let Some(dec) = &fec_dec {
-                            if fec::is_parity_frame(&data) {
-                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_vswitch(
-                                        &c_sess,
-                                        core,
-                                        s,
-                                        f,
-                                        reorder_ready,
-                                    );
-                                };
-                                dec.on_parity(&data, &mut sink);
-                                release_shared_frame(data);
-                                continue;
-                            }
-                        }
-                    }
-
-                    if let Some(dec) = &fec_dec {
+                if let Some(dec) = &fec_dec {
+                    if fec::is_parity_frame(&data) {
                         let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                            deliver_to_vswitch(&c_sess, core, s, f, reorder_ready);
+                            deliver_to_vswitch(
+                                &c_sess,
+                                core,
+                                s,
+                                FramePayload::Shared(f),
+                                reorder_ready,
+                            );
                         };
-                        dec.on_data(seq, &data, &mut sink);
+                        dec.on_parity(&data, &mut sink);
+                        release_frame_vec(data);
+                        continue;
                     }
+                }
+            }
 
-                    if !c_sess.dedup.lock().is_duplicate(seq) {
-                        deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
-                    } else {
-                        release_shared_frame(data);
-                    }
+            if let Some(dec) = &fec_dec {
+                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                    deliver_to_vswitch(
+                        &c_sess,
+                        core,
+                        s,
+                        FramePayload::Shared(f),
+                        reorder_ready,
+                    );
+                };
+                dec.on_data(seq, &data, &mut sink);
+            }
+
+            if !c_sess.dedup.lock().is_duplicate(seq) {
+                deliver_to_vswitch(
+                    &c_sess,
+                    core,
+                    seq,
+                    FramePayload::Owned(data),
+                    reorder_ready,
+                );
+            } else {
+                release_frame_vec(data);
+            }
                 }
             }
             Ok(None) => break,
@@ -1700,15 +1711,16 @@ fn deliver_to_vswitch(
     c_sess: &Arc<ClientSession>,
     core: &Arc<ServerCore>,
     seq: u32,
-    frame: Arc<Vec<u8>>,
-    ready: &mut Vec<Arc<Vec<u8>>>,
+    frame: FramePayload,
+    ready: &mut Vec<FramePayload>,
 ) {
     ready.clear();
     c_sess
         .reorder_buf
         .lock()
-        .insert_into(seq, frame, ready);
+        .insert_payload_into(seq, frame, ready);
     for ordered in ready.drain(..) {
+        let ordered = ordered.into_shared();
         if c_sess.mac_bin != [0u8; 6] {
             core.vswitch.process_session_frame(
                 &c_sess.stat.client_id,

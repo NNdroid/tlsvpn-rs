@@ -2,6 +2,7 @@ use lazy_static::lazy_static;
 use std::cell::RefCell;
 
 use crate::utils::FastRand;
+use crate::frame::FramePayload;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,7 +148,7 @@ pub struct ReorderStats {
 /// 帧以 Arc 共享：重排输出 → 交换机 → 端口 → 多后端广播全程零拷贝。
 pub struct ReorderBuffer {
     expected_seq: u32,
-    ring: Vec<Option<Arc<Vec<u8>>>>,
+    ring: Vec<Option<FramePayload>>,
     seq_slots: Vec<u32>,
     bitmap: Vec<u64>,
     window_mask: u32,
@@ -176,13 +177,14 @@ impl ReorderBuffer {
     /// 典型无丢包链路每个输入帧都会立即就绪。旧接口每包构造一个
     /// `Vec<Arc<Vec<u8>>>`，造成纯 allocator churn；由调用方长期复用
     /// scratch 后，顺序流不再为重排输出额外分配。
-    pub fn insert_into(
+    pub fn insert_payload_into(
         &mut self,
         seq: u32,
-        data: Arc<Vec<u8>>,
-        ready: &mut Vec<Arc<Vec<u8>>>,
+        data: FramePayload,
+        ready: &mut Vec<FramePayload>,
     ) {
         if seq == 0 {
+            data.release();
             return;
         }
 
@@ -193,12 +195,14 @@ impl ReorderBuffer {
         // 丢弃太老的包（int32 语义比较，对齐 Go）
         let diff = seq.wrapping_sub(self.expected_seq) as i32;
         if diff < 0 {
+            data.release();
             return;
         }
 
         let distance = diff as u32;
         if distance >= self.ring.len() as u32 {
             if distance >= REORDER_MAX_WINDOW || !self.grow_window(distance + 1) {
+                data.release();
                 return;
             }
         }
@@ -206,9 +210,7 @@ impl ReorderBuffer {
         let idx = (seq & self.window_mask) as usize;
         // 动态扩容后用真实 seq 校验槽位，避免窗口变大时错误碰撞。
         if self.ring[idx].is_some() {
-            if self.seq_slots[idx] == seq {
-                return;
-            }
+            data.release();
             return;
         }
 
@@ -221,6 +223,19 @@ impl ReorderBuffer {
         } else {
             self.refresh_gap(Instant::now());
         }
+    }
+
+    /// Arc compatibility wrapper. Hot client/server paths use
+    /// insert_payload_into() and keep Owned payloads through reorder.
+    pub fn insert_into(
+        &mut self,
+        seq: u32,
+        data: Arc<Vec<u8>>,
+        ready: &mut Vec<Arc<Vec<u8>>>,
+    ) {
+        let mut payload_ready = Vec::new();
+        self.insert_payload_into(seq, FramePayload::Shared(data), &mut payload_ready);
+        ready.extend(payload_ready.into_iter().map(FramePayload::into_shared));
     }
 
     /// 兼容包装：测试和非热路径可继续按返回 Vec 的方式使用。
@@ -267,7 +282,7 @@ impl ReorderBuffer {
         true
     }
 
-    fn flush_locked_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
+    fn flush_locked_into(&mut self, ready: &mut Vec<FramePayload>) {
         self.gap_since = None;
         loop {
             let idx = (self.expected_seq & self.window_mask) as usize;
@@ -276,6 +291,8 @@ impl ReorderBuffer {
             self.bitmap[idx / 64] &= !(1u64 << (idx % 64));
             if !frame.is_empty() {
                 ready.push(frame);
+            } else {
+                frame.release();
             }
             self.expected_seq = self.expected_seq.wrapping_add(1);
         }
@@ -302,7 +319,9 @@ impl ReorderBuffer {
     pub fn reset(&mut self) {
         self.expected_seq = 0;
         for slot in self.ring.iter_mut() {
-            *slot = None;
+            if let Some(frame) = slot.take() {
+                frame.release();
+            }
         }
         self.seq_slots.fill(0);
         self.bitmap.fill(0);
@@ -320,7 +339,7 @@ impl ReorderBuffer {
     }
 
     /// 缺口 deadline 到达后向前寻找第一个已收到的帧，跳过永久缺失序号。
-    pub fn flush_timeout_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
+    pub fn flush_payload_timeout_into(&mut self, ready: &mut Vec<FramePayload>) {
         let Some(since) = self.gap_since else { return };
         if since.elapsed() < REORDER_SKIP_DELAY || !self.has_gap() {
             return;
@@ -341,7 +360,14 @@ impl ReorderBuffer {
         self.gap_since = None;
     }
 
-    /// 兼容包装；热路径优先使用 `flush_timeout_into`。
+    /// Arc compatibility wrapper for tests/non-hot callers.
+    pub fn flush_timeout_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
+        let mut payload_ready = Vec::new();
+        self.flush_payload_timeout_into(&mut payload_ready);
+        ready.extend(payload_ready.into_iter().map(FramePayload::into_shared));
+    }
+
+    /// 兼容包装；热路径优先使用 `flush_payload_timeout_into`。
     pub fn flush_timeout(&mut self) -> Vec<Arc<Vec<u8>>> {
         let mut ready = Vec::new();
         self.flush_timeout_into(&mut ready);

@@ -357,7 +357,7 @@ impl FecDecoder {
     }
 
     /// 记录一个已解密的数据帧。out 为恢复帧输出回调（按原 seq 注入重排缓冲）。
-    pub fn on_data(&self, seq: u32, frame: &Arc<Vec<u8>>, out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {
+    pub fn on_data(&self, seq: u32, frame: &[u8], out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {
         if frame.is_empty() || seq == 0 {
             return;
         }

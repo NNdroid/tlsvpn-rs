@@ -1513,7 +1513,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
-    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
+    let mut reorder_ready: Vec<FramePayload> = Vec::with_capacity(64);
 
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
         if cl.tx_port.is_sequence_exhausted() {
@@ -1585,11 +1585,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         {
             cl.reorder_buf
                 .lock()
-                .flush_timeout_into(&mut reorder_ready);
+                .flush_payload_timeout_into(&mut reorder_ready);
         }
         for ordered in reorder_ready.drain(..) {
-            let _ = cl.tap.send(&ordered);
-            release_shared_frame(ordered);
+            let _ = cl.tap.send(ordered.as_slice());
+            ordered.release();
         }
 
         // ---- 下行读取：mio 是边沿触发，必须真正 drain socket 到 WouldBlock。----
@@ -1667,37 +1667,46 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 }
                             }
 
-                            let data = Arc::new(data);
                             if seq == 0 {
-                                if let Some(dec) = &fec_dec {
-                                    if fec::is_parity_frame(&data) {
-                                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                            deliver_to_tap(
-                                                &cl,
-                                                s,
-                                                f,
-                                                &mut reorder_ready,
-                                            );
-                                        };
-                                        dec.on_parity(&data, &mut sink);
-                                        release_shared_frame(data);
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if let Some(dec) = &fec_dec {
+                        if let Some(dec) = &fec_dec {
+                            if fec::is_parity_frame(&data) {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_tap(&cl, s, f, &mut reorder_ready);
+                                    deliver_to_tap(
+                                        &cl,
+                                        s,
+                                        FramePayload::Shared(f),
+                                        &mut reorder_ready,
+                                    );
                                 };
-                                dec.on_data(seq, &data, &mut sink);
+                                dec.on_parity(&data, &mut sink);
+                                release_frame_vec(data);
+                                continue;
                             }
+                        }
+                    }
 
-                            if !cl.dedup.lock().is_duplicate(seq) {
-                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-                            } else {
-                                release_shared_frame(data);
-                            }
+                    if let Some(dec) = &fec_dec {
+                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                            deliver_to_tap(
+                                &cl,
+                                s,
+                                FramePayload::Shared(f),
+                                &mut reorder_ready,
+                            );
+                        };
+                        dec.on_data(seq, &data, &mut sink);
+                    }
+
+                    if !cl.dedup.lock().is_duplicate(seq) {
+                        deliver_to_tap(
+                            &cl,
+                            seq,
+                            FramePayload::Owned(data),
+                            &mut reorder_ready,
+                        );
+                    } else {
+                        release_frame_vec(data);
+                    }
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -1855,14 +1864,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 fn deliver_to_tap(
     cl: &Arc<Client>,
     seq: u32,
-    frame: Arc<Vec<u8>>,
-    ready: &mut Vec<Arc<Vec<u8>>>,
+    frame: FramePayload,
+    ready: &mut Vec<FramePayload>,
 ) {
     ready.clear();
-    cl.reorder_buf.lock().insert_into(seq, frame, ready);
+    cl.reorder_buf.lock().insert_payload_into(seq, frame, ready);
     for ordered in ready.drain(..) {
-        let _ = cl.tap.send(&ordered);
-        release_shared_frame(ordered);
+        let _ = cl.tap.send(ordered.as_slice());
+        ordered.release();
     }
 }
 
