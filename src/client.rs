@@ -756,9 +756,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                 match dev.recv(&mut frame) {
                     Ok(n) if n > 0 => {
                         frame.truncate(n);
-                        // AsyncPort/Arc 直接接管 TAP 填充的 pooled Vec；不再
-                        // temp [u8; 65536] -> Vec 做逐帧 memcpy。
-                        port.write_frame(Arc::new(frame));
+                        // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
+                        // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
+                        port.write_owned_frame(frame);
                     }
                     Ok(_) => release_frame_vec(frame),
                     Err(_) => {
@@ -1715,8 +1715,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             while let Ok(f) = rx.try_recv() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                append_padded_frame(&mut send_buf, f.seq, &f.data, ic_ref);
-                release_shared_frame(f.data);
+                append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);
+                f.data.release();
                 tx_packets_batch += 1;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
