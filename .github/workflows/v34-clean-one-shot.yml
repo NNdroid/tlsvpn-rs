@@ -1,0 +1,293 @@
+name: v34 clean one-shot client backend ArrayQueue
+
+on:
+  push:
+    branches:
+      - perf/client-backend-arrayqueue-v34
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch existing client backend queue
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/net.rs')
+          s = p.read_text()
+
+          old = '''pub struct BackendNotify {
+              waker: Arc<mio::Waker>,
+              dirty: Arc<ArrayQueue<mio::Token>>,
+              token: mio::Token,
+              // 同一 backend 只允许一个未消费的 wake。高吞吐时几十个连续 frame
+              // 合并成一次 poll 唤醒，避免每包 eventfd/write syscall。
+              pending: AtomicBool,
+          }
+          '''
+          new = '''pub struct BackendNotify {
+              waker: Arc<mio::Waker>,
+              dirty: Arc<ArrayQueue<mio::Token>>,
+              token: mio::Token,
+              // Client-only fast path: replace the existing bounded channel data hop
+              // with the already-available lock-free ArrayQueue. Server backends keep
+              // using the channel path; notification/coalescing semantics are shared.
+              fast_q: Option<Arc<ArrayQueue<VPNFrame>>>,
+              // 同一 backend 只允许一个未消费的 wake。高吞吐时几十个连续 frame
+              // 合并成一次 poll 唤醒，避免每包 eventfd/write syscall。
+              pending: AtomicBool,
+          }
+          '''
+          if old not in s:
+              raise SystemExit('BackendNotify struct anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        Self {
+                      waker,
+                      dirty,
+                      token,
+                      pending: AtomicBool::new(false),
+                  }
+              }
+          '''
+          new = '''        Self {
+                      waker,
+                      dirty,
+                      token,
+                      fast_q: None,
+                      pending: AtomicBool::new(false),
+                  }
+              }
+
+              pub fn new_with_fast_queue(
+                  waker: Arc<mio::Waker>,
+                  dirty: Arc<ArrayQueue<mio::Token>>,
+                  token: mio::Token,
+                  fast_q: Arc<ArrayQueue<VPNFrame>>,
+              ) -> Self {
+                  Self {
+                      waker,
+                      dirty,
+                      token,
+                      fast_q: Some(fast_q),
+                      pending: AtomicBool::new(false),
+                  }
+              }
+          '''
+          if old not in s:
+              raise SystemExit('BackendNotify constructor anchor not found')
+          s = s.replace(old, new, 1)
+
+          anchor = '''    /// 尝试把 payload 所有权直接投递给单个后端。Owned(Vec) 与
+              /// Shared(Arc<Vec>) 都会在 TrySendError 时原样返回，因此 fallback
+              /// 到其它物理路径不需要复制 payload。
+          '''
+          helpers = '''    #[inline]
+              fn backend_fast_queue(b: &Backend) -> Option<&Arc<ArrayQueue<VPNFrame>>> {
+                  b.notify.as_ref().and_then(|n| n.fast_q.as_ref())
+              }
+
+              #[inline]
+              fn backend_queue_len(b: &Backend) -> usize {
+                  Self::backend_fast_queue(b).map_or_else(|| b.ch.len(), |q| q.len())
+              }
+
+              #[inline]
+              fn backend_queue_capacity(b: &Backend) -> usize {
+                  Self::backend_fast_queue(b)
+                      .map_or_else(|| b.ch.capacity().unwrap_or(4096), |q| q.capacity())
+              }
+
+          '''
+          if anchor not in s:
+              raise SystemExit('queue helper insertion anchor not found')
+          s = s.replace(anchor, helpers + anchor, 1)
+
+          old = '''        match b.ch.try_send(VPNFrame { seq, data }) {
+                      Ok(()) => {
+                          if let Some(n) = &b.notify {
+                              n.wake();
+                          }
+                          Ok(())
+                      }
+                      Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => {
+                          Err(frame.data)
+                      }
+                  }
+          '''
+          new = '''        let frame = VPNFrame { seq, data };
+                  if let Some(q) = Self::backend_fast_queue(b) {
+                      match q.push(frame) {
+                          Ok(()) => {
+                              if let Some(n) = &b.notify {
+                                  n.wake();
+                              }
+                              Ok(())
+                          }
+                          Err(frame) => Err(frame.data),
+                      }
+                  } else {
+                      match b.ch.try_send(frame) {
+                          Ok(()) => {
+                              if let Some(n) = &b.notify {
+                                  n.wake();
+                              }
+                              Ok(())
+                          }
+                          Err(TrySendError::Full(frame))
+                          | Err(TrySendError::Disconnected(frame)) => Err(frame.data),
+                      }
+                  }
+          '''
+          if old not in s:
+              raise SystemExit('try_send block anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        let q_len = b.ch.len();
+                  let capacity = b.ch.capacity().unwrap_or(4096);
+          '''
+          new = '''        let q_len = Self::backend_queue_len(b);
+                  let capacity = Self::backend_queue_capacity(b);
+          '''
+          if old not in s:
+              raise SystemExit('backend_score queue anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        let under_pressure = current < backends.len()
+                      && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_BACKLOG;
+          '''
+          new = '''        let under_pressure = current < backends.len()
+                      && Self::backend_queue_len(&backends[current]) >= Self::MULTIPATH_STRIPE_BACKLOG;
+          '''
+          if old not in s:
+              raise SystemExit('multipath backlog anchor not found')
+          s = s.replace(old, new, 1)
+
+          test_anchor = '''    #[test]
+              fn owned_payload_falls_back_without_payload_copy() {
+          '''
+          test = '''    #[test]
+              fn client_fast_queue_preserves_owned_payload() {
+                  let port = AsyncPort::new("fast-queue".into());
+                  let poll = mio::Poll::new().unwrap();
+                  let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(7)).unwrap());
+                  let q = Arc::new(ArrayQueue::new(8));
+                  let (tx, _rx) = crossbeam_channel::bounded(1);
+                  let backend = Arc::new(Backend {
+                      ch: tx,
+                      rtt_cache: Arc::new(AtomicU32::new(1_000)),
+                      notify: Some(Arc::new(BackendNotify::new_with_fast_queue(
+                          waker,
+                          Arc::new(ArrayQueue::new(8)),
+                          mio::Token(7),
+                          q.clone(),
+                      ))),
+                  });
+                  port.register_backend(backend.clone());
+
+                  let data = vec![0x5a; 1400];
+                  let ptr = data.as_ptr();
+                  port.write_owned_frame(data);
+                  assert_eq!(AsyncPort::backend_queue_len(&backend), 1);
+                  let frame = q.pop().expect("fast queue must receive frame");
+                  assert_eq!(frame.seq, 1);
+                  assert_eq!(frame.data.data_ptr(), ptr);
+                  frame.data.release();
+              }
+
+              #[test]
+              fn owned_payload_falls_back_without_payload_copy() {
+          '''
+          if test_anchor not in s:
+              raise SystemExit('net test anchor not found')
+          s = s.replace(test_anchor, test, 1)
+          p.write_text(s)
+
+          p = Path('src/client.rs')
+          s = p.read_text()
+          old = '''    let rtt_cache = Arc::new(AtomicU32::new(50000));
+              let (tx, rx) = bounded(1024);
+              let backend = Arc::new(Backend {
+                  ch: tx.clone(),
+                  rtt_cache: rtt_cache.clone(),
+                  notify: Some(Arc::new(BackendNotify::new(
+                      conn_waker.clone(),
+                      // 客户端只看 TOKEN_WAKE，本队列用于复用统一通知结构。
+                      Arc::new(ArrayQueue::new(1)),
+                      TOKEN_WAKE,
+                  ))),
+              });
+          '''
+          new = '''    let rtt_cache = Arc::new(AtomicU32::new(50000));
+              // Keep a tiny channel only as the cold-path backend identity used by
+              // unregister_backend(). Client dataplane frames use tx_queue directly.
+              let (tx, _rx_identity) = bounded(1);
+              let tx_queue = Arc::new(ArrayQueue::new(1024));
+              let backend = Arc::new(Backend {
+                  ch: tx.clone(),
+                  rtt_cache: rtt_cache.clone(),
+                  notify: Some(Arc::new(BackendNotify::new_with_fast_queue(
+                      conn_waker.clone(),
+                      // 客户端只看 TOKEN_WAKE，本队列用于复用统一通知结构。
+                      Arc::new(ArrayQueue::new(1)),
+                      TOKEN_WAKE,
+                      tx_queue.clone(),
+                  ))),
+              });
+          '''
+          if old not in s:
+              raise SystemExit('client backend construction anchor not found')
+          s = s.replace(old, new, 1)
+          old = '''        if !tls.wants_write() && (woken || !rx.is_empty()) {
+          '''
+          new = '''        if !tls.wants_write() && (woken || !tx_queue.is_empty()) {
+          '''
+          if old not in s:
+              raise SystemExit('client queue readiness anchor not found')
+          s = s.replace(old, new, 1)
+          old = '''            while let Ok(f) = rx.try_recv() {
+          '''
+          new = '''            while let Some(f) = tx_queue.pop() {
+          '''
+          if old not in s:
+              raise SystemExit('client queue drain anchor not found')
+          s = s.replace(old, new, 1)
+          old = '''    cl.tx_port.unregister_backend(&tx);
+              cl.live_conns.fetch_sub(1, Ordering::Relaxed);
+          '''
+          new = '''    cl.tx_port.unregister_backend(&tx);
+              while let Some(f) = tx_queue.pop() {
+                  f.data.release();
+              }
+              cl.live_conns.fetch_sub(1, Ordering::Relaxed);
+          '''
+          if old not in s:
+              raise SystemExit('client cleanup anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Check Linux build
+        run: cargo check --all-targets
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Commit experiment and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/v34-clean-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/net.rs src/client.rs .github/workflows/v34-clean-one-shot.yml
+          git commit -m 'perf: use ArrayQueue for client backend hop'
+          git push origin HEAD:perf/client-backend-arrayqueue-v34
