@@ -196,10 +196,59 @@ impl FrameScanner {
 
 }
 
-#[derive(Clone)]
+/// AsyncPort/backend 内部的 payload 所有权。
+///
+/// - Owned: 数据只会投递到一条 backend 时直接移动 pooled Vec，不分配 Arc 控制块；
+/// - Shared: VSwitch 洪泛/重排等确实存在多 owner 时保留 Arc 零拷贝共享。
+pub enum FramePayload {
+    Owned(Vec<u8>),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl FramePayload {
+    #[inline]
+    pub fn from_shared(data: std::sync::Arc<Vec<u8>>) -> Self {
+        match std::sync::Arc::try_unwrap(data) {
+            Ok(buf) => Self::Owned(buf),
+            Err(shared) => Self::Shared(shared),
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(buf) => buf,
+            Self::Shared(buf) => buf,
+        }
+    }
+
+    #[inline]
+    pub fn release(self) {
+        match self {
+            Self::Owned(buf) => release_frame_vec(buf),
+            Self::Shared(buf) => release_shared_frame(buf),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr()
+    }
+}
+
+impl std::ops::Deref for FramePayload {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 pub struct VPNFrame {
     pub seq: u32,
-    pub data: std::sync::Arc<Vec<u8>>,
+    pub data: FramePayload,
 }
 
 #[cfg(test)]
