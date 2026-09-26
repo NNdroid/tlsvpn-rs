@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use rustls::{ClientConfig, ClientConnection};
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -230,12 +230,28 @@ pub struct SessionState {
 // descriptors are recycled so the handoff itself does not allocate per frame.
 const TAP_DELIVERY_QUEUE: usize = 256;
 const TAP_DELIVERY_BATCH_CAP: usize = 64;
+// TCP ACK/keepalive/control Ethernet frames are normally far below this bound.
+// When no older TAP delivery is queued or in-flight, delivering one such frame
+// inline avoids an extra scheduler hop without allowing it to overtake bulk RX.
+const TAP_DELIVERY_INLINE_MAX_FRAME: usize = 256;
 type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
 
+#[inline]
+fn tap_delivery_can_inline(pending_batches: usize, batch: &TapDeliveryBatch) -> bool {
+    pending_batches == 0
+        && batch.len() == 1
+        && batch[0].len() <= TAP_DELIVERY_INLINE_MAX_FRAME
+}
+
 struct TapDelivery {
+    tap: Arc<dyn TapDevice>,
     tx: Sender<TapDeliveryBatch>,
     pool_tx: Sender<TapDeliveryBatch>,
     pool_rx: Receiver<TapDeliveryBatch>,
+    // Counts queued + currently-being-written batches. Producers call deliver()
+    // while holding the reorder lock, so pending==0 is sufficient to prove that
+    // a tiny inline frame cannot overtake an older batch.
+    pending_batches: Arc<AtomicUsize>,
     dropped: AtomicU64,
 }
 
@@ -244,19 +260,28 @@ impl TapDelivery {
         let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
         let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
         let worker_pool = pool_tx.clone();
+        let worker_tap = tap.clone();
+        let pending_batches = Arc::new(AtomicUsize::new(0));
+        let worker_pending = pending_batches.clone();
         std::thread::spawn(move || {
             while let Ok(mut batch) = rx.recv() {
                 for frame in batch.drain(..) {
-                    let _ = tap.send(&frame);
+                    let _ = worker_tap.send(&frame);
                     release_shared_frame(frame);
                 }
+                // Decrement only after every TAP write in the batch has completed.
+                // A producer that subsequently observes zero can safely inline the
+                // next tiny frame without reordering it ahead of this batch.
+                worker_pending.fetch_sub(1, Ordering::Release);
                 let _ = worker_pool.try_send(batch);
             }
         });
         Self {
+            tap,
             tx,
             pool_tx,
             pool_rx,
+            pending_batches,
             dropped: AtomicU64::new(0),
         }
     }
@@ -275,15 +300,26 @@ impl TapDelivery {
     }
 
     #[inline]
-    fn enqueue(&self, batch: TapDeliveryBatch) {
+    fn deliver(&self, mut batch: TapDeliveryBatch) {
         if batch.is_empty() {
             self.recycle(batch);
             return;
         }
+
+        if tap_delivery_can_inline(self.pending_batches.load(Ordering::Acquire), &batch) {
+            let frame = batch.pop().unwrap();
+            let _ = self.tap.send(&frame);
+            release_shared_frame(frame);
+            self.recycle(batch);
+            return;
+        }
+
+        self.pending_batches.fetch_add(1, Ordering::AcqRel);
         match self.tx.try_send(batch) {
             Ok(()) => {}
             Err(TrySendError::Full(mut batch))
             | Err(TrySendError::Disconnected(mut batch)) => {
+                self.pending_batches.fetch_sub(1, Ordering::AcqRel);
                 self.dropped
                     .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 for frame in batch.drain(..) {
@@ -1923,7 +1959,7 @@ fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>) {
         drop(reorder);
         cl.tap_delivery.recycle(ready);
     } else {
-        cl.tap_delivery.enqueue(ready);
+        cl.tap_delivery.deliver(ready);
     }
 }
 
@@ -1935,7 +1971,7 @@ fn flush_reorder_to_tap(cl: &Arc<Client>) {
         drop(reorder);
         cl.tap_delivery.recycle(ready);
     } else {
-        cl.tap_delivery.enqueue(ready);
+        cl.tap_delivery.deliver(ready);
     }
 }
 
@@ -1963,8 +1999,21 @@ fn clamp_poll_for_tx_backlog(
 
 #[cfg(test)]
 mod tx_poll_tests {
-    use super::{clamp_poll_for_tx_backlog, client_socket_interest};
+    use super::{clamp_poll_for_tx_backlog, client_socket_interest, tap_delivery_can_inline};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn tiny_tap_frame_only_inlines_without_older_delivery_work() {
+        let small = vec![Arc::new(vec![0u8; 96])];
+        let large = vec![Arc::new(vec![0u8; 1400])];
+        let two_small = vec![Arc::new(vec![0u8; 96]), Arc::new(vec![0u8; 96])];
+
+        assert!(tap_delivery_can_inline(0, &small));
+        assert!(!tap_delivery_can_inline(1, &small));
+        assert!(!tap_delivery_can_inline(0, &large));
+        assert!(!tap_delivery_can_inline(0, &two_small));
+    }
 
     #[test]
     fn writable_interest_is_only_enabled_for_real_backpressure() {
