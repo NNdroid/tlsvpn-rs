@@ -992,6 +992,9 @@ pub struct AsyncPort {
     data_cursor: AtomicUsize,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
+    // FEC 关闭是默认/常见路径。用一个原子快标志让数据热路径完全跳过
+    // encoder mutex；只有真正启用 XOR FEC 时才进入串行 encoder 状态。
+    fec_enabled: AtomicBool,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
     sequence_exhausted: AtomicBool,
@@ -1008,6 +1011,7 @@ impl AsyncPort {
             data_cursor: AtomicUsize::new(0),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
+            fec_enabled: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
@@ -1017,6 +1021,8 @@ impl AsyncPort {
     /// 挂载 XOR FEC 编码器（须在数据流开始前调用一次）
     pub fn attach_encoder(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         *self.encoder.lock() = Some(FecEncoder::new(k, ic));
+        // 先发布完整 encoder，再放行无锁快路径观察到 enabled=true。
+        self.fec_enabled.store(true, Ordering::Release);
     }
 
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
@@ -1024,11 +1030,22 @@ impl AsyncPort {
         self.sequence_exhausted.store(false, Ordering::Release);
         self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
-        *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
+        let enabled = k >= crate::fec::FEC_MIN_GROUP;
+        if !enabled {
+            // 禁用时先撤掉快标志：之后的新数据包不再进入 mutex。
+            // 已经观察到 true 的并发 writer 会先完成其 encoder 临界区，
+            // 随后的 lock() 会等待它退出再清空状态。
+            self.fec_enabled.store(false, Ordering::Release);
+        }
+        *self.encoder.lock() = if enabled {
             Some(FecEncoder::new(k, ic))
         } else {
             None
         };
+        if enabled {
+            // 启用时相反：encoder 完整构造后再发布 true。
+            self.fec_enabled.store(true, Ordering::Release);
+        }
     }
 
     pub fn is_sequence_exhausted(&self) -> bool {
@@ -1282,12 +1299,16 @@ impl AsyncPort {
             return;
         };
 
-        // FEC encoder 是 session/port 级串行状态；只持锁一次。
-        let parity = self
-            .encoder
-            .lock()
-            .as_mut()
-            .and_then(|enc| enc.add(seq, &frame));
+        // FEC-off 是默认热路径：只做一个 relaxed atomic load，不再每包
+        // 获取 parking_lot::Mutex。启用 FEC 时仍保持原来的串行 encoder 语义。
+        let parity = if self.fec_enabled.load(Ordering::Relaxed) {
+            self.encoder
+                .lock()
+                .as_mut()
+                .and_then(|enc| enc.add(seq, &frame))
+        } else {
+            None
+        };
 
         let selected_idx = self.selected_data_backend_index(&backends);
         let data_idx = self.send_data_frame_to_any_owned(&backends, selected_idx, seq, frame);
