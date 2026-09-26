@@ -1612,7 +1612,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if !proxied {
             poll_timeout = poll_timeout.min(next_rtt_refresh.saturating_duration_since(now));
         }
-        if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
+        let reorder_wait = cl.reorder_buf.lock().next_timeout();
+        if let Some(wait) = reorder_wait {
             poll_timeout = poll_timeout.min(wait);
         }
         // BackendNotify coalesces producer wakeups. One wake can therefore
@@ -1654,7 +1655,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // A gap timeout can release a burst. Queue it while still holding the
         // reorder lock so multiple physical connections cannot enqueue ready batches
         // out of sequence; the TAP syscall itself runs on the delivery worker.
-        flush_reorder_to_tap(&cl);
+        if reorder_wait.is_some() {
+            flush_reorder_to_tap(&cl);
+        }
 
         // ---- 下行读取：mio 是边沿触发，必须真正 drain socket 到 WouldBlock。----
         // 每次 read_tls 后立即 process_new_packets + drain plaintext，避免 rustls
