@@ -1,0 +1,353 @@
+name: v33 clean one-shot Linux TAP offload
+
+on:
+  push:
+    branches:
+      - perf/linux-tap-offload-v33
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply clean three-file dataplane patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # ---------- src/tap.rs ----------
+          tap = Path('src/tap.rs')
+          s = tap.read_text()
+          needle = 'use tun_rs::SyncDevice;\n'
+          insert = '''use tun_rs::SyncDevice;
+
+          #[cfg(target_os = "linux")]
+          pub const TAP_IDEAL_BATCH_SIZE: usize = tun_rs::IDEAL_BATCH_SIZE;
+          #[cfg(not(target_os = "linux"))]
+          pub const TAP_IDEAL_BATCH_SIZE: usize = 1;
+
+          #[inline]
+          pub fn tap_batch_raw_buffer_size() -> usize {
+              #[cfg(target_os = "linux")]
+              {
+                  return tun_rs::VIRTIO_NET_HDR_LEN + 65535;
+              }
+              #[cfg(not(target_os = "linux"))]
+              {
+                  0
+              }
+          }
+          '''
+          if needle not in s:
+              raise SystemExit('tap import anchor not found')
+          s = s.replace(needle, insert, 1)
+
+          old_trait = '''pub trait TapDevice: Send + Sync {
+              fn send(&self, data: &[u8]) -> io::Result<()>;
+              fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+          }
+          '''
+          new_trait = '''pub trait TapDevice: Send + Sync {
+              fn send(&self, data: &[u8]) -> io::Result<()>;
+              fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+
+              /// Receive one kernel TAP read and expose every packet produced by it.
+              /// Linux SyncDevice overrides this with tun-rs recv_multiple(), which
+              /// splits a GSO packet into ordinary MTU frames without an extra hop.
+              /// Other platforms keep the existing single-frame semantics.
+              fn recv_batch(
+                  &self,
+                  original_buffer: &mut [u8],
+                  bufs: &mut [Vec<u8>],
+                  sizes: &mut [usize],
+              ) -> io::Result<usize> {
+                  let _ = original_buffer;
+                  if bufs.is_empty() || sizes.is_empty() {
+                      return Ok(0);
+                  }
+                  let n = self.recv(&mut bufs[0])?;
+                  sizes[0] = n;
+                  Ok(1)
+              }
+          }
+          '''
+          if old_trait not in s:
+              raise SystemExit('TapDevice trait anchor not found')
+          s = s.replace(old_trait, new_trait, 1)
+
+          old_impl = '''impl TapDevice for SyncDevice {
+              fn send(&self, data: &[u8]) -> io::Result<()> {
+                  SyncDevice::send(self, data).map(|_| ())
+              }
+              fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                  SyncDevice::recv(self, buf)
+              }
+          }
+          '''
+          new_impl = '''impl TapDevice for SyncDevice {
+              fn send(&self, data: &[u8]) -> io::Result<()> {
+                  SyncDevice::send(self, data).map(|_| ())
+              }
+              fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                  SyncDevice::recv(self, buf)
+              }
+
+              #[cfg(target_os = "linux")]
+              fn recv_batch(
+                  &self,
+                  original_buffer: &mut [u8],
+                  bufs: &mut [Vec<u8>],
+                  sizes: &mut [usize],
+              ) -> io::Result<usize> {
+                  self.recv_multiple(original_buffer, bufs, sizes, 0)
+              }
+          }
+          '''
+          if old_impl not in s:
+              raise SystemExit('SyncDevice impl anchor not found')
+          tap.write_text(s.replace(old_impl, new_impl, 1))
+
+          # ---------- src/net.rs ----------
+          net = Path('src/net.rs')
+          s = net.read_text()
+          anchor = '''    pub fn write_owned_frame(&self, frame: Vec<u8>) {
+              self.write_payload(FramePayload::Owned(frame));
+          }
+
+          '''
+          batch_method = '''    pub fn write_owned_frame(&self, frame: Vec<u8>) {
+              self.write_payload(FramePayload::Owned(frame));
+          }
+
+              /// Client TAP bulk path: process one already-owned burst under one backend
+              /// snapshot/path decision and one FEC encoder lock. Backend queues stay
+              /// per-frame so wire/TLS consumer semantics remain unchanged.
+              pub fn write_owned_batch(&self, frames: &mut Vec<Vec<u8>>) {
+                  if frames.is_empty() {
+                      return;
+                  }
+
+                  let backends = self.backends.read();
+                  if backends.is_empty()
+                      || !backends.iter().any(|b| Self::backend_score(b).is_some())
+                  {
+                      let mut dropped = 0u64;
+                      for frame in frames.drain(..) {
+                          if !frame.is_empty() {
+                              dropped += 1;
+                          }
+                          release_frame_vec(frame);
+                      }
+                      self.drop_n(dropped);
+                      return;
+                  }
+
+                  let selected_idx = self.selected_data_backend_index(&backends);
+                  let mut encoder = self.encoder.lock();
+
+                  for frame in frames.drain(..) {
+                      let frame = FramePayload::Owned(frame);
+                      if frame.is_empty() {
+                          frame.release();
+                          continue;
+                      }
+
+                      let Some(seq) = self.next_seq() else {
+                          self.drop_n(1);
+                          frame.release();
+                          continue;
+                      };
+
+                      let parity = encoder
+                          .as_mut()
+                          .and_then(|enc| enc.add(seq, frame.as_slice()));
+                      let data_idx = self.send_data_payload_to_any(
+                          &backends,
+                          selected_idx,
+                          seq,
+                          frame,
+                      );
+
+                      if let Some(par) = parity {
+                          if backends.len() < 2 {
+                              release_frame_vec(par);
+                              continue;
+                          }
+                          self.parity_sent.fetch_add(1, Ordering::Relaxed);
+                          let par = FramePayload::Owned(par);
+                          if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
+                              self.send_payload_to(&backends[idx], 0, par);
+                          } else {
+                              self.drop_n(1);
+                              par.release();
+                          }
+                      }
+                  }
+              }
+
+          '''
+          if anchor not in s:
+              raise SystemExit('write_owned_frame anchor not found')
+          s = s.replace(anchor, batch_method, 1)
+
+          test_anchor = '''    #[test]
+              fn owned_payload_falls_back_without_payload_copy() {
+          '''
+          batch_test = '''    #[test]
+              fn owned_batch_preserves_sequence_and_payload_ownership() {
+                  let port = AsyncPort::new("owned-batch".into());
+                  let (backend, rx) = make_backend();
+                  port.register_backend(backend);
+
+                  let mut batch = Vec::with_capacity(8);
+                  let mut ptrs = Vec::new();
+                  for marker in 1u8..=4 {
+                      let mut frame = crate::buffer::acquire_frame_vec(1400);
+                      frame.clear();
+                      frame.resize(1400, marker);
+                      ptrs.push(frame.as_ptr());
+                      batch.push(frame);
+                  }
+
+                  port.write_owned_batch(&mut batch);
+                  assert!(batch.is_empty(), "batch ownership must be consumed");
+                  for (idx, expected_ptr) in ptrs.into_iter().enumerate() {
+                      let frame = rx.try_recv().expect("batched frame must reach backend");
+                      assert_eq!(frame.seq, (idx + 1) as u32);
+                      assert_eq!(frame.data.data_ptr(), expected_ptr);
+                      assert_eq!(frame.data[frame.data.len() - 1], (idx + 1) as u8);
+                      frame.data.release();
+                  }
+              }
+
+              #[test]
+              fn owned_payload_falls_back_without_payload_copy() {
+          '''
+          if test_anchor not in s:
+              raise SystemExit('owned payload test anchor not found')
+          net.write_text(s.replace(test_anchor, batch_test, 1))
+
+          # ---------- src/client.rs ----------
+          client = Path('src/client.rs')
+          s = client.read_text()
+          builder_pattern = re.compile(
+              r'(        let builder = tun_rs::DeviceBuilder::new\(\)\n'
+              r'            \.name\(&args\.tap\)\n'
+              r'            \.layer\(tun_rs::Layer::L2\)\n'
+              r'            \.mtu\(args\.mtu\);\n)'
+              r'(        // DeviceBuilder 的方法按值消费 self，mac 只能作为链上的另一节\n)'
+          )
+          builder_replacement = (
+              r'\1'
+              '        // Linux virtio-net offload lets recv_multiple() split one GSO read\n'
+              '        // into ordinary MTU frames in the existing TAP reader thread.\n'
+              '        #[cfg(target_os = "linux")]\n'
+              '        let builder = builder.offload(true);\n'
+              r'\2'
+          )
+          s, n = builder_pattern.subn(builder_replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'client builder replacement count={n}')
+
+          tap_pattern = re.compile(
+              r'    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）\n'
+              r'    let tx_port = Arc::new\(AsyncPort::new\("client_tx_port"\.to_string\(\)\)\);\n'
+              r'    \{.*?\n    \}\n\n'
+              r'    let reorder_buf = Arc::new\(Mutex::new\(ReorderBuffer::new\(\)\)\);',
+              re.S,
+          )
+          tap_replacement = '''    // TAP reader stays the sole producer: no extra queue/thread handoff.
+              // Linux offload can return multiple MTU frames from one GSO read; a one-frame
+              // result keeps the existing direct write_owned_frame() fast path.
+              let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+              {
+                  let dev = device.clone();
+                  let port = tx_port.clone();
+                  let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
+                  let tap_batch_size = if args.tap == "mem" {
+                      1
+                  } else {
+                      crate::tap::TAP_IDEAL_BATCH_SIZE
+                  };
+                  std::thread::spawn(move || {
+                      let mut original_buffer = vec![
+                          0u8;
+                          crate::tap::tap_batch_raw_buffer_size().max(tap_read_size)
+                      ];
+                      let mut frames: Vec<Vec<u8>> = (0..tap_batch_size)
+                          .map(|_| acquire_frame_vec(tap_read_size))
+                          .collect();
+                      let mut sizes = vec![0usize; tap_batch_size];
+                      let mut batch = Vec::<Vec<u8>>::with_capacity(tap_batch_size);
+
+                      loop {
+                          if EXIT.load(Ordering::Relaxed) {
+                              return;
+                          }
+                          match dev.recv_batch(&mut original_buffer, &mut frames, &mut sizes) {
+                              Ok(count) if count > 0 => {
+                                  batch.clear();
+                                  let count = count.min(frames.len()).min(sizes.len());
+                                  for i in 0..count {
+                                      let n = sizes[i].min(frames[i].len());
+                                      let mut frame = std::mem::replace(
+                                          &mut frames[i],
+                                          acquire_frame_vec(tap_read_size),
+                                      );
+                                      frame.truncate(n);
+                                      if frame.is_empty() {
+                                          release_frame_vec(frame);
+                                      } else {
+                                          batch.push(frame);
+                                      }
+                                  }
+
+                                  if batch.len() == 1 {
+                                      port.write_owned_frame(batch.pop().unwrap());
+                                  } else if !batch.is_empty() {
+                                      port.write_owned_batch(&mut batch);
+                                  }
+                              }
+                              Ok(_) => {}
+                              Err(_) => {
+                                  if EXIT.load(Ordering::Relaxed) {
+                                      return;
+                                  }
+                                  std::thread::sleep(Duration::from_secs(1));
+                              }
+                          }
+                      }
+                  });
+              }
+
+              let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));'''
+          s, n = tap_pattern.subn(tap_replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'client TAP replacement count={n}')
+          client.write_text(s)
+          PY
+
+      - name: Check Linux build
+        run: cargo check --all-targets
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Commit only intended files and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/v33-clean-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/client.rs src/net.rs src/tap.rs .github/workflows/v33-clean-one-shot.yml
+          git commit -m 'perf: batch Linux TAP reads with GSO offload'
+          git push origin HEAD:perf/linux-tap-offload-v33
