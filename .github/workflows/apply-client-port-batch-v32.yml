@@ -20,6 +20,7 @@ jobs:
         shell: bash
         run: |
           python3 .github/apply-client-port-batch-v32.py
+          sed -i 's/let mut frame = acquire_frame_vec(1400);/let mut frame = crate::buffer::acquire_frame_vec(1400);/' src/net.rs
           git diff --check
           cargo test --quiet owned_batch_preserves_sequence_and_payload_ownership
           cargo test --quiet owned_payload_falls_back_without_payload_copy
