@@ -653,6 +653,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             .name(&args.tap)
             .layer(tun_rs::Layer::L2)
             .mtu(args.mtu);
+        // Linux virtio-net offload: recv_multiple() can split one GSO read.
+        #[cfg(target_os = "linux")]
+        let builder = builder.offload(true);
         // DeviceBuilder 的方法按值消费 self，mac 只能作为链上的另一节
         let builder = if let Some(m) = apply_mac {
             builder.mac_addr(m)
@@ -740,40 +743,71 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         }
     }
 
-    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
-    let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
-    {
-        let dev = device.clone();
-        let port = tx_port.clone();
-        // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
-        let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
-        std::thread::spawn(move || {
-            loop {
-                if EXIT.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut frame = acquire_frame_vec(tap_read_size);
-                match dev.recv(&mut frame) {
-                    Ok(n) if n > 0 => {
+// TAP reader remains the sole producer: no extra channel/thread handoff.
+// Linux offload may return several MTU frames from one GSO read. Single
+// frames keep the existing write_owned_frame() path.
+let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+{
+    let dev = device.clone();
+    let port = tx_port.clone();
+    let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
+    let tap_batch_size = if args.tap == "mem" {
+        1
+    } else {
+        crate::tap::TAP_IDEAL_BATCH_SIZE
+    };
+    std::thread::spawn(move || {
+        let mut original_buffer = vec![
+            0u8;
+            crate::tap::tap_batch_raw_buffer_size().max(tap_read_size)
+        ];
+        let mut frames: Vec<Vec<u8>> = (0..tap_batch_size)
+            .map(|_| acquire_frame_vec(tap_read_size))
+            .collect();
+        let mut sizes = vec![0usize; tap_batch_size];
+        let mut batch = Vec::<Vec<u8>>::with_capacity(tap_batch_size);
+
+        loop {
+            if EXIT.load(Ordering::Relaxed) {
+                return;
+            }
+            match dev.recv_batch(&mut original_buffer, &mut frames, &mut sizes) {
+                Ok(count) if count > 0 => {
+                    batch.clear();
+                    let count = count.min(frames.len()).min(sizes.len());
+                    for i in 0..count {
+                        let n = sizes[i].min(frames[i].len());
+                        let mut frame = std::mem::replace(
+                            &mut frames[i],
+                            acquire_frame_vec(tap_read_size),
+                        );
                         frame.truncate(n);
-                        // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
-                        // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
-                        port.write_owned_frame(frame);
-                    }
-                    Ok(_) => release_frame_vec(frame),
-                    Err(_) => {
-                        release_frame_vec(frame);
-                        if EXIT.load(Ordering::Relaxed) {
-                            return;
+                        if frame.is_empty() {
+                            release_frame_vec(frame);
+                        } else {
+                            batch.push(frame);
                         }
-                        std::thread::sleep(Duration::from_secs(1));
                     }
+                    if batch.len() == 1 {
+                        port.write_owned_frame(batch.pop().unwrap());
+                    } else if !batch.is_empty() {
+                        port.write_owned_batch(&mut batch);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if EXIT.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
                 }
             }
-        });
-    }
+        }
+    });
+}
 
-    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));
+let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));
+
     // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline
     // 会合并 session reorder deadline，仅在真实 gap 存在时提前唤醒。
 
