@@ -992,6 +992,9 @@ pub struct AsyncPort {
     data_cursor: AtomicUsize,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
+    // FEC 关闭是主流热路径；原子门让每个数据帧无需进入 encoder mutex。
+    // 启用时仍走原有锁，保持 encoder 状态串行化。
+    fec_enabled: AtomicBool,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
     sequence_exhausted: AtomicBool,
@@ -1008,6 +1011,7 @@ impl AsyncPort {
             data_cursor: AtomicUsize::new(0),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
+            fec_enabled: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
@@ -1017,6 +1021,8 @@ impl AsyncPort {
     /// 挂载 XOR FEC 编码器（须在数据流开始前调用一次）
     pub fn attach_encoder(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         *self.encoder.lock() = Some(FecEncoder::new(k, ic));
+        // 先发布完整 encoder，再打开热路径门。
+        self.fec_enabled.store(true, Ordering::Release);
     }
 
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
@@ -1024,11 +1030,15 @@ impl AsyncPort {
         self.sequence_exhausted.store(false, Ordering::Release);
         self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
-        *self.encoder.lock() = if k >= crate::fec::FEC_MIN_GROUP {
+        let fec_enabled = k >= crate::fec::FEC_MIN_GROUP;
+        *self.encoder.lock() = if fec_enabled {
             Some(FecEncoder::new(k, ic))
         } else {
             None
         };
+        // Release 与发送热路径的 Acquire 配对；启用时确保先看到 encoder，
+        // 关闭时即使竞态读到旧 true，也只会多拿一次锁并得到 None。
+        self.fec_enabled.store(fec_enabled, Ordering::Release);
     }
 
     pub fn is_sequence_exhausted(&self) -> bool {
@@ -1297,11 +1307,14 @@ impl AsyncPort {
         };
 
         // FEC 只借用 payload bytes；Owned/Shared 的所有权都继续向 backend 移动。
-        let parity = self
-            .encoder
-            .lock()
-            .as_mut()
-            .and_then(|enc| enc.add(seq, frame.as_slice()));
+        let parity = if self.fec_enabled.load(Ordering::Acquire) {
+            self.encoder
+                .lock()
+                .as_mut()
+                .and_then(|enc| enc.add(seq, frame.as_slice()))
+        } else {
+            None
+        };
 
         let selected_idx = self.selected_data_backend_index(&backends);
         let data_idx = self.send_data_payload_to_any(&backends, selected_idx, seq, frame);
@@ -1712,6 +1725,24 @@ mod tests {
         port.reset_epoch(0, None);
         assert_eq!(port.next_seq(), Some(1));
         assert!(!port.is_sequence_exhausted());
+    }
+
+    #[test]
+    fn fec_fast_path_tracks_epoch_enablement() {
+        let port = AsyncPort::new("fec-fastpath".into());
+        assert!(!port.fec_enabled.load(Ordering::Acquire));
+
+        port.reset_epoch(crate::fec::FEC_MIN_GROUP, None);
+        assert!(port.fec_enabled.load(Ordering::Acquire));
+        assert!(port.encoder.lock().is_some());
+
+        port.reset_epoch(0, None);
+        assert!(!port.fec_enabled.load(Ordering::Acquire));
+        assert!(port.encoder.lock().is_none());
+
+        port.attach_encoder(crate::fec::FEC_MIN_GROUP, None);
+        assert!(port.fec_enabled.load(Ordering::Acquire));
+        assert!(port.encoder.lock().is_some());
     }
 
     #[test]
