@@ -2013,6 +2013,51 @@ mod tests {
         assert_eq!(port.parity_sent(), 2);
     }
 
+    #[test]
+    fn disabling_fec_keeps_data_flow_without_new_parity() {
+        let port = AsyncPort::new("fec-disable-fastpath".into());
+        let (backend0, rx0) = make_backend();
+        let (backend1, rx1) = make_backend();
+        port.register_backend(backend0);
+        port.register_backend(backend1);
+
+        port.reset_epoch(2, None);
+        port.write_frame(Arc::new(vec![0x11; 1400]));
+        port.write_frame(Arc::new(vec![0x22; 1400]));
+
+        let mut parity_before = 0usize;
+        for rx in [&rx0, &rx1] {
+            while let Ok(f) = rx.try_recv() {
+                if f.seq == 0 {
+                    parity_before += 1;
+                }
+                release_shared_frame(f.data);
+            }
+        }
+        assert_eq!(parity_before, 1);
+        assert_eq!(port.parity_sent(), 1);
+
+        port.reset_epoch(0, None);
+        port.write_frame(Arc::new(vec![0x33; 1400]));
+        port.write_frame(Arc::new(vec![0x44; 1400]));
+
+        let mut data_after = 0usize;
+        let mut parity_after = 0usize;
+        for rx in [&rx0, &rx1] {
+            while let Ok(f) = rx.try_recv() {
+                if f.seq == 0 {
+                    parity_after += 1;
+                } else {
+                    data_after += 1;
+                }
+                release_shared_frame(f.data);
+            }
+        }
+        assert_eq!(data_after, 2, "disabling FEC must not interrupt data delivery");
+        assert_eq!(parity_after, 0, "disabled FEC must not emit parity frames");
+        assert_eq!(port.parity_sent(), 1, "historical parity counter remains monotonic");
+    }
+
     /// 从收帧端取走当前所有帧的载荷末字节（测试断言顺序与内容用）
     fn drained_last_byte(rx: &crossbeam_channel::Receiver<VPNFrame>) -> Vec<u8> {
         let mut out = Vec::new();
