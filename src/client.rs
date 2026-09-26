@@ -1473,15 +1473,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let conn_waker: Arc<mio::Waker> =
         Arc::new(mio::Waker::new(poll.registry(), TOKEN_WAKE).expect("Waker init"));
     let rtt_cache = Arc::new(AtomicU32::new(50000));
-    let (tx, rx) = bounded(1024);
+    // Keep a tiny channel only as the cold-path backend identity used by
+    // unregister_backend(). Client dataplane frames use tx_queue directly.
+    let (tx, _rx_identity) = bounded(1);
+    let tx_queue = Arc::new(ArrayQueue::new(1024));
     let backend = Arc::new(Backend {
         ch: tx.clone(),
         rtt_cache: rtt_cache.clone(),
-        notify: Some(Arc::new(BackendNotify::new(
+        notify: Some(Arc::new(BackendNotify::new_with_fast_queue(
             conn_waker.clone(),
             // 客户端只看 TOKEN_WAKE，本队列用于复用统一通知结构。
             Arc::new(ArrayQueue::new(1)),
             TOKEN_WAKE,
+            tx_queue.clone(),
         ))),
     });
     cl.tx_port.register_backend(backend.clone());
@@ -1706,14 +1710,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
-        if !tls.wants_write() && (woken || !rx.is_empty()) {
+        if !tls.wants_write() && (woken || !tx_queue.is_empty()) {
             if let Some(n) = &backend.notify {
                 // Only clear pending when we are actually going to drain the
                 // backend queue. If TLS is socket-backpressured, leave pending
                 // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
-            while let Ok(f) = rx.try_recv() {
+            while let Some(f) = tx_queue.pop() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
                 append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);
                 f.data.release();
@@ -1797,6 +1801,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
 
     cl.tx_port.unregister_backend(&tx);
+    while let Some(f) = tx_queue.pop() {
+        f.data.release();
+    }
     cl.live_conns.fetch_sub(1, Ordering::Relaxed);
     *ci.state.lock() = "retrying".into();
     linked_at.elapsed()

@@ -931,6 +931,10 @@ pub struct BackendNotify {
     waker: Arc<mio::Waker>,
     dirty: Arc<ArrayQueue<mio::Token>>,
     token: mio::Token,
+    // Client-only fast path: replace the existing bounded channel data hop
+    // with the already-available lock-free ArrayQueue. Server backends keep
+    // using the channel path; notification/coalescing semantics are shared.
+    fast_q: Option<Arc<ArrayQueue<VPNFrame>>>,
     // 同一 backend 只允许一个未消费的 wake。高吞吐时几十个连续 frame
     // 合并成一次 poll 唤醒，避免每包 eventfd/write syscall。
     pending: AtomicBool,
@@ -946,6 +950,22 @@ impl BackendNotify {
             waker,
             dirty,
             token,
+            fast_q: None,
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    pub fn new_with_fast_queue(
+        waker: Arc<mio::Waker>,
+        dirty: Arc<ArrayQueue<mio::Token>>,
+        token: mio::Token,
+        fast_q: Arc<ArrayQueue<VPNFrame>>,
+    ) -> Self {
+        Self {
+            waker,
+            dirty,
+            token,
+            fast_q: Some(fast_q),
             pending: AtomicBool::new(false),
         }
     }
@@ -1060,6 +1080,22 @@ impl AsyncPort {
         }
     }
 
+    #[inline]
+    fn backend_fast_queue(b: &Backend) -> Option<&Arc<ArrayQueue<VPNFrame>>> {
+        b.notify.as_ref().and_then(|n| n.fast_q.as_ref())
+    }
+
+    #[inline]
+    fn backend_queue_len(b: &Backend) -> usize {
+        Self::backend_fast_queue(b).map_or_else(|| b.ch.len(), |q| q.len())
+    }
+
+    #[inline]
+    fn backend_queue_capacity(b: &Backend) -> usize {
+        Self::backend_fast_queue(b)
+            .map_or_else(|| b.ch.capacity().unwrap_or(4096), |q| q.capacity())
+    }
+
     /// 尝试把 payload 所有权直接投递给单个后端。Owned(Vec) 与
     /// Shared(Arc<Vec>) 都会在 TrySendError 时原样返回，因此 fallback
     /// 到其它物理路径不需要复制 payload。
@@ -1070,15 +1106,27 @@ impl AsyncPort {
         seq: u32,
         data: FramePayload,
     ) -> Result<(), FramePayload> {
-        match b.ch.try_send(VPNFrame { seq, data }) {
-            Ok(()) => {
-                if let Some(n) = &b.notify {
-                    n.wake();
+        let frame = VPNFrame { seq, data };
+        if let Some(q) = Self::backend_fast_queue(b) {
+            match q.push(frame) {
+                Ok(()) => {
+                    if let Some(n) = &b.notify {
+                        n.wake();
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Err(frame) => Err(frame.data),
             }
-            Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => {
-                Err(frame.data)
+        } else {
+            match b.ch.try_send(frame) {
+                Ok(()) => {
+                    if let Some(n) = &b.notify {
+                        n.wake();
+                    }
+                    Ok(())
+                }
+                Err(TrySendError::Full(frame))
+                | Err(TrySendError::Disconnected(frame)) => Err(frame.data),
             }
         }
     }
@@ -1130,8 +1178,8 @@ impl AsyncPort {
     }
 
     fn backend_score(b: &Backend) -> Option<u32> {
-        let q_len = b.ch.len();
-        let capacity = b.ch.capacity().unwrap_or(4096);
+        let q_len = Self::backend_queue_len(b);
+        let capacity = Self::backend_queue_capacity(b);
         if capacity <= 2 || q_len >= capacity - 2 {
             return None;
         }
@@ -1188,7 +1236,7 @@ impl AsyncPort {
 
         let current = self.preferred.load(Ordering::Relaxed);
         let under_pressure = current < backends.len()
-            && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_BACKLOG;
+            && Self::backend_queue_len(&backends[current]) >= Self::MULTIPATH_STRIPE_BACKLOG;
 
         if !under_pressure {
             let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
@@ -1747,6 +1795,35 @@ mod tests {
         for f in rx.try_iter() {
             f.data.release();
         }
+    }
+
+    #[test]
+    fn client_fast_queue_preserves_owned_payload() {
+        let port = AsyncPort::new("fast-queue".into());
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(7)).unwrap());
+        let q = Arc::new(ArrayQueue::new(8));
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let backend = Arc::new(Backend {
+            ch: tx,
+            rtt_cache: Arc::new(AtomicU32::new(1_000)),
+            notify: Some(Arc::new(BackendNotify::new_with_fast_queue(
+                waker,
+                Arc::new(ArrayQueue::new(8)),
+                mio::Token(7),
+                q.clone(),
+            ))),
+        });
+        port.register_backend(backend.clone());
+
+        let data = vec![0x5a; 1400];
+        let ptr = data.as_ptr();
+        port.write_owned_frame(data);
+        assert_eq!(AsyncPort::backend_queue_len(&backend), 1);
+        let frame = q.pop().expect("fast queue must receive frame");
+        assert_eq!(frame.seq, 1);
+        assert_eq!(frame.data.data_ptr(), ptr);
+        frame.data.release();
     }
 
     #[test]
