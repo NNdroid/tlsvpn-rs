@@ -1,0 +1,82 @@
+name: v40 retry2 owned reorder
+
+on:
+  push:
+    branches:
+      - perf/owned-reorder-v40
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply corrected owned-reorder patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          wf = Path('.github/workflows/v40-one-shot.yml').read_text()
+          marker = "python3 - <<'PY'\n"
+          start = wf.index(marker) + len(marker)
+          end = wf.index("\n          PY\n", start)
+          code = textwrap.dedent(wf[start:end])
+
+          # Replace the brittle server timeout-loop whole-block anchor.
+          old_start = code.index('# timeout output to VSwitch: insert late Arc conversion.')
+          old_end = code.index("s = s.replace('reorder_ready: &mut Vec<Arc<Vec<u8>>>,',", old_start)
+          replacement = '''# timeout output to VSwitch: insert late Arc conversion.
+          scope = s.index('for session in reorder_sessions')
+          needle = 'for ordered in reorder_ready.drain(..) {'
+          loop_at = s.index(needle, scope)
+          insert_at = loop_at + len(needle)
+          s = s[:insert_at] + '\\n            let ordered = ordered.into_shared();' + s[insert_at:]
+          '''
+          code = code[:old_start] + textwrap.dedent(replacement) + code[old_end:]
+          exec(compile(code, 'v40-one-shot-patched', 'exec'))
+
+          # The original client splice stops immediately before Ok(None), so it must
+          # restore the closing brace for the Ok(Some(...)) match arm explicitly.
+          p = Path('src/client.rs')
+          s = p.read_text()
+          scope = s.index('// Drain all plaintext made available by this TLS read')
+          marker = '                        Ok(None) => break,'
+          pos = s.index(marker, scope)
+          before = s[max(scope, pos - 80):pos]
+          if not before.rstrip().endswith('}'):
+              s = s[:pos] + '                        }\n' + s[pos:]
+          else:
+              # The nearest brace may close the dedup if/else, not the match arm.
+              # Count the exact tail emitted by the replacement and add the match-arm
+              # brace when only one closing brace follows release_frame_vec(data).
+              tail = s[max(scope, pos - 220):pos]
+              if tail.count('release_frame_vec(data);') and tail.rstrip().endswith('}'):
+                  lines = [ln for ln in tail.splitlines() if ln.strip()]
+                  if len(lines) >= 2 and lines[-1].strip() == '}' and lines[-2].strip() == 'release_frame_vec(data);':
+                      s = s[:pos] + '                        }\n' + s[pos:]
+          p.write_text(s)
+          PY
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Run all tests
+        run: cargo test --all-targets
+
+      - name: Commit experiment and remove one-shot workflows
+        shell: bash
+        run: |
+          rm -f .github/workflows/v40-one-shot.yml .github/workflows/v40-retry.yml .github/workflows/v40-retry2.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/frame.rs src/buffer.rs src/fec.rs src/client.rs src/server.rs .github/workflows/v40-one-shot.yml .github/workflows/v40-retry.yml .github/workflows/v40-retry2.yml
+          git commit -m 'perf: keep received frames owned through reorder'
+          git push origin HEAD:perf/owned-reorder-v40
