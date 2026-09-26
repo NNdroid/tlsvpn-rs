@@ -1684,7 +1684,6 @@ pub type SharedFlag = Arc<AtomicBool>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::release_shared_frame;
     use std::sync::atomic::AtomicU32;
 
     /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
@@ -1725,8 +1724,8 @@ mod tests {
             notify: None,
         });
         // backend_score reserves two slots as the high-water mark.
-        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![1]) }).unwrap();
-        tx.try_send(VPNFrame { seq: 0, data: Arc::new(vec![2]) }).unwrap();
+        tx.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![1]) }).unwrap();
+        tx.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![2]) }).unwrap();
         port.register_backend(backend);
 
         port.write_frame(Arc::new(vec![0x5a; 1400]));
@@ -1744,14 +1743,14 @@ mod tests {
             .find(|f| f.seq != 0)
             .expect("frame should dispatch once backend has capacity");
         assert_eq!(sent.seq, 1);
-        release_shared_frame(sent.data);
+        sent.data.release();
         for f in rx.try_iter() {
-            release_shared_frame(f.data);
+            f.data.release();
         }
     }
 
     #[test]
-    fn owned_arc_falls_back_without_payload_copy() {
+    fn owned_payload_falls_back_without_payload_copy() {
         let port = AsyncPort::new("owned-fallback".into());
 
         let (tx0, rx0) = crossbeam_channel::bounded(4);
@@ -1770,26 +1769,26 @@ mod tests {
         port.register_backend(b1);
 
         // backend_score reserves two slots, so two queued items make b0 unavailable.
-        tx0.try_send(VPNFrame { seq: 0, data: Arc::new(vec![1]) }).unwrap();
-        tx0.try_send(VPNFrame { seq: 0, data: Arc::new(vec![2]) }).unwrap();
+        tx0.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![1]) }).unwrap();
+        tx0.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![2]) }).unwrap();
 
-        let data = Arc::new(vec![0x5a; 1400]);
-        let ptr = Arc::as_ptr(&data);
-        port.write_frame(data);
+        let data = vec![0x5a; 1400];
+        let ptr = data.as_ptr();
+        port.write_owned_frame(data);
 
         let sent = rx1
             .try_iter()
             .find(|f| f.seq != 0)
             .expect("frame must fall back to second backend");
-        assert_eq!(Arc::as_ptr(&sent.data), ptr, "fallback must keep the same Arc payload");
+        assert_eq!(sent.data.data_ptr(), ptr, "fallback must keep the same payload buffer");
         assert_eq!(sent.seq, 1);
-        release_shared_frame(sent.data);
+        sent.data.release();
 
         for f in rx0.try_iter() {
-            release_shared_frame(f.data);
+            f.data.release();
         }
         for f in rx1.try_iter() {
-            release_shared_frame(f.data);
+            f.data.release();
         }
     }
 
@@ -1820,7 +1819,7 @@ mod tests {
         );
 
         while b.ch.len() < b.ch.capacity().unwrap() - 2 {
-            b.ch.try_send(VPNFrame { seq: 0, data: Arc::new(Vec::new()) }).unwrap();
+            b.ch.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(Vec::new()) }).unwrap();
         }
         assert_eq!(
             port.pick_backend_index(&backends),
@@ -1850,7 +1849,7 @@ mod tests {
         assert_eq!(r1.len(), 0);
         assert_eq!(r2.len(), 0);
         while let Ok(f) = r0.try_recv() {
-            release_shared_frame(f.data);
+            f.data.release();
         }
 
         // 给三条相近 RTT 路径制造相同的持续 backlog；之后 bulk 流量应该
@@ -1859,7 +1858,7 @@ mod tests {
             for _ in 0..(AsyncPort::MULTIPATH_STRIPE_BACKLOG + 4) {
                 b.ch.try_send(VPNFrame {
                     seq: 0,
-                    data: Arc::new(Vec::new()),
+                    data: FramePayload::Owned(Vec::new()),
                 })
                 .unwrap();
             }
@@ -1879,7 +1878,7 @@ mod tests {
 
         for rx in [&r0, &r1, &r2] {
             while let Ok(f) = rx.try_recv() {
-                release_shared_frame(f.data);
+                f.data.release();
             }
         }
     }
@@ -1926,7 +1925,7 @@ mod tests {
             } else {
                 data += 1;
             }
-            release_shared_frame(f.data);
+            f.data.release();
         }
         assert_eq!(data, 2);
         assert_eq!(parity, 0);
@@ -1944,7 +1943,7 @@ mod tests {
                 if f.seq == 0 {
                     parity += 1;
                 }
-                release_shared_frame(f.data);
+                f.data.release();
             }
         }
         assert_eq!(parity, 1);
@@ -1977,7 +1976,7 @@ mod tests {
                 } else {
                     data += 1;
                 }
-                drop(f.data);
+                f.data.release();
             }
         }
         assert_eq!(data, 2);
@@ -2008,6 +2007,7 @@ mod tests {
         let mut out = Vec::new();
         while let Ok(f) = rx.try_recv() {
             out.push(f.data[f.data.len() - 1]);
+            f.data.release();
         }
         out
     }
@@ -2062,7 +2062,7 @@ mod tests {
         vs.process_session_frame("A", mac_a, eth_frame(&mac_b, &mac_a, &[0x5a]));
         let delivered = rx_b.try_recv().expect("cached unicast must reach B");
         assert_eq!(delivered.data[delivered.data.len() - 1], 0x5a);
-        release_shared_frame(delivered.data);
+        delivered.data.release();
 
         vs.remove_port("B");
         assert!(
@@ -2144,7 +2144,7 @@ mod tests {
         assert_eq!(vs.spoof_drops(), 1);
         assert_eq!(vs.mac_port(&mac_a), Some("A".to_string()));
         let delivered = rx_a.try_recv().expect("trusted TAP frame should forward");
-        release_shared_frame(delivered.data);
+        delivered.data.release();
     }
 
     #[test]
