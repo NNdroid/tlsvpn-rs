@@ -433,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn buffered_duplicate_is_delivered_only_once_after_gap_fill() {
+        let mut rb = ReorderBuffer::new();
+        assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);
+
+        assert!(rb.insert(3, Arc::new(vec![0x33])).is_empty());
+        assert!(rb.insert(3, Arc::new(vec![0x99])).is_empty());
+
+        let ready = rb.insert(2, Arc::new(vec![0x22]));
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].as_slice(), &[0x22]);
+        assert_eq!(ready[1].as_slice(), &[0x33]);
+    }
+
+    #[test]
     fn idle_time_does_not_pre_age_a_future_gap() {
         let mut rb = ReorderBuffer::new();
         assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);

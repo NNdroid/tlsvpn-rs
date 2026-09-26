@@ -1693,11 +1693,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 dec.on_data(seq, &data, &mut sink);
                             }
 
-                            if !cl.dedup.lock().is_duplicate(seq) {
-                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-                            } else {
-                                release_shared_frame(data);
-                            }
+                            // ReorderBuffer already drops old/replayed seq values and
+                            // duplicate occupied slots. FEC processing happens before this
+                            // point, so the separate DeDuplicator mutex does not protect
+                            // the decoder either. Keep one delivery-dedup authority.
+                            deliver_to_tap(&cl, seq, data, &mut reorder_ready);
                         }
                         Ok(None) => break,
                         Err(e) => {

@@ -1662,11 +1662,10 @@ fn process_plain_frames(
                         dec.on_data(seq, &data, &mut sink);
                     }
 
-                    if !c_sess.dedup.lock().is_duplicate(seq) {
-                        deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
-                    } else {
-                        release_shared_frame(data);
-                    }
+                    // ReorderBuffer is the final delivery boundary and already
+                    // rejects both old/replayed seq values and duplicate occupied slots.
+                    // Avoid a second per-frame mutex + fixed-window lookup here.
+                    deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
                 }
             }
             Ok(None) => break,
