@@ -740,14 +740,19 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         }
     }
 
-    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
+    // TAP 读线程：首帧保持阻塞读取；若 Linux fd 上已经有更多帧，
+    // 在同一线程内最多 drain 32 帧 / 32 KiB，再直接交给 AsyncPort。
+    // 不增加 channel/dispatcher，也不启用 virtio/GSO。
     let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
     {
         let dev = device.clone();
         let port = tx_port.clone();
-        // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
         let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
+            const MAX_BURST_BYTES: usize = 32 * 1024;
+            const MAX_BURST_FRAMES: usize = 32;
+            let mut batch = Vec::<Vec<u8>>::with_capacity(MAX_BURST_FRAMES);
+
             loop {
                 if EXIT.load(Ordering::Relaxed) {
                     return;
@@ -756,9 +761,39 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                 match dev.recv(&mut frame) {
                     Ok(n) if n > 0 => {
                         frame.truncate(n);
-                        // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
-                        // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
-                        port.write_owned_frame(frame);
+                        let mut burst_bytes = n;
+                        batch.push(frame);
+
+                        while batch.len() < MAX_BURST_FRAMES
+                            && burst_bytes < MAX_BURST_BYTES
+                        {
+                            match dev.rx_ready_now() {
+                                Ok(true) => {}
+                                Ok(false) | Err(_) => break,
+                            }
+                            let mut next = acquire_frame_vec(tap_read_size);
+                            match dev.recv(&mut next) {
+                                Ok(m) if m > 0 => {
+                                    next.truncate(m);
+                                    burst_bytes = burst_bytes.saturating_add(m);
+                                    batch.push(next);
+                                }
+                                Ok(_) => {
+                                    release_frame_vec(next);
+                                    break;
+                                }
+                                Err(_) => {
+                                    release_frame_vec(next);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if batch.len() == 1 {
+                            port.write_owned_frame(batch.pop().unwrap());
+                        } else {
+                            port.write_owned_batch(&mut batch);
+                        }
                     }
                     Ok(_) => release_frame_vec(frame),
                     Err(_) => {

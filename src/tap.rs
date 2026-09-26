@@ -1,6 +1,9 @@
 use std::io;
 use tun_rs::SyncDevice;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 /// Abstraction over the L2 TAP device. Both the real kernel TAP
 /// (`tun_rs::SyncDevice`) and the in-memory backend (`MemTap`) implement it, so
 /// the rest of the stack (vswitch, tunnel, handshake, FEC, encryption) is
@@ -15,6 +18,13 @@ pub fn tap_read_buffer_size(mtu: u16) -> usize {
 pub trait TapDevice: Send + Sync {
     fn send(&self, data: &[u8]) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// True when another frame can be read immediately without changing
+    /// the TAP fd to nonblocking mode. The default keeps other platforms
+    /// and the in-memory backend on the original single-frame path.
+    fn rx_ready_now(&self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl TapDevice for SyncDevice {
@@ -23,6 +33,28 @@ impl TapDevice for SyncDevice {
     }
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         SyncDevice::recv(self, buf)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rx_ready_now(&self) -> io::Result<bool> {
+        let mut pfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if rc > 0 {
+                return Ok((pfd.revents & libc::POLLIN) != 0);
+            }
+            if rc == 0 {
+                return Ok(false);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 }
 
