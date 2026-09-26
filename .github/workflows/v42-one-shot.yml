@@ -19,198 +19,38 @@ jobs:
 
       - name: Patch client RX TAP delivery
         shell: bash
+        env:
+          PATCH_GZ_B64: >-
+            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
+            ekjdY8o6UMyPTf1MraENbMPjwmdCCWgR6IBy1fokPADAru9/8Ob+vX/2brwDZwAlNMhKumtABxRg01DcInoKGjIyTObbXMENc8rylzMWV9O+MtkVauOJVl4q
+            ehOpzsSJwBytY7U+VW6Qfhl1gQXQtn/tWv/Wp/3tuwv9127DiOvtfNz/7E7v5x9p5Dm4/3bv6t96//iid/U3suvB+NMHDG7+1WBMBTwf3nowHJFf3X/TUqL/
+            8ofezs7DD3Z7uzf6n78G2HXv/rt7O7vo1QzGeM3mq+jh7d/1PnwHrvJycyvHaytGVf0piFw0L7k0zjI7TYiei9LvPK2/qRmk704ZRNI/GPyk8q4EoupWNgUr
+            Jnlxbpsx7ehrph7HKoHUyXWUn8al+Ttp7k45c6eYt/JKXZi2Mg6n4h/B0IPZhFWaL8Adna4prbIFgaDD4SkX8XK3Dh+6cnBEXTk1BbmY0pSrsMJATMCLgppR
+            FxK5bw9Hm37moGUzVdt+kmCYi3JtyxR9fki7Sp5oE46I3N7H6h8KcrJLBRKGwcdrkMFwtSfSAK2g+idN5Ux3KlKnlDWjjKnKliwsI/wtkz0LzfDq4GQLReP3
+            MbiuGcpp07BysHFiDs0PDzYMsoeo5KlcoclFkm1k5rJlXONsM5MXvIXkvjIna5wpW/cVmOTaBhxdiWXG3f1N+nMyUv5/duUMaKOY2qiNo2Tq0TfEgImjilT/
+            Q5bXrP8CKon0Z9gdAAA=
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path('src/client.rs')
-          s = p.read_text()
-
-          old = 'use crossbeam_channel::bounded;\n'
-          new = 'use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};\n'
-          if old not in s:
-              raise SystemExit('crossbeam import anchor not found')
-          s = s.replace(old, new, 1)
-
-          anchor = '// ======================= 客户端 =======================\n\npub struct Client {\n'
-          delivery = '''// ======================= 客户端 =======================
-
-// Match the Go receive architecture: reorder extraction must not block the TLS
-// socket reader on a TAP write syscall. Batches are bounded and their Vec
-// descriptors are recycled so the handoff itself does not allocate per frame.
-const TAP_DELIVERY_QUEUE: usize = 256;
-const TAP_DELIVERY_BATCH_CAP: usize = 64;
-type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
-
-struct TapDelivery {
-    tx: Sender<TapDeliveryBatch>,
-    pool_tx: Sender<TapDeliveryBatch>,
-    pool_rx: Receiver<TapDeliveryBatch>,
-    dropped: AtomicU64,
-}
-
-impl TapDelivery {
-    fn new(tap: Arc<dyn TapDevice>) -> Self {
-        let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
-        let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
-        let worker_pool = pool_tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(mut batch) = rx.recv() {
-                for frame in batch.drain(..) {
-                    let _ = tap.send(&frame);
-                    release_shared_frame(frame);
-                }
-                let _ = worker_pool.try_send(batch);
-            }
-        });
-        Self {
-            tx,
-            pool_tx,
-            pool_rx,
-            dropped: AtomicU64::new(0),
-        }
-    }
-
-    #[inline]
-    fn acquire(&self) -> TapDeliveryBatch {
-        self.pool_rx
-            .try_recv()
-            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP))
-    }
-
-    #[inline]
-    fn recycle(&self, mut batch: TapDeliveryBatch) {
-        batch.clear();
-        let _ = self.pool_tx.try_send(batch);
-    }
-
-    #[inline]
-    fn enqueue(&self, batch: TapDeliveryBatch) {
-        if batch.is_empty() {
-            self.recycle(batch);
-            return;
-        }
-        match self.tx.try_send(batch) {
-            Ok(()) => {}
-            Err(TrySendError::Full(mut batch))
-            | Err(TrySendError::Disconnected(mut batch)) => {
-                self.dropped
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                for frame in batch.drain(..) {
-                    release_shared_frame(frame);
-                }
-                self.recycle(batch);
-            }
-        }
-    }
-}
-
-pub struct Client {
-'''
-          if anchor not in s:
-              raise SystemExit('Client struct insertion anchor not found')
-          s = s.replace(anchor, delivery, 1)
-
-          old = '    pub reorder_buf: Arc<Mutex<ReorderBuffer>>,\n    pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,\n'
-          new = '    pub reorder_buf: Arc<Mutex<ReorderBuffer>>,\n    tap_delivery: TapDelivery,\n    pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,\n'
-          if old not in s:
-              raise SystemExit('Client field anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));\n    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline\n'
-          new = '    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));\n    let tap_delivery = TapDelivery::new(device.clone());\n    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline\n'
-          if old not in s:
-              raise SystemExit('TapDelivery init anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '        reorder_buf: reorder_buf.clone(),\n        fec_dec: Mutex::new(None),\n'
-          new = '        reorder_buf: reorder_buf.clone(),\n        tap_delivery,\n        fec_dec: Mutex::new(None),\n'
-          if old not in s:
-              raise SystemExit('Client init field anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);\n\n    while !conn_closed && !EXIT.load(Ordering::Relaxed) {\n'
-          new = '    while !conn_closed && !EXIT.load(Ordering::Relaxed) {\n'
-          if old not in s:
-              raise SystemExit('reorder scratch anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '''        // gap timeout 只在 deadline 到期时产生输出；scratch Vec 在整个连接期复用。
-        reorder_ready.clear();
-        {
-            cl.reorder_buf
-                .lock()
-                .flush_timeout_into(&mut reorder_ready);
-        }
-        for ordered in reorder_ready.drain(..) {
-            let _ = cl.tap.send(&ordered);
-            release_shared_frame(ordered);
-        }
-'''
-          new = '''        // A gap timeout can release a burst. Queue it while still holding the
-        // reorder lock so multiple physical connections cannot enqueue ready batches
-        // out of sequence; the TAP syscall itself runs on the delivery worker.
-        flush_reorder_to_tap(&cl);
-'''
-          if old not in s:
-              raise SystemExit('gap flush anchor not found')
-          s = s.replace(old, new, 1)
-
-          s = s.replace('deliver_to_tap(\n                                                &cl,\n                                                s,\n                                                f,\n                                                &mut reorder_ready,\n                                            );', 'deliver_to_tap(&cl, s, f);', 1)
-          s = s.replace('deliver_to_tap(&cl, s, f, &mut reorder_ready);', 'deliver_to_tap(&cl, s, f);', 1)
-          s = s.replace('deliver_to_tap(&cl, seq, data, &mut reorder_ready);', 'deliver_to_tap(&cl, seq, data);', 1)
-          if 'reorder_ready' in s[s.find("// ---- 下行读取"):s.find("// ---- 上行")]:
-              raise SystemExit('not all RX reorder_ready call sites were replaced')
-
-          old = '''/// 把数据/恢复帧注入重排缓冲并写 TAP。ready 由连接线程长期复用，
-/// 正常顺序流不会为 `Vec<Arc<_>>` 额外 malloc。
-fn deliver_to_tap(
-    cl: &Arc<Client>,
-    seq: u32,
-    frame: Arc<Vec<u8>>,
-    ready: &mut Vec<Arc<Vec<u8>>>,
-) {
-    ready.clear();
-    cl.reorder_buf.lock().insert_into(seq, frame, ready);
-    for ordered in ready.drain(..) {
-        let _ = cl.tap.send(&ordered);
-        release_shared_frame(ordered);
-    }
-}
-'''
-          new = '''/// Inject one data/recovered frame into reorder and hand any newly contiguous
-/// output to the dedicated TAP writer. Enqueue happens under the reorder lock:
-/// this is nonblocking and preserves strict order across physical connections.
-fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>) {
-    let mut ready = cl.tap_delivery.acquire();
-    let mut reorder = cl.reorder_buf.lock();
-    reorder.insert_into(seq, frame, &mut ready);
-    if ready.is_empty() {
-        drop(reorder);
-        cl.tap_delivery.recycle(ready);
-    } else {
-        cl.tap_delivery.enqueue(ready);
-    }
-}
-
-fn flush_reorder_to_tap(cl: &Arc<Client>) {
-    let mut ready = cl.tap_delivery.acquire();
-    let mut reorder = cl.reorder_buf.lock();
-    reorder.flush_timeout_into(&mut ready);
-    if ready.is_empty() {
-        drop(reorder);
-        cl.tap_delivery.recycle(ready);
-    } else {
-        cl.tap_delivery.enqueue(ready);
-    }
-}
-'''
-          if old not in s:
-              raise SystemExit('deliver_to_tap helper anchor not found')
-          s = s.replace(old, new, 1)
-
-          p.write_text(s)
-          PY
+          printf '%s' "$PATCH_GZ_B64" | base64 -d | gzip -d > /tmp/v42_patch.py
+          python3 /tmp/v42_patch.py
 
       - name: Check Linux build
         run: cargo check --all-targets
