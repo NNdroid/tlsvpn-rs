@@ -965,10 +965,10 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     std::thread::spawn(move || {
         while let Ok(f) = tap_rx.recv() {
             if !f.data.is_empty() {
-                let _ = dev_writer.send(&f.data);
+                let _ = dev_writer.send(f.data.as_slice());
             }
-            // TAP 是该分支终点；若没有其它 Arc 持有者，归还 2KB 热帧池。
-            release_shared_frame(f.data);
+            // TAP 是该分支终点；Owned 直接归 Vec 池，Shared 在最后 owner 时归池。
+            f.data.release();
         }
     });
 
@@ -1759,8 +1759,8 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
-        append_padded_frame(&mut sess.send_buf, f.seq, &f.data, ic_ref);
-        release_shared_frame(f.data);
+        append_padded_frame(&mut sess.send_buf, f.seq, f.data.as_slice(), ic_ref);
+        f.data.release();
         pulled += 1;
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
