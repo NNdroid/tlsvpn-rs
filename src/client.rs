@@ -1539,6 +1539,16 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
             poll_timeout = poll_timeout.min(wait);
         }
+        // BackendNotify coalesces producer wakeups. One wake can therefore
+        // represent more than one TLS plaintext batch. If frames remain
+        // queued after the previous 32 KiB drain and rustls is not blocked
+        // on socket writes, poll nonblocking so we service that backlog
+        // immediately while still observing socket readability.
+        poll_timeout = clamp_poll_for_tx_backlog(
+            poll_timeout,
+            !rx.is_empty(),
+            tls.wants_write(),
+        );
         if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
             close_reason = format!("mio poll failed: {e}");
             break;
@@ -1815,6 +1825,40 @@ fn deliver_to_tap(
     for ordered in ready.drain(..) {
         let _ = cl.tap.send(&ordered);
         release_shared_frame(ordered);
+    }
+}
+
+#[inline]
+fn clamp_poll_for_tx_backlog(
+    base: Duration,
+    tx_backlog: bool,
+    tls_wants_write: bool,
+) -> Duration {
+    if tx_backlog && !tls_wants_write {
+        Duration::ZERO
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tx_poll_tests {
+    use super::clamp_poll_for_tx_backlog;
+    use std::time::Duration;
+
+    #[test]
+    fn queued_tx_without_tls_backpressure_never_sleeps() {
+        assert_eq!(
+            clamp_poll_for_tx_backlog(Duration::from_millis(200), true, false),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn no_backlog_keeps_timer_and_tls_backpressure_does_not_spin() {
+        let base = Duration::from_millis(200);
+        assert_eq!(clamp_poll_for_tx_backlog(base, false, false), base);
+        assert_eq!(clamp_poll_for_tx_backlog(base, true, true), base);
     }
 }
 
