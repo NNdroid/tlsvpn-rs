@@ -23,7 +23,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # tap.rs: expose a zero-time readiness probe without changing O_NONBLOCK.
           p = Path('src/tap.rs')
           s = p.read_text()
           s = s.replace(
@@ -96,8 +95,6 @@ jobs:
               raise SystemExit('SyncDevice impl anchor not found')
           p.write_text(s.replace(old, new, 1))
 
-          # net.rs: reuse the proven ownership-preserving batch primitive from #32,
-          # but call it directly from the existing TAP reader thread.
           p = Path('src/net.rs')
           s = p.read_text()
           anchor = '''    /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
@@ -107,7 +104,7 @@ jobs:
               }
 
           '''
-          batch = '''    /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
+          replacement = '''    /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
               /// 都为 Arc 控制块做一次 heap allocation/free。
               pub fn write_owned_frame(&self, frame: Vec<u8>) {
                   self.write_payload(FramePayload::Owned(frame));
@@ -123,9 +120,7 @@ jobs:
 
                   let backends = self.backends.read();
                   if backends.is_empty()
-                      || !backends
-                          .iter()
-                          .any(|b| Self::backend_score(b).is_some())
+                      || !backends.iter().any(|b| Self::backend_score(b).is_some())
                   {
                       let mut dropped = 0u64;
                       for frame in frames.drain(..) {
@@ -138,12 +133,8 @@ jobs:
                       return;
                   }
 
-                  // Match the existing Go batch semantics: select the preferred data
-                  // path once for this short input burst, with normal per-frame fallback
-                  // if that backend fills while the burst is being dispatched.
                   let selected_idx = self.selected_data_backend_index(&backends);
                   let mut encoder = self.encoder.lock();
-
                   for frame in frames.drain(..) {
                       let frame = FramePayload::Owned(frame);
                       if frame.is_empty() {
@@ -180,7 +171,7 @@ jobs:
           '''
           if anchor not in s:
               raise SystemExit('write_owned_frame anchor not found')
-          s = s.replace(anchor, batch, 1)
+          s = s.replace(anchor, replacement, 1)
 
           test_anchor = '''    #[test]
               fn owned_payload_falls_back_without_payload_copy() {
@@ -219,97 +210,82 @@ jobs:
               raise SystemExit('batch test anchor not found')
           p.write_text(s.replace(test_anchor, test, 1))
 
-          # client.rs: first read remains blocking. Only if poll(0) says another frame
-          # is already queued do we drain a bounded 32 KiB burst in this same thread.
           p = Path('src/client.rs')
           s = p.read_text()
-          old = '''        std::thread::spawn(move || {
-                  loop {
-                      if EXIT.load(Ordering::Relaxed) {
-                          return;
-                      }
-                      let mut frame = acquire_frame_vec(tap_read_size);
-                      match dev.recv(&mut frame) {
-                          Ok(n) if n > 0 => {
-                              frame.truncate(n);
-                              // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
-                              // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
-                              port.write_owned_frame(frame);
-                          }
-                          Ok(_) => release_frame_vec(frame),
-                          Err(_) => {
-                              release_frame_vec(frame);
-                              if EXIT.load(Ordering::Relaxed) {
-                                  return;
-                              }
-                              std::thread::sleep(Duration::from_secs(1));
-                          }
-                      }
-                  }
-              });
-          '''
-          new = '''        std::thread::spawn(move || {
-                  const MAX_BURST_BYTES: usize = 32 * 1024;
-                  const MAX_BURST_FRAMES: usize = 32;
-                  let mut batch = Vec::<Vec<u8>>::with_capacity(MAX_BURST_FRAMES);
+          start_marker = '    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）\n'
+          end_marker = '\n\n    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));'
+          start = s.find(start_marker)
+          end = s.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('client TAP reader range not found')
+          new_block = '''    // TAP 读线程：首帧保持阻塞读取；若 Linux fd 上已经有更多帧，
+              // 在同一线程内最多 drain 32 帧 / 32 KiB，再直接交给 AsyncPort。
+              // 不增加 channel/dispatcher，也不启用 virtio/GSO。
+              let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+              {
+                  let dev = device.clone();
+                  let port = tx_port.clone();
+                  let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
+                  std::thread::spawn(move || {
+                      const MAX_BURST_BYTES: usize = 32 * 1024;
+                      const MAX_BURST_FRAMES: usize = 32;
+                      let mut batch = Vec::<Vec<u8>>::with_capacity(MAX_BURST_FRAMES);
 
-                  loop {
-                      if EXIT.load(Ordering::Relaxed) {
-                          return;
-                      }
-                      let mut frame = acquire_frame_vec(tap_read_size);
-                      match dev.recv(&mut frame) {
-                          Ok(n) if n > 0 => {
-                              frame.truncate(n);
-                              let mut burst_bytes = n;
-                              batch.push(frame);
+                      loop {
+                          if EXIT.load(Ordering::Relaxed) {
+                              return;
+                          }
+                          let mut frame = acquire_frame_vec(tap_read_size);
+                          match dev.recv(&mut frame) {
+                              Ok(n) if n > 0 => {
+                                  frame.truncate(n);
+                                  let mut burst_bytes = n;
+                                  batch.push(frame);
 
-                              while batch.len() < MAX_BURST_FRAMES
-                                  && burst_bytes < MAX_BURST_BYTES
-                              {
-                                  match dev.rx_ready_now() {
-                                      Ok(true) => {}
-                                      Ok(false) | Err(_) => break,
-                                  }
-                                  let mut next = acquire_frame_vec(tap_read_size);
-                                  match dev.recv(&mut next) {
-                                      Ok(m) if m > 0 => {
-                                          next.truncate(m);
-                                          burst_bytes = burst_bytes.saturating_add(m);
-                                          batch.push(next);
+                                  while batch.len() < MAX_BURST_FRAMES
+                                      && burst_bytes < MAX_BURST_BYTES
+                                  {
+                                      match dev.rx_ready_now() {
+                                          Ok(true) => {}
+                                          Ok(false) | Err(_) => break,
                                       }
-                                      Ok(_) => {
-                                          release_frame_vec(next);
-                                          break;
-                                      }
-                                      Err(_) => {
-                                          release_frame_vec(next);
-                                          break;
+                                      let mut next = acquire_frame_vec(tap_read_size);
+                                      match dev.recv(&mut next) {
+                                          Ok(m) if m > 0 => {
+                                              next.truncate(m);
+                                              burst_bytes = burst_bytes.saturating_add(m);
+                                              batch.push(next);
+                                          }
+                                          Ok(_) => {
+                                              release_frame_vec(next);
+                                              break;
+                                          }
+                                          Err(_) => {
+                                              release_frame_vec(next);
+                                              break;
+                                          }
                                       }
                                   }
-                              }
 
-                              if batch.len() == 1 {
-                                  port.write_owned_frame(batch.pop().unwrap());
-                              } else {
-                                  port.write_owned_batch(&mut batch);
+                                  if batch.len() == 1 {
+                                      port.write_owned_frame(batch.pop().unwrap());
+                                  } else {
+                                      port.write_owned_batch(&mut batch);
+                                  }
                               }
-                          }
-                          Ok(_) => release_frame_vec(frame),
-                          Err(_) => {
-                              release_frame_vec(frame);
-                              if EXIT.load(Ordering::Relaxed) {
-                                  return;
+                              Ok(_) => release_frame_vec(frame),
+                              Err(_) => {
+                                  release_frame_vec(frame);
+                                  if EXIT.load(Ordering::Relaxed) {
+                                      return;
+                                  }
+                                  std::thread::sleep(Duration::from_secs(1));
                               }
-                              std::thread::sleep(Duration::from_secs(1));
                           }
                       }
-                  }
-              });
-          '''
-          if old not in s:
-              raise SystemExit('client TAP reader anchor not found')
-          p.write_text(s.replace(old, new, 1))
+                  });
+              }'''
+          p.write_text(s[:start] + new_block + s[end:])
           PY
 
       - name: Check Linux build
