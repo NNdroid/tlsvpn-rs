@@ -1,0 +1,229 @@
+name: v42 one-shot async client TAP delivery
+
+on:
+  push:
+    branches:
+      - perf/client-tap-delivery-v42
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch client RX TAP delivery
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/client.rs')
+          s = p.read_text()
+
+          old = 'use crossbeam_channel::bounded;\n'
+          new = 'use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};\n'
+          if old not in s:
+              raise SystemExit('crossbeam import anchor not found')
+          s = s.replace(old, new, 1)
+
+          anchor = '// ======================= 客户端 =======================\n\npub struct Client {\n'
+          delivery = '''// ======================= 客户端 =======================
+
+// Match the Go receive architecture: reorder extraction must not block the TLS
+// socket reader on a TAP write syscall. Batches are bounded and their Vec
+// descriptors are recycled so the handoff itself does not allocate per frame.
+const TAP_DELIVERY_QUEUE: usize = 256;
+const TAP_DELIVERY_BATCH_CAP: usize = 64;
+type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
+
+struct TapDelivery {
+    tx: Sender<TapDeliveryBatch>,
+    pool_tx: Sender<TapDeliveryBatch>,
+    pool_rx: Receiver<TapDeliveryBatch>,
+    dropped: AtomicU64,
+}
+
+impl TapDelivery {
+    fn new(tap: Arc<dyn TapDevice>) -> Self {
+        let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let worker_pool = pool_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(mut batch) = rx.recv() {
+                for frame in batch.drain(..) {
+                    let _ = tap.send(&frame);
+                    release_shared_frame(frame);
+                }
+                let _ = worker_pool.try_send(batch);
+            }
+        });
+        Self {
+            tx,
+            pool_tx,
+            pool_rx,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn acquire(&self) -> TapDeliveryBatch {
+        self.pool_rx
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP))
+    }
+
+    #[inline]
+    fn recycle(&self, mut batch: TapDeliveryBatch) {
+        batch.clear();
+        let _ = self.pool_tx.try_send(batch);
+    }
+
+    #[inline]
+    fn enqueue(&self, batch: TapDeliveryBatch) {
+        if batch.is_empty() {
+            self.recycle(batch);
+            return;
+        }
+        match self.tx.try_send(batch) {
+            Ok(()) => {}
+            Err(TrySendError::Full(mut batch))
+            | Err(TrySendError::Disconnected(mut batch)) => {
+                self.dropped
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for frame in batch.drain(..) {
+                    release_shared_frame(frame);
+                }
+                self.recycle(batch);
+            }
+        }
+    }
+}
+
+pub struct Client {
+'''
+          if anchor not in s:
+              raise SystemExit('Client struct insertion anchor not found')
+          s = s.replace(anchor, delivery, 1)
+
+          old = '    pub reorder_buf: Arc<Mutex<ReorderBuffer>>,\n    pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,\n'
+          new = '    pub reorder_buf: Arc<Mutex<ReorderBuffer>>,\n    tap_delivery: TapDelivery,\n    pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,\n'
+          if old not in s:
+              raise SystemExit('Client field anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));\n    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline\n'
+          new = '    let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));\n    let tap_delivery = TapDelivery::new(device.clone());\n    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline\n'
+          if old not in s:
+              raise SystemExit('TapDelivery init anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '        reorder_buf: reorder_buf.clone(),\n        fec_dec: Mutex::new(None),\n'
+          new = '        reorder_buf: reorder_buf.clone(),\n        tap_delivery,\n        fec_dec: Mutex::new(None),\n'
+          if old not in s:
+              raise SystemExit('Client init field anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);\n\n    while !conn_closed && !EXIT.load(Ordering::Relaxed) {\n'
+          new = '    while !conn_closed && !EXIT.load(Ordering::Relaxed) {\n'
+          if old not in s:
+              raise SystemExit('reorder scratch anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        // gap timeout 只在 deadline 到期时产生输出；scratch Vec 在整个连接期复用。
+        reorder_ready.clear();
+        {
+            cl.reorder_buf
+                .lock()
+                .flush_timeout_into(&mut reorder_ready);
+        }
+        for ordered in reorder_ready.drain(..) {
+            let _ = cl.tap.send(&ordered);
+            release_shared_frame(ordered);
+        }
+'''
+          new = '''        // A gap timeout can release a burst. Queue it while still holding the
+        // reorder lock so multiple physical connections cannot enqueue ready batches
+        // out of sequence; the TAP syscall itself runs on the delivery worker.
+        flush_reorder_to_tap(&cl);
+'''
+          if old not in s:
+              raise SystemExit('gap flush anchor not found')
+          s = s.replace(old, new, 1)
+
+          s = s.replace('deliver_to_tap(\n                                                &cl,\n                                                s,\n                                                f,\n                                                &mut reorder_ready,\n                                            );', 'deliver_to_tap(&cl, s, f);', 1)
+          s = s.replace('deliver_to_tap(&cl, s, f, &mut reorder_ready);', 'deliver_to_tap(&cl, s, f);', 1)
+          s = s.replace('deliver_to_tap(&cl, seq, data, &mut reorder_ready);', 'deliver_to_tap(&cl, seq, data);', 1)
+          if 'reorder_ready' in s[s.find("// ---- 下行读取"):s.find("// ---- 上行")]:
+              raise SystemExit('not all RX reorder_ready call sites were replaced')
+
+          old = '''/// 把数据/恢复帧注入重排缓冲并写 TAP。ready 由连接线程长期复用，
+/// 正常顺序流不会为 `Vec<Arc<_>>` 额外 malloc。
+fn deliver_to_tap(
+    cl: &Arc<Client>,
+    seq: u32,
+    frame: Arc<Vec<u8>>,
+    ready: &mut Vec<Arc<Vec<u8>>>,
+) {
+    ready.clear();
+    cl.reorder_buf.lock().insert_into(seq, frame, ready);
+    for ordered in ready.drain(..) {
+        let _ = cl.tap.send(&ordered);
+        release_shared_frame(ordered);
+    }
+}
+'''
+          new = '''/// Inject one data/recovered frame into reorder and hand any newly contiguous
+/// output to the dedicated TAP writer. Enqueue happens under the reorder lock:
+/// this is nonblocking and preserves strict order across physical connections.
+fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>) {
+    let mut ready = cl.tap_delivery.acquire();
+    let mut reorder = cl.reorder_buf.lock();
+    reorder.insert_into(seq, frame, &mut ready);
+    if ready.is_empty() {
+        drop(reorder);
+        cl.tap_delivery.recycle(ready);
+    } else {
+        cl.tap_delivery.enqueue(ready);
+    }
+}
+
+fn flush_reorder_to_tap(cl: &Arc<Client>) {
+    let mut ready = cl.tap_delivery.acquire();
+    let mut reorder = cl.reorder_buf.lock();
+    reorder.flush_timeout_into(&mut ready);
+    if ready.is_empty() {
+        drop(reorder);
+        cl.tap_delivery.recycle(ready);
+    } else {
+        cl.tap_delivery.enqueue(ready);
+    }
+}
+'''
+          if old not in s:
+              raise SystemExit('deliver_to_tap helper anchor not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          PY
+
+      - name: Check Linux build
+        run: cargo check --all-targets
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Commit experiment and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/v42-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/client.rs .github/workflows/v42-one-shot.yml
+          git commit -m 'perf(client): decouple TAP delivery from TLS reads'
+          git push origin HEAD:perf/client-tap-delivery-v42
