@@ -260,10 +260,18 @@ impl ResolvesServerCert for ObservingCertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let info = {
             let offered_cipher_suites = normalize_tls_u16(
-                &hello.cipher_suites().iter().map(|v| u16::from(*v)).collect::<Vec<_>>(),
+                &hello
+                    .cipher_suites()
+                    .iter()
+                    .map(|v| u16::from(*v))
+                    .collect::<Vec<_>>(),
             );
             let offered_signature_schemes = normalize_tls_u16(
-                &hello.signature_schemes().iter().map(|v| u16::from(*v)).collect::<Vec<_>>(),
+                &hello
+                    .signature_schemes()
+                    .iter()
+                    .map(|v| u16::from(*v))
+                    .collect::<Vec<_>>(),
             );
             let offered_groups = normalize_tls_u16(
                 &hello
@@ -514,7 +522,8 @@ impl WebStatsProvider for ServerCore {
         // 逐会话的真实取值在 clients 表里（brutal_tx/brutal_rx/enc_algo/fec_group）。
         let brut = brutal_system_status();
         // applied 只统计 setsockopt 真的成功过的会话，不是"配置了就算生效"
-        let applied: usize = sessions.values()
+        let applied: usize = sessions
+            .values()
             .map(|s| s.brutal_applied_conns.load(Ordering::Relaxed) as usize)
             .sum();
         let mut brutal_errors = Vec::<String>::new();
@@ -529,7 +538,8 @@ impl WebStatsProvider for ServerCore {
         } else {
             brutal_errors.join("; ")
         };
-        let total_conns: usize = sessions.values()
+        let total_conns: usize = sessions
+            .values()
             .map(|s| s.stat.active_conns.load(Ordering::Relaxed).max(0) as usize)
             .sum();
         let mut min_up = u64::MAX;
@@ -545,7 +555,10 @@ impl WebStatsProvider for ServerCore {
             min_down = min_down.min(split_legacy_brutal_rate(down, n, n - 1));
             max_down = max_down.max(split_legacy_brutal_rate(down, n, 0));
         }
-        if sessions.is_empty() { min_up = 0; min_down = 0; }
+        if sessions.is_empty() {
+            min_up = 0;
+            min_down = 0;
+        }
         let negotiate = serde_json::json!({
             "protocol_version": 2,
             "fec": true,
@@ -597,7 +610,8 @@ impl WebStatsProvider for ServerCore {
         let sessions = self.sessions.read();
         let (mut tx, mut rx, mut pk) = (0u64, 0u64, 0u64);
         let (mut rec, mut lost) = (0u64, 0u64);
-        let (mut dropped, mut reorder_gap, mut reorder_flushes, mut reorder_skipped) = (0u64, 0u64, 0u64, 0u64);
+        let (mut dropped, mut reorder_gap, mut reorder_flushes, mut reorder_skipped) =
+            (0u64, 0u64, 0u64, 0u64);
         for s in sessions.values() {
             tx += s.stat.tx_bytes.load(Ordering::Relaxed);
             rx += s.stat.rx_bytes.load(Ordering::Relaxed);
@@ -1043,8 +1057,12 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         if let Some(e) = tap_setup_error {
             let cleanup = hooks.down();
             return Err(match cleanup {
-                Ok(()) => format!("Server tunnel interface is not ready; refusing to run up hook: {e}"),
-                Err(down) => format!("Server tunnel interface is not ready: {e}; cleanup failed: {down}"),
+                Ok(()) => {
+                    format!("Server tunnel interface is not ready; refusing to run up hook: {e}")
+                }
+                Err(down) => {
+                    format!("Server tunnel interface is not ready: {e}; cleanup failed: {down}")
+                }
             });
         }
         if let Err(e) = hooks.up(hook_env) {
@@ -1181,8 +1199,7 @@ fn worker_loop(
                 }
             }
         }
-        poll.poll(&mut events, Some(poll_timeout))
-            .unwrap();
+        poll.poll(&mut events, Some(poll_timeout)).unwrap();
 
         let mut closed_tokens: Vec<Token> = Vec::new();
 
@@ -1294,7 +1311,10 @@ fn worker_loop(
             // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
             // "connection lost: timeout" 窗口。
             if idle_time > 15 {
-                debug!("closing token {:?}: no TLS receive progress for {}s", token, idle_time);
+                debug!(
+                    "closing token {:?}: no TLS receive progress for {}s",
+                    token, idle_time
+                );
                 closed_tokens.push(*token);
                 continue;
             }
@@ -1416,10 +1436,7 @@ fn worker_loop(
                         'socket_read: loop {
                             match sess.tls.read_tls(&mut sess.socket) {
                                 Ok(0) => {
-                                    debug!(
-                                        "closing token {:?}: tls.read_tls returned EOF",
-                                        token
-                                    );
+                                    debug!("closing token {:?}: tls.read_tls returned EOF", token);
                                     close = true;
                                     break 'socket_read;
                                 }
@@ -1430,11 +1447,7 @@ fn worker_loop(
                                     break 'socket_read;
                                 }
                                 Err(e) => {
-                                    debug!(
-                                        "closing token {:?}: tls.read_tls failed: {}",
-                                        token,
-                                        e
-                                    );
+                                    debug!("closing token {:?}: tls.read_tls failed: {}", token, e);
                                     close = true;
                                     break 'socket_read;
                                 }
@@ -1443,8 +1456,7 @@ fn worker_loop(
                             if let Err(e) = sess.tls.process_new_packets() {
                                 debug!(
                                     "closing token {:?}: tls.process_new_packets failed: {}",
-                                    token,
-                                    e
+                                    token, e
                                 );
                                 if !sess.handshake_done {
                                     serve_fallback_http(&mut sess.socket, false);
@@ -1457,12 +1469,8 @@ fn worker_loop(
                             if !sess.sniffed_inner {
                                 match sess.scanner.peek_first_byte() {
                                     Some(b) if b >= 0x20 => {
-                                        let is_h2 =
-                                            sess.tls.alpn_protocol() == Some(b"h2");
-                                        serve_fallback_http(
-                                            &mut sess.tls.writer(),
-                                            is_h2,
-                                        );
+                                        let is_h2 = sess.tls.alpn_protocol() == Some(b"h2");
+                                        serve_fallback_http(&mut sess.tls.writer(), is_h2);
                                         close = true;
                                     }
                                     Some(_) => sess.sniffed_inner = true,
@@ -1505,7 +1513,12 @@ fn worker_loop(
                         close_session_tls(&mut s);
                         let _ = poll.registry().deregister(&mut s.socket);
                         let _ = tarpit; // 认证失败立即释放资源；不再创建无界 tarpit OS 线程。
-                        on_conn_closed(s.client_session, s.tx_backend, s.session_epoch, s.brutal_applied);
+                        on_conn_closed(
+                            s.client_session,
+                            s.tx_backend,
+                            s.session_epoch,
+                            s.brutal_applied,
+                        );
                     }
                 }
             }
@@ -1548,7 +1561,12 @@ fn worker_loop(
                 // 两处都补发 close_notify。
                 close_session_tls(&mut s);
                 let _ = poll.registry().deregister(&mut s.socket);
-                on_conn_closed(s.client_session, s.tx_backend, s.session_epoch, s.brutal_applied);
+                on_conn_closed(
+                    s.client_session,
+                    s.tx_backend,
+                    s.session_epoch,
+                    s.brutal_applied,
+                );
             }
         }
     }
@@ -1575,8 +1593,7 @@ fn process_plain_frames(
                 let mut data = raw;
 
                 if sess.handshake_done {
-                    rx_bytes_batch =
-                        rx_bytes_batch.saturating_add((data.len() + 10) as u64);
+                    rx_bytes_batch = rx_bytes_batch.saturating_add((data.len() + 10) as u64);
                     rx_packets_batch = rx_packets_batch.saturating_add(1);
                 }
 
@@ -1640,13 +1657,7 @@ fn process_plain_frames(
                         if let Some(dec) = &fec_dec {
                             if fec::is_parity_frame(&data) {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_vswitch(
-                                        &c_sess,
-                                        core,
-                                        s,
-                                        f,
-                                        reorder_ready,
-                                    );
+                                    deliver_to_vswitch(&c_sess, core, s, f, reorder_ready);
                                 };
                                 dec.on_parity(&data, &mut sink);
                                 release_shared_frame(data);
@@ -1671,7 +1682,10 @@ fn process_plain_frames(
             }
             Ok(None) => break,
             Err(e) => {
-                debug!("closing session plaintext path: frame scanner failed: {}", e);
+                debug!(
+                    "closing session plaintext path: frame scanner failed: {}",
+                    e
+                );
                 if !sess.handshake_done {
                     let is_h2 = sess.tls.alpn_protocol() == Some(b"h2");
                     serve_fallback_http(&mut sess.tls.writer(), is_h2);
@@ -1695,7 +1709,6 @@ fn process_plain_frames(
     }
 }
 
-
 fn deliver_to_vswitch(
     c_sess: &Arc<ClientSession>,
     core: &Arc<ServerCore>,
@@ -1704,17 +1717,11 @@ fn deliver_to_vswitch(
     ready: &mut Vec<Arc<Vec<u8>>>,
 ) {
     ready.clear();
-    c_sess
-        .reorder_buf
-        .lock()
-        .insert_into(seq, frame, ready);
+    c_sess.reorder_buf.lock().insert_into(seq, frame, ready);
     for ordered in ready.drain(..) {
         if c_sess.mac_bin != [0u8; 6] {
-            core.vswitch.process_session_frame(
-                &c_sess.stat.client_id,
-                c_sess.mac_bin,
-                ordered,
-            );
+            core.vswitch
+                .process_session_frame(&c_sess.stat.client_id, c_sess.mac_bin, ordered);
         } else {
             core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
         }
@@ -1754,7 +1761,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
 
     // Stay below rustls' bounded outgoing plaintext buffer. A 256KiB
     // write_all() can fail with WriteZero before ciphertext is drained.
-    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    const TLS_WRITE_BATCH_BYTES: usize = 64 * 1024;
     let mut pulled = 0u64;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
@@ -1839,7 +1846,10 @@ enum HandshakeOutcome {
 }
 
 fn valid_session_token_format(token: &str) -> bool {
-    token.len() == 64 && hex::decode(token).map(|raw| raw.len() == 32).unwrap_or(false)
+    token.len() == 64
+        && hex::decode(token)
+            .map(|raw| raw.len() == 32)
+            .unwrap_or(false)
 }
 
 fn accept_session_resume_token(epoch: &mut SessionEpochState, presented: &str) -> bool {
@@ -1881,10 +1891,18 @@ fn rotate_session_epoch(
     let (ic_tx, ic_rx, fec_tx, fec_rx) = if core.encrypt {
         let algo = epoch.enc_algo;
         (
-            Some(Arc::new(InnerCipher::gcm_for_algo(&core.psk, &salt_b, algo)?)),
-            Some(Arc::new(InnerCipher::gcm_for_algo(&core.psk, &salt_a, algo)?)),
-            Some(Arc::new(InnerCipher::gcm_domain_for_algo(&core.psk, &salt_b, "fec", algo)?)),
-            Some(Arc::new(InnerCipher::gcm_domain_for_algo(&core.psk, &salt_a, "fec", algo)?)),
+            Some(Arc::new(InnerCipher::gcm_for_algo(
+                &core.psk, &salt_b, algo,
+            )?)),
+            Some(Arc::new(InnerCipher::gcm_for_algo(
+                &core.psk, &salt_a, algo,
+            )?)),
+            Some(Arc::new(InnerCipher::gcm_domain_for_algo(
+                &core.psk, &salt_b, "fec", algo,
+            )?)),
+            Some(Arc::new(InnerCipher::gcm_domain_for_algo(
+                &core.psk, &salt_a, "fec", algo,
+            )?)),
         )
     } else {
         (None, None, None, None)
@@ -2078,7 +2096,10 @@ fn handle_handshake(
                 {
                     let mut epoch = existing.epoch_state.write();
                     if let Err(e) = ensure_pending_resume_token(&mut epoch) {
-                        warn!("[{}] failed to prepare the next session token: {}", client_id, e);
+                        warn!(
+                            "[{}] failed to prepare the next session token: {}",
+                            client_id, e
+                        );
                         return HandshakeOutcome::Close;
                     }
                 }
@@ -2135,11 +2156,7 @@ fn handle_handshake(
             // FEC 协商：req.fec 即 XOR 模式，K 直接取请求值——上面的拒连闸已
             // 保证它在 [fec_group_min, fec_group_max] ⊆ [2,64] 内，无需再夹取；
             // 未请求 FEC 时为 0（不编码）。
-            let fec_enc_k: i64 = if req.fec {
-                req.fec_group
-            } else {
-                0
-            };
+            let fec_enc_k: i64 = if req.fec { req.fec_group } else { 0 };
             // 内层算法在前置闸门已按服务端 enc_algo 精确匹配；这里不再做降级。
             let salt_a = new_random_salt();
             let salt_b = new_random_salt();
@@ -2294,8 +2311,11 @@ fn handle_handshake(
     let response_epoch = epoch_snapshot.epoch;
     let response_enc_algo = epoch_snapshot.enc_algo;
     let response_token = response_resume_token(&epoch_snapshot);
-    let (response_enc_salt, response_enc_salt2) =
-        response_enc_salts(response_enc_algo, &epoch_snapshot.salt_a, &epoch_snapshot.salt_b);
+    let (response_enc_salt, response_enc_salt2) = response_enc_salts(
+        response_enc_algo,
+        &epoch_snapshot.salt_a,
+        &epoch_snapshot.salt_b,
+    );
     drop(epoch_snapshot);
     if let Some(b) = &sess.tx_backend {
         b.rtt_cache.store(50000, Ordering::Relaxed);
@@ -2310,8 +2330,10 @@ fn handle_handshake(
     // client_tx_rate 是客户端→服务端（上行），客户端自己整形，本端只把它
     // 裁进自己的上行预算内。曾写反导致客户端面板"上行 125 配 30 上行总量"。
     let group_offer = req.brutal_groups
-        && req.brutal_conns > 0 && req.brutal_conns <= 65536
-        && req.brutal_conn_index >= 0 && req.brutal_conn_index < req.brutal_conns
+        && req.brutal_conns > 0
+        && req.brutal_conns <= 65536
+        && req.brutal_conn_index >= 0
+        && req.brutal_conn_index < req.brutal_conns
         && req.brutal_total_tx <= MAX_BRUTAL_RATE_MBPS
         && req.brutal_total_rx <= MAX_BRUTAL_RATE_MBPS;
     let (requested_rx, requested_tx) = if group_offer {
@@ -2329,8 +2351,14 @@ fn handle_handshake(
         client_tx_rate = requested_tx;
     }
     let server_legacy_rate_bps = if group_offer {
-        split_legacy_brutal_rate_bps(server_tx_rate, req.brutal_conns as usize, req.brutal_conn_index as usize)
-    } else { server_tx_rate * 1_000_000 / 8 };
+        split_legacy_brutal_rate_bps(
+            server_tx_rate,
+            req.brutal_conns as usize,
+            req.brutal_conn_index as usize,
+        )
+    } else {
+        server_tx_rate * 1_000_000 / 8
+    };
     // 先记录协商预算；Brutal 必须等成功响应进入 TLS/TCP 写路径后再应用，
     // 否则 setsockopt 的异常时延会让客户端误以为应用层握手卡死。
     c_sess.brutal_tx.store(server_tx_rate, Ordering::Relaxed);
@@ -2367,7 +2395,10 @@ fn handle_handshake(
     let mut buf = Vec::with_capacity(1024);
     append_padded_frame(&mut buf, 0, &resp_json, None);
     if let Err(e) = sess.tls.writer().write_all(&buf) {
-        debug!("[{}] failed to queue handshake response: {}", resp.client_id, e);
+        debug!(
+            "[{}] failed to queue handshake response: {}",
+            resp.client_id, e
+        );
         return HandshakeOutcome::Close;
     }
     let mut close = false;
@@ -2377,9 +2408,20 @@ fn handle_handshake(
     }
 
     let brutal_result = if core.brutal && server_tx_rate > 0 {
-        let group_id = if group_offer { brutal_group_id("server", &response_token) } else { 0 };
-        apply_tcp_brutal(&sess.socket, server_tx_rate, server_legacy_rate_bps, group_id)
-    } else { BrutalApplyResult::default() };
+        let group_id = if group_offer {
+            brutal_group_id("server", &response_token)
+        } else {
+            0
+        };
+        apply_tcp_brutal(
+            &sess.socket,
+            server_tx_rate,
+            server_legacy_rate_bps,
+            group_id,
+        )
+    } else {
+        BrutalApplyResult::default()
+    };
     sess.brutal_applied = brutal_result.applied;
     if brutal_result.applied {
         c_sess.brutal_applied_conns.fetch_add(1, Ordering::Relaxed);
@@ -2399,7 +2441,9 @@ fn on_conn_closed(
         c_sess.port.unregister_backend(&backend.ch);
         if brutal_applied {
             let _ = c_sess.brutal_applied_conns.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(1)),
             );
         }
         if c_sess.epoch_state.read().epoch != connection_epoch {
@@ -2482,7 +2526,10 @@ mod tests {
         let token = new_session_token().unwrap();
         assert!(valid_session_token_format(&token));
         for bad in [String::new(), "abcd".into(), "z".repeat(64), "0".repeat(63)] {
-            assert!(!valid_session_token_format(&bad), "malformed token accepted: {bad:?}");
+            assert!(
+                !valid_session_token_format(&bad),
+                "malformed token accepted: {bad:?}"
+            );
         }
     }
 
@@ -2539,10 +2586,16 @@ mod tests {
         // 对齐 Go applyDefaults：0 = 协议边界 [2,64]，即未配置时不额外限制。
         assert_eq!(
             crate::fec::normalize_fec_group_bounds(0, 0),
-            (crate::fec::FEC_MIN_GROUP as i64, crate::fec::FEC_MAX_GROUP as i64)
+            (
+                crate::fec::FEC_MIN_GROUP as i64,
+                crate::fec::FEC_MAX_GROUP as i64
+            )
         );
         assert_eq!(crate::fec::normalize_fec_group_bounds(4, 8), (4, 8));
-        assert_eq!(crate::fec::normalize_fec_group_bounds(2, 0), (2, crate::fec::FEC_MAX_GROUP as i64));
+        assert_eq!(
+            crate::fec::normalize_fec_group_bounds(2, 0),
+            (2, crate::fec::FEC_MAX_GROUP as i64)
+        );
         assert_eq!(
             crate::fec::normalize_fec_group_bounds(0, 16),
             (crate::fec::FEC_MIN_GROUP as i64, 16)

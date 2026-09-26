@@ -38,9 +38,8 @@ fn reconnect_backoff_delay(attempt: u32) -> Duration {
     // 避免 ISP 抖动时全体同步重拨。封顶阶段上界被裁到 max_ms，下界仍在 2/3 d。
     let third = d_ms / 3;
     let jitter_range = (third * 2).max(1u64) as usize;
-    let jitter = crate::utils::RNG.with(|rng| {
-        rng.borrow_mut().gen_range(0usize, jitter_range) as u64
-    });
+    let jitter =
+        crate::utils::RNG.with(|rng| rng.borrow_mut().gen_range(0usize, jitter_range) as u64);
     let delay_ms = third * 2 + jitter;
     if delay_ms > max_ms {
         RECONNECT_BACKOFF_MAX
@@ -364,10 +363,16 @@ impl WebStatsProvider for Client {
         // 协商结果：客户端模式是端到端会话的实际参数（服务端回传的取值），
         // brutal 段把"配置意图"和"内核实际状态"分开设——非 Linux 或没装 brutal
         // 模块时 apply 必然失败，混在一起就无法区分"没配置"和"配置了没生效"。
-        let n: u64 = if self.conns_count == 0 { 1 } else { self.conns_count as u64 };
-        let per_up_min = split_legacy_brutal_rate(self.brutal_up, n as usize, n.saturating_sub(1) as usize);
+        let n: u64 = if self.conns_count == 0 {
+            1
+        } else {
+            self.conns_count as u64
+        };
+        let per_up_min =
+            split_legacy_brutal_rate(self.brutal_up, n as usize, n.saturating_sub(1) as usize);
         let per_up_max = split_legacy_brutal_rate(self.brutal_up, n as usize, 0);
-        let per_down_min = split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
+        let per_down_min =
+            split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
         let per_down_max = split_legacy_brutal_rate(self.brutal_down, n as usize, 0);
         // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
         let mut applied_conns = 0usize;
@@ -717,7 +722,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         .filter(|s| !s.is_empty())
         .collect();
     if targets.is_empty() {
-        return Err("Client addr resolved to zero endpoints; check the addr field in the config file".into());
+        return Err(
+            "Client addr resolved to zero endpoints; check the addr field in the config file"
+                .into(),
+        );
     }
 
     // SOCKS5 全局代理
@@ -1195,7 +1203,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         brutal_conns: cl.conns_count as i64,
         brutal_conn_index: conn_index as i64,
         encrypt: cl.encrypt,
-        enc_algo: if cl.encrypt { cl.enc_algo } else { ENC_ALGO_NONE },
+        enc_algo: if cl.encrypt {
+            cl.enc_algo
+        } else {
+            ENC_ALGO_NONE
+        },
         session_token,
     };
     let req_json = serde_json::to_vec(&req).unwrap();
@@ -1228,19 +1240,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // TLS + TLSVPN 握手都已完成，现在才启用 Brutal。优先采用服务端裁剪后的
     // group 总预算；若对端未返回 group 语义，则兼容旧端，按本地逐连接预算应用。
     if cl.brutal && client_tx_rate_bps > 0 && cl.socks5.is_none() {
-        let (total_rate, legacy_bps) =
-            if resp.brutal_groups && resp.brutal_total_tx > 0 {
-                (
-                    resp.brutal_total_tx,
-                    split_legacy_brutal_rate_bps(
-                        resp.brutal_total_tx,
-                        cl.conns_count,
-                        conn_index,
-                    ),
-                )
-            } else {
-                (cl.brutal_up, client_tx_rate_bps)
-            };
+        let (total_rate, legacy_bps) = if resp.brutal_groups && resp.brutal_total_tx > 0 {
+            (
+                resp.brutal_total_tx,
+                split_legacy_brutal_rate_bps(resp.brutal_total_tx, cl.conns_count, conn_index),
+            )
+        } else {
+            (cl.brutal_up, client_tx_rate_bps)
+        };
         *ci.brutal.lock() = apply_tcp_brutal(&sock, total_rate, legacy_bps, brutal_group);
     }
 
@@ -1452,7 +1459,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         };
         let hook_result = if let Some(e) = readiness_error {
             cl.hooks.activate(hook_env);
-            Err(format!("cannot run lifecycle up hook before tunnel networking is ready: {e}"))
+            Err(format!(
+                "cannot run lifecycle up hook before tunnel networking is ready: {e}"
+            ))
         } else {
             cl.hooks.up(hook_env)
         };
@@ -1505,7 +1514,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
     // buffer") before write_tls() gets a chance to drain ciphertext.
-    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    const TLS_WRITE_BATCH_BYTES: usize = 64 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
@@ -1568,9 +1577,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // gap timeout 只在 deadline 到期时产生输出；scratch Vec 在整个连接期复用。
         reorder_ready.clear();
         {
-            cl.reorder_buf
-                .lock()
-                .flush_timeout_into(&mut reorder_ready);
+            cl.reorder_buf.lock().flush_timeout_into(&mut reorder_ready);
         }
         for ordered in reorder_ready.drain(..) {
             let _ = cl.tap.send(&ordered);
@@ -1641,10 +1648,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                             data.truncate(n);
                                         }
                                         Err(_) => {
-                                            debug!(
-                                                "dropped tampered/foreign frame (seq={})",
-                                                seq
-                                            );
+                                            debug!("dropped tampered/foreign frame (seq={})", seq);
                                             release_frame_vec(data);
                                             continue;
                                         }
@@ -1657,12 +1661,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 if let Some(dec) = &fec_dec {
                                     if fec::is_parity_frame(&data) {
                                         let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                            deliver_to_tap(
-                                                &cl,
-                                                s,
-                                                f,
-                                                &mut reorder_ready,
-                                            );
+                                            deliver_to_tap(&cl, s, f, &mut reorder_ready);
                                         };
                                         dec.on_parity(&data, &mut sink);
                                         release_shared_frame(data);
@@ -1697,8 +1696,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
-            cl.rx_packets
-                .fetch_add(rx_packets_batch, Ordering::Relaxed);
+            cl.rx_packets.fetch_add(rx_packets_batch, Ordering::Relaxed);
             ci.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
         }
 
@@ -1737,8 +1735,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 break;
             }
             if tx_packets_batch != 0 {
-                cl.tx_packets
-                    .fetch_add(tx_packets_batch, Ordering::Relaxed);
+                cl.tx_packets.fetch_add(tx_packets_batch, Ordering::Relaxed);
             }
             cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
             ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
@@ -1804,12 +1801,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
 /// 把数据/恢复帧注入重排缓冲并写 TAP。ready 由连接线程长期复用，
 /// 正常顺序流不会为 `Vec<Arc<_>>` 额外 malloc。
-fn deliver_to_tap(
-    cl: &Arc<Client>,
-    seq: u32,
-    frame: Arc<Vec<u8>>,
-    ready: &mut Vec<Arc<Vec<u8>>>,
-) {
+fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>, ready: &mut Vec<Arc<Vec<u8>>>) {
     ready.clear();
     cl.reorder_buf.lock().insert_into(seq, frame, ready);
     for ordered in ready.drain(..) {
