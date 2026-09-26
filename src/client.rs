@@ -663,7 +663,14 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             builder
         };
         let dev = builder.build_sync().unwrap();
-        Arc::new(dev)
+        #[cfg(target_os = "linux")]
+        {
+            Arc::new(crate::tap::LinuxOffloadTap::new(dev))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Arc::new(dev)
+        }
     };
 
     // MAC：显式指定时上面的 builder 已写入设备，这里沿用同一个值；否则读
@@ -795,10 +802,11 @@ let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
                     }
                 }
                 Ok(_) => {}
-                Err(_) => {
+                Err(e) => {
                     if EXIT.load(Ordering::Relaxed) {
                         return;
                     }
+                    warn!("Linux TAP batch read failed: {}", e);
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }

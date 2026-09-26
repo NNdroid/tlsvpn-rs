@@ -2,6 +2,9 @@ use std::io;
 use tun_rs::SyncDevice;
 
 #[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+#[cfg(target_os = "linux")]
 pub const TAP_IDEAL_BATCH_SIZE: usize = tun_rs::IDEAL_BATCH_SIZE;
 #[cfg(not(target_os = "linux"))]
 pub const TAP_IDEAL_BATCH_SIZE: usize = 1;
@@ -66,6 +69,75 @@ impl TapDevice for SyncDevice {
         sizes: &mut [usize],
     ) -> io::Result<usize> {
         self.recv_multiple(original_buffer, bufs, sizes, 0)
+    }
+}
+
+/// Linux client TAP with virtio-net offload enabled.
+/// IFF_VNET_HDR changes the write contract in both directions: userspace
+/// prepends a virtio_net_hdr even for a normal non-GSO Ethernet frame.
+#[cfg(target_os = "linux")]
+pub struct LinuxOffloadTap {
+    inner: SyncDevice,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxOffloadTap {
+    pub fn new(inner: SyncDevice) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TapDevice for LinuxOffloadTap {
+    fn send(&self, data: &[u8]) -> io::Result<()> {
+        let hdr = [0u8; tun_rs::VIRTIO_NET_HDR_LEN];
+        let iov = [
+            libc::iovec {
+                iov_base: hdr.as_ptr() as *mut libc::c_void,
+                iov_len: hdr.len(),
+            },
+            libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            },
+        ];
+        let written = unsafe {
+            libc::writev(
+                self.inner.as_raw_fd(),
+                iov.as_ptr(),
+                iov.len() as libc::c_int,
+            )
+        };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let expected = hdr.len() + data.len();
+        if written as usize != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("short TAP write: {written}/{expected}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut original = vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535];
+        let mut out = [buf];
+        let mut sizes = [0usize; 1];
+        let count = self
+            .inner
+            .recv_multiple(&mut original, &mut out, &mut sizes, 0)?;
+        Ok(if count == 0 { 0 } else { sizes[0] })
+    }
+
+    fn recv_batch(
+        &self,
+        original_buffer: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> io::Result<usize> {
+        self.inner.recv_multiple(original_buffer, bufs, sizes, 0)
     }
 }
 
