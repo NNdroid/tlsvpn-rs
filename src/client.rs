@@ -1245,6 +1245,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         .registry()
         .reregister(&mut sock, TOKEN_CONN, client_socket_interest(false));
 
+    // rustls defaults its outgoing application-data/TLS-record buffers to 64 KiB.
+    // A 64 KiB plaintext write expands slightly after record headers/tags, so the
+    // default limit can return a short plaintext write / WriteZero. Give one batch
+    // explicit headroom while keeping the buffer bounded per physical connection.
+    tls.set_buffer_limit(Some(128 * 1024));
+
     // 3. 握手请求（对齐 Go）
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
     let session_token = cl.session.lock().session_token.clone();
@@ -1580,10 +1586,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut conn_closed = false;
     let mut close_reason = String::new();
 
-    // Keep one plaintext batch below rustls' bounded outgoing plaintext
-    // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
-    // buffer") before write_tls() gets a chance to drain ciphertext.
-    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    // rustls' connection buffer limit above is 128 KiB, leaving ciphertext
+    // headroom for one 64 KiB plaintext batch while matching the Go/uTLS batching
+    // ceiling. The buffer remains bounded; write_tls() still drains to EAGAIN.
+    const TLS_WRITE_BATCH_BYTES: usize = 64 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
