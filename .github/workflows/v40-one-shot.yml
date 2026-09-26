@@ -1,0 +1,477 @@
+name: v40 one-shot owned reorder
+
+on:
+  push:
+    branches:
+      - perf/owned-reorder-v40
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch owned/shared reorder path
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # FramePayload: allow late conversion to Arc only when a downstream
+          # component actually needs shared ownership.
+          p = Path('src/frame.rs')
+          s = p.read_text()
+          anchor = '''    #[inline]
+              pub fn release(self) {
+                  match self {
+                      Self::Owned(buf) => release_frame_vec(buf),
+                      Self::Shared(buf) => release_shared_frame(buf),
+                  }
+              }
+          '''
+          repl = '''    #[inline]
+              pub fn release(self) {
+                  match self {
+                      Self::Owned(buf) => release_frame_vec(buf),
+                      Self::Shared(buf) => release_shared_frame(buf),
+                  }
+              }
+
+              #[inline]
+              pub fn into_shared(self) -> std::sync::Arc<Vec<u8>> {
+                  match self {
+                      Self::Owned(buf) => std::sync::Arc::new(buf),
+                      Self::Shared(buf) => buf,
+                  }
+              }
+          '''
+          if anchor not in s:
+              raise SystemExit('FramePayload release anchor not found')
+          p.write_text(s.replace(anchor, repl, 1))
+
+          # ReorderBuffer: store FramePayload rather than forcing Arc at ingress.
+          p = Path('src/buffer.rs')
+          s = p.read_text()
+          if 'use crate::frame::FramePayload;' not in s:
+              s = s.replace('use crate::utils::FastRand;\n', 'use crate::utils::FastRand;\nuse crate::frame::FramePayload;\n', 1)
+          s = s.replace('ring: Vec<Option<Arc<Vec<u8>>>>,', 'ring: Vec<Option<FramePayload>>,', 1)
+
+          old_sig = '''    pub fn insert_into(
+                  &mut self,
+                  seq: u32,
+                  data: Arc<Vec<u8>>,
+                  ready: &mut Vec<Arc<Vec<u8>>>,
+              ) {
+          '''
+          new_sig = '''    pub fn insert_payload_into(
+                  &mut self,
+                  seq: u32,
+                  data: FramePayload,
+                  ready: &mut Vec<FramePayload>,
+              ) {
+          '''
+          if old_sig not in s:
+              raise SystemExit('insert_into signature not found')
+          s = s.replace(old_sig, new_sig, 1)
+
+          # Release pooled Owned buffers on reject paths instead of dropping them.
+          s = s.replace('''        if seq == 0 {
+                      return;
+                  }
+          ''', '''        if seq == 0 {
+                      data.release();
+                      return;
+                  }
+          ''', 1)
+          s = s.replace('''        if diff < 0 {
+                      return;
+                  }
+          ''', '''        if diff < 0 {
+                      data.release();
+                      return;
+                  }
+          ''', 1)
+          s = s.replace('''            if distance >= REORDER_MAX_WINDOW || !self.grow_window(distance + 1) {
+                          return;
+                      }
+          ''', '''            if distance >= REORDER_MAX_WINDOW || !self.grow_window(distance + 1) {
+                          data.release();
+                          return;
+                      }
+          ''', 1)
+          s = s.replace('''        if self.ring[idx].is_some() {
+                      if self.seq_slots[idx] == seq {
+                          return;
+                      }
+                      return;
+                  }
+          ''', '''        if self.ring[idx].is_some() {
+                      data.release();
+                      return;
+                  }
+          ''', 1)
+
+          # Compatibility Arc API for tests/non-hot callers.
+          insert_anchor = '''    /// 兼容包装：测试和非热路径可继续按返回 Vec 的方式使用。
+              pub fn insert(&mut self, seq: u32, data: Arc<Vec<u8>>) -> Vec<Arc<Vec<u8>>> {
+                  let mut ready = Vec::new();
+                  self.insert_into(seq, data, &mut ready);
+                  ready
+              }
+          '''
+          insert_repl = '''    /// Arc compatibility wrapper. Hot client/server paths use
+              /// insert_payload_into() and keep Owned payloads through reorder.
+              pub fn insert_into(
+                  &mut self,
+                  seq: u32,
+                  data: Arc<Vec<u8>>,
+                  ready: &mut Vec<Arc<Vec<u8>>>,
+              ) {
+                  let mut payload_ready = Vec::new();
+                  self.insert_payload_into(seq, FramePayload::Shared(data), &mut payload_ready);
+                  ready.extend(payload_ready.into_iter().map(FramePayload::into_shared));
+              }
+
+              /// 兼容包装：测试和非热路径可继续按返回 Vec 的方式使用。
+              pub fn insert(&mut self, seq: u32, data: Arc<Vec<u8>>) -> Vec<Arc<Vec<u8>>> {
+                  let mut ready = Vec::new();
+                  self.insert_into(seq, data, &mut ready);
+                  ready
+              }
+          '''
+          if insert_anchor not in s:
+              raise SystemExit('insert compatibility anchor not found')
+          s = s.replace(insert_anchor, insert_repl, 1)
+
+          old_flush = 'fn flush_locked_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {'
+          if old_flush not in s:
+              raise SystemExit('flush_locked_into signature not found')
+          s = s.replace(old_flush, 'fn flush_locked_into(&mut self, ready: &mut Vec<FramePayload>) {', 1)
+          s = s.replace('''            if !frame.is_empty() {
+                          ready.push(frame);
+                      }
+          ''', '''            if !frame.is_empty() {
+                          ready.push(frame);
+                      } else {
+                          frame.release();
+                      }
+          ''', 1)
+
+          # reset() must recycle Owned pooled vectors.
+          s = s.replace('''        for slot in self.ring.iter_mut() {
+                      *slot = None;
+                  }
+          ''', '''        for slot in self.ring.iter_mut() {
+                      if let Some(frame) = slot.take() {
+                          frame.release();
+                      }
+                  }
+          ''', 1)
+
+          old_timeout_sig = 'pub fn flush_timeout_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {'
+          if old_timeout_sig not in s:
+              raise SystemExit('flush_timeout_into signature not found')
+          s = s.replace(old_timeout_sig, 'pub fn flush_payload_timeout_into(&mut self, ready: &mut Vec<FramePayload>) {', 1)
+
+          timeout_anchor = '''    /// 兼容包装；热路径优先使用 `flush_timeout_into`。
+              pub fn flush_timeout(&mut self) -> Vec<Arc<Vec<u8>>> {
+                  let mut ready = Vec::new();
+                  self.flush_timeout_into(&mut ready);
+                  ready
+              }
+          '''
+          timeout_repl = '''    /// Arc compatibility wrapper for tests/non-hot callers.
+              pub fn flush_timeout_into(&mut self, ready: &mut Vec<Arc<Vec<u8>>>) {
+                  let mut payload_ready = Vec::new();
+                  self.flush_payload_timeout_into(&mut payload_ready);
+                  ready.extend(payload_ready.into_iter().map(FramePayload::into_shared));
+              }
+
+              /// 兼容包装；热路径优先使用 `flush_payload_timeout_into`。
+              pub fn flush_timeout(&mut self) -> Vec<Arc<Vec<u8>>> {
+                  let mut ready = Vec::new();
+                  self.flush_timeout_into(&mut ready);
+                  ready
+              }
+          '''
+          if timeout_anchor not in s:
+              raise SystemExit('flush timeout compatibility anchor not found')
+          s = s.replace(timeout_anchor, timeout_repl, 1)
+          p.write_text(s)
+
+          # FEC decoder only reads normal data; accept &[u8] so callers do not need
+          # an Arc merely to update XOR state. Recovered frames stay Arc outputs.
+          p = Path('src/fec.rs')
+          s = p.read_text()
+          old = 'pub fn on_data(&self, seq: u32, frame: &Arc<Vec<u8>>, out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {'
+          new = 'pub fn on_data(&self, seq: u32, frame: &[u8], out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {'
+          if old not in s:
+              raise SystemExit('FecDecoder::on_data signature not found')
+          p.write_text(s.replace(old, new, 1))
+
+          # Client hot path: keep normal decrypted frames Owned through reorder/TAP.
+          p = Path('src/client.rs')
+          s = p.read_text()
+          s = s.replace('let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);',
+                        'let mut reorder_ready: Vec<FramePayload> = Vec::with_capacity(64);', 1)
+          s = s.replace('.flush_timeout_into(&mut reorder_ready);', '.flush_payload_timeout_into(&mut reorder_ready);', 1)
+          s = s.replace('''        for ordered in reorder_ready.drain(..) {
+                      let _ = cl.tap.send(&ordered);
+                      release_shared_frame(ordered);
+                  }
+          ''', '''        for ordered in reorder_ready.drain(..) {
+                      let _ = cl.tap.send(ordered.as_slice());
+                      ordered.release();
+                  }
+          ''', 1)
+
+          start = s.find('                            let data = Arc::new(data);\n')
+          end_marker = '                        Ok(None) => break,\n'
+          end = s.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('client receive ownership block not found')
+          old_block = s[start:end]
+          new_block = '''                            if seq == 0 {
+                                  if let Some(dec) = &fec_dec {
+                                      if fec::is_parity_frame(&data) {
+                                          let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                              deliver_to_tap(
+                                                  &cl,
+                                                  s,
+                                                  FramePayload::Shared(f),
+                                                  &mut reorder_ready,
+                                              );
+                                          };
+                                          dec.on_parity(&data, &mut sink);
+                                          release_frame_vec(data);
+                                          continue;
+                                      }
+                                  }
+                              }
+
+                              if let Some(dec) = &fec_dec {
+                                  let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                      deliver_to_tap(
+                                          &cl,
+                                          s,
+                                          FramePayload::Shared(f),
+                                          &mut reorder_ready,
+                                      );
+                                  };
+                                  dec.on_data(seq, &data, &mut sink);
+                              }
+
+                              if !cl.dedup.lock().is_duplicate(seq) {
+                                  deliver_to_tap(
+                                      &cl,
+                                      seq,
+                                      FramePayload::Owned(data),
+                                      &mut reorder_ready,
+                                  );
+                              } else {
+                                  release_frame_vec(data);
+                              }
+          '''
+          s = s[:start] + new_block + s[end:]
+
+          old_deliver = '''fn deliver_to_tap(
+              cl: &Arc<Client>,
+              seq: u32,
+              frame: Arc<Vec<u8>>,
+              ready: &mut Vec<Arc<Vec<u8>>>,
+          ) {
+              ready.clear();
+              cl.reorder_buf.lock().insert_into(seq, frame, ready);
+              for ordered in ready.drain(..) {
+                  let _ = cl.tap.send(&ordered);
+                  release_shared_frame(ordered);
+              }
+          }
+          '''
+          new_deliver = '''fn deliver_to_tap(
+              cl: &Arc<Client>,
+              seq: u32,
+              frame: FramePayload,
+              ready: &mut Vec<FramePayload>,
+          ) {
+              ready.clear();
+              cl.reorder_buf.lock().insert_payload_into(seq, frame, ready);
+              for ordered in ready.drain(..) {
+                  let _ = cl.tap.send(ordered.as_slice());
+                  ordered.release();
+              }
+          }
+          '''
+          if old_deliver not in s:
+              raise SystemExit('client deliver_to_tap anchor not found')
+          p.write_text(s.replace(old_deliver, new_deliver, 1))
+
+          # Server uses the same payload-native reorder so ReorderBuffer itself does
+          # not need an allocating Arc compatibility wrapper on the hot path. Convert
+          # to Arc only at the VSwitch boundary where shared ownership is real.
+          p = Path('src/server.rs')
+          s = p.read_text()
+          s = s.replace('let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);',
+                        'let mut reorder_ready: Vec<FramePayload> = Vec::with_capacity(64);', 1)
+          s = s.replace('.flush_timeout_into(&mut reorder_ready);', '.flush_payload_timeout_into(&mut reorder_ready);', 1)
+          # timeout output to VSwitch: insert late Arc conversion.
+          timeout_loop = '''            for ordered in reorder_ready.drain(..) {
+                      if session.mac_bin != [0u8; 6] {
+                          core.vswitch.process_session_frame(
+                              &session.stat.client_id,
+                              session.mac_bin,
+                              ordered,
+                          );
+                      } else {
+                          core.vswitch.process_frame(&session.stat.client_id, ordered);
+                      }
+                  }
+          '''
+          timeout_new = '''            for ordered in reorder_ready.drain(..) {
+                      let ordered = ordered.into_shared();
+                      if session.mac_bin != [0u8; 6] {
+                          core.vswitch.process_session_frame(
+                              &session.stat.client_id,
+                              session.mac_bin,
+                              ordered,
+                          );
+                      } else {
+                          core.vswitch.process_frame(&session.stat.client_id, ordered);
+                      }
+                  }
+          '''
+          if timeout_loop not in s:
+              raise SystemExit('server timeout reorder output anchor not found')
+          s = s.replace(timeout_loop, timeout_new, 1)
+          s = s.replace('reorder_ready: &mut Vec<Arc<Vec<u8>>>,',
+                        'reorder_ready: &mut Vec<FramePayload>,', 1)
+
+          start = s.find('                    let data = Arc::new(data);\n')
+          end_marker = '                }\n            }\n            Ok(None) => break,\n'
+          end = s.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('server receive ownership block not found')
+          old_block = s[start:end]
+          new_block = '''                    if seq == 0 {
+                          if let Some(dec) = &fec_dec {
+                              if fec::is_parity_frame(&data) {
+                                  let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                      deliver_to_vswitch(
+                                          &c_sess,
+                                          core,
+                                          s,
+                                          FramePayload::Shared(f),
+                                          reorder_ready,
+                                      );
+                                  };
+                                  dec.on_parity(&data, &mut sink);
+                                  release_frame_vec(data);
+                                  continue;
+                              }
+                          }
+                      }
+
+                      if let Some(dec) = &fec_dec {
+                          let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                              deliver_to_vswitch(
+                                  &c_sess,
+                                  core,
+                                  s,
+                                  FramePayload::Shared(f),
+                                  reorder_ready,
+                              );
+                          };
+                          dec.on_data(seq, &data, &mut sink);
+                      }
+
+                      if !c_sess.dedup.lock().is_duplicate(seq) {
+                          deliver_to_vswitch(
+                              &c_sess,
+                              core,
+                              seq,
+                              FramePayload::Owned(data),
+                              reorder_ready,
+                          );
+                      } else {
+                          release_frame_vec(data);
+                      }
+          '''
+          s = s[:start] + new_block + s[end:]
+
+          old_deliver = '''fn deliver_to_vswitch(
+              c_sess: &Arc<ClientSession>,
+              core: &Arc<ServerCore>,
+              seq: u32,
+              frame: Arc<Vec<u8>>,
+              ready: &mut Vec<Arc<Vec<u8>>>,
+          ) {
+              ready.clear();
+              c_sess
+                  .reorder_buf
+                  .lock()
+                  .insert_into(seq, frame, ready);
+              for ordered in ready.drain(..) {
+                  if c_sess.mac_bin != [0u8; 6] {
+                      core.vswitch.process_session_frame(
+                          &c_sess.stat.client_id,
+                          c_sess.mac_bin,
+                          ordered,
+                      );
+                  } else {
+                      core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
+                  }
+              }
+          }
+          '''
+          new_deliver = '''fn deliver_to_vswitch(
+              c_sess: &Arc<ClientSession>,
+              core: &Arc<ServerCore>,
+              seq: u32,
+              frame: FramePayload,
+              ready: &mut Vec<FramePayload>,
+          ) {
+              ready.clear();
+              c_sess
+                  .reorder_buf
+                  .lock()
+                  .insert_payload_into(seq, frame, ready);
+              for ordered in ready.drain(..) {
+                  let ordered = ordered.into_shared();
+                  if c_sess.mac_bin != [0u8; 6] {
+                      core.vswitch.process_session_frame(
+                          &c_sess.stat.client_id,
+                          c_sess.mac_bin,
+                          ordered,
+                      );
+                  } else {
+                      core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
+                  }
+              }
+          }
+          '''
+          if old_deliver not in s:
+              raise SystemExit('server deliver_to_vswitch anchor not found')
+          p.write_text(s.replace(old_deliver, new_deliver, 1))
+          PY
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Run all tests
+        run: cargo test --all-targets
+
+      - name: Commit experiment and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/v40-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/frame.rs src/buffer.rs src/fec.rs src/client.rs src/server.rs .github/workflows/v40-one-shot.yml
+          git commit -m 'perf: keep received frames owned through reorder'
+          git push origin HEAD:perf/owned-reorder-v40
