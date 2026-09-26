@@ -23,69 +23,29 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          replacements = {
-              'src/client.rs': (
-                  '''                            if !cl.dedup.lock().is_duplicate(seq) {
-                                  deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-                              } else {
-                                  release_shared_frame(data);
-                              }
-''',
-                  '''                            // ReorderBuffer already drops both already-delivered old
-                              // sequence numbers and duplicate in-window slots. FEC processing
-                              // happens before this point, so the separate DeDuplicator mutex
-                              // does not protect the decoder either. Let reorder be the single
-                              // delivery-dedup authority on the receive hot path.
-                              deliver_to_tap(&cl, seq, data, &mut reorder_ready);
-'''
-              ),
-              'src/server.rs': (
-                  '''                    if !c_sess.dedup.lock().is_duplicate(seq) {
-                          deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
-                      } else {
-                          release_shared_frame(data);
-                      }
-''',
-                  '''                    // ReorderBuffer is the final delivery boundary and already
-                      // rejects both old/replayed seq values and duplicate occupied slots.
-                      // Avoid a second per-frame mutex + fixed-window lookup here.
-                      deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
-'''
-              ),
-          }
+          client = Path('src/client.rs')
+          s = client.read_text()
+          old = "                            if !cl.dedup.lock().is_duplicate(seq) {\n                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);\n                            } else {\n                                release_shared_frame(data);\n                            }\n"
+          new = "                            // ReorderBuffer already drops old/replayed seq values and\n                            // duplicate occupied slots. FEC processing happens before this\n                            // point, so the separate DeDuplicator mutex does not protect\n                            // the decoder either. Keep one delivery-dedup authority.\n                            deliver_to_tap(&cl, seq, data, &mut reorder_ready);\n"
+          if old not in s:
+              raise SystemExit('src/client.rs: hot-path dedup anchor not found')
+          client.write_text(s.replace(old, new, 1))
 
-          for name, (old, new) in replacements.items():
-              p = Path(name)
-              s = p.read_text()
-              if old not in s:
-                  raise SystemExit(f'{name}: hot-path dedup anchor not found')
-              p.write_text(s.replace(old, new, 1))
+          server = Path('src/server.rs')
+          s = server.read_text()
+          old = "                    if !c_sess.dedup.lock().is_duplicate(seq) {\n                        deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);\n                    } else {\n                        release_shared_frame(data);\n                    }\n"
+          new = "                    // ReorderBuffer is the final delivery boundary and already\n                    // rejects both old/replayed seq values and duplicate occupied slots.\n                    // Avoid a second per-frame mutex + fixed-window lookup here.\n                    deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);\n"
+          if old not in s:
+              raise SystemExit('src/server.rs: hot-path dedup anchor not found')
+          server.write_text(s.replace(old, new, 1))
 
-          p = Path('src/buffer.rs')
-          s = p.read_text()
-          anchor = '''    #[test]
-      fn idle_time_does_not_pre_age_a_future_gap() {
-'''
-          test = '''    #[test]
-      fn buffered_duplicate_is_delivered_only_once_after_gap_fill() {
-          let mut rb = ReorderBuffer::new();
-          assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);
-
-          assert!(rb.insert(3, Arc::new(vec![0x33])).is_empty());
-          assert!(rb.insert(3, Arc::new(vec![0x99])).is_empty());
-
-          let ready = rb.insert(2, Arc::new(vec![0x22]));
-          assert_eq!(ready.len(), 2);
-          assert_eq!(ready[0].as_slice(), &[0x22]);
-          assert_eq!(ready[1].as_slice(), &[0x33]);
-      }
-
-      #[test]
-      fn idle_time_does_not_pre_age_a_future_gap() {
-'''
+          buf = Path('src/buffer.rs')
+          s = buf.read_text()
+          anchor = "    #[test]\n    fn idle_time_does_not_pre_age_a_future_gap() {\n"
+          test = "    #[test]\n    fn buffered_duplicate_is_delivered_only_once_after_gap_fill() {\n        let mut rb = ReorderBuffer::new();\n        assert_eq!(rb.insert(1, Arc::new(vec![1])).len(), 1);\n\n        assert!(rb.insert(3, Arc::new(vec![0x33])).is_empty());\n        assert!(rb.insert(3, Arc::new(vec![0x99])).is_empty());\n\n        let ready = rb.insert(2, Arc::new(vec![0x22]));\n        assert_eq!(ready.len(), 2);\n        assert_eq!(ready[0].as_slice(), &[0x22]);\n        assert_eq!(ready[1].as_slice(), &[0x33]);\n    }\n\n    #[test]\n    fn idle_time_does_not_pre_age_a_future_gap() {\n"
           if anchor not in s:
               raise SystemExit('src/buffer.rs: test insertion anchor not found')
-          p.write_text(s.replace(anchor, test, 1))
+          buf.write_text(s.replace(anchor, test, 1))
           PY
 
       - name: Check Linux build
