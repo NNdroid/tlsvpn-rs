@@ -59,74 +59,68 @@ jobs:
               raise SystemExit('loop state anchor not found')
           s = s.replace(old, new, 1)
 
-          old = '''            Err(e)
-                          if e.kind() == std::io::ErrorKind::WouldBlock
-                              || e.kind() == std::io::ErrorKind::TimedOut =>
-                      {
-                          break
-                      }
-                      Err(e) => {
-                          close_reason = format!("tls.write_tls failed: {e}");
-                          conn_closed = true;
-                          break;
-                      }
-                  }
-              }
+          marker = '        // 冲刷写队列（非阻塞；WouldBlock 等下次 poll 后重试）\n'
+          if marker not in s:
+              raise SystemExit('write loop marker not found')
+          prefix, tail = s.split(marker, 1)
 
-              if last_write_progress.elapsed() > Duration::from_secs(10) {
-          '''
-          new = '''            Err(e)
-                          if e.kind() == std::io::ErrorKind::WouldBlock
-                              || e.kind() == std::io::ErrorKind::TimedOut =>
-                      {
-                          // The data loop normally listens only for READABLE. Once
-                          // the socket actually backpressures, subscribe to WRITABLE
-                          // so kernel send-buffer recovery wakes us immediately rather
-                          // than waiting for the RTT/reorder timer.
-                          if !write_blocked {
-                              if let Err(reg_err) = poll.registry().reregister(
-                                  &mut sock,
-                                  TOKEN_CONN,
-                                  client_socket_interest(true),
-                              ) {
-                                  close_reason = format!(
-                                      "mio reregister writable after TLS backpressure failed: {reg_err}"
-                                  );
-                                  conn_closed = true;
-                              } else {
-                                  write_blocked = true;
-                              }
+          old = '''                Err(e)
+                              if e.kind() == std::io::ErrorKind::WouldBlock
+                                  || e.kind() == std::io::ErrorKind::TimedOut =>
+                          {
+                              break
                           }
-                          break
-                      }
-                      Err(e) => {
-                          close_reason = format!("tls.write_tls failed: {e}");
-                          conn_closed = true;
-                          break;
-                      }
-                  }
-              }
-
-              if write_blocked && !tls.wants_write() && !conn_closed {
-                  if let Err(reg_err) = poll.registry().reregister(
-                      &mut sock,
-                      TOKEN_CONN,
-                      client_socket_interest(false),
-                  ) {
-                      close_reason = format!(
-                          "mio restore read-only interest after TLS drain failed: {reg_err}"
-                      );
-                      conn_closed = true;
-                  } else {
-                      write_blocked = false;
-                  }
-              }
-
-              if last_write_progress.elapsed() > Duration::from_secs(10) {
           '''
-          if old not in s:
-              raise SystemExit('write_tls backpressure anchor not found')
-          s = s.replace(old, new, 1)
+          new = '''                Err(e)
+                              if e.kind() == std::io::ErrorKind::WouldBlock
+                                  || e.kind() == std::io::ErrorKind::TimedOut =>
+                          {
+                              // Normally the data loop listens only for READABLE. Once
+                              // the kernel socket backpressures, subscribe to WRITABLE so
+                              // send-buffer recovery wakes us immediately instead of
+                              // waiting for the RTT/reorder timer.
+                              if !write_blocked {
+                                  if let Err(reg_err) = poll.registry().reregister(
+                                      &mut sock,
+                                      TOKEN_CONN,
+                                      client_socket_interest(true),
+                                  ) {
+                                      close_reason = format!(
+                                          "mio reregister writable after TLS backpressure failed: {reg_err}"
+                                      );
+                                      conn_closed = true;
+                                  } else {
+                                      write_blocked = true;
+                                  }
+                              }
+                              break
+                          }
+          '''
+          if old not in tail:
+              raise SystemExit('write_tls backpressure block not found')
+          tail = tail.replace(old, new, 1)
+
+          stall_anchor = '        if last_write_progress.elapsed() > Duration::from_secs(10) {\n'
+          restore = '''        if write_blocked && !tls.wants_write() && !conn_closed {
+              if let Err(reg_err) = poll.registry().reregister(
+                  &mut sock,
+                  TOKEN_CONN,
+                  client_socket_interest(false),
+              ) {
+                  close_reason = format!(
+                      "mio restore read-only interest after TLS drain failed: {reg_err}"
+                  );
+                  conn_closed = true;
+              } else {
+                  write_blocked = false;
+              }
+          }
+
+          '''
+          if stall_anchor not in tail:
+              raise SystemExit('write stall anchor not found')
+          tail = tail.replace(stall_anchor, restore + stall_anchor, 1)
+          s = prefix + marker + tail
 
           old = '''#[inline]
           fn clamp_poll_for_tx_backlog(
