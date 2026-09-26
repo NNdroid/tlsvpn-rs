@@ -1,5 +1,5 @@
 use crate::Args;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use mio::Interest;
 use parking_lot::Mutex;
@@ -225,6 +225,76 @@ pub struct SessionState {
 
 // ======================= 客户端 =======================
 
+// Match the Go receive architecture: reorder extraction must not block the TLS
+// socket reader on a TAP write syscall. Batches are bounded and their Vec
+// descriptors are recycled so the handoff itself does not allocate per frame.
+const TAP_DELIVERY_QUEUE: usize = 256;
+const TAP_DELIVERY_BATCH_CAP: usize = 64;
+type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
+
+struct TapDelivery {
+    tx: Sender<TapDeliveryBatch>,
+    pool_tx: Sender<TapDeliveryBatch>,
+    pool_rx: Receiver<TapDeliveryBatch>,
+    dropped: AtomicU64,
+}
+
+impl TapDelivery {
+    fn new(tap: Arc<dyn TapDevice>) -> Self {
+        let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let worker_pool = pool_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(mut batch) = rx.recv() {
+                for frame in batch.drain(..) {
+                    let _ = tap.send(&frame);
+                    release_shared_frame(frame);
+                }
+                let _ = worker_pool.try_send(batch);
+            }
+        });
+        Self {
+            tx,
+            pool_tx,
+            pool_rx,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn acquire(&self) -> TapDeliveryBatch {
+        self.pool_rx
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP))
+    }
+
+    #[inline]
+    fn recycle(&self, mut batch: TapDeliveryBatch) {
+        batch.clear();
+        let _ = self.pool_tx.try_send(batch);
+    }
+
+    #[inline]
+    fn enqueue(&self, batch: TapDeliveryBatch) {
+        if batch.is_empty() {
+            self.recycle(batch);
+            return;
+        }
+        match self.tx.try_send(batch) {
+            Ok(()) => {}
+            Err(TrySendError::Full(mut batch))
+            | Err(TrySendError::Disconnected(mut batch)) => {
+                self.dropped
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for frame in batch.drain(..) {
+                    release_shared_frame(frame);
+                }
+                self.recycle(batch);
+            }
+        }
+    }
+}
+
 pub struct Client {
     pub client_id: String,
     pub psk: String,
@@ -257,6 +327,7 @@ pub struct Client {
     pub mac: String,
     pub tx_port: Arc<AsyncPort>,
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
+    tap_delivery: TapDelivery,
     pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,
     pub dedup: Arc<Mutex<DeDuplicator>>,
     pub session: Mutex<SessionState>,
@@ -774,6 +845,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     }
 
     let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));
+    let tap_delivery = TapDelivery::new(device.clone());
     // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline
     // 会合并 session reorder deadline，仅在真实 gap 存在时提前唤醒。
 
@@ -839,6 +911,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         mac: actual_mac.clone(),
         tx_port: tx_port.clone(),
         reorder_buf: reorder_buf.clone(),
+        tap_delivery,
         fec_dec: Mutex::new(None),
         dedup: Arc::new(Mutex::new(DeDuplicator::new())),
         session: Mutex::new(session),
@@ -1513,8 +1586,6 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
-    let mut reorder_ready: Vec<Arc<Vec<u8>>> = Vec::with_capacity(64);
-
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
         if cl.tx_port.is_sequence_exhausted() {
             close_reason = "sequence space exhausted".into();
@@ -1541,7 +1612,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if !proxied {
             poll_timeout = poll_timeout.min(next_rtt_refresh.saturating_duration_since(now));
         }
-        if let Some(wait) = cl.reorder_buf.lock().next_timeout() {
+        let reorder_wait = cl.reorder_buf.lock().next_timeout();
+        if let Some(wait) = reorder_wait {
             poll_timeout = poll_timeout.min(wait);
         }
         // BackendNotify coalesces producer wakeups. One wake can therefore
@@ -1580,16 +1652,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             next_rtt_refresh = Instant::now() + Duration::from_millis(200);
         }
 
-        // gap timeout 只在 deadline 到期时产生输出；scratch Vec 在整个连接期复用。
-        reorder_ready.clear();
-        {
-            cl.reorder_buf
-                .lock()
-                .flush_timeout_into(&mut reorder_ready);
-        }
-        for ordered in reorder_ready.drain(..) {
-            let _ = cl.tap.send(&ordered);
-            release_shared_frame(ordered);
+        // A gap timeout can release a burst. Queue it while still holding the
+        // reorder lock so multiple physical connections cannot enqueue ready batches
+        // out of sequence; the TAP syscall itself runs on the delivery worker.
+        if reorder_wait.is_some() {
+            flush_reorder_to_tap(&cl);
         }
 
         // ---- 下行读取：mio 是边沿触发，必须真正 drain socket 到 WouldBlock。----
@@ -1672,12 +1739,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 if let Some(dec) = &fec_dec {
                                     if fec::is_parity_frame(&data) {
                                         let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                            deliver_to_tap(
-                                                &cl,
-                                                s,
-                                                f,
-                                                &mut reorder_ready,
-                                            );
+                                            deliver_to_tap(&cl, s, f);
                                         };
                                         dec.on_parity(&data, &mut sink);
                                         release_shared_frame(data);
@@ -1688,13 +1750,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
                             if let Some(dec) = &fec_dec {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_tap(&cl, s, f, &mut reorder_ready);
+                                    deliver_to_tap(&cl, s, f);
                                 };
                                 dec.on_data(seq, &data, &mut sink);
                             }
 
                             if !cl.dedup.lock().is_duplicate(seq) {
-                                deliver_to_tap(&cl, seq, data, &mut reorder_ready);
+                                deliver_to_tap(&cl, seq, data);
                             } else {
                                 release_shared_frame(data);
                             }
@@ -1850,19 +1912,30 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     linked_at.elapsed()
 }
 
-/// 把数据/恢复帧注入重排缓冲并写 TAP。ready 由连接线程长期复用，
-/// 正常顺序流不会为 `Vec<Arc<_>>` 额外 malloc。
-fn deliver_to_tap(
-    cl: &Arc<Client>,
-    seq: u32,
-    frame: Arc<Vec<u8>>,
-    ready: &mut Vec<Arc<Vec<u8>>>,
-) {
-    ready.clear();
-    cl.reorder_buf.lock().insert_into(seq, frame, ready);
-    for ordered in ready.drain(..) {
-        let _ = cl.tap.send(&ordered);
-        release_shared_frame(ordered);
+/// Inject one data/recovered frame into reorder and hand any newly contiguous
+/// output to the dedicated TAP writer. Enqueue happens under the reorder lock:
+/// this is nonblocking and preserves strict order across physical connections.
+fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>) {
+    let mut ready = cl.tap_delivery.acquire();
+    let mut reorder = cl.reorder_buf.lock();
+    reorder.insert_into(seq, frame, &mut ready);
+    if ready.is_empty() {
+        drop(reorder);
+        cl.tap_delivery.recycle(ready);
+    } else {
+        cl.tap_delivery.enqueue(ready);
+    }
+}
+
+fn flush_reorder_to_tap(cl: &Arc<Client>) {
+    let mut ready = cl.tap_delivery.acquire();
+    let mut reorder = cl.reorder_buf.lock();
+    reorder.flush_timeout_into(&mut ready);
+    if ready.is_empty() {
+        drop(reorder);
+        cl.tap_delivery.recycle(ready);
+    } else {
+        cl.tap_delivery.enqueue(ready);
     }
 }
 
