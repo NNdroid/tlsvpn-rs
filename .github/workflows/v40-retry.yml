@@ -1,0 +1,60 @@
+name: v40 retry owned reorder
+
+on:
+  push:
+    branches:
+      - perf/owned-reorder-v40
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patched one-shot script
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          wf = Path('.github/workflows/v40-one-shot.yml').read_text()
+          marker = "python3 - <<'PY'\n"
+          start = wf.index(marker) + len(marker)
+          end = wf.index("\n          PY\n", start)
+          code = textwrap.dedent(wf[start:end])
+
+          old_start = code.index('# timeout output to VSwitch: insert late Arc conversion.')
+          old_end = code.index("s = s.replace('reorder_ready: &mut Vec<Arc<Vec<u8>>>,',", old_start)
+          replacement = '''# timeout output to VSwitch: insert late Arc conversion.
+          scope = s.index('for session in reorder_sessions')
+          needle = 'for ordered in reorder_ready.drain(..) {'
+          loop_at = s.index(needle, scope)
+          insert_at = loop_at + len(needle)
+          s = s[:insert_at] + '\\n            let ordered = ordered.into_shared();' + s[insert_at:]
+          '''
+          code = code[:old_start] + textwrap.dedent(replacement) + code[old_end:]
+          exec(compile(code, 'v40-one-shot-patched', 'exec'))
+          PY
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Run all tests
+        run: cargo test --all-targets
+
+      - name: Commit experiment and remove one-shot workflows
+        shell: bash
+        run: |
+          rm -f .github/workflows/v40-one-shot.yml .github/workflows/v40-retry.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/frame.rs src/buffer.rs src/fec.rs src/client.rs src/server.rs .github/workflows/v40-one-shot.yml .github/workflows/v40-retry.yml
+          git commit -m 'perf: keep received frames owned through reorder'
+          git push origin HEAD:perf/owned-reorder-v40
