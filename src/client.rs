@@ -740,8 +740,11 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         }
     }
 
-    // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
+    // TAP 读线程 → 4096 帧有界输入队列 → AsyncPort burst dispatcher。
+    // Go 端也是先把单帧送入输入队列，再由一个 dispatcher 聚合到最多 64 KiB；
+    // 低流量下 dispatcher 收到首帧后立即发送，不引入定时等待。
     let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+    let (tap_tx, tap_rx) = bounded::<Vec<u8>>(4096);
     {
         let dev = device.clone();
         let port = tx_port.clone();
@@ -756,9 +759,14 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                 match dev.recv(&mut frame) {
                     Ok(n) if n > 0 => {
                         frame.truncate(n);
-                        // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
-                        // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
-                        port.write_owned_frame(frame);
+                        // 入口背压发生在 seq 分配前，队列满时归还 pooled Vec。
+                        match tap_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(frame))
+                            | Err(crossbeam_channel::TrySendError::Disconnected(frame)) => {
+                                port.drop_owned_frame(frame);
+                            }
+                        }
                     }
                     Ok(_) => release_frame_vec(frame),
                     Err(_) => {
@@ -769,6 +777,35 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 }
+            }
+        });
+    }
+    {
+        let port = tx_port.clone();
+        std::thread::spawn(move || {
+            const MAX_BATCH_BYTES: usize = 64 * 1024;
+            const MAX_BATCH_FRAMES: usize = 128;
+            let mut batch = Vec::<Vec<u8>>::with_capacity(MAX_BATCH_FRAMES);
+
+            loop {
+                let first = match tap_rx.recv() {
+                    Ok(frame) => frame,
+                    Err(_) => return,
+                };
+                let mut batch_bytes = first.len();
+                batch.push(first);
+
+                while batch.len() < MAX_BATCH_FRAMES && batch_bytes < MAX_BATCH_BYTES {
+                    match tap_rx.try_recv() {
+                        Ok(frame) => {
+                            batch_bytes = batch_bytes.saturating_add(frame.len());
+                            batch.push(frame);
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                port.write_owned_batch(&mut batch);
             }
         });
     }

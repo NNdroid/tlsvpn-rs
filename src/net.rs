@@ -1268,6 +1268,83 @@ impl AsyncPort {
         self.write_payload(FramePayload::Owned(frame));
     }
 
+    /// Client TAP bulk path: process one already-owned burst under one backend
+    /// snapshot/path decision and one FEC encoder lock. The backend channel is
+    /// intentionally still per-frame in this first experiment, so the A/B only
+    /// measures dispatch-side batching and keeps connection/TLS consumers intact.
+    pub fn write_owned_batch(&self, frames: &mut Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let backends = self.backends.read();
+        if backends.is_empty()
+            || !backends
+                .iter()
+                .any(|b| Self::backend_score(b).is_some())
+        {
+            let mut dropped = 0u64;
+            for frame in frames.drain(..) {
+                if !frame.is_empty() {
+                    dropped += 1;
+                }
+                release_frame_vec(frame);
+            }
+            self.drop_n(dropped);
+            return;
+        }
+
+        // Go chooses the data path once per input batch. Doing the same here
+        // avoids per-packet RwLock/RTT scoring while retaining per-frame fallback
+        // if the chosen physical queue fills during the burst.
+        let selected_idx = self.selected_data_backend_index(&backends);
+        let mut encoder = self.encoder.lock();
+
+        for frame in frames.drain(..) {
+            let frame = FramePayload::Owned(frame);
+            if frame.is_empty() {
+                frame.release();
+                continue;
+            }
+
+            let Some(seq) = self.next_seq() else {
+                self.drop_n(1);
+                frame.release();
+                continue;
+            };
+
+            let parity = encoder
+                .as_mut()
+                .and_then(|enc| enc.add(seq, frame.as_slice()));
+            let data_idx =
+                self.send_data_payload_to_any(&backends, selected_idx, seq, frame);
+
+            if let Some(par) = parity {
+                if backends.len() < 2 {
+                    release_frame_vec(par);
+                    continue;
+                }
+                self.parity_sent.fetch_add(1, Ordering::Relaxed);
+                let par = FramePayload::Owned(par);
+                if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
+                    self.send_payload_to(&backends[idx], 0, par);
+                } else {
+                    self.drop_n(1);
+                    par.release();
+                }
+            }
+        }
+    }
+
+    /// Drop an owned TAP frame before sequence allocation. Used by the client
+    /// input queue when its bounded 4096-frame burst buffer is full.
+    pub fn drop_owned_frame(&self, frame: Vec<u8>) {
+        if !frame.is_empty() {
+            self.drop_n(1);
+        }
+        release_frame_vec(frame);
+    }
+
     fn write_payload(&self, frame: FramePayload) {
         if frame.is_empty() {
             frame.release();
@@ -1746,6 +1823,33 @@ mod tests {
         sent.data.release();
         for f in rx.try_iter() {
             f.data.release();
+        }
+    }
+
+    #[test]
+    fn owned_batch_preserves_sequence_and_payload_ownership() {
+        let port = AsyncPort::new("owned-batch".into());
+        let (backend, rx) = make_backend();
+        port.register_backend(backend);
+
+        let mut batch = Vec::with_capacity(8);
+        let mut ptrs = Vec::new();
+        for marker in 1u8..=4 {
+            let mut frame = crate::buffer::acquire_frame_vec(1400);
+            frame.clear();
+            frame.resize(1400, marker);
+            ptrs.push(frame.as_ptr());
+            batch.push(frame);
+        }
+
+        port.write_owned_batch(&mut batch);
+        assert!(batch.is_empty(), "batch ownership must be consumed");
+        for (idx, expected_ptr) in ptrs.into_iter().enumerate() {
+            let frame = rx.try_recv().expect("batched frame must reach backend");
+            assert_eq!(frame.seq, (idx + 1) as u32);
+            assert_eq!(frame.data.data_ptr(), expected_ptr);
+            assert_eq!(frame.data[frame.data.len() - 1], (idx + 1) as u8);
+            frame.data.release();
         }
     }
 
