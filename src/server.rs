@@ -1144,6 +1144,35 @@ fn acceptor_loop(mut listener: TcpListener, queues: Vec<Sender<MioTcpStream>>) {
     }
 }
 
+#[inline]
+fn clamp_worker_poll_for_tx_backlog(base: Duration, tx_backlog_ready: bool) -> Duration {
+    if tx_backlog_ready {
+        Duration::ZERO
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod worker_poll_tests {
+    use super::clamp_worker_poll_for_tx_backlog;
+    use std::time::Duration;
+
+    #[test]
+    fn ready_tx_backlog_never_sleeps() {
+        assert_eq!(
+            clamp_worker_poll_for_tx_backlog(Duration::from_millis(250), true),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn no_ready_backlog_keeps_worker_deadline() {
+        let base = Duration::from_millis(17);
+        assert_eq!(clamp_worker_poll_for_tx_backlog(base, false), base);
+    }
+}
+
 /// 工作线程：独立的 Poll / Waker / 会话表，处理分片到本线程的连接。
 /// 共享状态（会话注册表、交换机、IP 池、封禁表）均已线程安全。
 fn worker_loop(
@@ -1174,13 +1203,22 @@ fn worker_loop(
         // 无重排缺口时保持 250ms 运维巡检；出现缺口后把 poll deadline 收紧到
         // 该会话的精确剩余时间，避免固定 250ms 盲等或 5ms 空转。
         let mut poll_timeout = Duration::from_millis(250);
+        let mut tx_backlog_ready = false;
         for sess in mio_sessions.values() {
             if let Some(c_sess) = &sess.client_session {
                 if let Some(wait) = c_sess.reorder_buf.lock().next_timeout() {
                     poll_timeout = poll_timeout.min(wait);
                 }
             }
+            if sess.handshake_done
+                && !sess.rx.is_empty()
+                && sess.write_stalled.is_none()
+                && !sess.tls.wants_write()
+            {
+                tx_backlog_ready = true;
+            }
         }
+        poll_timeout = clamp_worker_poll_for_tx_backlog(poll_timeout, tx_backlog_ready);
         poll.poll(&mut events, Some(poll_timeout))
             .unwrap();
 
