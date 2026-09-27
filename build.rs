@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -9,10 +10,29 @@ fn git(args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn watch_git_revision() {
+    let Some(head_path) = git(&["rev-parse", "--git-path", "HEAD"]) else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={head_path}");
+
+    if let Ok(head) = fs::read_to_string(&head_path) {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            if let Some(reference_path) = git(&["rev-parse", "--git-path", reference]) {
+                println!("cargo:rerun-if-changed={reference_path}");
+            }
+        }
+    }
+
+    if let Some(packed_refs) = git(&["rev-parse", "--git-path", "packed-refs"]) {
+        println!("cargo:rerun-if-changed={packed_refs}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=TLSVPN_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=TLSVPN_BUILD_TIME");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    watch_git_revision();
 
     let commit = std::env::var("TLSVPN_GIT_COMMIT")
         .ok()

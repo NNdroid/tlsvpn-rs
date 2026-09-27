@@ -1133,7 +1133,7 @@ function renderStatus(data){
 
   const peerLine=peerSummary(peer);
   document.getElementById('st-neg').innerHTML=kvRows([
-    ['对端',peerLine||'-'],
+    ['对端',peerLine?esc(peerLine):'-'],
     ['协议版本','v'+(g.protocol_version||'-')],
     ['内层加密算法',g.enc_algo===2?'AES-256-GCM':g.enc_algo===4?'AES-128-GCM':g.enc_algo===5?'ChaCha20-Poly1305':g.enc_algo===6?'XChaCha20-Poly1305':(g.enc_algo?'未知('+g.enc_algo+')':'明文（未启用）')],
     ['加密下限 min_enc',g.min_enc||'不限'],
