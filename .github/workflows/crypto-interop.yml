@@ -1,0 +1,61 @@
+name: Cross-language Inner AEAD
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/crypto.rs"
+      - "src/client.rs"
+      - "src/server.rs"
+      - "examples/interop_client.rs"
+      - "scripts/e2e_enc.sh"
+      - ".github/workflows/crypto-interop.yml"
+  workflow_dispatch:
+
+jobs:
+  inner-aead-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Checkout Go implementation
+      uses: actions/checkout@v4
+      with:
+        repository: NNdroid/tlsvpn
+        path: go-impl
+
+    - name: Build Rust implementation and probe
+      run: cargo build --bin tlsvpn --examples
+
+    - name: Build Go implementation and probe
+      run: |
+        (cd go-impl && bash scripts/build.sh linux/amd64)
+        (cd go-impl/interop && go build -o probe .)
+
+    - name: Run Go/Rust AEAD matrix
+      env:
+        E2E_RS_BIN: ${{ github.workspace }}/target/debug/tlsvpn
+        E2E_RS_PROBE: ${{ github.workspace }}/target/debug/examples/interop_client
+        E2E_GO_DIR: ${{ github.workspace }}/go-impl
+        E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+        E2E_GO_PROBE: ${{ github.workspace }}/go-impl/interop/probe
+      run: |
+        set -euo pipefail
+        port=21100
+        for algo in gcm256 gcm128 chacha20 xchacha20; do
+          SRV=rs PROBE=go ALGO="$algo" PORT="$port" bash scripts/e2e_enc.sh
+          port=$((port + 10))
+          SRV=go PROBE=rs ALGO="$algo" PORT="$port" bash scripts/e2e_enc.sh
+          port=$((port + 10))
+        done
