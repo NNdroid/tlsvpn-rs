@@ -1,0 +1,31 @@
+name: Bootstrap Rust peer info handshake
+on:
+  push:
+    branches:
+      - feat/peer-info-handshake
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/peer-info-handshake
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply patch
+        run: python3 scripts/bootstrap_peer_info.py
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --all --all-targets
+          cargo check --release
+      - name: Commit implementation
+        run: |
+          rm -f .github/workflows/bootstrap-peer-info.yml scripts/bootstrap_peer_info.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(protocol): exchange peer host metadata during handshake"
+          git push origin HEAD:feat/peer-info-handshake
