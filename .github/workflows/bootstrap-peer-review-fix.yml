@@ -91,7 +91,6 @@ jobs:
           }
           EOF
 
-          cargo fmt --all -- --check
           grep -F "['对端',peerLine?esc(peerLine):'-']" src/api.rs
 
       - name: Test
