@@ -38,9 +38,8 @@ fn reconnect_backoff_delay(attempt: u32) -> Duration {
     // 避免 ISP 抖动时全体同步重拨。封顶阶段上界被裁到 max_ms，下界仍在 2/3 d。
     let third = d_ms / 3;
     let jitter_range = (third * 2).max(1u64) as usize;
-    let jitter = crate::utils::RNG.with(|rng| {
-        rng.borrow_mut().gen_range(0usize, jitter_range) as u64
-    });
+    let jitter =
+        crate::utils::RNG.with(|rng| rng.borrow_mut().gen_range(0usize, jitter_range) as u64);
     let delay_ms = third * 2 + jitter;
     if delay_ms > max_ms {
         RECONNECT_BACKOFF_MAX
@@ -282,8 +281,7 @@ impl TapDelivery {
         }
         match self.tx.try_send(batch) {
             Ok(()) => {}
-            Err(TrySendError::Full(mut batch))
-            | Err(TrySendError::Disconnected(mut batch)) => {
+            Err(TrySendError::Full(mut batch)) | Err(TrySendError::Disconnected(mut batch)) => {
                 self.dropped
                     .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 for frame in batch.drain(..) {
@@ -421,7 +419,7 @@ impl WebStatsProvider for Client {
             "session_id": session_id,
             "session_epoch": session_epoch,
             "session_token": session_token,
-            "session_encrypt": is_gcm_algo(enc),
+            "session_encrypt": is_inner_aead_algo(enc),
             "active_conns": self.live_conns.load(Ordering::Relaxed),
             "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
             "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
@@ -435,10 +433,16 @@ impl WebStatsProvider for Client {
         // 协商结果：客户端模式是端到端会话的实际参数（服务端回传的取值），
         // brutal 段把"配置意图"和"内核实际状态"分开设——非 Linux 或没装 brutal
         // 模块时 apply 必然失败，混在一起就无法区分"没配置"和"配置了没生效"。
-        let n: u64 = if self.conns_count == 0 { 1 } else { self.conns_count as u64 };
-        let per_up_min = split_legacy_brutal_rate(self.brutal_up, n as usize, n.saturating_sub(1) as usize);
+        let n: u64 = if self.conns_count == 0 {
+            1
+        } else {
+            self.conns_count as u64
+        };
+        let per_up_min =
+            split_legacy_brutal_rate(self.brutal_up, n as usize, n.saturating_sub(1) as usize);
         let per_up_max = split_legacy_brutal_rate(self.brutal_up, n as usize, 0);
-        let per_down_min = split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
+        let per_down_min =
+            split_legacy_brutal_rate(self.brutal_down, n as usize, n.saturating_sub(1) as usize);
         let per_down_max = split_legacy_brutal_rate(self.brutal_down, n as usize, 0);
         // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
         let mut applied_conns = 0usize;
@@ -788,7 +792,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         .filter(|s| !s.is_empty())
         .collect();
     if targets.is_empty() {
-        return Err("Client addr resolved to zero endpoints; check the addr field in the config file".into());
+        return Err(
+            "Client addr resolved to zero endpoints; check the addr field in the config file"
+                .into(),
+        );
     }
 
     // SOCKS5 全局代理
@@ -1269,7 +1276,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         brutal_conns: cl.conns_count as i64,
         brutal_conn_index: conn_index as i64,
         encrypt: cl.encrypt,
-        enc_algo: if cl.encrypt { cl.enc_algo } else { ENC_ALGO_NONE },
+        enc_algo: if cl.encrypt {
+            cl.enc_algo
+        } else {
+            ENC_ALGO_NONE
+        },
         session_token,
     };
     let req_json = serde_json::to_vec(&req).unwrap();
@@ -1302,19 +1313,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // TLS + TLSVPN 握手都已完成，现在才启用 Brutal。优先采用服务端裁剪后的
     // group 总预算；若对端未返回 group 语义，则兼容旧端，按本地逐连接预算应用。
     if cl.brutal && client_tx_rate_bps > 0 && cl.socks5.is_none() {
-        let (total_rate, legacy_bps) =
-            if resp.brutal_groups && resp.brutal_total_tx > 0 {
-                (
-                    resp.brutal_total_tx,
-                    split_legacy_brutal_rate_bps(
-                        resp.brutal_total_tx,
-                        cl.conns_count,
-                        conn_index,
-                    ),
-                )
-            } else {
-                (cl.brutal_up, client_tx_rate_bps)
-            };
+        let (total_rate, legacy_bps) = if resp.brutal_groups && resp.brutal_total_tx > 0 {
+            (
+                resp.brutal_total_tx,
+                split_legacy_brutal_rate_bps(resp.brutal_total_tx, cl.conns_count, conn_index),
+            )
+        } else {
+            (cl.brutal_up, client_tx_rate_bps)
+        };
         *ci.brutal.lock() = apply_tcp_brutal(&sock, total_rate, legacy_bps, brutal_group);
     }
 
@@ -1353,8 +1359,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         };
         match (
-            InnerCipher::gcm_for_algo(&cl.psk, &stx, resp.enc_algo),
-            InnerCipher::gcm_for_algo(&cl.psk, &srx, resp.enc_algo),
+            InnerCipher::for_algo(&cl.psk, &stx, resp.enc_algo),
+            InnerCipher::for_algo(&cl.psk, &srx, resp.enc_algo),
         ) {
             (Ok(tx), Ok(rx)) => {
                 ic_tx = Some(Arc::new(tx));
@@ -1367,16 +1373,16 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 return Duration::ZERO;
             }
         }
-        fec_tx = InnerCipher::gcm_domain_for_algo(&cl.psk, &stx, "fec", resp.enc_algo)
+        fec_tx = InnerCipher::domain_for_algo(&cl.psk, &stx, "fec", resp.enc_algo)
             .ok()
             .map(Arc::new);
-        fec_rx = InnerCipher::gcm_domain_for_algo(&cl.psk, &srx, "fec", resp.enc_algo)
+        fec_rx = InnerCipher::domain_for_algo(&cl.psk, &srx, "fec", resp.enc_algo)
             .ok()
             .map(Arc::new);
         enc_algo = resp.enc_algo;
     }
 
-    if cl.min_enc > 0 && !is_gcm_algo(enc_algo) {
+    if cl.min_enc > 0 && !is_inner_aead_algo(enc_algo) {
         *ci.state.lock() = "retrying".into();
         *ci.last_error.lock() = format!(
             "server negotiated inner cipher {} is below min_enc {:?}",
@@ -1526,7 +1532,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         };
         let hook_result = if let Some(e) = readiness_error {
             cl.hooks.activate(hook_env);
-            Err(format!("cannot run lifecycle up hook before tunnel networking is ready: {e}"))
+            Err(format!(
+                "cannot run lifecycle up hook before tunnel networking is ready: {e}"
+            ))
         } else {
             cl.hooks.up(hook_env)
         };
@@ -1621,11 +1629,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // queued after the previous 32 KiB drain and rustls is not blocked
         // on socket writes, poll nonblocking so we service that backlog
         // immediately while still observing socket readability.
-        poll_timeout = clamp_poll_for_tx_backlog(
-            poll_timeout,
-            !rx.is_empty(),
-            tls.wants_write(),
-        );
+        poll_timeout = clamp_poll_for_tx_backlog(poll_timeout, !rx.is_empty(), tls.wants_write());
         if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
             close_reason = format!("mio poll failed: {e}");
             break;
@@ -1723,10 +1727,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                             data.truncate(n);
                                         }
                                         Err(_) => {
-                                            debug!(
-                                                "dropped tampered/foreign frame (seq={})",
-                                                seq
-                                            );
+                                            debug!("dropped tampered/foreign frame (seq={})", seq);
                                             release_frame_vec(data);
                                             continue;
                                         }
@@ -1774,8 +1775,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
-            cl.rx_packets
-                .fetch_add(rx_packets_batch, Ordering::Relaxed);
+            cl.rx_packets.fetch_add(rx_packets_batch, Ordering::Relaxed);
             ci.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
         }
 
@@ -1814,8 +1814,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 break;
             }
             if tx_packets_batch != 0 {
-                cl.tx_packets
-                    .fetch_add(tx_packets_batch, Ordering::Relaxed);
+                cl.tx_packets.fetch_add(tx_packets_batch, Ordering::Relaxed);
             }
             cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
             ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
@@ -1857,7 +1856,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                             write_blocked = true;
                         }
                     }
-                    break
+                    break;
                 }
                 Err(e) => {
                     close_reason = format!("tls.write_tls failed: {e}");
@@ -1868,19 +1867,17 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         if write_blocked && !tls.wants_write() && !conn_closed {
-    if let Err(reg_err) = poll.registry().reregister(
-        &mut sock,
-        TOKEN_CONN,
-        client_socket_interest(false),
-    ) {
-        close_reason = format!(
-            "mio restore read-only interest after TLS drain failed: {reg_err}"
-        );
-        conn_closed = true;
-    } else {
-        write_blocked = false;
-    }
-}
+            if let Err(reg_err) =
+                poll.registry()
+                    .reregister(&mut sock, TOKEN_CONN, client_socket_interest(false))
+            {
+                close_reason =
+                    format!("mio restore read-only interest after TLS drain failed: {reg_err}");
+                conn_closed = true;
+            } else {
+                write_blocked = false;
+            }
+        }
 
         if last_write_progress.elapsed() > Duration::from_secs(10) {
             close_reason = "write stalled for >10s".into();
@@ -1949,11 +1946,7 @@ fn client_socket_interest(write_blocked: bool) -> Interest {
 }
 
 #[inline]
-fn clamp_poll_for_tx_backlog(
-    base: Duration,
-    tx_backlog: bool,
-    tls_wants_write: bool,
-) -> Duration {
+fn clamp_poll_for_tx_backlog(base: Duration, tx_backlog: bool, tls_wants_write: bool) -> Duration {
     if tx_backlog && !tls_wants_write {
         Duration::ZERO
     } else {

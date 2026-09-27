@@ -1,5 +1,9 @@
-use ring::aead::{self, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
+use chacha20poly1305::{
+    aead::{AeadInPlace as _, KeyInit as _},
+    ChaCha20Poly1305, Nonce as ChaChaNonce, Tag as ChaChaTag, XChaCha20Poly1305, XNonce,
+};
 use hmac::{Hmac, Mac};
+use ring::aead::{self, Aad, LessSafeKey, Nonce as RingNonce, Tag as RingTag, UnboundKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -10,8 +14,11 @@ use crate::utils::*;
 pub const ENC_ALGO_NONE: i64 = 0;
 pub const ENC_ALGO_GCM: i64 = 2;
 pub const ENC_ALGO_GCM128: i64 = 4;
+pub const ENC_ALGO_CHACHA20: i64 = 5;
+pub const ENC_ALGO_XCHACHA20: i64 = 6;
 pub const GCM_TAG_SIZE: usize = 16;
 pub const GCM_NONCE_SIZE: usize = 12;
+pub const XCHACHA_NONCE_SIZE: usize = 24;
 pub const ENC_SALT_SIZE: usize = 8;
 
 // 兼容旧调用的默认算法；实际客户端握手由配置 enc_algo 显式选择。
@@ -181,8 +188,8 @@ pub fn pad_mode_invalid_error(mode: &str) -> String {
 // 旧实现里"是否加密"是布尔开关：一端把 encrypt 关掉，整条链路（含 FEC 校验帧）
 // 就只剩 TLS 一层。min_enc 把开关换成强度下限，允许运维强制"低于 GCM 一律拒连"。
 //
-// 取值："" 或 "any"（无下限）、"gcm"。只有一种内层算法，下限只剩"是否必须有
-// GCM"这一种语义。
+// 取值："" 或 "any"（无下限）、"gcm"。历史值 "gcm" 现在保留为“必须启用受支持的认证内层 AEAD”这一语义，
+// 不新增配置值；具体算法继续由 enc_algo 精确匹配。
 
 // 强度下限的解析结果（0 = 不设下限）。历史上还有 CTR 一档，只有单一算法后
 // 下限只剩"是否必须有 GCM"，两端都是 `enc_algo != ENC_ALGO_GCM` 的直接比较。
@@ -215,6 +222,9 @@ pub fn min_enc_invalid_error(mode: &str) -> String {
 /// 与 Go 逐字节一致是互通的前提，不得单独改动。
 pub const GCM_KEY_LABEL: &str = "_enc_key";
 pub const GCM128_KEY_LABEL: &str = "_enc_key128";
+pub const CHACHA_KEY_LABEL: &str = "_enc_chacha20";
+pub const XCHACHA_KEY_LABEL: &str = "_enc_xchacha20";
+pub const XCHACHA_NONCE_LABEL: &str = "tlsvpn-xchacha20-nonce-v1";
 
 /// 按标签派生 32 字节材料。AES-128 使用独立 label 的前 16 字节；
 /// 与 Go 的 sha256(psk + label) 完全一致。
@@ -228,16 +238,19 @@ fn derive_key_labeled(psk: &str, label: &str) -> [u8; 32] {
 }
 
 pub fn enc_algo_from_config(mode: &str) -> i64 {
-    if mode.trim().eq_ignore_ascii_case("gcm128") {
-        ENC_ALGO_GCM128
-    } else {
-        ENC_ALGO_GCM
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "gcm128" => ENC_ALGO_GCM128,
+        "chacha20" => ENC_ALGO_CHACHA20,
+        "xchacha20" => ENC_ALGO_XCHACHA20,
+        _ => ENC_ALGO_GCM,
     }
 }
 
 pub fn enc_algo_label(algo: i64) -> &'static str {
     match algo {
         ENC_ALGO_GCM128 => "gcm128",
+        ENC_ALGO_CHACHA20 => "chacha20",
+        ENC_ALGO_XCHACHA20 => "xchacha20",
         ENC_ALGO_GCM => "gcm256",
         _ => "none",
     }
@@ -247,6 +260,10 @@ pub fn is_gcm_algo(algo: i64) -> bool {
     algo == ENC_ALGO_GCM || algo == ENC_ALGO_GCM128
 }
 
+pub fn is_inner_aead_algo(algo: i64) -> bool {
+    is_gcm_algo(algo) || algo == ENC_ALGO_CHACHA20 || algo == ENC_ALGO_XCHACHA20
+}
+
 /// 每会话随机的方向盐（crypto/rand 等价物，对齐 Go newRandomSalt）
 pub fn new_random_salt() -> [u8; ENC_SALT_SIZE] {
     let mut s = [0u8; ENC_SALT_SIZE];
@@ -254,8 +271,9 @@ pub fn new_random_salt() -> [u8; ENC_SALT_SIZE] {
     s
 }
 
-/// 内层载荷 AES-GCM。AES-256 是兼容默认；AES-128 仅在 enc_algo=gcm128
-/// 显式协商后启用。nonce/AAD/tag/frame wire format 对两者完全相同。
+/// 统一内层 AEAD。AES-GCM 与 ChaCha20-Poly1305 使用 12B nonce = seq(4BE)||salt(8B)。
+/// XChaCha20-Poly1305 复用握手已有的 8B salt，确定性派生 20B prefix，再追加 seq(4BE)，
+/// 因此无需新增配置项、握手字段或修改 frame wire format；全部算法 tag 都是 16B。
 pub enum InnerCipher {
     Gcm256 {
         aead: LessSafeKey,
@@ -265,24 +283,40 @@ pub enum InnerCipher {
         aead: LessSafeKey,
         salt: [u8; ENC_SALT_SIZE],
     },
+    ChaCha20 {
+        aead: ChaCha20Poly1305,
+        salt: [u8; ENC_SALT_SIZE],
+    },
+    XChaCha20 {
+        aead: XChaCha20Poly1305,
+        nonce_prefix: [u8; 20],
+    },
 }
 
 impl InnerCipher {
-    /// 历史 API：固定 AES-256-GCM。
     pub fn gcm(psk: &str, salt: &[u8]) -> Result<InnerCipher, String> {
-        Self::gcm_for_algo(psk, salt, ENC_ALGO_GCM)
+        Self::for_algo(psk, salt, ENC_ALGO_GCM)
     }
-
     pub fn gcm_for_algo(psk: &str, salt: &[u8], algo: i64) -> Result<InnerCipher, String> {
-        Self::gcm_domain_for_algo(psk, salt, "data", algo)
+        Self::for_algo(psk, salt, algo)
     }
-
-    /// 历史 API：固定 AES-256-GCM data/fec domain。
     pub fn gcm_domain(psk: &str, salt: &[u8], domain: &str) -> Result<InnerCipher, String> {
-        Self::gcm_domain_for_algo(psk, salt, domain, ENC_ALGO_GCM)
+        Self::domain_for_algo(psk, salt, domain, ENC_ALGO_GCM)
+    }
+    pub fn gcm_domain_for_algo(
+        psk: &str,
+        salt: &[u8],
+        domain: &str,
+        algo: i64,
+    ) -> Result<InnerCipher, String> {
+        Self::domain_for_algo(psk, salt, domain, algo)
     }
 
-    pub fn gcm_domain_for_algo(
+    pub fn for_algo(psk: &str, salt: &[u8], algo: i64) -> Result<InnerCipher, String> {
+        Self::domain_for_algo(psk, salt, "data", algo)
+    }
+
+    pub fn domain_for_algo(
         psk: &str,
         salt: &[u8],
         domain: &str,
@@ -296,13 +330,14 @@ impl InnerCipher {
             ));
         }
         if domain != "data" && domain != "fec" {
-            return Err(format!("unknown GCM domain {:?}", domain));
+            return Err(format!("unknown AEAD domain {:?}", domain));
         }
-
         let base = match algo {
             ENC_ALGO_GCM => GCM_KEY_LABEL,
             ENC_ALGO_GCM128 => GCM128_KEY_LABEL,
-            _ => return Err(format!("unsupported GCM algorithm {}", algo)),
+            ENC_ALGO_CHACHA20 => CHACHA_KEY_LABEL,
+            ENC_ALGO_XCHACHA20 => XCHACHA_KEY_LABEL,
+            _ => return Err(format!("unsupported inner AEAD algorithm {}", algo)),
         };
         let label = if domain == "fec" {
             format!("{}_fec", base)
@@ -310,8 +345,8 @@ impl InnerCipher {
             base.to_string()
         };
         let key = derive_key_labeled(psk, &label);
-        let mut s = [0u8; ENC_SALT_SIZE];
-        s.copy_from_slice(salt);
+        let mut salt8 = [0u8; ENC_SALT_SIZE];
+        salt8.copy_from_slice(salt);
 
         match algo {
             ENC_ALGO_GCM => {
@@ -319,7 +354,7 @@ impl InnerCipher {
                     .map_err(|_| "invalid AES-256-GCM key".to_string())?;
                 Ok(InnerCipher::Gcm256 {
                     aead: LessSafeKey::new(key),
-                    salt: s,
+                    salt: salt8,
                 })
             }
             ENC_ALGO_GCM128 => {
@@ -327,7 +362,26 @@ impl InnerCipher {
                     .map_err(|_| "invalid AES-128-GCM key".to_string())?;
                 Ok(InnerCipher::Gcm128 {
                     aead: LessSafeKey::new(key),
-                    salt: s,
+                    salt: salt8,
+                })
+            }
+            ENC_ALGO_CHACHA20 => {
+                let aead = ChaCha20Poly1305::new_from_slice(&key)
+                    .map_err(|_| "invalid ChaCha20-Poly1305 key".to_string())?;
+                Ok(InnerCipher::ChaCha20 { aead, salt: salt8 })
+            }
+            ENC_ALGO_XCHACHA20 => {
+                let aead = XChaCha20Poly1305::new_from_slice(&key)
+                    .map_err(|_| "invalid XChaCha20-Poly1305 key".to_string())?;
+                let mut h = Sha256::new();
+                h.update(XCHACHA_NONCE_LABEL.as_bytes());
+                h.update(salt);
+                let digest = h.finalize();
+                let mut prefix = [0u8; 20];
+                prefix.copy_from_slice(&digest[..20]);
+                Ok(InnerCipher::XChaCha20 {
+                    aead,
+                    nonce_prefix: prefix,
                 })
             }
             _ => unreachable!(),
@@ -335,45 +389,59 @@ impl InnerCipher {
     }
 
     pub fn is_gcm(&self) -> bool {
-        true
+        matches!(
+            self,
+            InnerCipher::Gcm256 { .. } | InnerCipher::Gcm128 { .. }
+        )
     }
 
     pub fn tag_len(&self) -> usize {
         GCM_TAG_SIZE
     }
 
-    fn gcm_nonce(&self, seq: u32) -> Nonce {
-        let salt = match self {
-            InnerCipher::Gcm256 { salt, .. } | InnerCipher::Gcm128 { salt, .. } => salt,
-        };
+    fn standard_nonce(salt: &[u8; ENC_SALT_SIZE], seq: u32) -> [u8; GCM_NONCE_SIZE] {
         let mut nonce = [0u8; GCM_NONCE_SIZE];
-        nonce[0..4].copy_from_slice(&seq.to_be_bytes());
+        nonce[..4].copy_from_slice(&seq.to_be_bytes());
         nonce[4..].copy_from_slice(salt);
-        Nonce::assume_unique_for_key(nonce)
+        nonce
     }
-}
 
-fn gcm_aad(wire_len: u32, seq: u32) -> [u8; 8] {
-    let mut aad = [0u8; 8];
-    aad[0..4].copy_from_slice(&wire_len.to_be_bytes());
-    aad[4..8].copy_from_slice(&seq.to_be_bytes());
-    aad
-}
+    fn xchacha_nonce(prefix: &[u8; 20], seq: u32) -> [u8; XCHACHA_NONCE_SIZE] {
+        let mut nonce = [0u8; XCHACHA_NONCE_SIZE];
+        nonce[..20].copy_from_slice(prefix);
+        nonce[20..].copy_from_slice(&seq.to_be_bytes());
+        nonce
+    }
 
-impl InnerCipher {
     pub fn seal_in_place(&self, region: &mut [u8], pt_len: usize, seq: u32, wire_len: u32) {
         if pt_len == 0 {
             return;
         }
-        let nonce = self.gcm_nonce(seq);
         let aad = gcm_aad(wire_len, seq);
         let (ct, tag_space) = region.split_at_mut(pt_len);
-        let tag = match self {
-            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => aead
-                .seal_in_place_separate_tag(nonce, Aad::from(aad), ct)
-                .expect("GCM encryption cannot fail"),
-        };
-        tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_ref());
+        match self {
+            InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
+                let nonce = RingNonce::assume_unique_for_key(Self::standard_nonce(salt, seq));
+                let tag = aead
+                    .seal_in_place_separate_tag(nonce, Aad::from(aad), ct)
+                    .expect("AES-GCM encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_ref());
+            }
+            InnerCipher::ChaCha20 { aead, salt } => {
+                let nonce = Self::standard_nonce(salt, seq);
+                let tag = aead
+                    .encrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), &aad, ct)
+                    .expect("ChaCha20-Poly1305 encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
+            }
+            InnerCipher::XChaCha20 { aead, nonce_prefix } => {
+                let nonce = Self::xchacha_nonce(nonce_prefix, seq);
+                let tag = aead
+                    .encrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, ct)
+                    .expect("XChaCha20-Poly1305 encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
+            }
+        }
     }
 
     pub fn open_in_place<'a>(
@@ -388,13 +456,25 @@ impl InnerCipher {
         if data.len() < GCM_TAG_SIZE {
             return Err(());
         }
-        let nonce = self.gcm_nonce(seq);
         let aad = gcm_aad(wire_len, seq);
-        let (ct, tag) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| ())?;
+        let (ct, tag_bytes) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
         match self {
-            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => {
+            InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
+                let nonce = RingNonce::assume_unique_for_key(Self::standard_nonce(salt, seq));
+                let tag = RingTag::try_from(&tag_bytes[..]).map_err(|_| ())?;
                 aead.open_in_place_separate_tag(nonce, Aad::from(aad), tag, ct, 0..)
+                    .map_err(|_| ())?;
+            }
+            InnerCipher::ChaCha20 { aead, salt } => {
+                let nonce = Self::standard_nonce(salt, seq);
+                let tag = ChaChaTag::from_slice(tag_bytes);
+                aead.decrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), &aad, ct, tag)
+                    .map_err(|_| ())?;
+            }
+            InnerCipher::XChaCha20 { aead, nonce_prefix } => {
+                let nonce = Self::xchacha_nonce(nonce_prefix, seq);
+                let tag = ChaChaTag::from_slice(tag_bytes);
+                aead.decrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, ct, tag)
                     .map_err(|_| ())?;
             }
         }
@@ -411,22 +491,41 @@ impl InnerCipher {
         if src.len() < GCM_TAG_SIZE {
             return Err(());
         }
-        let (ct, tag) = src.split_at(src.len() - GCM_TAG_SIZE);
+        let (ct, tag_bytes) = src.split_at(src.len() - GCM_TAG_SIZE);
         if dst.len() < ct.len() {
             return Err(());
         }
         let out = &mut dst[..ct.len()];
         out.copy_from_slice(ct);
-        let nonce = self.gcm_nonce(seq);
-        let tag = Tag::try_from(tag).map_err(|_| ())?;
         match self {
-            InnerCipher::Gcm256 { aead, .. } | InnerCipher::Gcm128 { aead, .. } => {
+            InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
+                let nonce = RingNonce::assume_unique_for_key(Self::standard_nonce(salt, seq));
+                let tag = RingTag::try_from(tag_bytes).map_err(|_| ())?;
                 aead.open_in_place_separate_tag(nonce, Aad::from(aad), tag, out, 0..)
+                    .map_err(|_| ())?;
+            }
+            InnerCipher::ChaCha20 { aead, salt } => {
+                let nonce = Self::standard_nonce(salt, seq);
+                let tag = ChaChaTag::from_slice(tag_bytes);
+                aead.decrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), aad, out, tag)
+                    .map_err(|_| ())?;
+            }
+            InnerCipher::XChaCha20 { aead, nonce_prefix } => {
+                let nonce = Self::xchacha_nonce(nonce_prefix, seq);
+                let tag = ChaChaTag::from_slice(tag_bytes);
+                aead.decrypt_in_place_detached(XNonce::from_slice(&nonce), aad, out, tag)
                     .map_err(|_| ())?;
             }
         }
         Ok(out)
     }
+}
+
+fn gcm_aad(wire_len: u32, seq: u32) -> [u8; 8] {
+    let mut aad = [0u8; 8];
+    aad[0..4].copy_from_slice(&wire_len.to_be_bytes());
+    aad[4..8].copy_from_slice(&seq.to_be_bytes());
+    aad
 }
 
 pub fn gen_session_id() -> String {
@@ -826,10 +925,9 @@ mod tests {
     fn gcm128_cross_language_golden_vector() {
         let psk = "interop-gcm128-psk";
         let salt = hex::decode("0102030405060708").unwrap();
-        let plain = hex::decode(
-            "746c7376706e2d67636d3132382d63726f73732d6c616e67756167652d766563746f72",
-        )
-        .unwrap();
+        let plain =
+            hex::decode("746c7376706e2d67636d3132382d63726f73732d6c616e67756167652d766563746f72")
+                .unwrap();
         let want = hex::decode(
             "fad2a4db0a2a0d73db601949351e36d354bb4698df7c2f27040f8229960d93d67066fe116d875cb38daa0877f281a3d5fbab9e",
         )
@@ -932,5 +1030,131 @@ mod tests {
             client_rejects_min_enc(ENC_RANK_GCM, 3),
             "未知算法 ID 的协商结果不得被当成 GCM"
         );
+    }
+}
+
+#[cfg(test)]
+mod chacha_inner_tests {
+    use super::*;
+
+    #[test]
+    fn chacha_roundtrip_and_tamper() {
+        let salt = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        for algo in [ENC_ALGO_CHACHA20, ENC_ALGO_XCHACHA20] {
+            let tx = InnerCipher::for_algo("chacha-test-psk", &salt, algo).unwrap();
+            let rx = InnerCipher::for_algo("chacha-test-psk", &salt, algo).unwrap();
+            let pt = b"chacha inner payload";
+            let mut buf = vec![0u8; pt.len() + GCM_TAG_SIZE];
+            buf[..pt.len()].copy_from_slice(pt);
+            let wire_len = buf.len() as u32;
+            tx.seal_in_place(&mut buf, pt.len(), 0x10203040, wire_len);
+            let out = rx.open_in_place(&mut buf, 0x10203040, wire_len).unwrap();
+            assert_eq!(out, pt);
+
+            let mut bad = vec![0u8; pt.len() + GCM_TAG_SIZE];
+            bad[..pt.len()].copy_from_slice(pt);
+            let bad_wire = bad.len() as u32;
+            tx.seal_in_place(&mut bad, pt.len(), 7, bad_wire);
+            let last = bad.len() - 1;
+            bad[last] ^= 1;
+            assert!(rx.open_in_place(&mut bad, 7, bad_wire).is_err());
+        }
+    }
+
+    #[test]
+    fn xchacha_nonce_reuses_existing_salt_without_new_wire_field() {
+        let salt = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        let a = InnerCipher::for_algo("xnonce-psk", &salt, ENC_ALGO_XCHACHA20).unwrap();
+        let b = InnerCipher::for_algo("xnonce-psk", &salt, ENC_ALGO_XCHACHA20).unwrap();
+        let prefix_a = match a {
+            InnerCipher::XChaCha20 { nonce_prefix, .. } => nonce_prefix,
+            _ => unreachable!(),
+        };
+        let prefix_b = match b {
+            InnerCipher::XChaCha20 { nonce_prefix, .. } => nonce_prefix,
+            _ => unreachable!(),
+        };
+        assert_eq!(prefix_a, prefix_b);
+        let n1 = InnerCipher::xchacha_nonce(&prefix_a, 1);
+        let n2 = InnerCipher::xchacha_nonce(&prefix_a, 2);
+        assert_eq!(&n1[20..], &1u32.to_be_bytes());
+        assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn config_names_map_to_stable_algorithm_ids() {
+        for (name, id) in [
+            ("gcm256", ENC_ALGO_GCM),
+            ("gcm128", ENC_ALGO_GCM128),
+            ("chacha20", ENC_ALGO_CHACHA20),
+            ("xchacha20", ENC_ALGO_XCHACHA20),
+        ] {
+            assert_eq!(enc_algo_from_config(name), id);
+            assert_eq!(enc_algo_label(id), name);
+            assert!(is_inner_aead_algo(id));
+        }
+    }
+}
+
+#[cfg(test)]
+mod go_aead_known_answer_vectors {
+    use super::*;
+
+    #[test]
+    fn go_aead_known_answer_vectors_match() {
+        let psk = "cross-language-domain-vector";
+        let salt = hex::decode("0011223344556677").unwrap();
+        let plain = hex::decode("65746865726e65742d7061796c6f6164").unwrap();
+        let seq = 0x01020304u32;
+        let vectors = [
+            (
+                ENC_ALGO_GCM,
+                "data",
+                "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b",
+            ),
+            (
+                ENC_ALGO_GCM,
+                "fec",
+                "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56",
+            ),
+            (
+                ENC_ALGO_GCM128,
+                "data",
+                "aca23415a7f2daba74e4b585171732e8970a3346125a0ce7ff4a3681c5dc098b",
+            ),
+            (
+                ENC_ALGO_GCM128,
+                "fec",
+                "46276ec436392e1ea49e5f00726d9079703524f0b623df8e1ccf582216a12375",
+            ),
+            (
+                ENC_ALGO_CHACHA20,
+                "data",
+                "720c46b7bdec71fd38fbde65073f9bab7b0f40fa6bed33a973127531ce7f14d5",
+            ),
+            (
+                ENC_ALGO_CHACHA20,
+                "fec",
+                "ba223e31950d27fe521b6629df45160df251cc361c649e3e7654bf6be23bd7b0",
+            ),
+            (
+                ENC_ALGO_XCHACHA20,
+                "data",
+                "dab95dcd60c7526fea52c69928fcce4fe639b2d03e02e543dc5158522649d397",
+            ),
+            (
+                ENC_ALGO_XCHACHA20,
+                "fec",
+                "47fa22c20f87f0b4e46db710bace56dfab35bccf7ed17ca820ad3b4f35dad9d8",
+            ),
+        ];
+        for (algo, domain, want) in vectors {
+            let cipher = InnerCipher::domain_for_algo(psk, &salt, domain, algo).unwrap();
+            let mut wire = vec![0u8; plain.len() + GCM_TAG_SIZE];
+            wire[..plain.len()].copy_from_slice(&plain);
+            let wire_len = wire.len() as u32;
+            cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len);
+            assert_eq!(hex::encode(&wire), want, "algo={} domain={}", algo, domain);
+        }
     }
 }

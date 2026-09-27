@@ -68,7 +68,7 @@ pub struct Args {
     pub web_cert: String,
     pub web_key: String,
     pub encrypt: bool,
-    pub enc_algo: String, // gcm256（默认）| gcm128（显式性能模式）
+    pub enc_algo: String, // gcm256（默认）| gcm128 | chacha20 | xchacha20
     // 配置文件里是否显式写了 encrypt。bool 无法自辨"字段缺失"与"显式 false"，
     // 靠这个标记让 main 能给运维一条明确提示。不参与任何运行时逻辑。
     pub encrypt_present: bool,
@@ -184,10 +184,7 @@ fn load_config_file(path: &str) -> Result<Args, String> {
     // 完全相反。要显式关闭必须写 "encrypt": false。
     let mut raw_value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
-    let encrypt_present = raw_value
-        .get("encrypt")
-        .and_then(|e| e.as_bool())
-        .is_some();
+    let encrypt_present = raw_value.get("encrypt").and_then(|e| e.as_bool()).is_some();
 
     // server.session_token 已从配置契约删除：resume token 是 protocol v2 的强制属性。
     // 升级时仍接受旧配置中的该键，但无论 true/false 都忽略；其余未知字段继续由
@@ -232,7 +229,11 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         down: cfg.down,
         encrypt: if encrypt_present { cfg.encrypt } else { true },
         enc_algo: if (if encrypt_present { cfg.encrypt } else { true }) {
-            if cfg.enc_algo.is_empty() { "gcm256".into() } else { cfg.enc_algo }
+            if cfg.enc_algo.is_empty() {
+                "gcm256".into()
+            } else {
+                cfg.enc_algo
+            }
         } else {
             cfg.enc_algo
         },
@@ -486,16 +487,19 @@ fn validate_args(args: &Args) -> Result<(), String> {
         return Err(crypto::pad_mode_invalid_error(&args.pad_mode));
     }
     match args.enc_algo.as_str() {
-        "" | "gcm256" | "gcm128" => {}
+        "" | "gcm256" | "gcm128" | "chacha20" | "xchacha20" => {}
         _ => {
             return Err(format!(
-                "invalid enc_algo {:?} (want gcm256 or gcm128)",
+                "invalid enc_algo {:?} (want gcm256, gcm128, chacha20 or xchacha20)",
                 args.enc_algo
             ))
         }
     }
     if !args.enc_algo.is_empty() && !args.encrypt {
-        return Err(format!("enc_algo {:?} requires encrypt=true", args.enc_algo));
+        return Err(format!(
+            "enc_algo {:?} requires encrypt=true",
+            args.enc_algo
+        ));
     }
     // min_enc 取大小写敏感的闭集；"any" 与空串等价（都等于不设下限）
     match args.min_enc.as_str() {
@@ -586,7 +590,6 @@ fn validate_args(args: &Args) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 /// 从 argv 提取配置文件路径：`-c path`、`--config path`、`--config=path`。
 /// 除 --print-config 外这是唯一被识别的命令行面。
@@ -758,26 +761,20 @@ fn main() {
     }
 
     let run_result = match args.mode.as_str() {
-        "server" => {
-            start_server(
-                &args,
-                &config_path,
-                Arc::new(RuntimeCtx::from_args(&args, &config_path)),
-            )
-        }
-        "client" => {
-            start_client(
-                &args,
-                &config_path,
-                Arc::new(RuntimeCtx::from_args(&args, &config_path)),
-            )
-        }
-        other => {
-            Err(format!(
-                "Invalid configuration: unknown mode {:?} (want \"server\" or \"client\")",
-                other
-            ))
-        }
+        "server" => start_server(
+            &args,
+            &config_path,
+            Arc::new(RuntimeCtx::from_args(&args, &config_path)),
+        ),
+        "client" => start_client(
+            &args,
+            &config_path,
+            Arc::new(RuntimeCtx::from_args(&args, &config_path)),
+        ),
+        other => Err(format!(
+            "Invalid configuration: unknown mode {:?} (want \"server\" or \"client\")",
+            other
+        )),
     };
     if let Err(e) = run_result {
         error!("{}", e);
@@ -949,10 +946,16 @@ mod tests {
     #[test]
     fn interface_manager_defaults_to_self_and_rejects_netifd() {
         let mut without = serde_json::from_str::<serde_json::Value>(GO_CLIENT_CONFIG).unwrap();
-        without["client"].as_object_mut().unwrap().remove("interface_manager");
+        without["client"]
+            .as_object_mut()
+            .unwrap()
+            .remove("interface_manager");
 
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tlsvpn-interface-manager-{}.json", std::process::id()));
+        let path = dir.join(format!(
+            "tlsvpn-interface-manager-{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, serde_json::to_vec(&without).unwrap()).unwrap();
         let args = load_config_file(path.to_str().unwrap()).unwrap();
         assert_eq!(args.interface_manager, "self");
@@ -963,7 +966,10 @@ mod tests {
         let args = load_config_file(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
         let err = validate_args(&args).unwrap_err();
-        assert!(err.contains("unsupported by tlsvpn-rs"), "unexpected error: {err}");
+        assert!(
+            err.contains("unsupported by tlsvpn-rs"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1057,7 +1063,9 @@ mod tests {
                 (args.fec_group_min, args.fec_group_max),
                 want,
                 "[{} {}] 应归一为 {:?}",
-                min, max, want
+                min,
+                max,
+                want
             );
             assert!(
                 validate_args(&args).is_ok(),
@@ -1436,7 +1444,9 @@ mod tests {
         args.fec_group = 4;
         args.max_sessions = 1024;
         args.brutal_up = crate::net::MAX_BRUTAL_RATE_MBPS + 1;
-        assert!(validate_args(&args).unwrap_err().contains("brutal_up/brutal_down"));
+        assert!(validate_args(&args)
+            .unwrap_err()
+            .contains("brutal_up/brutal_down"));
 
         args.brutal_up = 100;
         args.conns = 65537;
@@ -1464,8 +1474,7 @@ mod tests {
     #[test]
     #[ignore = "benchmark: long-running (1M iterations); run with `cargo test -- --ignored`"]
     fn bench_protocol_throughput() {
-        let ic = InnerCipher::gcm("benchmark_secret_key", &[7u8; ENC_SALT_SIZE])
-            .expect("gcm init");
+        let ic = InnerCipher::gcm("benchmark_secret_key", &[7u8; ENC_SALT_SIZE]).expect("gcm init");
         let payload = vec![0u8; 1400];
 
         let mut frame_buf = Vec::new();
