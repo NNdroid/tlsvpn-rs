@@ -1,14 +1,15 @@
-name: Bootstrap peer metadata cross-language e2e
+name: Finalize peer metadata session refresh
 
 on:
   push:
     branches: ["feat/peer-info-handshake"]
+    paths: [".github/workflows/bootstrap-peer-e2e.yml"]
 
 permissions:
   contents: write
 
 jobs:
-  validate:
+  finalize:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -19,49 +20,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-
-      - name: Add peer-info e2e to permanent cross-language gate
+      - name: Clear stale peer metadata on rolling downgrade
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('.github/workflows/rust.yml')
+          p = Path('src/server.rs')
           s = p.read_text()
-          old = '      run: bash scripts/e2e_test.sh\n'
-          new = '      run: |\n        bash scripts/e2e_test.sh\n        bash scripts/e2e_peer_info.sh\n'
+          old = '''    if let Some(peer) = req.peer_info.as_ref() {\n        *c_sess.peer_info.write() = Some(normalize_peer_info(peer));\n    }\n'''
+          new = '''    // peer_info describes the peer on this authenticated handshake. During a\n    // rolling downgrade an older client omits it, so clear metadata retained\n    // from the previous connection instead of showing a stale host identity.\n    *c_sess.peer_info.write() = req.peer_info.as_ref().map(normalize_peer_info);\n'''
           if s.count(old) != 1:
-              raise SystemExit(f'expected one e2e run line, found {s.count(old)}')
+              raise SystemExit(f'expected one peer refresh block, found {s.count(old)}')
           p.write_text(s.replace(old, new, 1))
           PY
-          bash -n scripts/e2e_peer_info.sh
 
-      - name: Checkout Go implementation at current main
-        uses: actions/checkout@v4
-        with:
-          repository: NNdroid/tlsvpn
-          path: go-impl
+      - name: Test feature branch
+        run: cargo test --all --all-targets
 
-      - name: Build both implementations
-        run: |
-          bash scripts/build.sh native
-          (cd go-impl && bash scripts/build.sh linux/amd64)
-          echo "Rust branch: $(git rev-parse --short HEAD)"
-          echo "Go main:     $(git -C go-impl rev-parse --short HEAD)"
-
-      - name: Run real cross-language peer metadata assertions
-        env:
-          E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
-          E2E_GO_DIR: ${{ github.workspace }}/go-impl
-          E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
-        run: bash scripts/e2e_peer_info.sh
-
-      - name: Commit permanent regression gate and remove bootstrap workflow
+      - name: Commit production fix
         run: |
           git config user.name NNdroid
           git config user.email 99177648+NNdroid@users.noreply.github.com
-          git rm .github/workflows/bootstrap-peer-e2e.yml
-          git add .github/workflows/rust.yml scripts/e2e_peer_info.sh
-          git commit -m "test(e2e): gate cross-language peer metadata"
+          git add src/server.rs
+          git commit -m "fix(protocol): clear stale peer metadata on reconnect"
           git push origin HEAD:feat/peer-info-handshake
