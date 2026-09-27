@@ -23,6 +23,7 @@ use crate::fec::{self, FecDecoder};
 use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
+use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::tap::{MemTap, TapDevice};
 use crate::utils::*;
 
@@ -197,6 +198,7 @@ pub struct ClientSession {
     pub dedup: Arc<Mutex<DeDuplicator>>,
     pub fec_enc_k: i64,
     pub mac: String,
+    pub peer_info: RwLock<Option<PeerInfo>>,
     // 握手 MAC 的二进制形式（建会话时解析一次）。全零表示未上报/为空，
     // 归属校验对此放行（见 src_mac_allowed）
     pub mac_bin: [u8; 6],
@@ -507,6 +509,7 @@ impl WebStatsProvider for ServerCore {
                     "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
                     "online_sec": s.created_at.elapsed().as_secs(),
                     "uptime_sec": s.created_at.elapsed().as_secs(),
+                    "peer_info": s.peer_info.read().clone(),
                 }),
             );
         }
@@ -2273,6 +2276,7 @@ fn handle_handshake(
                 dedup: Arc::new(Mutex::new(DeDuplicator::new())),
                 fec_enc_k,
                 mac,
+                peer_info: RwLock::new(req.peer_info.as_ref().map(normalize_peer_info)),
                 ipv4: v4ip,
                 ipv6: v6ip,
                 epoch_state: RwLock::new(SessionEpochState {
@@ -2300,6 +2304,10 @@ fn handle_handshake(
             sess
         }
     };
+
+    if let Some(peer) = req.peer_info.as_ref() {
+        *c_sess.peer_info.write() = Some(normalize_peer_info(peer));
+    }
 
     let epoch_snapshot = c_sess.epoch_state.read();
     sess.ic_rx = epoch_snapshot.ic_rx.clone();
@@ -2386,6 +2394,7 @@ fn handle_handshake(
         enc_salt2: response_enc_salt2,
         session_token: response_token.clone(),
         tls: observed_tls_handshake(sess),
+        peer_info: Some(local_peer_info()),
     };
     let resp_json = serde_json::to_vec(&resp).unwrap();
     let mut buf = Vec::with_capacity(1024);

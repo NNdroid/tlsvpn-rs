@@ -18,6 +18,7 @@ use crate::fec::{self, clamp_fec_group, FecDecoder};
 use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
+use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::socks5::{split_host_port, Socks5Proxy};
 use crate::tap::{MemTap, TapDevice};
 
@@ -220,6 +221,7 @@ pub struct SessionState {
     brutal_tx: u64,
     brutal_rx: u64,
     tls: Option<TLSHandshakeInfo>,
+    peer_info: Option<PeerInfo>,
 }
 
 // ======================= 客户端 =======================
@@ -409,6 +411,7 @@ impl WebStatsProvider for Client {
         let negotiated_brutal_tx = sess.brutal_tx;
         let negotiated_brutal_rx = sess.brutal_rx;
         let negotiated_tls = sess.tls.clone();
+        let negotiated_peer = sess.peer_info.clone();
         drop(sess);
         let reorder = self.reorder_buf.lock().stats();
         let local = serde_json::json!({
@@ -516,6 +519,7 @@ impl WebStatsProvider for Client {
             "fec_mode": fec_status,
             "enc_algo": enc,
             "negotiate": negotiate,
+            "peer": negotiated_peer,
         })
     }
 
@@ -1282,6 +1286,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             ENC_ALGO_NONE
         },
         session_token,
+        peer_info: Some(local_peer_info()),
     };
     let req_json = serde_json::to_vec(&req).unwrap();
     let mut send_buf = Vec::with_capacity(2 * 1024);
@@ -1455,6 +1460,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // 服务端返回的是它实际看到的 ClientHello；旧服务端没有该可选字段时清空，
         // 避免重连到旧节点后面板继续展示上一个节点的陈旧观测值。
         st.tls = resp.tls.clone();
+        // peer_info is optional for rolling upgrades; clear stale metadata when an old server omits it.
+        st.peer_info = resp.peer_info.as_ref().map(normalize_peer_info);
         // 落盘：进程重启后第一次握手就能回带令牌接回同一会话
         persist_session_state(
             cl,
