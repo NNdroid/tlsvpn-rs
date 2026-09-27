@@ -2305,9 +2305,10 @@ fn handle_handshake(
         }
     };
 
-    if let Some(peer) = req.peer_info.as_ref() {
-        *c_sess.peer_info.write() = Some(normalize_peer_info(peer));
-    }
+    // peer_info describes the peer on this authenticated handshake. During a
+    // rolling downgrade an older client omits it, so clear metadata retained
+    // from the previous connection instead of showing a stale host identity.
+    *c_sess.peer_info.write() = req.peer_info.as_ref().map(normalize_peer_info);
 
     let epoch_snapshot = c_sess.epoch_state.read();
     sess.ic_rx = epoch_snapshot.ic_rx.clone();
