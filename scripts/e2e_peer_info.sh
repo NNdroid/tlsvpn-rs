@@ -63,6 +63,7 @@ srv, cli, srv_port, cli_port, auth = sys.argv[1:]
 username, password = auth.split(":", 1)
 basic_header = "Basic " + base64.b64encode(auth.encode()).decode()
 openers = {}
+wire_impl = {"go": "go", "rs": "rust"}
 
 def opener_for(port, impl):
     key = (port, impl)
@@ -115,8 +116,8 @@ while time.time() < deadline:
         last_cs = get(cli_port, cli)
         peers = [c.get("peer_info") for c in (last_ss.get("clients") or {}).values() if isinstance(c, dict)]
         peer = next((p for p in peers if isinstance(p, dict)), None)
-        validate(peer, cli, "server stats -> client")
-        validate(last_cs.get("peer"), srv, "client stats -> server")
+        validate(peer, wire_impl[cli], "server stats -> client")
+        validate(last_cs.get("peer"), wire_impl[srv], "client stats -> server")
         print("PASS", f"{srv}_server<-{cli}_client",
               "client=", json.dumps(peer, ensure_ascii=False, sort_keys=True),
               "server=", json.dumps(last_cs["peer"], ensure_ascii=False, sort_keys=True))
