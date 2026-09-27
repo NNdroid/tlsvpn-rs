@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tlsvpn Dashboard</title>
+<link rel="stylesheet" href="style.css">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+</head>
+<body>
+<div id="toasts" aria-live="polite"></div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/>
+        </svg>
+      </div>
+      <div class="brand-txt">
+        <div class="brand-name">TLSVPN <span class="chip mode" id="mode-chip"><span class="cdot"></span><span id="mode">…</span></span></div>
+        <div class="brand-meta"><small id="meta"></small></div>
+      </div>
+    </div>
+    <button class="menu-btn" id="menu-btn" data-i18n-title="menu_tip" aria-label="menu">
+      <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+    </button>
+    <div class="topctl" id="topctl">
+      <div class="seg" id="lang-seg">
+        <button data-v="zh-CN" onclick="setLang('zh-CN')">简中</button>
+        <button data-v="zh-TW" onclick="setLang('zh-TW')">繁中</button>
+        <button data-v="en" onclick="setLang('en')">EN</button>
+        <button data-v="de" onclick="setLang('de')">DE</button>
+        <button data-v="fr" onclick="setLang('fr')">FR</button>
+        <button data-v="ja" onclick="setLang('ja')">JA</button>
+      </div>
+      <div class="seg" id="theme-seg" data-i18n-title="theme_tip">
+        <button data-v="system" onclick="setTheme('system')">
+          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <span data-i18n="theme.sys">-</span>
+        </button>
+        <button data-v="light" onclick="setTheme('light')">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <button data-v="dark" onclick="setTheme('dark')">
+          <svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+      </div>
+      <div class="seg" id="refresh-seg" data-i18n-title="refresh_tip">
+        <button data-v="2" onclick="setRefresh(2)">2s</button>
+        <button data-v="5" onclick="setRefresh(5)">5s</button>
+        <button data-v="10" onclick="setRefresh(10)">10s</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="kpis">
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="kpi-label" data-i18n="kpi.active">-</span></div>
+      <div class="kpi-val" id="active-clients">0</div>
+      <div class="kpi-sub" id="conns-sub">-</div>
+    </div>
+    <div class="card kpi-card kpi-link" data-goto="traffic" data-i18n-title="goto.traffic">
+      <div class="kpi-top"><span class="kpi-ico green"><svg viewBox="0 0 24 24"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg></span><span class="kpi-label" data-i18n="kpi.tx">-</span><span class="kpi-go"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></span></div>
+      <div class="kpi-val" id="total-tx">0 B</div>
+      <div class="kpi-sub"><span class="arr-up">↑</span> <span class="num speed" id="total-tx-speed">-</span></div>
+    </div>
+    <div class="card kpi-card kpi-link" data-goto="traffic" data-i18n-title="goto.traffic">
+      <div class="kpi-top"><span class="kpi-ico cyan"><svg viewBox="0 0 24 24"><line x1="17" y1="7" x2="7" y2="17"/><polyline points="17 17 7 17 7 7"/></svg></span><span class="kpi-label" data-i18n="kpi.rx">-</span><span class="kpi-go"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></span></div>
+      <div class="kpi-val" id="total-rx">0 B</div>
+      <div class="kpi-sub"><span class="arr-down">↓</span> <span class="num speed dn" id="total-rx-speed">-</span></div>
+    </div>
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 10v6m11-11h-6M7 12H1m17.78-7.78l-4.24 4.24m-7.08 7.08l-4.24 4.24m16.02 0l-4.24-4.24m-7.08-7.08L3.22 4.22"/></svg></span><span class="kpi-label" data-i18n="kpi.cpu">-</span></div>
+      <div class="kpi-val" id="cpu-kpi">-</div>
+      <div class="kpi-sub"><span data-i18n="kpi.cores">-</span> <span class="num" id="cores">-</span></div>
+    </div>
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico amber"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span><span class="kpi-label" data-i18n="kpi.uptime">-</span></div>
+      <div class="kpi-val" id="uptime">-</div>
+      <div class="kpi-sub"><span data-i18n="kpi.version">-</span> <span id="ver">-</span> · <a href="#" onclick="doAction('gc');return false;" data-i18n="kpi.gc">-</a></div>
+    </div>
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="kpi-label" data-i18n="kpi.fec">-</span></div>
+      <div class="kpi-val" id="fec-kpi">-</div>
+      <div class="kpi-sub"><span data-i18n="kpi.parity">-</span> <span class="num" id="parity">-</span> · <span data-i18n="kpi.overhead">-</span> <span class="num" id="fec-overhead">-</span></div>
+    </div>
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="kpi-label" data-i18n="kpi.pps">-</span></div>
+      <div class="kpi-val" id="k-pps">0</div>
+      <div class="kpi-sub"><span class="arr-up">↑</span> <span class="num" id="pps-up">0</span> <span class="arr-down">↓</span> <span class="num" id="pps-down">0</span> <span class="dim">pps</span></div>
+    </div>
+    <div class="card kpi-card kpi-link" data-goto="logs" data-log-filter="error" data-i18n-title="goto.logs">
+      <div class="kpi-top"><span class="kpi-ico amber"><svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span><span class="kpi-label" data-i18n="kpi.dropped">-</span><span class="kpi-go"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></span></div>
+      <div class="kpi-val" id="k-dropped">0</div>
+      <div class="kpi-sub"><span data-i18n="kpi.reorder">-</span> <span class="num" id="reorder-skipped">-</span> · TAP <span class="num" id="tap-errors">-</span></div>
+    </div>
+    <div class="card kpi-card">
+      <div class="kpi-top"><span class="kpi-ico cyan"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span><span class="kpi-label" data-i18n="kpi.mem">-</span></div>
+      <div class="kpi-val" id="mem">-</div>
+      <div class="kpi-sub"><span data-i18n="kpi.goroutines">-</span> <span class="num" id="goroutines">-</span></div>
+    </div>
+    <div class="card kpi-card" id="ippool-card" style="display:none">
+      <div class="kpi-top"><span class="kpi-ico green"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span><span class="kpi-label" data-i18n="kpi.pool">-</span></div>
+      <div class="kpi-val" id="ippool-kpi">-</div>
+      <div class="kpi-sub"><span data-i18n="kpi.v6used">-</span> <span class="num" id="v6used">-</span></div>
+    </div>
+    <div class="card kpi-card" id="pad-card" style="display:none">
+      <div class="kpi-top"><span class="kpi-ico cyan"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1" stroke-dasharray="3 2"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1" stroke-dasharray="3 2"/></svg></span><span class="kpi-label" data-i18n="ov.pad_kpi">-</span></div>
+      <div class="kpi-val" id="pad-kpi">-</div>
+      <div class="kpi-sub"><span data-i18n="ov.pad_bytes">-</span> <span class="num" id="pad-bytes">-</span> / <span id="pad-mode">-</span></div>
+    </div>
+    <div class="card kpi-card" id="sess-card" style="display:none">
+      <div class="kpi-top"><span class="kpi-ico green"><svg viewBox="0 0 24 24"><path d="M2 12a10 10 0 1 1 20 0 10 10 0 0 1-20 0z"/><path d="M12 2v10l7 4"/></svg></span><span class="kpi-label" data-i18n="ov.sessions">-</span></div>
+      <div class="kpi-val" id="sess-kpi">-</div>
+      <div class="kpi-sub"><span data-i18n="ov.reconnect">-</span> <span class="num" id="reconn-kpi">-</span></div>
+    </div>
+  </div>
+
+  <div id="alertbar" class="alertbar" style="display:none">
+    <svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <span id="alertbar-txt"></span>
+    <span class="alertbar-cnt mono" id="alertbar-cnt"></span>
+    <button class="alertbar-x" id="alertbar-x" aria-label="dismiss">×</button>
+  </div>
+
+  <section class="card chart-card">
+    <div class="chart-head">
+      <h2 class="card-title" data-i18n="chart.title">-</h2>
+      <span class="dim" style="font-size:.82em" data-i18n="chart.win">-</span>
+      <div class="seg" id="range-seg">
+        <button data-v="2m" class="on" onclick="setRange('2m')" data-i18n="chart.r2m">-</button>
+        <button data-v="1h" onclick="setRange('1h')" data-i18n="chart.r1h">-</button>
+        <button data-v="24h" onclick="setRange('24h')" data-i18n="chart.r24h">-</button>
+      </div>
+      <div class="chart-live mono"><span class="arr-up">↑ <span id="live-up">-</span></span><span class="arr-down">↓ <span id="live-down">-</span></span></div>
+    </div>
+    <canvas id="chart" width="1160" height="216"></canvas>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--up)"></i><span data-i18n="legend.up">-</span></span>
+      <span><i class="dot" style="background:var(--down)"></i><span data-i18n="legend.down">-</span></span>
+      <span id="legend-rtt" style="display:none"><i class="dot" style="background:var(--warn)"></i><span data-i18n="legend.rtt">-</span></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="tabs" id="tabs">
+      <button class="on" data-pane="clients" data-i18n="tab.clients">-</button>
+      <button data-pane="conns" data-i18n="tab.conns">-</button>
+      <button data-pane="macs" data-i18n="tab.macs">-</button>
+      <button data-pane="bans" data-i18n="tab.bans">-</button>
+      <button data-pane="traffic" data-i18n="tab.traffic">-</button>
+      <button data-pane="status" data-i18n="tab.status">-</button>
+      <button data-pane="diag" data-i18n="tab.diag">-</button>
+      <button data-pane="sec" data-i18n="tab.sc">-</button>
+      <button data-pane="topo" data-i18n="tab.tp">-</button>
+      <button data-pane="events" data-i18n="tab.ev">-</button>
+      <button data-pane="logs" data-i18n="tab.logs">-</button>
+      <button data-pane="settings" data-i18n="tab.settings">-</button>
+    </div>
+
+    <div class="pane on" id="pane-clients">
+      <div class="toolbar">
+        <div class="search" id="search-clients" data-i18n-title="filter_tip">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="client-filter" data-i18n-ph="filter_ph">
+          <button class="search-clear" onclick="clearFilter('clients')" aria-label="clear">×</button>
+          <span class="search-count mono" id="client-count"></span>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" onclick="exportCSV('clients')" data-i18n="ov.export">-</button>
+      </div>
+      <div class="twrap"><table>
+        <thead><tr><th data-sort="id" data-i18n="th.id">-</th><th data-sort="v4" data-i18n="th.v4">-</th><th class="hide-sm" data-i18n="th.v6">-</th><th class="hide-sm" data-i18n="th.mac">-</th><th class="num" data-sort="tcp" data-i18n="th.tcp">-</th><th class="num" data-sort="tx" data-i18n="th.tx">-</th><th class="num" data-sort="rx" data-i18n="th.rx">-</th><th class="num" data-sort="txs" data-i18n="th.txs">-</th><th class="num" data-sort="rxs" data-i18n="th.rxs">-</th><th class="hide-sm" data-i18n="th.fec">-</th><th class="hide-sm" data-i18n="th.enc">-</th><th data-i18n="th.ops">-</th></tr></thead>
+        <tbody id="clients-body"></tbody>
+      </table></div>
+      <div class="pager" id="pager-clients"></div>
+    </div>
+
+    <div class="pane" id="pane-conns">
+      <div class="toolbar">
+        <div class="search" id="search-conns" data-i18n-title="filter_tip">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="conn-filter" data-i18n-ph="filter_ph">
+          <button class="search-clear" onclick="clearFilter('conns')" aria-label="clear">×</button>
+          <span class="search-count mono" id="conn-count"></span>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" onclick="exportCSV('conns')" data-i18n="ov.export">-</button>
+      </div>
+      <div class="statstrip" id="conn-quality"></div>
+      <div class="twrap"><table>
+        <thead><tr><th data-sort="owner" data-i18n="th.owner">-</th><th class="hide-srv" data-sort="target" data-i18n="th.target">-</th><th data-sort="remote" data-i18n="th.remote">-</th><th data-i18n="th.state">-</th><th class="num" data-sort="rtt" data-i18n="th.rtt">-</th><th class="num" data-sort="tx" data-i18n="th.tx">-</th><th class="num" data-sort="rx" data-i18n="th.rx">-</th><th class="hide-sm num" data-sort="txs" data-i18n="th.txs">-</th><th class="hide-sm num" data-sort="rxs" data-i18n="th.rxs">-</th><th class="hide-sm" data-i18n="th.sni">-</th><th class="hide-sm num" data-sort="age" data-i18n="th.age">-</th><th class="hide-sm" data-i18n="th.epoch">-</th><th class="hide-sm" data-i18n="th.enc">-</th><th class="hide-sm" data-i18n="th.fec">-</th><th class="hide-sm" data-i18n="th.brutal">-</th><th class="hide-sm" data-i18n="th.err">-</th><th data-i18n="th.ops">-</th></tr></thead>
+        <tbody id="conns-body"></tbody>
+      </table></div>
+      <div class="pager" id="pager-conns"></div>
+    </div>
+
+    <div class="pane" id="pane-macs">
+      <div class="toolbar">
+        <div class="search" id="search-macs" data-i18n-title="filter_tip">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="mac-filter" data-i18n-ph="filter_ph">
+          <button class="search-clear" onclick="clearFilter('macs')" aria-label="clear">×</button>
+          <span class="search-count mono" id="mac-count"></span>
+        </div>
+      </div>
+      <div class="twrap"><table>
+        <thead><tr><th data-i18n="th.mac">-</th><th data-i18n="m.port">-</th><th data-i18n="m.seen">-</th></tr></thead>
+        <tbody id="macs-body"></tbody>
+      </table></div>
+      <div class="pager" id="pager-macs"></div>
+    </div>
+
+    <div class="pane" id="pane-bans">
+      <div class="toolbar">
+        <input class="input" id="ban-id" data-i18n-ph="bans.id_ph" style="width:230px">
+        <input class="input" id="ban-min" data-i18n-ph="bans.min_ph" style="width:170px">
+        <button class="btn primary" onclick="addBan()" data-i18n="bans.add">-</button>
+        <button class="btn ghost" onclick="fetchStats()" data-i18n="bans.refresh">-</button>
+      </div>
+      <div class="twrap"><table>
+        <thead><tr><th data-i18n="th.id">-</th><th data-i18n="bans.left">-</th><th data-i18n="th.ops">-</th></tr></thead>
+        <tbody id="bans-body"></tbody>
+      </table></div>
+      <div class="pager" id="pager-bans"></div>
+    </div>
+
+    <div class="pane" id="pane-traffic">
+      <div class="toolbar">
+        <label class="lbl"><span data-i18n="tr.client">-</span>
+          <select id="tr-client" class="sel" onchange="renderTrafficView()" style="max-width:260px">
+            <option value="" data-i18n="tr.all">-</option>
+          </select>
+        </label>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" onclick="exportCSV('traffic')" data-i18n="ov.export">-</button>
+      </div>
+      <div class="st-grid" style="margin-bottom:14px">
+        <div class="st-block">
+          <div class="kpi-top"><span class="kpi-ico green"><svg viewBox="0 0 24 24"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg></span><span class="kpi-label" data-i18n="tr.today_up">-</span></div>
+          <div class="kpi-val" id="tr-up">0 B</div>
+        </div>
+        <div class="st-block">
+          <div class="kpi-top"><span class="kpi-ico cyan"><svg viewBox="0 0 24 24"><line x1="17" y1="7" x2="7" y2="17"/><polyline points="17 17 7 17 7 7"/></svg></span><span class="kpi-label" data-i18n="tr.today_down">-</span></div>
+          <div class="kpi-val" id="tr-down">0 B</div>
+        </div>
+        <div class="st-block">
+          <div class="kpi-top"><span class="kpi-ico amber"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="kpi-label" data-i18n="tr.today_total">-</span></div>
+          <div class="kpi-val" id="tr-total">0 B</div>
+        </div>
+      </div>
+      <div class="chart-head">
+        <h3 class="card-title" data-i18n="tr.daily">-</h3>
+        <span class="dim" style="font-size:.82em" id="tr-caption"></span>
+        <div class="legend" style="margin-left:auto;margin-top:0">
+          <span><i class="dot" style="background:var(--up)"></i><span data-i18n="tr.up">-</span></span>
+          <span><i class="dot" style="background:var(--down)"></i><span data-i18n="tr.down">-</span></span>
+        </div>
+      </div>
+      <canvas id="traffic-chart" height="220"></canvas>
+      <div class="twrap" style="margin-top:12px"><table>
+        <thead><tr><th data-sort="date" data-i18n="tr.date">-</th><th class="num" data-sort="up" data-i18n="tr.up">-</th><th class="num" data-sort="down" data-i18n="tr.down">-</th><th class="num" data-sort="total" data-i18n="tr.total">-</th></tr></thead>
+        <tbody id="traffic-body"></tbody>
+      </table></div>
+      <div class="pager" id="pager-traffic"></div>
+    </div>
+
+    <div class="pane" id="pane-status">
+      <div id="status-restart" class="warnbar" style="display:none"></div>
+      <div class="st-grid st-cols">
+        <div class="st-block"><h3 data-i18n="stt.brutal">-</h3><div class="twrap"><table class="kv" id="st-brutal"></table></div></div>
+        <div class="st-block"><h3 data-i18n="stt.negt">-</h3><div class="twrap"><table class="kv" id="st-neg"></table></div></div>
+        <div class="st-block"><h3 data-i18n="stt.host">-</h3><div class="twrap"><table class="kv" id="st-sys"></table></div></div>
+        <div class="st-block"><h3 data-i18n="stt.cfg">-</h3><div class="twrap"><table class="kv" id="st-cfg"></table></div></div>
+        <!-- 下面几块与上面共用同一个列容器。st-cols 是 CSS 多栏，每个容器各自独立
+             平衡高度；拆成两个容器时前一组末尾会空出一整列，新块只能整体挤到下一行 -->
+        <div class="st-block"><h3 id="st-pad-h" data-i18n="ov.pad_kpi">-</h3><div class="twrap"><table class="kv" id="st-pad"></table></div></div>
+        <div class="st-block"><h3 id="st-protect-h" data-i18n="ov.protect">-</h3><div class="twrap"><table class="kv" id="st-protect"></table></div><div class="twrap" style="margin-top:8px"><table class="kv" id="st-psk"></table></div></div>
+        <div class="st-block"><h3 data-i18n="ov.hooks">-</h3><div class="twrap"><table class="kv" id="st-hooks"></table></div></div>
+        <div class="st-block"><h3 id="st-routes-h" data-i18n="ov.routes">-</h3><div class="twrap"><table class="kv mono" id="st-routes"></table></div></div>
+        <div class="st-block"><h3 data-i18n="ov.tap">-</h3><div class="twrap"><table class="kv" id="st-tap"></table></div></div>
+      </div>
+    </div>
+
+    <!-- 诊断中心：健康度环 + 分类自检清单。检查项全部取自最近一次 /api/stats
+         快照（clients/server_conns/fec/reorder/protect/system/cfg…）加本地算的读数，
+         不新增端点、不发额外请求；阈值与"概览"页顶部异常提醒条同源 -->
+    <div class="pane" id="pane-diag">
+      <div class="dg-wrap">
+        <div class="dg-score">
+          <div class="dg-ring">
+            <svg viewBox="0 0 120 120" width="120" height="120" aria-hidden="true">
+              <circle class="dg-bg" cx="60" cy="60" r="50"/>
+              <circle class="dg-fg" id="dg-ring-fg" cx="60" cy="60" r="50"/>
+            </svg>
+            <div class="dg-ring-c">
+              <div class="dg-score-n" id="dg-score-n">-</div>
+              <div class="dg-score-l" data-i18n="dg.score">-</div>
+            </div>
+          </div>
+          <div class="dg-verdict" id="dg-verdict">-</div>
+          <div class="dg-chips" id="dg-chips"></div>
+          <div class="dg-meta">
+            <span id="dg-total">-</span>
+            <span id="dg-updated" class="dim">-</span>
+          </div>
+        </div>
+        <div class="dg-grid" id="dg-grid"></div>
+      </div>
+    </div>
+
+    <!-- 安全中心：与诊断中心同源（最近一次 /api/stats 快照），取向不同——
+         诊断问"有没有东西坏了"，这里问"每一项防护现在是不是开着、有没有被试探过"。
+         结构复用诊断中心的 dg-* 样式，只换数据源与文案；
+         布尔开关一律三态（开/关/字段缺位），缺位判不适用而不当漏洞 -->
+    <div class="pane" id="pane-sec">
+      <div class="dg-wrap">
+        <div class="dg-score">
+          <div class="dg-ring">
+            <svg viewBox="0 0 120 120" width="120" height="120" aria-hidden="true">
+              <circle class="dg-bg" cx="60" cy="60" r="50"/>
+              <circle class="dg-fg" id="sc-ring-fg" cx="60" cy="60" r="50"/>
+            </svg>
+            <div class="dg-ring-c">
+              <div class="dg-score-n" id="sc-score-n">-</div>
+              <div class="dg-score-l" data-i18n="sc.score">-</div>
+            </div>
+          </div>
+          <div class="dg-verdict" id="sc-verdict">-</div>
+          <div class="dg-chips" id="sc-chips"></div>
+          <div class="dg-meta">
+            <span id="sc-total">-</span>
+            <span id="sc-updated" class="dim">-</span>
+          </div>
+        </div>
+        <div class="dg-grid" id="sc-grid"></div>
+      </div>
+    </div>
+
+    <!-- 拓扑：同一份快照画成「端点 → 核心 → 出口」的关系图，不新增端点。
+         服务端是「客户端 → 虚拟交换机 → TAP/内核路由」，客户端是「本机 → 多后端 → 对端」。
+         节点上的加密/FEC/密钥代际/TLS/SNI 标记逐端点显示；
+         服务端模式的客户端节点可点，复用客户端表的 data-open 抽屉 -->
+    <div class="pane" id="pane-topo">
+      <div class="toolbar">
+        <span class="dim" data-i18n="tp.title">-</span>
+        <span class="tp-mode" id="tp-mode">-</span>
+        <span class="spacer"></span>
+        <span class="dim" id="tp-meta"></span>
+        <span class="dim mono" id="tp-updated">-</span>
+      </div>
+      <div id="tpo" class="tpo"></div>
+    </div>
+
+    <!-- 事件流：默认走 SSE 长连接（/api/events，先回放积压再转实时），
+         启用 -web-auth 时浏览器 EventSource 带不了 Authorization 头、连续失败两次后
+         自动回退成 2.5s 一次的增量快照轮询；事件本体在后端内存环形缓冲里 -->
+    <div class="pane" id="pane-events">
+      <div class="toolbar">
+        <span class="ev-live" id="ev-live"><span class="ev-pulse"></span><span id="ev-live-t">-</span></span>
+        <div class="seg" id="ev-seg">
+          <button class="on" data-evlvl="all" onclick="setEvLvl('all')" data-i18n="ev.all">-</button>
+          <button data-evlvl="info" onclick="setEvLvl('info')" data-i18n="ev.info">-</button>
+          <button data-evlvl="warn" onclick="setEvLvl('warn')" data-i18n="ev.warn">-</button>
+          <button data-evlvl="error" onclick="setEvLvl('error')" data-i18n="ev.error">-</button>
+        </div>
+        <span class="spacer"></span>
+        <span class="dim mono" id="ev-count"></span>
+        <button class="btn ghost sm" onclick="clearEvents()" data-i18n="ev.clear">-</button>
+      </div>
+      <div id="evbox" class="evbox"></div>
+    </div>
+
+    <div class="pane" id="pane-logs">
+      <div class="toolbar">
+        <label class="lbl"><span data-i18n="logs.level">-</span>
+          <select id="loglevel" class="sel" onchange="setLogLevel(this.value)">
+            <option value="debug">debug</option><option value="info">info</option>
+            <option value="warn">warn</option><option value="error">error</option>
+          </select>
+        </label>
+        <label class="lbl"><input type="checkbox" id="autoscroll" class="switch" checked> <span data-i18n="logs.autoscroll">-</span></label>
+        <div class="search" style="width:230px">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="log-filter" data-i18n-ph="filter_ph">
+          <button class="search-clear" id="log-filter-clear" aria-label="clear">×</button>
+          <span class="search-count mono" id="log-count"></span>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" onclick="clearLog()" data-i18n="logs.clear">-</button>
+        <button class="btn ghost sm" onclick="downloadLog()" data-i18n="logs.download">-</button>
+      </div>
+      <div id="logbox" class="term"></div>
+    </div>
+
+    <div class="pane" id="pane-settings">
+      <div class="toolbar">
+        <span class="status-txt" style="flex:1" data-i18n="set.hint">-</span>
+        <button class="btn ghost" onclick="loadConfig()" data-i18n="set.load">-</button>
+        <button class="btn ghost" onclick="saveConfig(false)" data-i18n="set.save">-</button>
+        <button class="btn primary" onclick="saveConfig(true)" data-i18n="set.apply">-</button>
+        <span id="cfg-status" class="status-txt"></span>
+      </div>
+      <textarea id="cfg-editor" class="editor" spellcheck="false"></textarea>
+    </div>
+  </section>
+</main>
+
+  <!-- 客户端详情抽屉：点客户端表任意行从右侧展开身份 / 流量 / 连接 / 安全四块。
+       内容全部来自同一次 /api/stats 快照（clients、server_conns、client_traffic）
+       加本地算的速率差，不额外发请求；抽屉开着时每个轮询周期跟着刷新 -->
+  <div class="drawer-mask" id="drawer-mask"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <div class="drawer-head">
+      <div class="dc-head-top" id="drawer-head"></div>
+      <button class="drawer-x" data-act="close" aria-label="close">×</button>
+    </div>
+    <div class="drawer-acts" id="drawer-acts"></div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+<footer><span id="footer-text"></span><span class="sep">·</span><span id="updated-at"></span><span class="sep">·</span><span id="tls-flag"></span></footer>
+<script src="app.js"></script>
+<script src="zh-tw.js"></script>
+<script src="frameviz.js"></script>
+<script src="frameviz-zh-tw.js"></script>
+</body>
+</html>

@@ -75,7 +75,11 @@ fn hash_psk(psk: &str) -> String {
 
 fn gcm_domain_seal(v: &GcmDomainVec) -> Vec<u8> {
     // 数据面用 "_enc_key"，FEC 面再加 "_fec" 后缀——与 Go gcmKeyLabel 逐字一致。
-    let label: &[u8] = if v.domain == "fec" { b"_enc_key_fec" } else { b"_enc_key" };
+    let label: &[u8] = if v.domain == "fec" {
+        b"_enc_key_fec"
+    } else {
+        b"_enc_key"
+    };
     let mut h = Sha256::new();
     h.update(v.psk.as_bytes());
     h.update(label);
@@ -111,7 +115,11 @@ fn is_tls_grease(v: u16) -> bool {
 fn tls_client_hello_fingerprint(v: &TlsFingerprintVec) -> String {
     let mut canonical = b"tls-clienthello-v1\0".to_vec();
     for values in [&v.cipher_suites, &v.signature_schemes, &v.groups] {
-        let normalized: Vec<u16> = values.iter().copied().filter(|x| !is_tls_grease(*x)).collect();
+        let normalized: Vec<u16> = values
+            .iter()
+            .copied()
+            .filter(|x| !is_tls_grease(*x))
+            .collect();
         canonical.extend_from_slice(&(normalized.len() as u16).to_be_bytes());
         for value in normalized {
             canonical.extend_from_slice(&value.to_be_bytes());
@@ -193,8 +201,14 @@ fn test_gcm_domain_known_answer_vectors() {
     let seq = 16909060u32;
     let pt_hex = "65746865726e65742d7061796c6f6164";
     for (domain, want) in [
-        ("data", "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b"),
-        ("fec", "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56"),
+        (
+            "data",
+            "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b",
+        ),
+        (
+            "fec",
+            "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56",
+        ),
     ] {
         let v = GcmDomainVec {
             psk: psk.into(),
@@ -588,9 +602,11 @@ fn test_golden_handshake_keys_match_rust() {
     let tls_shape = serde_json::to_value(full_tls_info_shape()).unwrap();
     let tls_have: std::collections::BTreeSet<String> =
         tls_shape.as_object().unwrap().keys().cloned().collect();
-    let tls_golden: std::collections::BTreeSet<String> =
-        g.tls_info_keys.iter().cloned().collect();
-    assert_eq!(tls_have, tls_golden, "TLSHandshakeInfo 字段集与 Go 端不一致");
+    let tls_golden: std::collections::BTreeSet<String> = g.tls_info_keys.iter().cloned().collect();
+    assert_eq!(
+        tls_have, tls_golden,
+        "TLSHandshakeInfo 字段集与 Go 端不一致"
+    );
 }
 
 #[test]
@@ -656,15 +672,15 @@ fn test_padding_length_bucket_branches_match_go() {
     // 桶边界两侧必须给出不同的填充量：落在桶内是确定性值，越界则进入随机小额。
     // 入参是线路长度（明文 + GCM 标签），不是明文长度。
     for (wire_len, want) in [
-        (0usize, (118usize, 118usize)),  // 10+0=10 < 128
-        (117usize, (1usize, 1usize)),    // 10+117=127 < 128
-        (118, (128, 128)),               // 10+118=128 恰好出桶 → 下一桶 256
-        (245, (1, 1)),                   // 10+245=255 < 256
-        (246, (128, 128)),               // 10+246=256 → 384
-        (4085, (1, 1)),                  // 10+4085=4095 < 4096
-        (4086, (1, 100)),                // 10+4086=4096 越出所有桶 → jumbo 随机
-        (1400, (190, 190)),              // 10+1400=1410 → 1600 桶，常见大帧仍在桶内
-        (5000, (1, 100)),                // 10+5000=5010 越出所有桶 → jumbo 随机
+        (0usize, (118usize, 118usize)), // 10+0=10 < 128
+        (117usize, (1usize, 1usize)),   // 10+117=127 < 128
+        (118, (128, 128)),              // 10+118=128 恰好出桶 → 下一桶 256
+        (245, (1, 1)),                  // 10+245=255 < 256
+        (246, (128, 128)),              // 10+246=256 → 384
+        (4085, (1, 1)),                 // 10+4085=4095 < 4096
+        (4086, (1, 100)),               // 10+4086=4096 越出所有桶 → jumbo 随机
+        (1400, (190, 190)),             // 10+1400=1410 → 1600 桶，常见大帧仍在桶内
+        (5000, (1, 100)),               // 10+5000=5010 越出所有桶 → jumbo 随机
     ] {
         assert_eq!(
             golden_pad_bucket(wire_len),
