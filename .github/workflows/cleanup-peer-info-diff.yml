@@ -1,0 +1,32 @@
+name: Cleanup peer info diff
+on:
+  push:
+    branches:
+      - feat/peer-info-handshake
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/peer-info-handshake
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore unrelated files and reapply protocol delta
+        run: |
+          git checkout origin/main -- src/api.rs src/buffer.rs src/fec.rs src/frame.rs src/hooks.rs src/net.rs src/utils.rs tests/dashboard_script_test.rs tests/gen_golden.rs tests/protocol_conformance.rs
+          python3 scripts/cleanup_peer_info_diff.py
+      - name: Test without repository-wide formatting
+        run: |
+          cargo test --all --all-targets
+          cargo check --release
+      - name: Commit clean diff
+        run: |
+          rm -f .github/workflows/cleanup-peer-info-diff.yml scripts/cleanup_peer_info_diff.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: keep peer metadata diff scoped"
+          git push origin HEAD:feat/peer-info-handshake
