@@ -58,16 +58,42 @@ run_case() {
   e2e_wait_port 127.0.0.1 "$cli_web" 20 || { echo "FAIL $cli client WebUI did not start"; cat "$cli_log"; return 1; }
 
   if ! python3 - "$srv" "$cli" "$srv_web" "$cli_web" "$WEB_AUTH" <<'PY'
-import base64, json, sys, time, urllib.request
+import base64, http.cookiejar, json, sys, time, urllib.request
 srv, cli, srv_port, cli_port, auth = sys.argv[1:]
-auth_header = "Basic " + base64.b64encode(auth.encode()).decode()
+username, password = auth.split(":", 1)
+basic_header = "Basic " + base64.b64encode(auth.encode()).decode()
+openers = {}
 
-def get(port):
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/stats",
-        headers={"Authorization": auth_header},
-    )
-    with urllib.request.urlopen(req, timeout=2) as r:
+def opener_for(port, impl):
+    key = (port, impl)
+    if key in openers:
+        return openers[key]
+    if impl == "go":
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        body = json.dumps({"username": username, "password": password}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/login",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req, timeout=2) as r:
+            if r.status != 200:
+                raise RuntimeError(f"Go dashboard login status={r.status}")
+    else:
+        class BasicHandler(urllib.request.BaseHandler):
+            def http_request(self, req):
+                req.add_unredirected_header("Authorization", basic_header)
+                return req
+            https_request = http_request
+        opener = urllib.request.build_opener(BasicHandler())
+    openers[key] = opener
+    return opener
+
+def get(port, impl):
+    opener = opener_for(port, impl)
+    with opener.open(f"http://127.0.0.1:{port}/api/stats", timeout=2) as r:
         return json.load(r)
 
 def validate(info, expected, where):
@@ -82,23 +108,27 @@ def validate(info, expected, where):
 
 deadline = time.time() + 20
 last = None
+last_ss = last_cs = None
 while time.time() < deadline:
     try:
-        ss = get(srv_port)
-        cs = get(cli_port)
-        peers = [c.get("peer_info") for c in (ss.get("clients") or {}).values() if isinstance(c, dict)]
+        last_ss = get(srv_port, srv)
+        last_cs = get(cli_port, cli)
+        peers = [c.get("peer_info") for c in (last_ss.get("clients") or {}).values() if isinstance(c, dict)]
         peer = next((p for p in peers if isinstance(p, dict)), None)
         validate(peer, cli, "server stats -> client")
-        validate(cs.get("peer"), srv, "client stats -> server")
+        validate(last_cs.get("peer"), srv, "client stats -> server")
         print("PASS", f"{srv}_server<-{cli}_client",
               "client=", json.dumps(peer, ensure_ascii=False, sort_keys=True),
-              "server=", json.dumps(cs["peer"], ensure_ascii=False, sort_keys=True))
+              "server=", json.dumps(last_cs["peer"], ensure_ascii=False, sort_keys=True))
         break
     except Exception as exc:
         last = exc
         time.sleep(0.5)
 else:
-    raise SystemExit(f"peer metadata did not converge: {last}")
+    print(f"peer metadata did not converge: {last!r}", file=sys.stderr)
+    print("server stats:", json.dumps(last_ss, ensure_ascii=False, sort_keys=True) if last_ss else "<unavailable>", file=sys.stderr)
+    print("client stats:", json.dumps(last_cs, ensure_ascii=False, sort_keys=True) if last_cs else "<unavailable>", file=sys.stderr)
+    raise SystemExit(1)
 PY
   then
     echo "FAIL peer metadata $srv server <- $cli client"
