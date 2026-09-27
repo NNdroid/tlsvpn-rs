@@ -1,0 +1,67 @@
+name: Bootstrap peer metadata cross-language e2e
+
+on:
+  push:
+    branches: ["feat/peer-info-handshake"]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/peer-info-handshake
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Add peer-info e2e to permanent cross-language gate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/rust.yml')
+          s = p.read_text()
+          old = '      run: bash scripts/e2e_test.sh\n'
+          new = '      run: |\n        bash scripts/e2e_test.sh\n        bash scripts/e2e_peer_info.sh\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one e2e run line, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          bash -n scripts/e2e_peer_info.sh
+
+      - name: Checkout Go implementation at current main
+        uses: actions/checkout@v4
+        with:
+          repository: NNdroid/tlsvpn
+          path: go-impl
+
+      - name: Build both implementations
+        run: |
+          bash scripts/build.sh native
+          (cd go-impl && bash scripts/build.sh)
+          echo "Rust branch: $(git rev-parse --short HEAD)"
+          echo "Go main:     $(git -C go-impl rev-parse --short HEAD)"
+
+      - name: Run real cross-language peer metadata assertions
+        env:
+          E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
+          E2E_GO_DIR: ${{ github.workspace }}/go-impl
+          E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
+        run: bash scripts/e2e_peer_info.sh
+
+      - name: Commit permanent regression gate and remove bootstrap workflow
+        run: |
+          git config user.name NNdroid
+          git config user.email 99177648+NNdroid@users.noreply.github.com
+          git rm .github/workflows/bootstrap-peer-e2e.yml
+          git add .github/workflows/rust.yml scripts/e2e_peer_info.sh
+          git commit -m "test(e2e): gate cross-language peer metadata"
+          git push origin HEAD:feat/peer-info-handshake
