@@ -176,7 +176,12 @@ impl ReorderBuffer {
     /// 典型无丢包链路每个输入帧都会立即就绪。旧接口每包构造一个
     /// `Vec<Arc<Vec<u8>>>`，造成纯 allocator churn；由调用方长期复用
     /// scratch 后，顺序流不再为重排输出额外分配。
-    pub fn insert_into(&mut self, seq: u32, data: Arc<Vec<u8>>, ready: &mut Vec<Arc<Vec<u8>>>) {
+    pub fn insert_into(
+        &mut self,
+        seq: u32,
+        data: Arc<Vec<u8>>,
+        ready: &mut Vec<Arc<Vec<u8>>>,
+    ) {
         if seq == 0 {
             return;
         }
@@ -247,9 +252,7 @@ impl ReorderBuffer {
         let mut new_bitmap = vec![0u64; new_size / 64];
 
         for idx in 0..old_size {
-            let Some(frame) = self.ring[idx].take() else {
-                continue;
-            };
+            let Some(frame) = self.ring[idx].take() else { continue };
             let seq = self.seq_slots[idx];
             let new_idx = (seq & new_mask) as usize;
             new_ring[new_idx] = Some(frame);
@@ -268,9 +271,7 @@ impl ReorderBuffer {
         self.gap_since = None;
         loop {
             let idx = (self.expected_seq & self.window_mask) as usize;
-            let Some(frame) = self.ring[idx].take() else {
-                break;
-            };
+            let Some(frame) = self.ring[idx].take() else { break };
             self.seq_slots[idx] = 0;
             self.bitmap[idx / 64] &= !(1u64 << (idx % 64));
             if !frame.is_empty() {
@@ -315,8 +316,7 @@ impl ReorderBuffer {
     /// 距离当前缺口 deadline 的剩余时间。无缺口时返回 None，调用方可以让
     /// poller 使用自己的常规定时周期而不为空闲会话轮询。
     pub fn next_timeout(&self) -> Option<Duration> {
-        self.gap_since
-            .map(|since| REORDER_SKIP_DELAY.saturating_sub(since.elapsed()))
+        self.gap_since.map(|since| REORDER_SKIP_DELAY.saturating_sub(since.elapsed()))
     }
 
     /// 缺口 deadline 到达后向前寻找第一个已收到的帧，跳过永久缺失序号。
@@ -443,14 +443,7 @@ mod tests {
         let ready = rb.flush_timeout();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].as_slice(), &[3]);
-        assert_eq!(
-            rb.stats(),
-            ReorderStats {
-                gap_events: 1,
-                timeout_flushes: 1,
-                skipped_frames: 1
-            }
-        );
+        assert_eq!(rb.stats(), ReorderStats { gap_events: 1, timeout_flushes: 1, skipped_frames: 1 });
     }
 
     #[test]
@@ -469,6 +462,7 @@ mod tests {
         assert_eq!(ready[0].as_slice(), &[0x5a]);
         assert_eq!(rb.stats().skipped_frames, 4094);
     }
+
 
     #[test]
     fn reorder_growth_uses_smallest_power_of_two_window() {

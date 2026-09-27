@@ -38,11 +38,7 @@ pub struct LifecycleHooks {
 
 impl LifecycleHooks {
     pub fn new(up_path: String, down_path: String) -> Self {
-        Self {
-            up_path,
-            down_path,
-            state: Mutex::new(HookState::default()),
-        }
+        Self { up_path, down_path, state: Mutex::new(HookState::default()) }
     }
 
     pub fn configured(&self) -> bool {
@@ -95,9 +91,7 @@ fn run_hook(kind: &str, path: &str, env: &HookEnv) -> Result<(), String> {
         cmd.current_dir(dir);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("{kind} hook {path} failed: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("{kind} hook {path} failed: {e}"))?;
     let stdout = child.stdout.take().map(spawn_output_reader);
     let stderr = child.stderr.take().map(spawn_output_reader);
     let deadline = Instant::now() + HOOK_TIMEOUT;
@@ -119,16 +113,12 @@ fn run_hook(kind: &str, path: &str, env: &HookEnv) -> Result<(), String> {
     let mut output = Vec::new();
     let output_deadline = Instant::now() + Duration::from_secs(2);
     if let Some(receiver) = stdout {
-        if let Ok(mut bytes) =
-            receiver.recv_timeout(output_deadline.saturating_duration_since(Instant::now()))
-        {
+        if let Ok(mut bytes) = receiver.recv_timeout(output_deadline.saturating_duration_since(Instant::now())) {
             output.append(&mut bytes);
         }
     }
     if let Some(receiver) = stderr {
-        if let Ok(mut bytes) =
-            receiver.recv_timeout(output_deadline.saturating_duration_since(Instant::now()))
-        {
+        if let Ok(mut bytes) = receiver.recv_timeout(output_deadline.saturating_duration_since(Instant::now())) {
             if !output.is_empty() && !bytes.is_empty() {
                 output.push(b'\n');
             }
@@ -180,11 +170,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(mut reader: R) -> Receiver<Vec<
 }
 
 fn with_output(message: String, output: &str) -> String {
-    if output.is_empty() {
-        message
-    } else {
-        format!("{message} (output: {output})")
-    }
+    if output.is_empty() { message } else { format!("{message} (output: {output})") }
 }
 
 fn hook_work_dir(config: &str) -> Option<PathBuf> {
@@ -220,10 +206,7 @@ fn hook_environment(kind: &str, env: &HookEnv) -> Vec<(String, String)> {
 #[cfg(not(windows))]
 fn base_hook_environment() -> Vec<(String, String)> {
     vec![
-        (
-            "PATH".into(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-        ),
+        ("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()),
         ("LANG".into(), "C".into()),
         ("LC_ALL".into(), "C".into()),
     ]
@@ -257,29 +240,15 @@ mod tests {
     #[test]
     fn hook_environment_has_openvpn_and_tlsvpn_names() {
         let env = HookEnv {
-            mode: "client".into(),
-            dev: "tap7".into(),
-            config: "/etc/tlsvpn/client.json".into(),
-            ipv4: "10.5.8.2/24".into(),
-            ipv6: "fd00::2/64".into(),
-            gateway_v4: "10.5.8.1".into(),
-            gateway_v6: "fd00::1".into(),
+            mode: "client".into(), dev: "tap7".into(), config: "/etc/tlsvpn/client.json".into(),
+            ipv4: "10.5.8.2/24".into(), ipv6: "fd00::2/64".into(),
+            gateway_v4: "10.5.8.1".into(), gateway_v6: "fd00::1".into(),
         };
-        let vars = hook_environment("up", &env)
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
+        let vars = hook_environment("up", &env).into_iter().collect::<std::collections::HashMap<_, _>>();
         assert_eq!(vars.get("script_type").map(String::as_str), Some("up"));
-        assert_eq!(
-            vars.get("ifconfig_local").map(String::as_str),
-            Some("10.5.8.2")
-        );
-        assert_eq!(
-            vars.get("TLSVPN_IPV4").map(String::as_str),
-            Some("10.5.8.2/24")
-        );
-        assert!(!base_hook_environment()
-            .iter()
-            .any(|(key, _)| key == "AWS_SECRET_ACCESS_KEY"));
+        assert_eq!(vars.get("ifconfig_local").map(String::as_str), Some("10.5.8.2"));
+        assert_eq!(vars.get("TLSVPN_IPV4").map(String::as_str), Some("10.5.8.2/24"));
+        assert!(!base_hook_environment().iter().any(|(key, _)| key == "AWS_SECRET_ACCESS_KEY"));
     }
 
     #[test]
@@ -291,10 +260,7 @@ mod tests {
     #[test]
     fn empty_hooks_are_idempotent() {
         let hooks = LifecycleHooks::new(String::new(), String::new());
-        let env = HookEnv {
-            dev: "tap0".into(),
-            ..HookEnv::default()
-        };
+        let env = HookEnv { dev: "tap0".into(), ..HookEnv::default() };
         assert!(hooks.up(env.clone()).is_ok());
         assert!(hooks.up(env).is_ok());
         assert!(hooks.down().is_ok());
@@ -304,11 +270,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn executable_hooks_run_through_the_real_process_path() {
-        let path = std::path::PathBuf::from(
-            std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()),
-        )
-        .join("System32")
-        .join("whoami.exe");
+        let path = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()))
+            .join("System32")
+            .join("whoami.exe");
         if !path.is_file() {
             return;
         }
@@ -316,11 +280,7 @@ mod tests {
             path.to_string_lossy().into_owned(),
             path.to_string_lossy().into_owned(),
         );
-        let env = HookEnv {
-            mode: "client".into(),
-            dev: "tap0".into(),
-            ..HookEnv::default()
-        };
+        let env = HookEnv { mode: "client".into(), dev: "tap0".into(), ..HookEnv::default() };
         hooks.up(env).unwrap();
         hooks.down().unwrap();
     }
@@ -353,12 +313,9 @@ mod tests {
             script.to_string_lossy().into_owned(),
         ));
         let env = HookEnv {
-            mode: "client".into(),
-            dev: "tap7".into(),
-            config: config.to_string_lossy().into_owned(),
-            ipv4: "10.5.8.2/24".into(),
-            ipv6: "fd00::2/64".into(),
-            gateway_v4: "10.5.8.1".into(),
+            mode: "client".into(), dev: "tap7".into(),
+            config: config.to_string_lossy().into_owned(), ipv4: "10.5.8.2/24".into(),
+            ipv6: "fd00::2/64".into(), gateway_v4: "10.5.8.1".into(),
             gateway_v6: "fd00::1".into(),
         };
         let mut threads = Vec::new();
@@ -376,10 +333,7 @@ mod tests {
         let lines = std::fs::read_to_string(&events).unwrap();
         assert_eq!(
             lines.lines().collect::<Vec<_>>(),
-            vec![
-                "up|tap7|10.5.8.2|10.5.8.2/24",
-                "down|tap7|10.5.8.2|10.5.8.2/24"
-            ]
+            vec!["up|tap7|10.5.8.2|10.5.8.2/24", "down|tap7|10.5.8.2|10.5.8.2/24"]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

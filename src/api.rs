@@ -1,4 +1,3 @@
-use crate::peer_info::PeerInfo;
 use base64ct::{Base64, Encoding};
 use parking_lot::Mutex;
 use serde_json::json;
@@ -12,6 +11,7 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use crate::peer_info::PeerInfo;
 
 // ======================= 握手协议结构（与 Go frame.go 契约一致） =======================
 //
@@ -160,12 +160,8 @@ mod peer_info_protocol_tests {
 
         let mut req = req;
         req.peer_info = Some(PeerInfo {
-            implementation: "rust".into(),
-            hostname: "node-r".into(),
-            os: "linux".into(),
-            arch: "aarch64".into(),
-            version: "v1".into(),
-            ..Default::default()
+            implementation: "rust".into(), hostname: "node-r".into(), os: "linux".into(),
+            arch: "aarch64".into(), version: "v1".into(), ..Default::default()
         });
         let encoded = serde_json::to_string(&req).unwrap();
         let round: HandshakeReq = serde_json::from_str(&encoded).unwrap();
@@ -191,11 +187,7 @@ pub fn is_tls_grease(v: u16) -> bool {
 }
 
 pub fn normalize_tls_u16(values: &[u16]) -> Vec<u16> {
-    values
-        .iter()
-        .copied()
-        .filter(|v| !is_tls_grease(*v))
-        .collect()
+    values.iter().copied().filter(|v| !is_tls_grease(*v)).collect()
 }
 
 /// 规范字节串：kind + NUL；cipher/signature/group 各为 u16 大端项数和有序项；
@@ -595,49 +587,49 @@ impl RuntimeCtx {
         let pad_actual = crate::crypto::pad_mode_name();
         let web_https = !args.web_cert.is_empty() && !args.web_key.is_empty();
         let mut cfg = serde_json::json!({
-            "mode": args.mode,
-            "encrypt": args.encrypt,
-            "enc_algo": args.enc_algo,
-            "min_enc": args.min_enc,
-            "pad_mode": pad_actual,
-            "brutal": args.brutal,
-            "brutal_up": args.brutal_up,
-            "brutal_down": args.brutal_down,
-            "socks5": !args.socks5.is_empty(),
-            "fec": args.fec,
-            "fec_group": args.fec_group,
-            "log_level": args.loglevel,
-            "up": !args.up.is_empty(),
-            "down": !args.down.is_empty(),
-            "conns": args.conns,
-            "workers": args.workers,
-            "mtu": args.mtu,
-            "tap": args.tap,
-            "mac": args.mac,
-            "addr": args.addr,
-            "web_addr": args.web,
-            "web_auth": !args.web_auth.is_empty(),
-            "web_bind": args.web_bind,
-            "web_https": web_https,
-            "encrypt_psk": true,
-            "max_sessions": args.max_sessions,
-            "v4_cidr": args.v4cidr,
-            "v6_cidr": args.v6cidr,
-            "req_v4": args.req_v4,
-            "req_v6": args.req_v6,
-            "sni": args.sni,
-            "insecure": args.insecure,
-            "cert_sha256": args.cert_sha256,
-            "interface_manager": args.interface_manager,
-            "fwmark": args.fwmark,
-            "fwmark_priority": args.fwmark_priority,
-            // 表号永远等于 fwmark 值，这不是巧合而是约定：显式列出来，
-            // 免得用户拿错表号去查 ip route
-            "fwmark_table": args.fwmark,
-            "extra_routes": args.extra_routes,
-            "source_rules": args.source_rules,
-            "encrypt_present": args.encrypt_present,
-        });
+                "mode": args.mode,
+                "encrypt": args.encrypt,
+                "enc_algo": args.enc_algo,
+                "min_enc": args.min_enc,
+                "pad_mode": pad_actual,
+                "brutal": args.brutal,
+                "brutal_up": args.brutal_up,
+                "brutal_down": args.brutal_down,
+                "socks5": !args.socks5.is_empty(),
+                "fec": args.fec,
+                "fec_group": args.fec_group,
+                "log_level": args.loglevel,
+                "up": !args.up.is_empty(),
+                "down": !args.down.is_empty(),
+                "conns": args.conns,
+                "workers": args.workers,
+                "mtu": args.mtu,
+                "tap": args.tap,
+                "mac": args.mac,
+                "addr": args.addr,
+                "web_addr": args.web,
+                "web_auth": !args.web_auth.is_empty(),
+                "web_bind": args.web_bind,
+                "web_https": web_https,
+                "encrypt_psk": true,
+                "max_sessions": args.max_sessions,
+                "v4_cidr": args.v4cidr,
+                "v6_cidr": args.v6cidr,
+                "req_v4": args.req_v4,
+                "req_v6": args.req_v6,
+                "sni": args.sni,
+                "insecure": args.insecure,
+                "cert_sha256": args.cert_sha256,
+                "interface_manager": args.interface_manager,
+                "fwmark": args.fwmark,
+                "fwmark_priority": args.fwmark_priority,
+                // 表号永远等于 fwmark 值，这不是巧合而是约定：显式列出来，
+                // 免得用户拿错表号去查 ip route
+                "fwmark_table": args.fwmark,
+                "extra_routes": args.extra_routes,
+                "source_rules": args.source_rules,
+                "encrypt_present": args.encrypt_present,
+            });
         // FEC 分组策略是服务端专属配置。客户端模式下这两个值是协议边界默认，
         // 显示出来会被误读成客户端策略，因此只在服务端模式下发。
         if args.mode == "server" {
@@ -723,11 +715,7 @@ pub fn brutal_system_status() -> serde_json::Value {
         error = format!(
             "kernel exposes no 'brutal' congestion controller (current={}, available={})",
             if current.is_empty() { "-" } else { &current },
-            if avail_raw.is_empty() {
-                "-"
-            } else {
-                &avail_raw
-            }
+            if avail_raw.is_empty() { "-" } else { &avail_raw }
         );
     }
     serde_json::json!({
@@ -741,11 +729,7 @@ pub fn brutal_system_status() -> serde_json::Value {
 /// 把内层加密强度下限的运行时取值（rank）翻译成配置页显示用的字符串。
 /// 只有一种算法（GCM），所以 rank>0 一律是 "gcm"，0 是未设下限。
 pub fn min_enc_label(rank: i64) -> &'static str {
-    if rank > 0 {
-        "gcm"
-    } else {
-        ""
-    }
+    if rank > 0 { "gcm" } else { "" }
 }
 
 // ======================= 面板（与 Go dashboardHTML 同源） =======================
@@ -1546,7 +1530,9 @@ pub fn start_web_server(
     ctx: Arc<RuntimeCtx>,
 ) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || serve_listener(addr, auth, cert, key, provider, ctx, None, stop));
+    std::thread::spawn(move || {
+        serve_listener(addr, auth, cert, key, provider, ctx, None, stop)
+    });
 }
 
 /// 同一地址 30 秒内只上报一次绑定失败，避免隧道 IP 未就绪时每 2 秒刷一条
@@ -1679,16 +1665,8 @@ mod tests {
     #[test]
     fn tls_client_hello_fingerprint_keeps_opaque_alpn_bytes() {
         let a = tls_client_hello_fingerprint_bytes(&[0x1301], &[], &[], &[vec![0xff, 0x00]]);
-        let b = tls_client_hello_fingerprint_bytes(
-            &[0x1301],
-            &[],
-            &[],
-            &[vec![0xef, 0xbf, 0xbd, 0x00]],
-        );
-        assert_ne!(
-            a, b,
-            "opaque ALPN bytes must not collapse through UTF-8 replacement"
-        );
+        let b = tls_client_hello_fingerprint_bytes(&[0x1301], &[], &[], &[vec![0xef, 0xbf, 0xbd, 0x00]]);
+        assert_ne!(a, b, "opaque ALPN bytes must not collapse through UTF-8 replacement");
     }
 
     #[test]
@@ -1717,10 +1695,7 @@ mod tests {
             "master_secret",
             "certificate_der",
         ] {
-            assert!(
-                !encoded.contains(forbidden),
-                "leaked forbidden field {forbidden}"
-            );
+            assert!(!encoded.contains(forbidden), "leaked forbidden field {forbidden}");
         }
     }
 

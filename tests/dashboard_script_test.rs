@@ -36,10 +36,7 @@ fn extract_js(src: &str) -> Result<(String, usize), String> {
         .find(marker)
         .ok_or_else(|| "DASHBOARD_HTML 不是 r##\" 字符串".to_owned())?;
     let open = anchor + rel + marker.len();
-    let end = open
-        + src[open..]
-            .find("\"##")
-            .ok_or_else(|| "r##\" 字符串未闭合".to_owned())?;
+    let end = open + src[open..].find("\"##").ok_or_else(|| "r##\" 字符串未闭合".to_owned())?;
     let html = &src[open..end];
 
     let sk = html
@@ -67,10 +64,7 @@ fn extract_html(src: &str) -> Result<String, String> {
         .find(marker)
         .ok_or_else(|| "DASHBOARD_HTML 不是 r##\" 字符串".to_owned())?;
     let open = anchor + rel + marker.len();
-    let end = open
-        + src[open..]
-            .find("\"##")
-            .ok_or_else(|| "r##\" 字符串未闭合".to_owned())?;
+    let end = open + src[open..].find("\"##").ok_or_else(|| "r##\" 字符串未闭合".to_owned())?;
     Ok(src[open..end].to_owned())
 }
 
@@ -103,20 +97,8 @@ fn starts_regex(prev_sig: u8, prev_ident: &str) -> bool {
     }
     matches!(
         prev_ident,
-        "" | "return"
-            | "typeof"
-            | "instanceof"
-            | "case"
-            | "delete"
-            | "void"
-            | "new"
-            | "in"
-            | "of"
-            | "do"
-            | "else"
-            | "throw"
-            | "yield"
-            | "await"
+        "" | "return" | "typeof" | "instanceof" | "case" | "delete" | "void" | "new" | "in"
+            | "of" | "do" | "else" | "throw" | "yield" | "await"
     )
 }
 
@@ -313,17 +295,13 @@ fn check(js: &str, base: usize) -> Result<(), String> {
             if !interp_depth.is_empty() {
                 *interp_depth.last_mut().unwrap() += 1;
             } else {
-                braces
-                    .entry(b'{')
-                    .or_default()
-                    .push(base + doc_line(js, i) - 1);
+                braces.entry(b'{').or_default().push(base + doc_line(js, i) - 1);
                 // 控制流块的花括号跟在 ) ; } > 或标识符（if/for/else/catch…）后面；
                 // 跟在 ( = , : ? ! & | + - * 后面的才是对象字面量
                 let is_obj = matches!(
                     prev_sig,
                     b'(' | b'=' | b',' | b':' | b'?' | b'!' | b'&' | b'|' | b'+' | b'-' | b'*'
-                ) || prev_ident == "return"
-                    || prev_ident == "yield";
+                ) || prev_ident == "return" || prev_ident == "yield";
                 // 对象字面量（属性冒号）与 switch（case 标签）在这个括号深度上抑制 ':'；
                 // 普通控制流块不抑制，块内错层的 ':' 仍然算数
                 let sw = switch_pending;
@@ -336,19 +314,13 @@ fn check(js: &str, base: usize) -> Result<(), String> {
                 brace_obj.push(suppress);
             }
         } else if c == b'(' {
-            braces
-                .entry(b'(')
-                .or_default()
-                .push(base + doc_line(js, i) - 1);
+            braces.entry(b'(').or_default().push(base + doc_line(js, i) - 1);
             // 从空栈起算，绝不继承外层计数：继承了就把「错层配平」当成合法
             q_open.push(vec![]);
             // `switch(k){` 走到这里时标识符已经消耗掉了，先记着等花括号用
             switch_pending = prev_ident == "switch";
         } else if c == b'[' {
-            braces
-                .entry(b'[')
-                .or_default()
-                .push(base + doc_line(js, i) - 1);
+            braces.entry(b'[').or_default().push(base + doc_line(js, i) - 1);
         } else if c == b'}' {
             if !interp_depth.is_empty() && *interp_depth.last().unwrap() == 0 {
                 interp_depth.pop();
@@ -450,11 +422,7 @@ fn check(js: &str, base: usize) -> Result<(), String> {
         if lines.is_empty() {
             continue;
         }
-        let where_at: String = lines
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let where_at: String = lines.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
         return Err(format!("api.rs 第 {where_at} 行：未闭合的 '{}'", c as char));
     }
     Ok(())
@@ -467,7 +435,7 @@ fn check(js: &str, base: usize) -> Result<(), String> {
 /// JS 把 `\\` 读成一个反斜杠，紧随的那个 `'` 就提前结束了字符串字面量，剩下的
 /// 内容变成一串裸字面量。括号恰好仍然配平，上面的检查抓不到。
 fn check_no_adjacent_strings(js: &str, base: usize) -> Result<(), String> {
-    const QUOTES: [u8; 3] = [b'\'', b'"', b'`'];
+    const QUOTES: [u8; 3] = [b'\'' , b'"', b'`'];
 
     // 跳过空白与注释，返回下一个有效字符位置；到结尾返回 None
     let skip = |mut j: usize, line: &mut usize| -> Option<usize> {
@@ -486,8 +454,7 @@ fn check_no_adjacent_strings(js: &str, base: usize) -> Result<(), String> {
                 }
                 b'/' if j + 1 < js.len() && js.as_bytes()[j + 1] == b'*' => {
                     j += 2;
-                    while j + 1 < js.len()
-                        && !(js.as_bytes()[j] == b'*' && js.as_bytes()[j + 1] == b'/')
+                    while j + 1 < js.len() && !(js.as_bytes()[j] == b'*' && js.as_bytes()[j + 1] == b'/')
                     {
                         if js.as_bytes()[j] == b'\n' {
                             *line += 1;
@@ -540,10 +507,7 @@ fn check_no_adjacent_strings(js: &str, base: usize) -> Result<(), String> {
         i += 1;
     }
     if in_str != 0 {
-        return Err(format!(
-            "api.rs 第 {at} 行：字符串未闭合",
-            at = base + line - 1
-        ));
+        return Err(format!("api.rs 第 {at} 行：字符串未闭合", at = base + line - 1));
     }
     Ok(())
 }
@@ -650,52 +614,29 @@ fn test_check_catches_misnested_ternary() {
 
     // 同一结构写对了：必须放行
     let ok = "[\n  ['a',(m>0?m.toFixed(1)+' MB':'-')+' / '+(n>0?n:'-')],\n];\n";
-    assert!(
-        check(ok, 1).is_ok(),
-        "配平正确的三元被误报：{:?}",
-        check(ok, 1)
-    );
+    assert!(check(ok, 1).is_ok(), "配平正确的三元被误报：{:?}", check(ok, 1));
 
     // 分支内容整体加括号是常见且合法的写法
     let ok_paren = "const s=(a?(b):(c))+' / '+(d?e:f);\n";
-    assert!(
-        check(ok_paren, 1).is_ok(),
-        "带括号的三元被误报：{:?}",
-        check(ok_paren, 1)
-    );
+    assert!(check(ok_paren, 1).is_ok(), "带括号的三元被误报：{:?}", check(ok_paren, 1));
 
     // 三元的两个分支都是对象字面量（AUTH_HDR 的实际写法）：属性冒号不是三元冒号
     let ok_obj = "const H=(u||p)?{A:'x'+u}:{};\n";
-    assert!(
-        check(ok_obj, 1).is_ok(),
-        "三元对象字面量被误报：{:?}",
-        check(ok_obj, 1)
-    );
+    assert!(check(ok_obj, 1).is_ok(), "三元对象字面量被误报：{:?}", check(ok_obj, 1));
 
     // 标签冒号、可选链、空值合并都不参与配对
     let ok_misc = "switch(k){case 1:a;break;default:a;break;}\nb?.c\nc??d\n";
-    assert!(
-        check(ok_misc, 1).is_ok(),
-        "标签/可选链/空值合并被误报：{:?}",
-        check(ok_misc, 1)
-    );
+    assert!(check(ok_misc, 1).is_ok(), "标签/可选链/空值合并被误报：{:?}", check(ok_misc, 1));
 
     // 正则字面量的字符类里可以有冒号，不能当成三元冒号
     let ok_regex = "s.replace(/[:.]/g,'-')+' / '+(b?c:d);\n";
-    assert!(
-        check(ok_regex, 1).is_ok(),
-        "正则里的冒号被误报：{:?}",
-        check(ok_regex, 1)
-    );
+    assert!(check(ok_regex, 1).is_ok(), "正则里的冒号被误报：{:?}", check(ok_regex, 1));
 
     // 反向：多余的 ':'、没配对的 '?' 都要报。
     // 最后一例专门钉住「括号全配平、只是漏了 ':'」——最容易漏掉的一种
     assert!(check("const s=(a:b);\n", 1).is_err(), "多余的 ':' 必须报错");
     assert!(check("const s=a?b;\n", 1).is_err(), "未闭合的三元必须报错");
-    assert!(
-        check("const s=(a?b);\n", 1).is_err(),
-        "漏了 ':' 的三元必须报错"
-    );
+    assert!(check("const s=(a?b);\n", 1).is_err(), "漏了 ':' 的三元必须报错");
 }
 
 /// 钉住「除号后面那个字符被跳过」这类漏字符缺陷。
@@ -709,61 +650,30 @@ fn test_check_does_not_skip_char_after_slash() {
     // 真实事故的原型：drawChart 里 `x=i/(MAXPTS-1)*W`，`(` 被跳掉后它配对的 `)`
     // 落到空栈上，报「多余的 )」
     let ok_div = "const x=i/(MAXPTS-1)*W;\n";
-    assert!(
-        check(ok_div, 1).is_ok(),
-        "除法后紧跟括号被误报：{:?}",
-        check(ok_div, 1)
-    );
+    assert!(check(ok_div, 1).is_ok(), "除法后紧跟括号被误报：{:?}", check(ok_div, 1));
 
     // 嵌套除法：两处 `/` 各要正确前进一次，跳掉任意一个都会失衡
     let ok_nested = "const x=a/(b/(c-1))*2;\n";
-    assert!(
-        check(ok_nested, 1).is_ok(),
-        "嵌套除法被误报：{:?}",
-        check(ok_nested, 1)
-    );
+    assert!(check(ok_nested, 1).is_ok(), "嵌套除法被误报：{:?}", check(ok_nested, 1));
 
     // 连续除法
     let ok_chain = "const x=a/b/c*(d+e);\n";
-    assert!(
-        check(ok_chain, 1).is_ok(),
-        "连续除法被误报：{:?}",
-        check(ok_chain, 1)
-    );
+    assert!(check(ok_chain, 1).is_ok(), "连续除法被误报：{:?}", check(ok_chain, 1));
 
     // 括号组后面接属性 / 下标，也要照常处理
     let ok_dot = "const x=a/(b).toFixed(1);\n";
-    assert!(
-        check(ok_dot, 1).is_ok(),
-        "括号后接属性被误报：{:?}",
-        check(ok_dot, 1)
-    );
+    assert!(check(ok_dot, 1).is_ok(), "括号后接属性被误报：{:?}", check(ok_dot, 1));
     let ok_brack = "const x=a/(b)[0];\n";
-    assert!(
-        check(ok_brack, 1).is_ok(),
-        "括号后接下标被误报：{:?}",
-        check(ok_brack, 1)
-    );
+    assert!(check(ok_brack, 1).is_ok(), "括号后接下标被误报：{:?}", check(ok_brack, 1));
 
     // 行注释、块注释、正则仍然要按原样整段跳过
     let ok_comments = "a/=b;// 注释(里有\na/=b;/* 注释(里有 */a/=b;\n";
-    assert!(
-        check(ok_comments, 1).is_ok(),
-        "注释被误报：{:?}",
-        check(ok_comments, 1)
-    );
+    assert!(check(ok_comments, 1).is_ok(), "注释被误报：{:?}", check(ok_comments, 1));
     let ok_regex2 = "a/=b;s.replace(/[:.]/g,'-')\n";
-    assert!(
-        check(ok_regex2, 1).is_ok(),
-        "正则被误报：{:?}",
-        check(ok_regex2, 1)
-    );
+    assert!(check(ok_regex2, 1).is_ok(), "正则被误报：{:?}", check(ok_regex2, 1));
 
     // 反着也要能报：同样位置真缺左括号，仍然要抓
-    assert!(
-        check("const x=a/b)\n", 1).is_err(),
-        "缺左括号的除法必须报错"
-    );
+    assert!(check("const x=a/b)\n", 1).is_err(), "缺左括号的除法必须报错");
 }
 
 #[test]
@@ -826,19 +736,13 @@ fn test_dashboard_renders_server_observed_tls() {
         "offered_cipher_suites",
         "自定义，非 JA3/JA4",
     ] {
-        assert!(
-            html.contains(token),
-            "dashboard does not render TLS field {token:?}"
-        );
+        assert!(html.contains(token), "dashboard does not render TLS field {token:?}");
     }
     for token in [
         "esc(tls.fingerprint_kind+':'+tls.fingerprint_sha256)",
         "esc(tls.cipher_suite",
         "esc(tls.sni)",
     ] {
-        assert!(
-            html.contains(token),
-            "server-observed TLS value is not escaped via {token:?}"
-        );
+        assert!(html.contains(token), "server-observed TLS value is not escaped via {token:?}");
     }
 }

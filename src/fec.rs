@@ -34,8 +34,16 @@ pub fn clamp_fec_group(k: usize) -> usize {
 /// 都必须给出同一个结论。
 pub fn normalize_fec_group_bounds(min: i64, max: i64) -> (i64, i64) {
     (
-        if min == 0 { FEC_MIN_GROUP as i64 } else { min },
-        if max == 0 { FEC_MAX_GROUP as i64 } else { max },
+        if min == 0 {
+            FEC_MIN_GROUP as i64
+        } else {
+            min
+        },
+        if max == 0 {
+            FEC_MAX_GROUP as i64
+        } else {
+            max
+        },
     )
 }
 
@@ -166,6 +174,7 @@ unsafe fn xor_combine_avx2(out: &mut [u8], parity: &[u8], acc: &[u8]) {
         *o = p ^ a;
     }
 }
+
 
 // ---------- NEON 路径（AArch64 baseline） ----------
 
