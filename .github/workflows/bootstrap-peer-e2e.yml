@@ -46,7 +46,7 @@ jobs:
       - name: Build both implementations
         run: |
           bash scripts/build.sh native
-          (cd go-impl && bash scripts/build.sh)
+          (cd go-impl && bash scripts/build.sh linux/amd64)
           echo "Rust branch: $(git rev-parse --short HEAD)"
           echo "Go main:     $(git -C go-impl rev-parse --short HEAD)"
 
