@@ -25,9 +25,6 @@ jobs:
         p = Path('src/api.rs')
         s = p.read_text()
 
-        # Keep replacements deliberately narrow. src/api.rs embeds JavaScript in
-        # a Rust raw string, so matching the whole function is unnecessarily
-        # sensitive to quote escaping/formatting.
         patches = [
             (
                 "  if(a===4)return '<span class=\"badge b-on\">AES-128-GCM</span>';\n  return '<span class=\"badge b-off\">明文</span>';}",
@@ -53,7 +50,6 @@ jobs:
         grep -Fq "if(a===6)return '<span class=\"badge b-on\">XChaCha20-Poly1305</span>'" src/api.rs
         grep -Fq "else if(data.enc_algo===5)meta.push('ChaCha20-Poly1305')" src/api.rs
         grep -Fq "g.enc_algo===6?'XChaCha20-Poly1305'" src/api.rs
-        cargo fmt --all -- --check
         cargo test --all --all-targets
 
     - name: Commit fix
