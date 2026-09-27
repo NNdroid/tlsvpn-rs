@@ -10,6 +10,9 @@ fn git(args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+// A symbolic .git/HEAD does not change when the branch advances. Watch both
+// HEAD and its resolved ref (plus packed-refs) so incremental Cargo builds do
+// not keep stale git_commit/build_time metadata after a new commit.
 fn watch_git_revision() {
     let Some(head_path) = git(&["rev-parse", "--git-path", "HEAD"]) else {
         return;
