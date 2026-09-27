@@ -919,6 +919,8 @@ function badge(f){if(!f||f==='off')return '<span class="badge b-off">关闭</spa
   return '<span class="badge b-on">'+f+'</span>';}
 function encBadge(a){if(a===2)return '<span class="badge b-on">AES-256-GCM</span>';
   if(a===4)return '<span class="badge b-on">AES-128-GCM</span>';
+  if(a===5)return '<span class="badge b-on">ChaCha20-Poly1305</span>';
+  if(a===6)return '<span class="badge b-on">XChaCha20-Poly1305</span>';
   return '<span class="badge b-off">明文</span>';}
 function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
 // kvRows 的单元格值按 HTML 原样输出，徽章行需要标签；来自 ip stderr 的报错
@@ -1027,7 +1029,7 @@ async function fetchStats(){
       document.getElementById('ippool-kpi').innerHTML=data.ip_pool.v4_used+'<small style="font-size:.55em;color:var(--muted)"> / '+data.ip_pool.v4_total+'</small>';
       document.getElementById('v6used').innerText=data.ip_pool.v6_used;}
 
-    const meta=[];if(data.enc_algo===2)meta.push('AES-256-GCM');else if(data.enc_algo===4)meta.push('AES-128-GCM');
+    const meta=[];if(data.enc_algo===2)meta.push('AES-256-GCM');else if(data.enc_algo===4)meta.push('AES-128-GCM');else if(data.enc_algo===5)meta.push('ChaCha20-Poly1305');else if(data.enc_algo===6)meta.push('XChaCha20-Poly1305');
     if(data.fec_mode&&data.fec_mode!=='off')meta.push('FEC '+data.fec_mode);
     const neg0=data.negotiate||{};if(neg0.protocol_version)meta.push('协议 v'+neg0.protocol_version);
     document.getElementById('meta').innerText=meta.join(' · ');
@@ -1104,7 +1106,7 @@ function renderStatus(data){
 
   document.getElementById('st-neg').innerHTML=kvRows([
     ['协议版本','v'+(g.protocol_version||'-')],
-    ['内层加密算法',g.enc_algo===2?'AES-256-GCM':(g.enc_algo?'未知('+g.enc_algo+')':'明文（未启用）')],
+    ['内层加密算法',g.enc_algo===2?'AES-256-GCM':g.enc_algo===4?'AES-128-GCM':g.enc_algo===5?'ChaCha20-Poly1305':g.enc_algo===6?'XChaCha20-Poly1305':(g.enc_algo?'未知('+g.enc_algo+')':'明文（未启用）')],
     ['加密下限 min_enc',g.min_enc||'不限'],
     ['混淆填充 pad_mode',g.pad_mode||'-'],
     ['FEC',g.fec?'开启':'关闭'],
