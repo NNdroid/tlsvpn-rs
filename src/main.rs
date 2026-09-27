@@ -15,6 +15,7 @@ pub mod fec;
 pub mod frame;
 pub mod hooks;
 pub mod net;
+pub mod peer_info;
 pub mod server;
 pub mod socks5;
 pub mod tap;

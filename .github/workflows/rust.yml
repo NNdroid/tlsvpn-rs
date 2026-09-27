@@ -119,7 +119,7 @@ jobs:
         # it was deleted. The Go repo is the only probe source now.
         (cd go-impl && go build -C interop -o probe .)
 
-    - name: Cross-language e2e (accept / tok / pad / minenc / cfg)
+    - name: Cross-language e2e (accept / tok / pad / minenc / cfg / peer metadata)
       env:
         E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
         # E2E_GO_DIR is what E2E_GO_PROBE's default is built from. Left unset it
@@ -128,7 +128,9 @@ jobs:
         # "缺少依赖: E2E_GO_PROBE".
         E2E_GO_DIR: ${{ github.workspace }}/go-impl
         E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
-      run: bash scripts/e2e_test.sh
+      run: |
+        bash scripts/e2e_test.sh
+        bash scripts/e2e_peer_info.sh
 
   # Network performance tests over a REAL TAP tunnel: ping (v4/v6, 0% loss),
   # traceroute (v4/v6 through the tunnel), iperf3 up/down throughput and an
