@@ -948,6 +948,7 @@ function encBadge(a){if(a===2)return '<span class="badge b-on">AES-256-GCM</span
   if(a===5)return '<span class="badge b-on">ChaCha20-Poly1305</span>';
   if(a===6)return '<span class="badge b-on">XChaCha20-Poly1305</span>';
   return '<span class="badge b-off">明文</span>';}
+function peerSummary(p){if(!p)return '';const a=[];if(p.hostname)a.push(p.hostname);const iv=[p.implementation,p.version].filter(Boolean).join(' ');if(iv)a.push(iv);const plat=[p.os,p.os_version,p.arch].filter(Boolean).join(' ');if(plat)a.push(plat);if(p.kernel)a.push('kernel '+p.kernel);return a.join(' · ');}
 function onoff(b){return b?'<span class="badge b-on">开启</span>':'<span class="badge b-off">关闭</span>';}
 // kvRows 的单元格值按 HTML 原样输出，徽章行需要标签；来自 ip stderr 的报错
 // 文本必须先转义，否则一条带 < 的内核消息就能改写面板结构
@@ -1013,7 +1014,7 @@ async function fetchStats(){
         ?((c.brutal_rx||0)+'↑/'+(c.brutal_tx||0)+'↓')
         :((c.brutal_rx||c.brutal_tx)?'未生效':'-');
       const brutTitle=c.brutal_error||'客户端→服务端（上行）/ 服务端→客户端（下行）(Mbps)';
-      tbody+='<tr><td title="'+esc(id)+'">'+esc(sid)+'</td><td>'+esc(c.ipv4||'-')+'</td><td class="hide-sm">'+esc(c.ipv6||'-')+'</td>'+
+      tbody+='<tr><td title="'+esc(id)+'">'+esc(sid)+(c.peer_info&&c.peer_info.hostname?'<br><span class="dim">'+esc(c.peer_info.hostname)+'</span>':'')+'</td><td>'+esc(c.ipv4||'-')+'</td><td class="hide-sm">'+esc(c.ipv6||'-')+'</td>'+
         '<td class="hide-sm">'+esc(c.mac||'-')+'</td><td>'+c.active_conns+'</td>'+
         '<td>'+fmtBytes(c.tx_bytes)+'</td><td>'+fmtBytes(c.rx_bytes)+'</td>'+
         '<td class="speed">'+fmtBytes(sx,true)+'</td><td class="speed">'+fmtBytes(sr,true)+'</td>'+
@@ -1065,7 +1066,7 @@ async function fetchStats(){
 }
 
 function renderStatus(data){
-  const s=data.system||{},c=data.cfg||{},g=data.negotiate||{},b=g.brutal||{},tls=g.tls||{},bs=data.brutal_system||{},mem=data.mem||{};
+  const s=data.system||{},c=data.cfg||{},g=data.negotiate||{},b=g.brutal||{},tls=g.tls||{},bs=data.brutal_system||{},mem=data.mem||{},peer=data.peer||{};
   // 内核态（模块在不在、当前 cc、可用列表）来自 brutal_system：它每轮都算，不依赖有没有会话。
   // 协商对象里的同名字段只在 brutal_system 缺时才兜底，免得一台没有任何客户端的机器
   // 只显示一堆 '-'，看不出 Brutal 到底能不能用。
@@ -1130,7 +1131,9 @@ function renderStatus(data){
     ['encrypt 字段是否显式写入',c.encrypt_present===false?'未写（按开启处理）':'已写入'],
   ]);
 
+  const peerLine=peerSummary(peer);
   document.getElementById('st-neg').innerHTML=kvRows([
+    ['对端',peerLine||'-'],
     ['协议版本','v'+(g.protocol_version||'-')],
     ['内层加密算法',g.enc_algo===2?'AES-256-GCM':g.enc_algo===4?'AES-128-GCM':g.enc_algo===5?'ChaCha20-Poly1305':g.enc_algo===6?'XChaCha20-Poly1305':(g.enc_algo?'未知('+g.enc_algo+')':'明文（未启用）')],
     ['加密下限 min_enc',g.min_enc||'不限'],
