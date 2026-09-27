@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Cross-language peer_info handshake + logical-session/Web API regression.
 # Uses real tlsvpn server/client binaries over the existing in-memory TAP mode.
-set -euo pipefail
+# Do not enable `set -e`: shared e2e cleanup helpers intentionally return nonzero
+# when there is nothing to clean (for example fuser on an unused port).
+set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/e2e_lib.sh"
@@ -54,7 +56,7 @@ run_case() {
   "$cli_bin" -c "$(e2e_winpath "$case_dir/client.json")" >"$cli_log" 2>&1 &
   e2e_wait_port 127.0.0.1 "$cli_web" 20 || { echo "FAIL $cli client WebUI did not start"; cat "$cli_log"; return 1; }
 
-  python3 - "$srv" "$cli" "$srv_web" "$cli_web" <<'PY'
+  if ! python3 - "$srv" "$cli" "$srv_web" "$cli_web" <<'PY'
 import json, sys, time, urllib.request
 srv, cli, srv_port, cli_port = sys.argv[1:]
 
@@ -92,15 +94,29 @@ while time.time() < deadline:
 else:
     raise SystemExit(f"peer metadata did not converge: {last}")
 PY
+  then
+    echo "FAIL peer metadata $srv server <- $cli client"
+    echo "----- server tail -----"
+    tail -40 "$srv_log" || true
+    echo "----- client tail -----"
+    tail -40 "$cli_log" || true
+    return 1
+  fi
 
   e2e_kill_port "$cli_web"
   e2e_kill_port "$srv_web"
   e2e_kill_port "$port"
+  return 0
 }
 
 # Exercise both cross-language directions. Values differ by language on purpose
 # (Go reports amd64, Rust reports x86_64); the contract is semantic, not string-equal.
-run_case rs go 21300 21301 21302 aa:bb:cc:dd:89:01
-run_case go rs 21310 21311 21312 aa:bb:cc:dd:89:02
+fails=0
+run_case rs go 21300 21301 21302 aa:bb:cc:dd:89:01 || fails=$((fails + 1))
+run_case go rs 21310 21311 21312 aa:bb:cc:dd:89:02 || fails=$((fails + 1))
 
+if [ "$fails" -ne 0 ]; then
+  echo "peer-info cross-language e2e: $fails direction(s) failed"
+  exit 1
+fi
 echo "peer-info cross-language e2e: all directions passed"
