@@ -1,0 +1,42 @@
+name: Apply Rust version/readme audit
+
+on:
+  push:
+    branches: [ "fix/readme-audit" ]
+    paths:
+      - ".github/scripts/patch_version_readme.py"
+      - ".github/workflows/apply_version_readme_fix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply audited patch
+        run: python3 .github/scripts/patch_version_readme.py
+      - name: Validate
+        env:
+          TLSVPN_VERSION: ci-version-test
+        run: |
+          cargo fmt --all -- --check
+          bash -n scripts/install.sh
+          cargo test --test version_readme_contract --verbose
+          cargo build --quiet
+          test "$(target/debug/tlsvpn -version)" = "ci-version-test"
+          test "$(target/debug/tlsvpn --version)" = "ci-version-test"
+          git diff --check
+      - name: Commit product changes
+        run: |
+          cargo fmt --all
+          git config user.name github-actions[bot]
+          git config user.email 41898282+NNdroid@users.noreply.github.com
+          git add build.rs src/api.rs src/main.rs src/peer_info.rs scripts/install.sh README.md .github/workflows/rust.yml tests/version_readme_contract.rs
+          git commit -m 'fix: align version reporting and README' || exit 0
+          git push origin HEAD:fix/readme-audit
