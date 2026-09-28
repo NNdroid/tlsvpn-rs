@@ -14,3 +14,11 @@ new = '''                    .and_then(|(_, q)| q.split('&').find_map(|kv| kv.st
 if s.count(old) != 1:
     raise SystemExit(f"expected one borrowed range block, got {s.count(old)}")
 p.write_text(s.replace(old, new, 1))
+
+p = Path("tests/dashboard_script_test.rs")
+s = p.read_text()
+old = '        "trend_json(range)",\n'
+new = '        "trend_json(&range)",\n'
+if s.count(old) != 1:
+    raise SystemExit(f"expected one old trend marker, got {s.count(old)}")
+p.write_text(s.replace(old, new, 1))
