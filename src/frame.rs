@@ -76,6 +76,74 @@ pub fn write_stream_frame_with_limit(buf: &mut Vec<u8>, frame: &[u8], record_lim
     append_padded_frame_with_limit(buf, 0, frame, None, record_limit);
 }
 
+pub const STREAM_TLS_BATCH_SOFT_LIMIT: usize = 12 * 1024;
+pub const MAX_TLS_PLAINTEXT_RECORD: usize = 16 * 1024;
+
+/// Data-plane aggregation primitive: append one TLSVPN frame with zero
+/// per-frame cover padding. The final frame in the TLS plaintext batch receives
+/// all cover bytes after multiple frames have naturally packed together.
+pub fn append_unpadded_frame(
+    buf: &mut Vec<u8>,
+    seq: u32,
+    data: &[u8],
+    ic: Option<&InnerCipher>,
+) -> usize {
+    let start = buf.len();
+    // A positive limit below the 10-byte frame header forces pad=0 while
+    // preserving the exact existing framing/encryption implementation.
+    append_padded_frame_with_limit(buf, seq, data, ic, 1);
+    start
+}
+
+pub fn stream_aligned_tls_plaintext_target(n: usize, record_limit: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mss = record_limit.saturating_add(TLS_RECORD_OVERHEAD_RESERVE);
+    let mss = if mss < 256 { FALLBACK_TCP_MSS } else { mss };
+    let segs = (n + TLS_RECORD_OVERHEAD_RESERVE + mss - 1) / mss;
+    let target = segs
+        .saturating_mul(mss)
+        .saturating_sub(TLS_RECORD_OVERHEAD_RESERVE);
+    if target < n || target > MAX_TLS_PLAINTEXT_RECORD {
+        n
+    } else {
+        target
+    }
+}
+
+/// Add cover bytes only to the final frame of an aggregated plaintext batch.
+/// This aligns the conservative TLS ciphertext budget to N*TCP_MSS while
+/// bounding padding to less than one MSS.
+pub fn pad_stream_batch_tail(
+    buf: &mut Vec<u8>,
+    last_frame_start: Option<usize>,
+    record_limit: usize,
+) -> usize {
+    if pad_mode_name() == PAD_MODE_OFF || buf.is_empty() {
+        return 0;
+    }
+    let Some(start) = last_frame_start else {
+        return 0;
+    };
+    if start + 10 > buf.len() {
+        return 0;
+    }
+    let target = stream_aligned_tls_plaintext_target(buf.len(), record_limit);
+    let pad_len = target.saturating_sub(buf.len());
+    if pad_len == 0 || pad_len > u16::MAX as usize {
+        return 0;
+    }
+    let old_pad = BigEndian::read_u16(&buf[start + 4..start + 6]) as usize;
+    if old_pad + pad_len > u16::MAX as usize || pad_len >= PADDING_CACHE.len() {
+        return 0;
+    }
+    BigEndian::write_u16(&mut buf[start + 4..start + 6], (old_pad + pad_len) as u16);
+    let offset = RNG.with(|rng| rng.borrow_mut().gen_range(0, PADDING_CACHE.len() - pad_len));
+    buf.extend_from_slice(&PADDING_CACHE[offset..offset + pad_len]);
+    pad_len
+}
+
 pub struct FrameScanner {
     buffer: Vec<u8>,
     offset: usize,
@@ -324,6 +392,37 @@ mod tests {
         let data_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
         assert_eq!(data_len, 300, "seq==0 的帧不得附加加密标签");
 
+        let _ = crate::crypto::set_pad_mode(&prev);
+    }
+
+    #[test]
+    fn stream_target_aligns_to_mss_budget() {
+        assert_eq!(
+            stream_aligned_tls_plaintext_target(2000, mss_padding_record_limit(1440)),
+            2848
+        );
+        assert_eq!(
+            stream_aligned_tls_plaintext_target(10000, mss_padding_record_limit(1440)),
+            10048
+        );
+    }
+
+    #[test]
+    fn stream_padding_only_touches_last_frame() {
+        let _g = crate::crypto::PAD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = crate::crypto::pad_mode_name();
+        let _ = crate::crypto::set_pad_mode("bucket");
+        let mut buf = Vec::new();
+        let _first = append_unpadded_frame(&mut buf, 1, &vec![0u8; 700], None);
+        let last = append_unpadded_frame(&mut buf, 2, &vec![0u8; 700], None);
+        assert_eq!(BigEndian::read_u16(&buf[4..6]), 0);
+        let before = buf.len();
+        let pad = pad_stream_batch_tail(&mut buf, Some(last), mss_padding_record_limit(1440));
+        assert!(pad > 0 && buf.len() > before);
+        assert_eq!(BigEndian::read_u16(&buf[last + 4..last + 6]) as usize, pad);
+        assert_eq!((buf.len() + TLS_RECORD_OVERHEAD_RESERVE) % 1440, 0);
         let _ = crate::crypto::set_pad_mode(&prev);
     }
 

@@ -1601,7 +1601,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
     // buffer") before write_tls() gets a chance to drain ciphertext.
-    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    const TLS_WRITE_BATCH_BYTES: usize = STREAM_TLS_BATCH_SOFT_LIMIT;
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
@@ -1808,6 +1808,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
+        let mut last_frame_start = None;
         if !tls.wants_write() && (woken || !rx.is_empty()) {
             if let Some(n) = &backend.notify {
                 // Only clear pending when we are actually going to drain the
@@ -1817,18 +1818,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             while let Ok(f) = rx.try_recv() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                append_padded_frame_with_limit(
+                last_frame_start = Some(append_unpadded_frame(
                     &mut send_buf,
                     f.seq,
                     f.data.as_slice(),
                     ic_ref,
-                    pad_record_limit,
-                );
+                ));
                 f.data.release();
                 tx_packets_batch += 1;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
                 }
+            }
+            if tx_packets_batch != 0 {
+                let _ = pad_stream_batch_tail(&mut send_buf, last_frame_start, pad_record_limit);
             }
         }
 
