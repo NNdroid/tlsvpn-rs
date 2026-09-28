@@ -17,12 +17,15 @@ jobs:
           ref: feat/webui-install-parity
           fetch-depth: 0
       - name: Apply final patch
-        run: python3 scripts/finalize_parity_patch.py
+        run: |
+          python3 scripts/finalize_parity_patch.py
+          python3 scripts/fix_finalize_range.py
       - name: Remove one-shot helpers
         run: |
           git rm .github/workflows/finalize-webui-installer.yml
           git rm .github/workflows/finalize-webui-installer-pr.yml
           git rm scripts/finalize_parity_patch.py
+          git rm scripts/fix_finalize_range.py
       - name: Validate product changes
         run: |
           git diff --check
