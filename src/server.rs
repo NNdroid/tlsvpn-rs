@@ -1831,23 +1831,26 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
 
     // Stay below rustls' bounded outgoing plaintext buffer. A 256KiB
     // write_all() can fail with WriteZero before ciphertext is drained.
-    const TLS_WRITE_BATCH_BYTES: usize = 32 * 1024;
+    const TLS_WRITE_BATCH_BYTES: usize = STREAM_TLS_BATCH_SOFT_LIMIT;
     let mut pulled = 0u64;
+    let mut last_frame_start = None;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
-        append_padded_frame_with_limit(
+        last_frame_start = Some(append_unpadded_frame(
             &mut sess.send_buf,
             f.seq,
             f.data.as_slice(),
             ic_ref,
-            sess.pad_record_limit,
-        );
+        ));
         f.data.release();
         pulled += 1;
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
         }
+    }
+    if pulled != 0 {
+        let _ = pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit);
     }
 
     if !sess.send_buf.is_empty() {

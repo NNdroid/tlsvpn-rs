@@ -9,7 +9,12 @@ fn version_and_readme_contract() {
     let peer = fs::read_to_string("src/peer_info.rs").unwrap();
     assert!(peer.contains("crate::api::APP_VERSION"));
     let readme = fs::read_to_string("README.md").unwrap();
-    for want in ["./tlsvpn -version", "supported by both implementations", "Out-of-range configuration is rejected locally", "HttpOnly SameSite session cookie"] {
+    for want in [
+        "./tlsvpn -version",
+        "supported by both implementations",
+        "Out-of-range configuration is rejected locally",
+        "HttpOnly SameSite session cookie",
+    ] {
         assert!(readme.contains(want), "README missing {want:?}");
     }
     assert!(!readme.contains("Go adds `traffic_days`/`traffic_file`"));
