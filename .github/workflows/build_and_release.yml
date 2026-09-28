@@ -29,6 +29,8 @@ jobs:
       # 编译 Release 版本
       - name: Build
         uses: houseabsolute/actions-rust-cross@v0
+        env:
+          TLSVPN_VERSION: ${{ github.ref_name }}
         with:
           target: ${{ matrix.target }}
           args: "--release"
@@ -53,6 +55,7 @@ jobs:
         uses: houseabsolute/actions-rust-cross@v0
         env:
           RUSTFLAGS: "-C target-cpu=cortex-a55"
+          TLSVPN_VERSION: ${{ github.ref_name }}
         with:
           target: aarch64-unknown-linux-musl
           args: "--release"

@@ -645,7 +645,7 @@ pub(crate) fn validate_config_value(
 }
 
 /// 从 argv 提取配置文件路径：`-c path`、`--config path`、`--config=path`。
-/// 除 --print-config 外这是唯一被识别的命令行面。
+/// 运行时配置仍只来自 JSON；--print-config 与 -version/--version 只是查询命令。
 fn parse_config_arg() -> Option<String> {
     let argv: Vec<String> = std::env::args().collect();
     for (i, a) in argv.iter().enumerate() {
@@ -660,8 +660,13 @@ fn parse_config_arg() -> Option<String> {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "-version" || a == "--version") {
+        println!("{}", crate::api::APP_VERSION);
+        return;
+    }
+
     // -print-config：输出示例 JSON 模板并退出（对齐 Go -print-config）
-    if std::env::args().any(|a| a == "--print-config") {
+    if std::env::args().any(|a| a == "--print-config" || a == "-print-config") {
         println!("{}", example_config_json());
         return;
     }
@@ -675,6 +680,7 @@ fn main() {
         None => {
             eprintln!("Usage: tlsvpn -c config.json");
             eprintln!("       tlsvpn --print-config > config.json   # 生成模板后编辑");
+            eprintln!("       tlsvpn -version                       # 显示构建版本");
             std::process::exit(2);
         }
     };

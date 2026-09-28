@@ -62,16 +62,17 @@ sudo ./target/release/tlsvpn -c server.json
 sudo ./target/release/tlsvpn -c client.json
 ```
 
-Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
+`"tap": "mem"` is a CI/e2e backend only: it has no real subnet behind it, drops writes, and does not provide a usable host VPN interface. Real interface addressing and policy routing are currently Linux-oriented.
 
-Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite and deliberately stay inside the Go/Rust shared config subset. Rust-only `workers`/`mtu` are omitted so Go can read them; Go-only persisted traffic-accounting keys (`traffic_days`, `traffic_file`) must likewise be omitted from files intended for Rust because both implementations reject unknown fields.
+Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite and deliberately stay inside the Go/Rust shared config subset. Rust-only `workers`/`mtu` are omitted so Go can read them. Persistent traffic-accounting keys (`traffic_days`, `traffic_file`) are supported by both implementations.
 
 ## Configuration
 
-`-c config.json` is the **only** runtime configuration surface (plus `--print-config` to print a template). The shared protocol/network fields intentionally track Go, but the complete config schemas are **not identical**: Rust adds `workers`/`mtu`, Go adds `traffic_days`/`traffic_file`, Rust currently supports only `client.interface_manager=self`, and Rust server mode requires an explicit certificate/key pair. Unknown fields are rejected. Start from the built-in shared-subset template:
+`-c config.json` is the **only** runtime configuration surface. `--print-config` prints a template and `-version`/`--version` prints the build version; neither adds runtime tuning flags. The shared protocol/network fields intentionally track Go, but the complete config schemas are **not identical**: Rust adds `workers`/`mtu`, Rust currently supports only `client.interface_manager=self`, and Rust server mode requires an explicit certificate/key pair. `traffic_days`/`traffic_file` are shared by both implementations. Unknown fields are rejected. Start from the built-in shared-subset template:
 
 ```bash
 ./tlsvpn --print-config > config.json
+./tlsvpn -version
 ```
 
 <details><summary>Representative shared-subset template (use <code>--print-config</code> for the canonical current output)</summary>
@@ -91,6 +92,8 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
+  "traffic_days": 30,
+  "traffic_file": "tlsvpn-traffic.json",
   "socks5": "",
   "tap": "tap0",
   "mac": "",
@@ -128,7 +131,7 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
 | `log_level` | `info` | — | `trace` / `debug` / `info` / `warn` / `error` — validated at startup, anything else is refused (switchable live from the dashboard) |
 | `web.addr` | (empty) | — | Dashboard listen address; off unless set |
-| `web.auth` | (required when enabled) | — | Basic Auth as `user:pass`, compared as fixed-length SHA-256 digests. Known example credentials are rejected |
+| `web.auth` | (required when enabled) | — | Credential source as `user:pass`. Browser login exchanges it for an HttpOnly SameSite session cookie; explicit Basic Auth remains accepted for scripts. Known example credentials are rejected |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving. On Linux the tunnel addresses are brought `up` first and the v6 address gets `nodad` — without it a v6 address that has no RA to answer for stays tentative forever, and `[fd00::1]:8080` never binds |
 | `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
@@ -140,7 +143,7 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `client.interface_manager` | `self` | client | Rust currently supports only `self`. The Go/OpenWrt `netifd` mode is intentionally rejected by tlsvpn-rs |
 | `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
 | `client.fec` | `false` | client | XOR-parity FEC over multipath; one parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K |
-| `client.fec_group` | `4` | client | XOR FEC group size K (2–64), clamped into range before it goes on the wire; the server may refuse an out-of-policy K |
+| `client.fec_group` | `4` | client | XOR FEC group size K (2–64). Out-of-range configuration is rejected locally; the server may also refuse a K outside its configured policy |
 | `client.sni` | `www.cloudflare.com` | client | SNI domain for handshake camouflage |
 | `client.insecure` | `false` | client | Skip server TLS verification (prefer `cert_sha256`) |
 | `client.cert_sha256` | (empty) | client | Pin the server cert by SHA-256 fingerprint (hex, colon-tolerant) |

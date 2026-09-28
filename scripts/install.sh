@@ -361,6 +361,19 @@ random_secret() {
   if have openssl; then openssl rand -hex 32; else od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; fi
 }
 
+binary_version() {
+  local bin="${1:-$INSTALL_DIR/$PROGRAM}"
+  [[ -x "$bin" ]] || return 1
+  "$bin" -version 2>/dev/null | head -n1
+}
+
+installed_version() {
+  local v=""
+  v="$(binary_version 2>/dev/null || true)"
+  if [[ -z "$v" && -r "$STATE_DIR/installed-version" ]]; then v="$(cat "$STATE_DIR/installed-version")"; fi
+  printf '%s' "$v"
+}
+
 release_arch() {
   local want="$ARCH"
   [[ "$want" == "auto" ]] && want="$HOST_ARCH"
@@ -878,7 +891,7 @@ upgrade_action() {
   load_state || true
   create_backup; ROLLBACK_ON_ERROR="yes"
   local before=""
-  [[ -x "$INSTALL_DIR/$PROGRAM" ]] && before="$($INSTALL_DIR/$PROGRAM --version 2>/dev/null || true)"
+  before="$(installed_version)"
   install_tlsvpn_binary
   start_service
   ROLLBACK_ON_ERROR="no"
@@ -892,7 +905,7 @@ maintenance_action() {
   if [[ "$CERT_MODE" == "lego" ]]; then renew_lego_certificate && cert_changed="yes" || true
   elif [[ "$CERT_MODE" == "self-signed" && -s "$CERT_DIR/server.crt" ]] && ! openssl x509 -checkend 2592000 -noout -in "$CERT_DIR/server.crt" >/dev/null 2>&1; then create_self_signed_certificate; cert_changed="yes"; fi
   local installed="" latest=""
-  [[ -r "$STATE_DIR/installed-version" ]] && installed="$(cat "$STATE_DIR/installed-version")"
+  installed="$(installed_version)"
   latest="$(latest_release_tag || true)"
   if [[ -n "$latest" && "$latest" != "$installed" ]]; then
     info "New release detected: ${installed:-unknown} -> $latest"
@@ -931,7 +944,8 @@ status_action() {
   detect_platform
   printf 'Distribution: %s\nArchitecture: %s\nInit: %s\n' "$DISTRO" "$HOST_ARCH" "$INIT_SYSTEM"
   if [[ -x "$INSTALL_DIR/$PROGRAM" ]]; then printf 'TLSVPN binary: %s\n' "$INSTALL_DIR/$PROGRAM"; else printf 'TLSVPN binary: not installed\n'; fi
-  [[ -r "$STATE_DIR/installed-version" ]] && printf 'Installed release: %s\n' "$(cat "$STATE_DIR/installed-version")"
+  local installed="$(installed_version)"
+  [[ -n "$installed" ]] && printf 'Installed release: %s\n' "$installed"
   printf 'Config: %s\n' "$([[ -r "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo 'not found')"
   if [[ -s "$CERT_DIR/server.crt" ]]; then
     printf 'Certificate: '; openssl x509 -noout -subject -enddate -in "$CERT_DIR/server.crt" 2>/dev/null | tr '\n' ' '; printf '\n'

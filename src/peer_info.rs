@@ -46,7 +46,7 @@ fn collect_peer_info() -> PeerInfo {
         hostname,
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::api::APP_VERSION.into(),
         git_commit: option_env!("TLSVPN_GIT_COMMIT").unwrap_or("").into(),
         build_time: option_env!("TLSVPN_BUILD_TIME").unwrap_or("").into(),
         ..Default::default()
