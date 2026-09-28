@@ -10,6 +10,7 @@ on:
       - "src/client.rs"
       - "src/server.rs"
       - "src/api.rs"
+      - "webui/app.js"
       - "examples/interop_client.rs"
       - "scripts/e2e_enc.sh"
       - ".github/workflows/crypto-interop.yml"
@@ -24,10 +25,10 @@ jobs:
 
     - name: Verify WebUI inner-AEAD labels
       run: |
-        grep -Fq "if(a===5)return '<span class=\"badge b-on\">ChaCha20-Poly1305</span>'" src/api.rs
-        grep -Fq "if(a===6)return '<span class=\"badge b-on\">XChaCha20-Poly1305</span>'" src/api.rs
-        grep -Fq "else if(data.enc_algo===5)meta.push('ChaCha20-Poly1305')" src/api.rs
-        grep -Fq "g.enc_algo===6?'XChaCha20-Poly1305'" src/api.rs
+        grep -Fq "if(a===5)return '<span class=\"badge b-on\">ChaCha20-Poly1305</span>'" webui/app.js
+        grep -Fq "if(a===6)return '<span class=\"badge b-on\">XChaCha20-Poly1305</span>'" webui/app.js
+        grep -Fq "else if(data.enc_algo===5)meta.push('ChaCha20-Poly1305')" webui/app.js
+        grep -Fq "g.enc_algo===6?'XChaCha20-Poly1305'" webui/app.js
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
