@@ -1683,6 +1683,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         } else {
             None
         };
+        let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
+        let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
 
         if readable {
             'socket_read: loop {
@@ -1749,7 +1751,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 if let Some(dec) = &fec_dec {
                                     if fec::is_parity_frame(&data) {
                                         let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                            deliver_to_tap(&cl, s, f);
+                                            reorder_input.push((s, f));
                                         };
                                         dec.on_parity(&data, &mut sink);
                                         release_shared_frame(data);
@@ -1758,17 +1760,23 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 }
                             }
 
-                            if let Some(dec) = &fec_dec {
-                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_tap(&cl, s, f);
-                                };
-                                dec.on_data(seq, &data, &mut sink);
+                            if fec_dec.is_some() {
+                                fec_data_batch.push((seq, data.clone()));
                             }
 
                             if !cl.dedup.is_duplicate(seq) {
-                                deliver_to_tap(&cl, seq, data);
+                                reorder_input.push((seq, data));
                             } else {
                                 release_shared_frame(data);
+                            }
+
+                            if fec_data_batch.len() >= 64 || reorder_input.len() >= 64 {
+                                flush_client_rx_batch(
+                                    &cl,
+                                    fec_dec.as_ref(),
+                                    &mut fec_data_batch,
+                                    &mut reorder_input,
+                                );
                             }
                         }
                         Ok(None) => break,
@@ -1781,6 +1789,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 }
             }
         }
+
+        flush_client_rx_batch(
+            &cl,
+            fec_dec.as_ref(),
+            &mut fec_data_batch,
+            &mut reorder_input,
+        );
 
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
@@ -1918,17 +1933,38 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     linked_at.elapsed()
 }
 
-/// Inject one data/recovered frame into reorder and hand any newly contiguous
-/// output to the dedicated TAP writer. Enqueue happens under the reorder lock:
-/// this is nonblocking and preserves strict order across physical connections.
-fn deliver_to_tap(cl: &Arc<Client>, seq: u32, frame: Arc<Vec<u8>>) {
+/// Flush one plaintext RX batch through FEC and reorder. FEC takes its mutex once
+/// per batch; reorder likewise receives the whole input burst under one lock.
+fn flush_client_rx_batch(
+    cl: &Arc<Client>,
+    fec_dec: Option<&Arc<FecDecoder>>,
+    fec_data: &mut Vec<(u32, Arc<Vec<u8>>)>,
+    reorder_input: &mut Vec<(u32, Arc<Vec<u8>>)>,
+) {
+    if let Some(dec) = fec_dec {
+        if !fec_data.is_empty() {
+            let mut sink = |seq: u32, frame: Arc<Vec<u8>>| {
+                reorder_input.push((seq, frame));
+            };
+            dec.on_data_batch(fec_data, &mut sink);
+        }
+    }
+    fec_data.clear();
+
+    if reorder_input.is_empty() {
+        return;
+    }
     let mut ready = cl.tap_delivery.acquire();
     let mut reorder = cl.reorder_buf.lock();
-    reorder.insert_into(seq, frame, &mut ready);
+    for (seq, frame) in reorder_input.drain(..) {
+        reorder.insert_into(seq, frame, &mut ready);
+    }
     if ready.is_empty() {
         drop(reorder);
         cl.tap_delivery.recycle(ready);
     } else {
+        // Keep enqueue under the reorder lock just like the old per-frame path so
+        // batches from different physical connections cannot overtake each other.
         cl.tap_delivery.enqueue(ready);
     }
 }
