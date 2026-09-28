@@ -31,8 +31,6 @@ jobs:
           if old_def not in script:
               raise SystemExit('reviewed helper rep() body not found')
           script = script.replace(old_def, new_def, 1)
-          # The reviewed helper used raw Python strings for source fragments. Convert
-          # them so \n means a real source newline rather than a literal backslash-n.
           script = script.replace("r'''", "'''")
           script = script.replace(
               "Path('.github/workflows/webui-install-helper.yml').unlink()",
@@ -40,6 +38,10 @@ jobs:
               1,
           )
           exec(compile(script, '<webui-parity-patch>', 'exec'), {'__name__':'__main__'})
+          main = Path('src/main.rs')
+          source = main.read_text()
+          if not source.startswith('#![recursion_limit'):
+              main.write_text('#![recursion_limit = "256"]\n' + source)
           META
       - name: Format and validate
         run: |
