@@ -1349,7 +1349,10 @@ pub fn web_port(addr: &str) -> u16 {
 /// Start the process-level dashboard/traffic sampler exactly once. It runs even
 /// when the HTTP dashboard is disabled so traffic_days/traffic_file keep the same
 /// process-level semantics as the Go implementation.
-pub fn start_dashboard_sampler(provider: Arc<dyn WebStatsProvider>, ctx: Arc<RuntimeCtx>) {
+pub fn start_dashboard_sampler(
+    provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
+) {
     if !ctx.web.try_start_sampler() {
         return;
     }
