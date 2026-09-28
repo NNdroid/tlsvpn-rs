@@ -329,7 +329,7 @@ pub struct Client {
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
     tap_delivery: TapDelivery,
     pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,
-    pub dedup: Arc<Mutex<DeDuplicator>>,
+    pub dedup: Arc<DeDuplicator>,
     pub session: Mutex<SessionState>,
     // 身份状态文件路径；空串 = 不持久化（进程内测试未从文件加载配置）
     pub state_path: String,
@@ -834,7 +834,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                 if EXIT.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut frame = acquire_frame_vec(tap_read_size);
+                let mut frame = acquire_frame_vec_overwrite(tap_read_size);
                 match dev.recv(&mut frame) {
                     Ok(n) if n > 0 => {
                         frame.truncate(n);
@@ -924,7 +924,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         reorder_buf: reorder_buf.clone(),
         tap_delivery,
         fec_dec: Mutex::new(None),
-        dedup: Arc::new(Mutex::new(DeDuplicator::new())),
+        dedup: Arc::new(DeDuplicator::new()),
         session: Mutex::new(session),
         state_path,
         identity: Mutex::new(identity),
@@ -1487,7 +1487,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             );
             drop(st);
             cl.reorder_buf.lock().reset();
-            cl.dedup.lock().reset();
+            cl.dedup.reset();
         }
     }
 
@@ -1765,7 +1765,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 dec.on_data(seq, &data, &mut sink);
                             }
 
-                            if !cl.dedup.lock().is_duplicate(seq) {
+                            if !cl.dedup.is_duplicate(seq) {
                                 deliver_to_tap(&cl, seq, data);
                             } else {
                                 release_shared_frame(data);

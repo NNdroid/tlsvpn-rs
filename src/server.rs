@@ -195,7 +195,7 @@ pub struct ClientSession {
     pub stat: Arc<ClientStat>,
     pub port: Arc<AsyncPort>,
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
-    pub dedup: Arc<Mutex<DeDuplicator>>,
+    pub dedup: Arc<DeDuplicator>,
     pub fec_enc_k: i64,
     pub mac: String,
     pub peer_info: RwLock<Option<PeerInfo>>,
@@ -1001,7 +1001,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
     std::thread::spawn(move || {
         loop {
-            let mut frame = acquire_frame_vec(tap_read_size);
+            let mut frame = acquire_frame_vec_overwrite(tap_read_size);
             match dev_reader.recv(&mut frame) {
                 Ok(n) if n > 0 => {
                     frame.truncate(n);
@@ -1686,7 +1686,7 @@ fn process_plain_frames(
                         dec.on_data(seq, &data, &mut sink);
                     }
 
-                    if !c_sess.dedup.lock().is_duplicate(seq) {
+                    if !c_sess.dedup.is_duplicate(seq) {
                         deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
                     } else {
                         release_shared_frame(data);
@@ -1928,7 +1928,7 @@ fn rotate_session_epoch(
         old.reset();
     }
     session.reorder_buf.lock().reset();
-    session.dedup.lock().reset();
+    session.dedup.reset();
     if session.fec_enc_k > 0 {
         session.port.reset_epoch(session.fec_enc_k as usize, fec_tx);
     } else {
@@ -2283,7 +2283,7 @@ fn handle_handshake(
                 stat,
                 port,
                 reorder_buf: Arc::new(Mutex::new(ReorderBuffer::new())),
-                dedup: Arc::new(Mutex::new(DeDuplicator::new())),
+                dedup: Arc::new(DeDuplicator::new()),
                 fec_enc_k,
                 mac,
                 peer_info: RwLock::new(req.peer_info.as_ref().map(normalize_peer_info)),

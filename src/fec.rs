@@ -34,16 +34,8 @@ pub fn clamp_fec_group(k: usize) -> usize {
 /// 都必须给出同一个结论。
 pub fn normalize_fec_group_bounds(min: i64, max: i64) -> (i64, i64) {
     (
-        if min == 0 {
-            FEC_MIN_GROUP as i64
-        } else {
-            min
-        },
-        if max == 0 {
-            FEC_MAX_GROUP as i64
-        } else {
-            max
-        },
+        if min == 0 { FEC_MIN_GROUP as i64 } else { min },
+        if max == 0 { FEC_MAX_GROUP as i64 } else { max },
     )
 }
 
@@ -175,7 +167,6 @@ unsafe fn xor_combine_avx2(out: &mut [u8], parity: &[u8], acc: &[u8]) {
     }
 }
 
-
 // ---------- NEON 路径（AArch64 baseline） ----------
 
 #[cfg(target_arch = "aarch64")]
@@ -224,6 +215,7 @@ pub struct FecEncoder {
     seqs: Vec<u32>,
     lens: Vec<usize>,
     acc: Vec<u8>,
+    active_len: usize,
     ic: Option<Arc<InnerCipher>>,
     parity_sent: u64,
 }
@@ -237,6 +229,7 @@ impl FecEncoder {
             lens: Vec::with_capacity(k),
             // 常见 Ethernet payload 一次扩到 2KB 档，之后复用。
             acc: Vec::with_capacity(2048),
+            active_len: 0,
             ic,
             // encoder 本身已由 AsyncPort mutex 串行访问，无需再做原子计数。
             parity_sent: 0,
@@ -258,7 +251,8 @@ impl FecEncoder {
         if data.len() > self.acc.len() {
             self.acc.resize(data.len(), 0);
         }
-        xor_into(&mut self.acc, data);
+        self.active_len = self.active_len.max(data.len());
+        xor_into(&mut self.acc[..data.len()], data);
         if self.seqs.len() < self.k {
             return None;
         }
@@ -271,13 +265,12 @@ impl FecEncoder {
     fn reset(&mut self) {
         self.seqs.clear();
         self.lens.clear();
-        for b in self.acc.iter_mut() {
-            *b = 0;
-        }
+        self.acc[..self.active_len].fill(0);
+        self.active_len = 0;
     }
 
     fn build_parity(&mut self) -> Vec<u8> {
-        let max_len = self.acc.len();
+        let max_len = self.active_len;
         let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
         let mut buf = acquire_frame_vec(6 + 4 * self.lens.len() + max_len + tag_len);
         buf[0] = FEC_MAGIC;
@@ -288,7 +281,7 @@ impl FecEncoder {
             BigEndian::write_u32(&mut buf[off..off + 4], *l as u32);
             off += 4;
         }
-        buf[off..off + max_len].copy_from_slice(&self.acc);
+        buf[off..off + max_len].copy_from_slice(&self.acc[..max_len]);
         if let Some(ic) = &self.ic {
             // 校验帧线路负载 = 描述符 + 加密后的异或载荷，以 groupStart 为 seq
             ic.seal_in_place(
