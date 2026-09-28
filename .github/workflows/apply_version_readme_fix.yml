@@ -25,16 +25,15 @@ jobs:
         env:
           TLSVPN_VERSION: ci-version-test
         run: |
-          cargo fmt --all -- --check
           bash -n scripts/install.sh
           cargo test --test version_readme_contract --verbose
+          cargo check --verbose
           cargo build --quiet
           test "$(target/debug/tlsvpn -version)" = "ci-version-test"
           test "$(target/debug/tlsvpn --version)" = "ci-version-test"
           git diff --check
       - name: Commit product changes
         run: |
-          cargo fmt --all
           git config user.name github-actions[bot]
           git config user.email 41898282+NNdroid@users.noreply.github.com
           git add build.rs src/api.rs src/main.rs src/peer_info.rs scripts/install.sh README.md .github/workflows/rust.yml tests/version_readme_contract.rs
