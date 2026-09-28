@@ -168,7 +168,34 @@ Keys that belong to the other mode are accepted but have no effect (a server ign
 
 Off by default; set `web.addr` to enable it. Rust embeds the same static WebUI asset set as Go (including zh-CN/zh-TW/en/de/fr/ja, local OS/arch icons, the current frame-format visualizer and favicon), while retaining the Rust backend/auth model. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Stats, per-connection details, FEC counters, MAC/IP-pool state, ban/kick controls, log tail with live level switching and Prometheus `/metrics` are backed by Rust APIs. Browser/API access uses HTTP Basic Auth from `web.auth`, and mutating control calls require `X-Requested-With: tlsvpn`.
 
-Current backend parity limits are explicit: `/api/trend` returns an empty compatibility series, `/api/events` returns an empty compatibility list rather than Go's event stream, and `POST /api/config` returns HTTP 501 because runtime config persistence/hot-apply is not implemented in Rust yet. `GET /api/config` is available for display. The shared frontend therefore looks aligned with Go, but those three backend capabilities are not yet equivalent.
+The dashboard backend follows the Go contract as well: browser login uses the same HttpOnly session-cookie flow (Basic Auth remains available to scripts), `/api/trend` keeps a live 1-second ring, `/api/events` provides SSE plus polling recovery, and the settings editor reads/writes the source JSON with PSK/Web-auth/SOCKS credentials redacted and preserved. `save_apply` hot-applies log level and padding immediately and reports every other changed path in `needs_restart`. Rust accepts Go's `traffic_days`/`traffic_file` configuration keys in addition to its `workers`/`mtu` extensions.
+
+## One-click installer
+
+`scripts/install.sh` is an English-only interactive/CLI installer for Debian, Ubuntu, Rocky/RHEL-family and Alpine Linux. It supports `install`, `upgrade`, `uninstall`, `rollback`, `maintenance` and `status`, keeps rollback snapshots of TLSVPN-managed files, installs systemd or OpenRC services, and can create a daily maintenance timer. Run it without an action for the wizard; type `back` at wizard prompts to move to the previous step.
+
+```bash
+# Interactive
+sudo bash scripts/install.sh
+
+# ACME/lego with a normal DNS name
+sudo bash scripts/install.sh install --mode server --psk 'REPLACE-ME' \
+  --cert-mode lego --cert-name vpn.example.com --email admin@example.com
+
+# ACME/lego with a public IP identifier (RFC 8738 / short-lived profile)
+sudo bash scripts/install.sh install --mode server --psk 'REPLACE-ME' \
+  --cert-mode lego --cert-name 203.0.113.10 --email admin@example.com
+
+# Client plus optional tuning/components
+sudo bash scripts/install.sh install --mode client --server vpn.example.com:4000 \
+  --psk 'REPLACE-ME' --tcp-brutal yes --optimize-kernel yes
+
+sudo bash scripts/install.sh upgrade
+sudo bash scripts/install.sh rollback
+sudo bash scripts/install.sh uninstall --purge
+```
+
+Certificates can use lego/ACME, self-signed, or an existing cert/key pair. Daily maintenance renews lego certificates and checks GitHub Releases for a newer TLSVPN binary. XanMod is intentionally automated only on Debian/Ubuntu x86_64; tcp-brutal is optional and skipped on Alpine, and the installer warns about known-risk newer XanMod combinations unless `--force-tcp-brutal` is explicitly supplied. XanMod packages are never automatically removed on uninstall because removing a running kernel is unsafe.
 
 ## Notes
 

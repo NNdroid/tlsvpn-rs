@@ -87,3 +87,55 @@ fn rust_embed_table_covers_primary_assets() {
         );
     }
 }
+
+#[test]
+fn rust_webui_backend_matches_go_management_contract() {
+    let api = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"))
+        .expect("api.rs");
+    let parity =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web_parity.rs"))
+            .expect("web_parity.rs");
+    for marker in [
+        "tlsvpn_session",
+        "/api/login",
+        "/api/logout",
+        "/api/auth/status",
+        "text/event-stream",
+        "save_apply",
+        "needs_restart",
+        "redacted_config",
+    ] {
+        assert!(
+            api.contains(marker) || parity.contains(marker),
+            "missing WebUI backend contract marker {marker}"
+        );
+    }
+    assert!(!api.contains("runtime config save/apply is not supported"));
+}
+
+#[test]
+fn installer_has_required_lifecycle_and_platform_contract() {
+    let installer =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .expect("install.sh");
+    for marker in [
+        "install_action",
+        "upgrade_action",
+        "uninstall_action",
+        "rollback_action",
+        "maintenance_action",
+        "debian|ubuntu",
+        "rocky",
+        "alpine",
+        "cert-mode",
+        "lego",
+        "self-signed",
+        "XanMod",
+        "tcp-brutal",
+        "tlsvpn-maintenance.timer",
+        "--non-interactive",
+        "back",
+    ] {
+        assert!(installer.contains(marker), "installer missing {marker}");
+    }
+}

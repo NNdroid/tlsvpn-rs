@@ -118,10 +118,12 @@ impl EventHub {
         while inner.ring.len() > EVENT_CAP {
             inner.ring.pop_front();
         }
-        inner.subscribers.retain(|tx| match tx.try_send(event.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
-        });
+        inner
+            .subscribers
+            .retain(|tx| match tx.try_send(event.clone()) {
+                Ok(()) | Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            });
     }
 
     pub fn snapshot(&self, after: u64) -> Vec<DashboardEvent> {

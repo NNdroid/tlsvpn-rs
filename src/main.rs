@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -20,6 +21,7 @@ pub mod server;
 pub mod socks5;
 pub mod tap;
 pub mod utils;
+pub mod web_parity;
 
 use crate::api::{init_logging, RuntimeCtx};
 use crate::buffer::*;
@@ -58,6 +60,8 @@ pub struct Args {
     pub brutal: bool,
     pub brutal_up: u64,
     pub brutal_down: u64,
+    pub traffic_days: i64,
+    pub traffic_file: String,
     pub conns: i32,
     pub fec: bool,
     pub fec_group: i64,
@@ -111,6 +115,10 @@ struct ConfigFile {
     brutal: bool,
     brutal_up: u64,
     brutal_down: u64,
+    #[serde(default)]
+    traffic_days: i64,
+    #[serde(default)]
+    traffic_file: String,
     workers: i32,
     mtu: u16,
     web: WebConfigFile,
@@ -261,6 +269,21 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.brutal_down
         },
+        traffic_days: if cfg.traffic_days == 0 {
+            30
+        } else {
+            cfg.traffic_days
+        },
+        traffic_file: if cfg.traffic_file.is_empty() {
+            let p = std::path::Path::new(path);
+            p.parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("tlsvpn-traffic.json")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            cfg.traffic_file
+        },
         web: cfg.web.addr,
         web_auth: cfg.web.auth,
         web_bind: if cfg.web.bind.is_empty() {
@@ -368,6 +391,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
     }
     if args.mode == "client" && args.conns > 65536 {
         return Err("client.conns must not exceed 65536".into());
+    }
+    if args.traffic_days != 0 && !(1..=3650).contains(&args.traffic_days) {
+        return Err("traffic_days must be between 1 and 3650".into());
     }
     // mode 闭集校验，文案与 Go Validate 逐字一致
     match args.mode.as_str() {
@@ -590,6 +616,32 @@ fn validate_args(args: &Args) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Validate a dashboard-edited JSON document with the exact same loader and
+/// validator used at process startup. The temporary file lives beside the real
+/// config so relative/default path semantics remain identical.
+pub(crate) fn validate_config_value(
+    value: &serde_json::Value,
+    source_path: &str,
+) -> Result<Args, String> {
+    let path = std::path::Path::new(source_path);
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".tlsvpn-web-validate-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut data = serde_json::to_vec_pretty(value).map_err(|e| format!("marshal config: {e}"))?;
+    data.push(b'\n');
+    std::fs::write(&tmp, data).map_err(|e| format!("write validation config: {e}"))?;
+    let result = load_config_file(tmp.to_str().unwrap_or(source_path))
+        .and_then(|args| validate_args(&args).map(|_| args));
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 /// 从 argv 提取配置文件路径：`-c path`、`--config path`、`--config=path`。
@@ -1520,6 +1572,8 @@ fn example_config_json() -> &'static str {
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
+  "traffic_days": 30,
+  "traffic_file": "tlsvpn-traffic.json",
   "socks5": "",
   "tap": "tap0",
   "mac": "",

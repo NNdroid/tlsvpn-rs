@@ -3,12 +3,12 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{mapref::entry::Entry, DashMap};
 use mio;
 use parking_lot::{Mutex, RwLock};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
@@ -122,7 +122,9 @@ pub fn split_legacy_brutal_rate(total: u64, conns: usize, index: usize) -> u64 {
 }
 
 pub fn split_legacy_brutal_rate_bps(total_mbps: u64, conns: usize, index: usize) -> u64 {
-    if total_mbps == 0 || conns == 0 || index >= conns { return 0; }
+    if total_mbps == 0 || conns == 0 || index >= conns {
+        return 0;
+    }
     let total_bps = total_mbps * 1_000_000 / 8;
     total_bps / conns as u64 + u64::from((index as u64) < total_bps % conns as u64)
 }
@@ -137,13 +139,24 @@ pub fn brutal_group_id(domain: &str, identity: &str) -> u64 {
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&digest[..8]);
     let id = u64::from_le_bytes(raw);
-    if id == 0 { 1 } else { id }
+    if id == 0 {
+        1
+    } else {
+        id
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn encode_brutal_params_bps(rate_bps: u64, gain: u32, group_id: Option<u64>) -> Result<Vec<u8>, String> {
+fn encode_brutal_params_bps(
+    rate_bps: u64,
+    gain: u32,
+    group_id: Option<u64>,
+) -> Result<Vec<u8>, String> {
     if rate_bps == 0 || rate_bps > MAX_BRUTAL_RATE_MBPS * 1_000_000 / 8 {
-        return Err(format!("TCP Brutal byte rate {} is outside the supported range", rate_bps));
+        return Err(format!(
+            "TCP Brutal byte rate {} is outside the supported range",
+            rate_bps
+        ));
     }
     let mut out = vec![0u8; if group_id.is_some() { 20 } else { 12 }];
     out[..8].copy_from_slice(&rate_bps.to_le_bytes());
@@ -170,10 +183,22 @@ fn decode_brutal_params_bps(params: &[u8]) -> Result<(u64, u32, u64), String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy_rate_bps: u64, group_id: u64) -> BrutalApplyResult {
-    let mut result = BrutalApplyResult { attempted: true, cwnd_gain: BRUTAL_CWND_GAIN, ..Default::default() };
+fn configure_tcp_brutal<O: BrutalSocketOps>(
+    ops: &mut O,
+    total_rate: u64,
+    legacy_rate_bps: u64,
+    group_id: u64,
+) -> BrutalApplyResult {
+    let mut result = BrutalApplyResult {
+        attempted: true,
+        cwnd_gain: BRUTAL_CWND_GAIN,
+        ..Default::default()
+    };
     if total_rate == 0 || total_rate > MAX_BRUTAL_RATE_MBPS {
-        result.error = format!("TCP Brutal rate {} Mbps is outside [1, {}]", total_rate, MAX_BRUTAL_RATE_MBPS);
+        result.error = format!(
+            "TCP Brutal rate {} Mbps is outside [1, {}]",
+            total_rate, MAX_BRUTAL_RATE_MBPS
+        );
         return result;
     }
     let previous = ops.get_congestion().unwrap_or_default();
@@ -181,7 +206,8 @@ fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy
         Ok(()) => {}
         Err(BrutalSockError::Locked) => {
             if ops.get_congestion().unwrap_or_default() != "brutal" {
-                result.error = "TCP_CONGESTION is rule-locked but current algorithm is not brutal".into();
+                result.error =
+                    "TCP_CONGESTION is rule-locked but current algorithm is not brutal".into();
                 return result;
             }
             result.rule_managed = true;
@@ -195,34 +221,54 @@ fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy
         Ok(v) => v,
         Err(BrutalSockError::NoVersion) => 0,
         Err(e) => {
-            if !previous.is_empty() && previous != "brutal" { let _ = ops.set_congestion(&previous); }
+            if !previous.is_empty() && previous != "brutal" {
+                let _ = ops.set_congestion(&previous);
+            }
             result.error = format!("TCP_BRUTAL_VERSION failed: {:?}", e);
             return result;
         }
     };
     result.version = version;
     let use_group = version >= BRUTAL_V2_VERSION && group_id != 0;
-    let rate_bps = if use_group { total_rate * 1_000_000 / 8 } else { legacy_rate_bps };
+    let rate_bps = if use_group {
+        total_rate * 1_000_000 / 8
+    } else {
+        legacy_rate_bps
+    };
     if rate_bps == 0 {
-        if !previous.is_empty() && previous != "brutal" { let _ = ops.set_congestion(&previous); }
+        if !previous.is_empty() && previous != "brutal" {
+            let _ = ops.set_congestion(&previous);
+        }
         result.error = "TCP Brutal legacy share is 0 Mbps; connection left unshaped to preserve the total limit".into();
         return result;
     }
-    let params = match encode_brutal_params_bps(rate_bps, BRUTAL_CWND_GAIN, if use_group { Some(group_id) } else { None }) {
+    let params = match encode_brutal_params_bps(
+        rate_bps,
+        BRUTAL_CWND_GAIN,
+        if use_group { Some(group_id) } else { None },
+    ) {
         Ok(v) => v,
-        Err(e) => { result.error = e; return result; }
+        Err(e) => {
+            result.error = e;
+            return result;
+        }
     };
     match ops.set_params(&params) {
         Ok(()) => {}
         Err(BrutalSockError::Locked) => result.rule_managed = true,
         Err(e) => {
-            if !previous.is_empty() && previous != "brutal" { let _ = ops.set_congestion(&previous); }
+            if !previous.is_empty() && previous != "brutal" {
+                let _ = ops.set_congestion(&previous);
+            }
             result.error = format!("TCP_BRUTAL_PARAMS failed: {:?}", e);
             return result;
         }
     }
     let read_size = if version >= BRUTAL_V2_VERSION { 20 } else { 12 };
-    match ops.get_params(read_size).and_then(|p| decode_brutal_params_bps(&p).map_err(BrutalSockError::Other)) {
+    match ops
+        .get_params(read_size)
+        .and_then(|p| decode_brutal_params_bps(&p).map_err(BrutalSockError::Other))
+    {
         Ok(actual) => {
             result.rate_bps = actual.0;
             result.rate_mbps = actual.0 * 8 / 1_000_000;
@@ -235,7 +281,9 @@ fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy
             result.rate_bps = 0;
             result.rate_mbps = 0;
             result.group_id = 0;
-            result.error = "TCP Brutal is active under a locked rule; actual rate and group are unavailable".into();
+            result.error =
+                "TCP Brutal is active under a locked rule; actual rate and group are unavailable"
+                    .into();
         }
         Err(e) => {
             // 参数已经成功写入；读回失败只影响可观测性，不应把连接降级成未启用。
@@ -250,12 +298,18 @@ fn configure_tcp_brutal<O: BrutalSocketOps>(ops: &mut O, total_rate: u64, legacy
 }
 
 #[cfg(target_os = "linux")]
-struct LinuxBrutalSocket { fd: i32 }
+struct LinuxBrutalSocket {
+    fd: i32,
+}
 
 #[cfg(target_os = "linux")]
 fn brutal_errno() -> BrutalSockError {
     let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EPERM) { BrutalSockError::Locked } else { BrutalSockError::Other(e.to_string()) }
+    if e.raw_os_error() == Some(libc::EPERM) {
+        BrutalSockError::Locked
+    } else {
+        BrutalSockError::Other(e.to_string())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -263,47 +317,115 @@ impl BrutalSocketOps for LinuxBrutalSocket {
     fn set_congestion(&mut self, algo: &str) -> Result<(), BrutalSockError> {
         let mut value = algo.as_bytes().to_vec();
         value.push(0);
-        let rc = unsafe { libc::setsockopt(self.fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, value.as_ptr() as *const _, value.len() as libc::socklen_t) };
-        if rc == 0 { Ok(()) } else { Err(brutal_errno()) }
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                value.as_ptr() as *const _,
+                value.len() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(brutal_errno())
+        }
     }
     fn get_congestion(&mut self) -> Result<String, BrutalSockError> {
         let mut value = [0u8; 32];
         let mut len = value.len() as libc::socklen_t;
-        let rc = unsafe { libc::getsockopt(self.fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, value.as_mut_ptr() as *mut _, &mut len) };
-        if rc != 0 { return Err(brutal_errno()); }
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                value.as_mut_ptr() as *mut _,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(brutal_errno());
+        }
         let end = value.iter().position(|b| *b == 0).unwrap_or(len as usize);
         Ok(String::from_utf8_lossy(&value[..end]).to_string())
     }
     fn get_version(&mut self) -> Result<u32, BrutalSockError> {
         let mut value = 0u32;
         let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        let rc = unsafe { libc::getsockopt(self.fd, libc::IPPROTO_TCP, TCP_BRUTAL_VERSION, &mut value as *mut _ as *mut _, &mut len) };
-        if rc == 0 { return Ok(value); }
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                TCP_BRUTAL_VERSION,
+                &mut value as *mut _ as *mut _,
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            return Ok(value);
+        }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ENOPROTOOPT) { Err(BrutalSockError::NoVersion) } else { Err(BrutalSockError::Other(e.to_string())) }
+        if e.raw_os_error() == Some(libc::ENOPROTOOPT) {
+            Err(BrutalSockError::NoVersion)
+        } else {
+            Err(BrutalSockError::Other(e.to_string()))
+        }
     }
     fn set_params(&mut self, params: &[u8]) -> Result<(), BrutalSockError> {
-        let rc = unsafe { libc::setsockopt(self.fd, libc::IPPROTO_TCP, TCP_BRUTAL_PARAMS, params.as_ptr() as *const _, params.len() as libc::socklen_t) };
-        if rc == 0 { Ok(()) } else { Err(brutal_errno()) }
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                TCP_BRUTAL_PARAMS,
+                params.as_ptr() as *const _,
+                params.len() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(brutal_errno())
+        }
     }
     fn get_params(&mut self, size: usize) -> Result<Vec<u8>, BrutalSockError> {
         let mut value = vec![0u8; size];
         let mut len = size as libc::socklen_t;
-        let rc = unsafe { libc::getsockopt(self.fd, libc::IPPROTO_TCP, TCP_BRUTAL_PARAMS, value.as_mut_ptr() as *mut _, &mut len) };
-        if rc != 0 { return Err(brutal_errno()); }
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                TCP_BRUTAL_PARAMS,
+                value.as_mut_ptr() as *mut _,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(brutal_errno());
+        }
         value.truncate(len as usize);
         Ok(value)
     }
 }
 
 #[cfg(target_os = "linux")]
-pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, total_rate: u64, legacy_rate: u64, group_id: u64) -> BrutalApplyResult {
-    let mut ops = LinuxBrutalSocket { fd: stream.as_raw_fd() };
+pub fn apply_tcp_brutal<S: AsRawFd>(
+    stream: &S,
+    total_rate: u64,
+    legacy_rate: u64,
+    group_id: u64,
+) -> BrutalApplyResult {
+    let mut ops = LinuxBrutalSocket {
+        fd: stream.as_raw_fd(),
+    };
     let result = configure_tcp_brutal(&mut ops, total_rate, legacy_rate, group_id);
     if result.applied && result.error.is_empty() {
         debug!("Applied TCP Brutal: {:?}", result);
     } else if result.applied {
-        warn!("TCP Brutal is active with limited observability: {}", result.error);
+        warn!(
+            "TCP Brutal is active with limited observability: {}",
+            result.error
+        );
     } else {
         warn!("TCP Brutal not applied: {}", result.error);
     }
@@ -311,8 +433,17 @@ pub fn apply_tcp_brutal<S: AsRawFd>(stream: &S, total_rate: u64, legacy_rate: u6
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_tcp_brutal<S: AsRawFd>(_stream: &S, _total_rate: u64, _legacy_rate: u64, _group_id: u64) -> BrutalApplyResult {
-    BrutalApplyResult { attempted: true, error: "TCP Brutal is only supported on Linux".into(), ..Default::default() }
+pub fn apply_tcp_brutal<S: AsRawFd>(
+    _stream: &S,
+    _total_rate: u64,
+    _legacy_rate: u64,
+    _group_id: u64,
+) -> BrutalApplyResult {
+    BrutalApplyResult {
+        attempted: true,
+        error: "TCP Brutal is only supported on Linux".into(),
+        ..Default::default()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -532,7 +663,12 @@ impl PolicyRoutingSpec {
 }
 
 /// "ip <family> rule <action> [priority N] fwmark M table M"
-fn rule_cmd(spec: &PolicyRoutingSpec, family: &str, action: &str, with_priority: bool) -> Vec<String> {
+fn rule_cmd(
+    spec: &PolicyRoutingSpec,
+    family: &str,
+    action: &str,
+    with_priority: bool,
+) -> Vec<String> {
     let mut cmd = vec![family.to_string(), "rule".into(), action.to_string()];
     if with_priority && spec.priority > 0 {
         cmd.push("priority".into());
@@ -543,7 +679,12 @@ fn rule_cmd(spec: &PolicyRoutingSpec, family: &str, action: &str, with_priority:
 }
 
 /// "ip <family> rule <action> [priority N] from <prefix> table <table>"
-fn source_rule_cmd(rule: &SourceRule, family: &str, action: &str, with_priority: bool) -> Vec<String> {
+fn source_rule_cmd(
+    rule: &SourceRule,
+    family: &str,
+    action: &str,
+    with_priority: bool,
+) -> Vec<String> {
     let mut cmd = vec![family.to_string(), "rule".into(), action.to_string()];
     if with_priority && rule.priority > 0 {
         cmd.push("priority".into());
@@ -580,7 +721,11 @@ fn extra_route_cmd(tap_name: &str, table: i32, raw: &str) -> Result<Vec<String>,
     let (prefix, dev) = parse_route_spec(raw)?;
     let mut cmd = vec!["route".into(), "replace".into(), prefix];
     cmd.push("dev".into());
-    cmd.push(if dev.is_empty() { tap_name.to_string() } else { dev });
+    cmd.push(if dev.is_empty() {
+        tap_name.to_string()
+    } else {
+        dev
+    });
     cmd.push("table".into());
     cmd.push(table.to_string());
     Ok(cmd)
@@ -648,7 +793,11 @@ fn normalize_prefix(first: &str) -> Result<String, String> {
     // segments() 是网络字节序，0xffff 在第 6 段（下标 5）。
     let bits = match &addr {
         std::net::IpAddr::V6(v6) => {
-            if v6.segments()[5] == 0xffff { 32 } else { 128 }
+            if v6.segments()[5] == 0xffff {
+                32
+            } else {
+                128
+            }
         }
         _ => 32,
     };
@@ -658,8 +807,7 @@ fn normalize_prefix(first: &str) -> Result<String, String> {
 /// 配置加载期就校验 extra_routes，把解析错误挡在隧道握手之前。
 pub fn validate_extra_routes(routes: &[String]) -> Result<(), String> {
     for raw in routes {
-        parse_route_spec(raw)
-            .map_err(|e| format!("client.extra_routes {:?}: {}", raw, e))?;
+        parse_route_spec(raw).map_err(|e| format!("client.extra_routes {:?}: {}", raw, e))?;
     }
     Ok(())
 }
@@ -673,10 +821,16 @@ pub fn validate_source_rules(rules: &mut [SourceRule]) -> Result<(), String> {
     for (i, r) in rules.iter_mut().enumerate() {
         let trimmed = r.from.trim();
         if trimmed.is_empty() {
-            return Err(format!("client.source_rules[{}].from: prefix must not be empty", i));
+            return Err(format!(
+                "client.source_rules[{}].from: prefix must not be empty",
+                i
+            ));
         }
         let Ok((prefix, dev)) = parse_route_spec(trimmed) else {
-            return Err(format!("client.source_rules[{}].from: invalid prefix {:?}", i, r.from));
+            return Err(format!(
+                "client.source_rules[{}].from: invalid prefix {:?}",
+                i, r.from
+            ));
         };
         if !dev.is_empty() {
             return Err(format!(
@@ -703,7 +857,11 @@ pub fn validate_source_rules(rules: &mut [SourceRule]) -> Result<(), String> {
 /// iproute2 命令前缀。前缀里没有冒号就是 IPv4；映射地址（::ffff:a.b.c.d）仍按
 /// IPv6 处理，与 `std::net::IpAddr::is_ipv4()` 的判定一致。
 fn prefix_family(prefix: &str) -> &'static str {
-    if prefix.contains(':') { "-6" } else { "-4" }
+    if prefix.contains(':') {
+        "-6"
+    } else {
+        "-4"
+    }
 }
 
 fn extra_route_del_cmd(tap_name: &str, table: i32, raw: &str) -> Option<Vec<String>> {
@@ -711,7 +869,11 @@ fn extra_route_del_cmd(tap_name: &str, table: i32, raw: &str) -> Option<Vec<Stri
     Some(route_del_cmd(
         prefix_family(&prefix),
         &prefix,
-        &if dev.is_empty() { tap_name.to_string() } else { dev },
+        &if dev.is_empty() {
+            tap_name.to_string()
+        } else {
+            dev
+        },
         table,
     ))
 }
@@ -747,7 +909,12 @@ pub fn policy_routing_cmds(
             pre.push(rule_cmd(spec, family, "del", false));
             install.push(rule_cmd(spec, family, "add", true));
         }
-        install.extend(default_routes(&spec.tap_name, &spec.gw_v4, &spec.gw_v6, spec.mark));
+        install.extend(default_routes(
+            &spec.tap_name,
+            &spec.gw_v4,
+            &spec.gw_v6,
+            spec.mark,
+        ));
         for raw in &spec.extra_routes {
             install.push(extra_route_cmd(&spec.tap_name, spec.mark, raw)?);
         }
@@ -756,7 +923,11 @@ pub fn policy_routing_cmds(
         // 规则只装到 from 自己的地址族：iproute2 会拒绝 -4 命令里出现 IPv6 前缀。
         // 清理路径同样按前缀判族，两边必须一致，否则会装出一条删不掉的规则。
         let fam = prefix_family(&rule.from);
-        let gateway = if fam == "-6" { &spec.gw_v6 } else { &spec.gw_v4 };
+        let gateway = if fam == "-6" {
+            &spec.gw_v6
+        } else {
+            &spec.gw_v4
+        };
         // 缺网关时整条规则命中后查不到默认路由、流量只会落回主表。报出来而不是
         // 静默跳过，否则用户以为配了、实际完全没生效。
         if gateway.is_empty() {
@@ -814,9 +985,18 @@ pub fn clean_policy_routing_cmds(spec: &PolicyRoutingSpec) -> Vec<Vec<String>> {
                 out.push(cmd);
             }
         }
-        let gateway = if fam == "-6" { &spec.gw_v6 } else { &spec.gw_v4 };
+        let gateway = if fam == "-6" {
+            &spec.gw_v6
+        } else {
+            &spec.gw_v4
+        };
         if !gateway.is_empty() {
-            out.push(route_del_cmd(fam, "default", &spec.tap_name, rule.table as i32));
+            out.push(route_del_cmd(
+                fam,
+                "default",
+                &spec.tap_name,
+                rule.table as i32,
+            ));
         }
     }
     out
@@ -904,7 +1084,10 @@ pub fn clean_policy_routing(spec: &PolicyRoutingSpec) -> Vec<String> {
     let mut errs = Vec::new();
     for cmd in clean_policy_routing_cmds(spec) {
         if !run_ip(&cmd, &mut errs) {
-            warn!("policy routing cleanup: {}", errs.last().unwrap_or(&String::new()));
+            warn!(
+                "policy routing cleanup: {}",
+                errs.last().unwrap_or(&String::new())
+            );
         }
     }
     errs
@@ -1150,7 +1333,9 @@ impl AsyncPort {
         let mut best_idx = None;
         let mut min_score = u32::MAX;
         for (idx, b) in backends.iter().enumerate() {
-            let Some(score) = Self::backend_score(b) else { continue };
+            let Some(score) = Self::backend_score(b) else {
+                continue;
+            };
             if score < min_score {
                 min_score = score;
                 best_idx = Some(idx);
@@ -1211,7 +1396,9 @@ impl AsyncPort {
         let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
         for offset in 0..backends.len() {
             let idx = (start + offset) % backends.len();
-            let Some(score) = Self::backend_score(&backends[idx]) else { continue };
+            let Some(score) = Self::backend_score(&backends[idx]) else {
+                continue;
+            };
             let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
             if rtt as u64 <= max_rtt && score as u64 <= max_score {
                 return Some(idx);
@@ -1281,10 +1468,7 @@ impl AsyncPort {
         }
 
         // 所有后端都达到高水位时，在消耗线路 seq/FEC 槽位之前直接丢弃。
-        if !backends
-            .iter()
-            .any(|b| Self::backend_score(b).is_some())
-        {
+        if !backends.iter().any(|b| Self::backend_score(b).is_some()) {
             self.drop_n(1);
             frame.release();
             return;
@@ -1534,8 +1718,7 @@ impl VSwitch {
             let (need_update, static_elsewhere) = match self.mac_table.get(&src_mac) {
                 Some(e) if e.static_entry => (false, e.port_id != src_port_id),
                 Some(e) => (
-                    e.port_id != src_port_id
-                        || e.updated_at.elapsed() > Duration::from_secs(5),
+                    e.port_id != src_port_id || e.updated_at.elapsed() > Duration::from_secs(5),
                     false,
                 ),
                 None => (true, false),
@@ -1724,8 +1907,16 @@ mod tests {
             notify: None,
         });
         // backend_score reserves two slots as the high-water mark.
-        tx.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![1]) }).unwrap();
-        tx.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![2]) }).unwrap();
+        tx.try_send(VPNFrame {
+            seq: 0,
+            data: FramePayload::Owned(vec![1]),
+        })
+        .unwrap();
+        tx.try_send(VPNFrame {
+            seq: 0,
+            data: FramePayload::Owned(vec![2]),
+        })
+        .unwrap();
         port.register_backend(backend);
 
         port.write_frame(Arc::new(vec![0x5a; 1400]));
@@ -1769,8 +1960,16 @@ mod tests {
         port.register_backend(b1);
 
         // backend_score reserves two slots, so two queued items make b0 unavailable.
-        tx0.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![1]) }).unwrap();
-        tx0.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(vec![2]) }).unwrap();
+        tx0.try_send(VPNFrame {
+            seq: 0,
+            data: FramePayload::Owned(vec![1]),
+        })
+        .unwrap();
+        tx0.try_send(VPNFrame {
+            seq: 0,
+            data: FramePayload::Owned(vec![2]),
+        })
+        .unwrap();
 
         let data = vec![0x5a; 1400];
         let ptr = data.as_ptr();
@@ -1780,7 +1979,11 @@ mod tests {
             .try_iter()
             .find(|f| f.seq != 0)
             .expect("frame must fall back to second backend");
-        assert_eq!(sent.data.data_ptr(), ptr, "fallback must keep the same payload buffer");
+        assert_eq!(
+            sent.data.data_ptr(),
+            ptr,
+            "fallback must keep the same payload buffer"
+        );
         assert_eq!(sent.seq, 1);
         sent.data.release();
 
@@ -1819,7 +2022,11 @@ mod tests {
         );
 
         while b.ch.len() < b.ch.capacity().unwrap() - 2 {
-            b.ch.try_send(VPNFrame { seq: 0, data: FramePayload::Owned(Vec::new()) }).unwrap();
+            b.ch.try_send(VPNFrame {
+                seq: 0,
+                data: FramePayload::Owned(Vec::new()),
+            })
+            .unwrap();
         }
         assert_eq!(
             port.pick_backend_index(&backends),
@@ -1868,9 +2075,7 @@ mod tests {
             port.write_frame(Arc::new(vec![0x22; 1400]));
         }
         let after = [r0.len(), r1.len(), r2.len()];
-        let used = (0..3)
-            .filter(|&i| after[i] > before[i])
-            .count();
+        let used = (0..3).filter(|&i| after[i] > before[i]).count();
         assert!(
             used >= 2,
             "bulk pressure should use multiple comparable paths: before={before:?} after={after:?}"
@@ -1893,12 +2098,20 @@ mod tests {
         notify.wake();
         notify.wake();
         notify.wake();
-        assert_eq!(dirty.len(), 1, "multiple producer frames must coalesce to one dirty token");
+        assert_eq!(
+            dirty.len(),
+            1,
+            "multiple producer frames must coalesce to one dirty token"
+        );
         assert_eq!(dirty.pop(), Some(mio::Token(7)));
 
         notify.consume_wake();
         notify.wake();
-        assert_eq!(dirty.len(), 1, "consumer re-arm must allow the next batch to wake");
+        assert_eq!(
+            dirty.len(),
+            1,
+            "consumer re-arm must allow the next batch to wake"
+        );
         assert_eq!(dirty.pop(), Some(mio::Token(7)));
 
         // Keep poll mutable/live so the Waker remains valid for the whole test.
@@ -2428,9 +2641,14 @@ mod tests {
     impl FakeBrutalSocket {
         fn v2() -> Self {
             Self {
-                congestion: "cubic".into(), version: Ok(BRUTAL_V2_VERSION),
-                set_algo_locked: false, set_params_locked: false, get_params_locked: false,
-                fail_params: false, params: Vec::new(), algo_calls: Vec::new(),
+                congestion: "cubic".into(),
+                version: Ok(BRUTAL_V2_VERSION),
+                set_algo_locked: false,
+                set_params_locked: false,
+                get_params_locked: false,
+                fail_params: false,
+                params: Vec::new(),
+                algo_calls: Vec::new(),
             }
         }
     }
@@ -2438,11 +2656,15 @@ mod tests {
     impl BrutalSocketOps for FakeBrutalSocket {
         fn set_congestion(&mut self, algo: &str) -> Result<(), BrutalSockError> {
             self.algo_calls.push(algo.to_string());
-            if self.set_algo_locked && algo == "brutal" { return Err(BrutalSockError::Locked); }
+            if self.set_algo_locked && algo == "brutal" {
+                return Err(BrutalSockError::Locked);
+            }
             self.congestion = algo.to_string();
             Ok(())
         }
-        fn get_congestion(&mut self) -> Result<String, BrutalSockError> { Ok(self.congestion.clone()) }
+        fn get_congestion(&mut self) -> Result<String, BrutalSockError> {
+            Ok(self.congestion.clone())
+        }
         fn get_version(&mut self) -> Result<u32, BrutalSockError> {
             match &self.version {
                 Ok(v) => Ok(*v),
@@ -2452,14 +2674,24 @@ mod tests {
             }
         }
         fn set_params(&mut self, params: &[u8]) -> Result<(), BrutalSockError> {
-            if self.set_params_locked { return Err(BrutalSockError::Locked); }
-            if self.fail_params { return Err(BrutalSockError::Other("bad params".into())); }
+            if self.set_params_locked {
+                return Err(BrutalSockError::Locked);
+            }
+            if self.fail_params {
+                return Err(BrutalSockError::Other("bad params".into()));
+            }
             self.params = params.to_vec();
             Ok(())
         }
         fn get_params(&mut self, size: usize) -> Result<Vec<u8>, BrutalSockError> {
-            if self.get_params_locked { return Err(BrutalSockError::Locked); }
-            if self.params.len() == size { Ok(self.params.clone()) } else { Err(BrutalSockError::Other("no params".into())) }
+            if self.get_params_locked {
+                return Err(BrutalSockError::Locked);
+            }
+            if self.params.len() == size {
+                Ok(self.params.clone())
+            } else {
+                Err(BrutalSockError::Other("no params".into()))
+            }
         }
     }
 
@@ -2511,7 +2743,9 @@ mod tests {
     #[test]
     fn brutal_legacy_distribution_preserves_total_and_groups_are_domain_separated() {
         for (total, conns) in [(30, 4), (2, 4), (101, 8)] {
-            let sum: u64 = (0..conns).map(|i| split_legacy_brutal_rate(total, conns, i)).sum();
+            let sum: u64 = (0..conns)
+                .map(|i| split_legacy_brutal_rate(total, conns, i))
+                .sum();
             assert_eq!(sum, total);
         }
         assert_eq!(split_legacy_brutal_rate(2, 4, 2), 0);
@@ -2564,7 +2798,11 @@ mod tests {
             ("\t10.0.0.0/8\tdev\tnet0", ("10.0.0.0/8", "net0")),
         ];
         for (raw, want) in ok {
-            assert_eq!(parse_route_spec(raw).unwrap(), (want.0.to_string(), want.1.to_string()), "{raw}");
+            assert_eq!(
+                parse_route_spec(raw).unwrap(),
+                (want.0.to_string(), want.1.to_string()),
+                "{raw}"
+            );
         }
         let bad = [
             ("", "entry must not be empty"),
@@ -2613,22 +2851,39 @@ mod tests {
             ("203.0.113.0/24", 1u16, 0u32),
             ("203.0.113.7", 65535u16, 0u32),
         ] {
-            let mut one = vec![SourceRule { from: from.into(), table, priority, ..SourceRule::default() }];
+            let mut one = vec![SourceRule {
+                from: from.into(),
+                table,
+                priority,
+                ..SourceRule::default()
+            }];
             let err = validate_source_rules(&mut one);
             assert!(err.is_ok(), "合法条目 {from} table={table} 应通过: {err:?}");
         }
 
         let bad = [
             (
-                SourceRule { from: "".into(), table: 100, ..SourceRule::default() },
+                SourceRule {
+                    from: "".into(),
+                    table: 100,
+                    ..SourceRule::default()
+                },
                 "prefix must not be empty",
             ),
             (
-                SourceRule { from: "banana".into(), table: 100, ..SourceRule::default() },
+                SourceRule {
+                    from: "banana".into(),
+                    table: 100,
+                    ..SourceRule::default()
+                },
                 "invalid prefix",
             ),
             (
-                SourceRule { from: "203.0.113.0/33".into(), table: 100, ..SourceRule::default() },
+                SourceRule {
+                    from: "203.0.113.0/33".into(),
+                    table: 100,
+                    ..SourceRule::default()
+                },
                 "invalid prefix",
             ),
             (
@@ -2640,15 +2895,27 @@ mod tests {
                 "expected a bare prefix",
             ),
             (
-                SourceRule { from: "203.0.113.0/24".into(), table: 0, ..SourceRule::default() },
+                SourceRule {
+                    from: "203.0.113.0/24".into(),
+                    table: 0,
+                    ..SourceRule::default()
+                },
                 "must be in [1, 65535]",
             ),
             (
-                SourceRule { from: "203.0.113.0/24".into(), table: 253, ..SourceRule::default() },
+                SourceRule {
+                    from: "203.0.113.0/24".into(),
+                    table: 253,
+                    ..SourceRule::default()
+                },
                 "must be in [1, 65535]",
             ),
             (
-                SourceRule { from: "203.0.113.0/24".into(), table: 255, ..SourceRule::default() },
+                SourceRule {
+                    from: "203.0.113.0/24".into(),
+                    table: 255,
+                    ..SourceRule::default()
+                },
                 "must be in [1, 65535]",
             ),
             (
@@ -2684,13 +2951,47 @@ mod tests {
                 vec!["-4", "rule", "add", "priority", "1000", "fwmark", "256", "table", "256"],
                 vec!["-6", "rule", "add", "priority", "1000", "fwmark", "256", "table", "256"],
                 vec![
-                    "-4", "route", "replace", "default", "via", "203.0.113.1", "dev", "tap0", "table", "256"
+                    "-4",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "203.0.113.1",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "256"
                 ],
                 vec![
-                    "-6", "route", "replace", "default", "via", "fd99:10:5:8::1", "dev", "tap0", "table", "256"
+                    "-6",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "fd99:10:5:8::1",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "256"
                 ],
-                vec!["route", "replace", "fd99:10:5:8::/64", "dev", "tap0", "table", "256"],
-                vec!["route", "replace", "192.0.2.0/24", "dev", "eth1", "table", "256"],
+                vec![
+                    "route",
+                    "replace",
+                    "fd99:10:5:8::/64",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "256"
+                ],
+                vec![
+                    "route",
+                    "replace",
+                    "192.0.2.0/24",
+                    "dev",
+                    "eth1",
+                    "table",
+                    "256"
+                ],
             ]
         );
         // 删规则的参数里不能出现 priority：优先级被改过之后旧值已不在配置里，
@@ -2713,7 +3014,16 @@ mod tests {
                 vec!["-4", "rule", "add", "fwmark", "256", "table", "256"],
                 vec!["-6", "rule", "add", "fwmark", "256", "table", "256"],
                 vec![
-                    "-4", "route", "replace", "default", "via", "203.0.113.1", "dev", "tap0", "table", "256"
+                    "-4",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "203.0.113.1",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "256"
                 ],
             ]
         );
@@ -2727,16 +3037,51 @@ mod tests {
         let (pre, install) = policy_routing_cmds(&s).unwrap();
         assert_eq!(
             pre,
-            vec![vec!["-6", "rule", "del", "from", "2001:db8::1/128", "table", "100"]]
+            vec![vec![
+                "-6",
+                "rule",
+                "del",
+                "from",
+                "2001:db8::1/128",
+                "table",
+                "100"
+            ]]
         );
         assert_eq!(
             install,
             vec![
-                vec!["-6", "rule", "add", "priority", "700", "from", "2001:db8::1/128", "table", "100"],
                 vec![
-                    "-6", "route", "replace", "default", "via", "fd99:10:5:8::1", "dev", "tap0", "table", "100"
+                    "-6",
+                    "rule",
+                    "add",
+                    "priority",
+                    "700",
+                    "from",
+                    "2001:db8::1/128",
+                    "table",
+                    "100"
                 ],
-                vec!["route", "replace", "fd99:10:5:8::/64", "dev", "tap0", "table", "100"],
+                vec![
+                    "-6",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "fd99:10:5:8::1",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "100"
+                ],
+                vec![
+                    "route",
+                    "replace",
+                    "fd99:10:5:8::/64",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "100"
+                ],
             ]
         );
         // 规则只能落在 from 自己的地址族：iproute2 会拒绝 -4 命令里出现 IPv6 前缀
@@ -2755,16 +3100,51 @@ mod tests {
         let (pre, install) = policy_routing_cmds(&s).unwrap();
         assert_eq!(
             pre,
-            vec![vec!["-4", "rule", "del", "from", "192.0.2.0/24", "table", "100"]]
+            vec![vec![
+                "-4",
+                "rule",
+                "del",
+                "from",
+                "192.0.2.0/24",
+                "table",
+                "100"
+            ]]
         );
         assert_eq!(
             install,
             vec![
-                vec!["-4", "rule", "add", "priority", "700", "from", "192.0.2.0/24", "table", "100"],
                 vec![
-                    "-4", "route", "replace", "default", "via", "203.0.113.1", "dev", "tap0", "table", "100"
+                    "-4",
+                    "rule",
+                    "add",
+                    "priority",
+                    "700",
+                    "from",
+                    "192.0.2.0/24",
+                    "table",
+                    "100"
                 ],
-                vec!["route", "replace", "10.0.0.0/8", "dev", "eth1", "table", "100"],
+                vec![
+                    "-4",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    "203.0.113.1",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "100"
+                ],
+                vec![
+                    "route",
+                    "replace",
+                    "10.0.0.0/8",
+                    "dev",
+                    "eth1",
+                    "table",
+                    "100"
+                ],
             ]
         );
         assert!(install.iter().all(|c| c[0] != "-6"), "{install:?}");
@@ -2799,10 +3179,14 @@ mod tests {
         s.mark = 0x100;
         s.priority = 1000;
         let (pre, install) = policy_routing_cmds(&s).unwrap();
-        let fwmark_rules: Vec<&Vec<String>> =
-            install.iter().filter(|c| c.iter().any(|a| a == "fwmark")).collect();
-        let from_rules: Vec<&Vec<String>> =
-            install.iter().filter(|c| c.iter().any(|a| a == "from")).collect();
+        let fwmark_rules: Vec<&Vec<String>> = install
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "fwmark"))
+            .collect();
+        let from_rules: Vec<&Vec<String>> = install
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "from"))
+            .collect();
         assert_eq!(fwmark_rules.len(), 2);
         assert_eq!(from_rules.len(), 1);
         // 两套规则各自落到自己的表，不能串
@@ -2834,8 +3218,26 @@ mod tests {
             vec![
                 vec!["-4", "rule", "del", "fwmark", "256", "table", "256"],
                 vec!["-6", "rule", "del", "fwmark", "256", "table", "256"],
-                vec!["-6", "route", "del", "fd99:10:5:8::/64", "dev", "tap0", "table", "256"],
-                vec!["-4", "route", "del", "192.0.2.0/24", "dev", "eth1", "table", "256"],
+                vec![
+                    "-6",
+                    "route",
+                    "del",
+                    "fd99:10:5:8::/64",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "256"
+                ],
+                vec![
+                    "-4",
+                    "route",
+                    "del",
+                    "192.0.2.0/24",
+                    "dev",
+                    "eth1",
+                    "table",
+                    "256"
+                ],
                 vec!["-4", "route", "del", "default", "dev", "tap0", "table", "256"],
                 vec!["-6", "route", "del", "default", "dev", "tap0", "table", "256"],
             ]
@@ -2848,8 +3250,25 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                vec!["-6", "rule", "del", "from", "2001:db8::1/128", "table", "100"],
-                vec!["-6", "route", "del", "fd99:10:5:8::/64", "dev", "tap0", "table", "100"],
+                vec![
+                    "-6",
+                    "rule",
+                    "del",
+                    "from",
+                    "2001:db8::1/128",
+                    "table",
+                    "100"
+                ],
+                vec![
+                    "-6",
+                    "route",
+                    "del",
+                    "fd99:10:5:8::/64",
+                    "dev",
+                    "tap0",
+                    "table",
+                    "100"
+                ],
                 vec!["-6", "route", "del", "default", "dev", "tap0", "table", "100"],
             ]
         );
@@ -2857,7 +3276,10 @@ mod tests {
 
     #[test]
     fn policy_routing_is_a_noop_when_fwmark_is_zero() {
-        let s = PolicyRoutingSpec { mark: 0, ..policy_spec() };
+        let s = PolicyRoutingSpec {
+            mark: 0,
+            ..policy_spec()
+        };
         assert!(!s.enabled());
         assert_eq!(policy_routing_cmds(&s).unwrap(), (Vec::new(), Vec::new()));
         assert!(clean_policy_routing_cmds(&s).is_empty());
