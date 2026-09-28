@@ -62,7 +62,7 @@ sudo ./target/release/tlsvpn -c server.json
 sudo ./target/release/tlsvpn -c client.json
 ```
 
-Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
+`"tap": "mem"` is a CI/e2e backend only: it has no real subnet behind it, drops writes, and does not provide a usable host VPN interface. Real interface addressing and policy routing are currently Linux-oriented.
 
 Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite and deliberately stay inside the Go/Rust shared config subset. Rust-only `workers`/`mtu` are omitted so Go can read them. Persistent traffic-accounting keys (`traffic_days`, `traffic_file`) are supported by both implementations.
 
