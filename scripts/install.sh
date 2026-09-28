@@ -229,10 +229,13 @@ require_root() {
 
 detect_platform() {
   [[ -r /etc/os-release ]] || die "Cannot detect Linux distribution (/etc/os-release missing)."
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  DISTRO="${ID:-unknown}"
-  DISTRO_LIKE="${ID_LIKE:-}"
+  # Read os-release in a subshell so keys such as VERSION= cannot clobber
+  # installer options like --version/latest.
+  local os_id os_id_like
+  os_id="$(. /etc/os-release; printf '%s' "${ID:-unknown}")"
+  os_id_like="$(. /etc/os-release; printf '%s' "${ID_LIKE:-}")"
+  DISTRO="$os_id"
+  DISTRO_LIKE="$os_id_like"
   case "$DISTRO" in
     debian|ubuntu) PKG_MGR="apt" ;;
     rocky|rhel|almalinux|centos|fedora) PKG_MGR="dnf" ;;
@@ -396,6 +399,7 @@ resolve_release() {
   if [[ "$VERSION" == "latest" ]]; then RELEASE_TAG="$(latest_release_tag)"; else RELEASE_TAG="$VERSION"; fi
   [[ -n "$RELEASE_TAG" ]] || die "Could not resolve a TLSVPN release tag."
   [[ "$RELEASE_TAG" == v* ]] || RELEASE_TAG="v$RELEASE_TAG"
+  [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] || die "Invalid TLSVPN release tag: $RELEASE_TAG"
   release_arch
 }
 
@@ -705,8 +709,15 @@ stop_service() {
 }
 start_service() {
   [[ "$NO_START" == "yes" ]] && return 0
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then run systemctl restart tlsvpn.service;
-  else run rc-service tlsvpn restart; fi
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    # A failed fresh install or a rollback after uninstall may legitimately have
+    # no service unit to restart. Do not turn recovery into a second error.
+    if [[ ! -e "$SYSTEMD_SERVICE" ]] && ! systemctl cat tlsvpn.service >/dev/null 2>&1; then return 0; fi
+    run systemctl restart tlsvpn.service
+  else
+    [[ -e "$OPENRC_SERVICE" ]] || return 0
+    run rc-service tlsvpn restart
+  fi
 }
 
 write_state() {

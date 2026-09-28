@@ -135,9 +135,16 @@ fn installer_has_required_lifecycle_and_platform_contract() {
         "tlsvpn-maintenance.timer",
         "--non-interactive",
         "back",
+        r#"os_id="$(. /etc/os-release; printf"#,
+        "Invalid TLSVPN release tag:",
+        "systemctl cat tlsvpn.service",
     ] {
         assert!(installer.contains(marker), "installer missing {marker}");
     }
+    assert!(
+        !installer.contains("\n  . /etc/os-release\n"),
+        "installer must not source /etc/os-release into its global namespace"
+    );
 }
 
 
