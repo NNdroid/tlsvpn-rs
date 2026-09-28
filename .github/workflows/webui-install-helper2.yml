@@ -1,0 +1,56 @@
+name: WebUI parity implementation helper v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/webui-install-parity'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Apply scoped patch from reviewed helper
+        run: |
+          python3 - <<'META'
+          import subprocess, textwrap
+          from pathlib import Path
+          old = subprocess.check_output([
+              'git','show','1d2f56ab7ece3fce03b31213ab01802d9333b4ea:.github/workflows/webui-install-helper.yml'
+          ], text=True)
+          block = old.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+          script = textwrap.dedent(block)
+          old_def = '''def rep(path, old, new, count=1):\n    p=Path(path); s=p.read_text()\n    n=s.count(old)\n    if n != count:\n        raise SystemExit(f'{path}: expected {count} matches, got {n}: {old[:120]!r}')\n    p.write_text(s.replace(old,new,count))\n'''
+          new_def = '''def rep(path, old, new, count=1):\n    p=Path(path); s=p.read_text()\n    n=s.count(old)\n    # This text also occurs in the embedded Go-config test fixture. For the\n    # --print-config edit only, target the last occurrence (the template).\n    if old.startswith('  "brutal_up": 100,') and count == 1 and n == 2:\n        idx=s.rfind(old)\n        p.write_text(s[:idx] + s[idx:].replace(old,new,1))\n        return\n    if n != count:\n        raise SystemExit(f'{path}: expected {count} matches, got {n}: {old[:120]!r}')\n    p.write_text(s.replace(old,new,count))\n'''
+          if old_def not in script:
+              raise SystemExit('reviewed helper rep() body not found')
+          script = script.replace(old_def, new_def, 1)
+          script = script.replace(
+              "Path('.github/workflows/webui-install-helper.yml').unlink()",
+              "Path('.github/workflows/webui-install-helper2.yml').unlink()",
+              1,
+          )
+          exec(compile(script, '<webui-parity-patch>', 'exec'), {'__name__':'__main__'})
+          META
+      - name: Format and validate
+        run: |
+          chmod +x scripts/install.sh
+          bash -n scripts/install.sh
+          scripts/install.sh --help >/dev/null
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo check --release
+      - name: Commit implementation
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: align Rust WebUI and add one-click installer'
+          git push origin HEAD:${{ github.head_ref }}
