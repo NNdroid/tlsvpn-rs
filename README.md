@@ -2,14 +2,14 @@
 
 **tlsvpn-rs** is the Rust implementation of [tlsvpn](https://github.com/NNdroid/tlsvpn) — a high-performance, high-stealth Layer 2 VPN that carries Ethernet frames over standard TCP TLS.
 
-The Rust and Go binaries are **fully interchangeable**: any client works against any server, locked byte-for-byte by shared protocol golden vectors and cross-implementation e2e tests. Beyond parity, the Rust build adds an event-driven I/O core (mio + Waker), multi-worker server sharding, and a protocol-path benchmark of **~3.7 GB/s** (frame scan + inner crypto, single core).
+The Rust and Go binaries are **wire-compatible**: any current Rust/Go client-server pairing speaks the same strict protocol v2, locked byte-for-byte by shared protocol golden vectors and cross-implementation e2e tests. Runtime configuration and WebUI backend capabilities are intentionally documented separately below because they are not currently identical. Beyond wire parity, the Rust build adds an event-driven I/O core (mio + Waker) and multi-worker server sharding.
 
 ## Features
 
 - **Camouflage** — real TLS with ALPN (`h2`/`http1.1`) and randomized payload padding. Invalid-PSK connections get an nginx-styled 403 page or a slow-loris tarpit; probes (printable first byte) are detected inside the TLS stream as well.
-- **Inner encryption (optional)** — authenticated AES-GCM *inside* TLS, with random per-direction salts, separate data/FEC keys, `nonce = seq‖salt`, and AAD over `wireLen‖seq`. `enc_algo: "gcm256"` remains the compatibility default; `"gcm128"` is an explicit performance mode. Both peers must match exactly.
+- **Inner encryption (optional)** — authenticated AEAD *inside* TLS: AES-256-GCM (`gcm256`, default), AES-128-GCM (`gcm128`), ChaCha20-Poly1305 (`chacha20`) or XChaCha20-Poly1305 (`xchacha20`). Data/FEC use separate keys and per-direction session salts. AES-GCM/ChaCha20 use `seq(4BE) || salt(8B)` nonces; XChaCha20 uses a derived 20-byte prefix plus `seq(4BE)`. AAD is `dataLen(4BE) || seq(4BE)`, and every current algorithm uses a 16-byte tag. Both peers must match exactly.
 - **Server-observed TLS diagnostics** — a successful application handshake can return an optional `tls` object with the negotiated version/cipher/ALPN/SNI and the ordered ClientHello cipher, signature, group and ALPN features actually seen by the server. The client Web UI displays the `tls-clienthello-v1` SHA-256. It filters GREASE and is intentionally **not called JA3/JA4**, because rustls/Go do not expose the full raw extension order. The digest is for diagnostics, not authentication; randoms, tickets, certificate bodies and key material are never returned.
-- **Multipath & FEC** — parallel TCP connections with MinRTT load balancing, or XOR-parity FEC: one parity frame per K data frames (≈1/K overhead) so any single lost frame is reconstructed transparently. Duplication FEC remains the automatic fallback.
+- **Multipath & FEC** — parallel TCP connections with MinRTT load balancing and XOR-parity FEC: one parity frame per K data frames (≈1/K overhead) so any single lost frame is reconstructed transparently. The old duplication-FEC fallback has been removed from the current wire protocol.
 - **Resilience** — comma-separated server addresses with round-robin per connection, exponential backoff with jitter, 30s-stable reset.
 - **Layer 2** — TAP device (ARP/DHCP/IPv6 pass-through), MAC-learning switch with flooding, and session survivorship: 120s grace with seamless resume across reconnects and restarts.
 - **Zero-copy data path** — frames stay `Arc`-shared end to end, so broadcast/flood/multi-backend dispatch is reference-count only, with AVX2-accelerated FEC parity math and O(1) reorder-gap resolution.
@@ -64,17 +64,17 @@ sudo ./target/release/tlsvpn -c client.json
 
 Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.
 
-Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite, so they never drift from the binary. They deliberately omit the two Rust-only keys (`workers`, `mtu`) so the Go binary can read them too: Go decodes with `DisallowUnknownFields` and refuses the whole file over an unknown key.
+Fuller ready-made examples are checked in at the repo root — `config.server.json` and `config.client.json` (same `psk`, so they pair up). They're validated by the test suite and deliberately stay inside the Go/Rust shared config subset. Rust-only `workers`/`mtu` are omitted so Go can read them; Go-only persisted traffic-accounting keys (`traffic_days`, `traffic_file`) must likewise be omitted from files intended for Rust because both implementations reject unknown fields.
 
 ## Configuration
 
-`-c config.json` is the **only** configuration surface — there are no other flags, and the format is identical to the Go build, so binaries can be swapped without touching a config. Unknown fields are rejected. Start from the built-in template:
+`-c config.json` is the **only** runtime configuration surface (plus `--print-config` to print a template). The shared protocol/network fields intentionally track Go, but the complete config schemas are **not identical**: Rust adds `workers`/`mtu`, Go adds `traffic_days`/`traffic_file`, Rust currently supports only `client.interface_manager=self`, and Rust server mode requires an explicit certificate/key pair. Unknown fields are rejected. Start from the built-in shared-subset template:
 
 ```bash
 ./tlsvpn --print-config > config.json
 ```
 
-<details><summary>Full template (matches <code>--print-config</code>)</summary>
+<details><summary>Representative shared-subset template (use <code>--print-config</code> for the canonical current output)</summary>
 
 ```json
 {
@@ -91,8 +91,6 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
-  "workers": 4,
-  "mtu": 1500,
   "socks5": "",
   "tap": "tap0",
   "mac": "",
@@ -105,7 +103,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 
 </details>
 
-All defaults match the Go implementation 1:1. Two fields are Rust extensions (`workers`, `mtu`) — Go has no such keys and refuses a config file containing them, so they only belong in Rust-only files.
+The wire-facing defaults are kept aligned with Go, but the full config surfaces differ. Rust-only `workers` and `mtu` belong only in Rust-specific files; Go-only `traffic_days` and `traffic_file` are not accepted by Rust. `client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode also requires explicit `server.cert`/`server.key`, whereas Go can generate and persist a self-signed pair.
 
 Session resume tokens are a mandatory protocol-v2 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
 
@@ -115,14 +113,14 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `psk` | (required) | — | High-entropy pre-shared key. Empty and known placeholder values are rejected |
 | `addr` | server `0.0.0.0:4000` | — | **Server**: listen address (`:4000` binds all interfaces). **Client**: comma-separated targets for multi-IP round-robin |
 | `up` / `down` | (empty) | — | Absolute executable paths for process-level tunnel lifecycle hooks |
-| `encrypt` | `true` when omitted in JSON | — | Enable inner authenticated AES-GCM |
-| `enc_algo` | `gcm256` | — | `gcm256` = AES-256-GCM compatibility default; `gcm128` = explicit AES-128-GCM performance mode. Both peers must match exactly |
-| `min_enc` | `""` | — | Strength floor: `gcm` requires authenticated GCM at the configured key size, `""`/`any` sets no floor. Requires `encrypt: true` |
+| `encrypt` | `true` when omitted in JSON | — | Enable inner authenticated AEAD |
+| `enc_algo` | `gcm256` | — | `gcm256` (AES-256-GCM), `gcm128` (AES-128-GCM), `chacha20` (ChaCha20-Poly1305), or `xchacha20` (XChaCha20-Poly1305). Both peers must match exactly |
+| `min_enc` | `gcm` when `encrypt=true` | — | Minimum inner-encryption policy. Omitted/empty normalizes to `gcm`; the legacy name means require a supported authenticated inner AEAD. Explicit `any` removes the floor. Requires `encrypt=true` |
 | `pad_mode` | `bucket` | — | Full-record padding: `bucket` maps every record to a fixed size with positive padding; only `off` permits zero padding |
 | `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
 | `workers` | `0` | — | **Rust-only extension** — Go rejects this key. Worker event-loop threads (0 = auto, one per CPU up to 8) |
-| `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU; higher values (8000–16000) mean fewer frames, TLS records and syscalls per byte — set it on **both** ends (receiver accepts up to 128 KB) |
+| `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU, validated in the `576`–`9000` range. Use the same intended L2 MTU on both tunnel endpoints |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
 | `mac` | (empty) | — | Explicit non-zero unicast TAP MAC. If empty, both real and `mem` clients generate and persist one; the server derives ClientID from canonical MAC + PSK |
 | `socks5` | (empty) | — | Route **all** outbound sockets through a SOCKS5 proxy (`host:port`, `user:pass@host:port`, `socks5h://…`) |
@@ -137,6 +135,7 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `server.fec_group_min` | `2` | server | Lower bound on a peer's FEC group size K; an FEC handshake below it is refused |
 | `server.fec_group_max` | `64` | server | Upper bound on a peer's FEC group size K; an FEC handshake above it is refused. Neither end is clamped, and defaults are the protocol limits so nothing is limited unless configured. One parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K: a `min` floor bounds bandwidth, while a `max` ceiling bounds pending-frame buffering and recovery latency |
+| `client.interface_manager` | `self` | client | Rust currently supports only `self`. The Go/OpenWrt `netifd` mode is intentionally rejected by tlsvpn-rs |
 | `client.conns` | `1` | client | Parallel TCP connections (multi-IP round-robin, MinRTT/FEC multipath) |
 | `client.fec` | `false` | client | XOR-parity FEC over multipath; one parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K |
 | `client.fec_group` | `4` | client | XOR FEC group size K (2–64), clamped into range before it goes on the wire; the server may refuse an out-of-policy K |
@@ -167,14 +166,16 @@ Keys that belong to the other mode are accepted but have no effect (a server ign
 
 ## Dashboard
 
-Off by default; set `web.addr` on **both** sides to enable it. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Throughput chart (120s), FEC recovered/lost counters, per-connection RTT/bytes/retries, MAC table, IP-pool usage, ban/kick/kick-all with immediate effect, in-panel log tail (500 lines) with live level switching, and Prometheus `/metrics`. Every control action requires a CSRF header (`X-Requested-With`).
+Off by default; set `web.addr` to enable it. Rust embeds the same static WebUI asset set as Go (including zh-CN/zh-TW/en/de/fr/ja, local OS/arch icons, the current frame-format visualizer and favicon), while retaining the Rust backend/auth model. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Stats, per-connection details, FEC counters, MAC/IP-pool state, ban/kick controls, log tail with live level switching and Prometheus `/metrics` are backed by Rust APIs. Browser/API access uses HTTP Basic Auth from `web.auth`, and mutating control calls require `X-Requested-With: tlsvpn`.
+
+Current backend parity limits are explicit: `/api/trend` returns an empty compatibility series, `/api/events` returns an empty compatibility list rather than Go's event stream, and `POST /api/config` returns HTTP 501 because runtime config persistence/hot-apply is not implemented in Rust yet. `GET /api/config` is available for display. The shared frontend therefore looks aligned with Go, but those three backend capabilities are not yet equivalent.
 
 ## Notes
 
 1. **Kernel module** — Brutal mode needs the Linux `tcp_brutal` module; elsewhere a warning is logged and it continues without it.
 2. **Permissions** — TAP requires `/dev/net/tun` access, typically root.
 3. **Client identity** — the ClientID derives from canonical TAP MAC + PSK. If no MAC is configured or readable, including `"tap": "mem"`, the client generates and persists a random non-zero unicast MAC together with its token and epoch.
-4. **Interoperability** — current Go and Rust builds share strict protocol v2 and byte-for-byte golden vectors, including data/FEC GCM domains. Upgrade both ends together; there is no pre-v2 compatibility mode, so an old binary is refused rather than downgraded.
+4. **Interoperability** — current Go and Rust builds share strict protocol v2 and byte-for-byte golden vectors, including frame headers and data/FEC AEAD-domain vectors. All four current inner AEAD algorithms are interoperable across implementations. Upgrade both ends together; there is no pre-v2 compatibility mode, so an old binary is refused rather than downgraded.
 
 ## Cortex-A55 / RK3568 optimized build
 
@@ -195,7 +196,7 @@ compatible CPUs.
 
 **Interop is locked by golden vectors.** `tlsvpn/testdata/protocol_golden.json` (generated by the Go repo) covers key derivation, CTR keystream, frame headers and handshake field names; `cargo test --test protocol_conformance` fails on any drift.
 
-**Cross-implementation e2e** — `scripts/e2e_test.sh` drives the four suites below against a real Rust build and a real Go build over the in-memory TAP, so it needs no `CAP_NET_ADMIN` and runs for real on hosted CI:
+**Cross-implementation e2e** — `scripts/e2e_test.sh` drives the five suites below against a real Rust build and a real Go build over the in-memory TAP, so it needs no `CAP_NET_ADMIN` and runs for real on hosted CI:
 
 ```bash
 ./scripts/build.sh native                      # Rust server/client
@@ -227,7 +228,7 @@ cargo run --release --example interop_client -- \
 
 ```bash
 cargo test --release bench_protocol_throughput -- --ignored --nocapture
-# Protocol Throughput: ~3200 MB/s
+# Prints the current runner's measured protocol-path throughput; avoid treating an old CI number as a fixed product guarantee
 
 ./scripts/build_pgo.sh   # PGO + native-CPU; needs rustup llvm-tools-preview
 ```
