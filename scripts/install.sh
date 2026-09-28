@@ -723,8 +723,8 @@ ExecStart=$INSTALL_DIR/$PROGRAM -c $CONFIG_FILE
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
 [Install]
@@ -770,6 +770,11 @@ start_service() {
     # no service unit to restart. Do not turn recovery into a second error.
     if [[ ! -e "$SYSTEMD_SERVICE" ]] && ! systemctl cat tlsvpn.service >/dev/null 2>&1; then return 0; fi
     run systemctl restart tlsvpn.service
+    if [[ "$DRY_RUN" != "yes" ]] && ! systemctl is-active --quiet tlsvpn.service; then
+      systemctl --no-pager --full status tlsvpn.service >&2 || true
+      journalctl -u tlsvpn.service -n 50 --no-pager >&2 || true
+      die "tlsvpn.service failed to start."
+    fi
   else
     [[ -e "$OPENRC_SERVICE" ]] || return 0
     run rc-service tlsvpn restart
