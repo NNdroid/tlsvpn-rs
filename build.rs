@@ -35,7 +35,16 @@ fn watch_git_revision() {
 fn main() {
     println!("cargo:rerun-if-env-changed=TLSVPN_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=TLSVPN_BUILD_TIME");
+    println!("cargo:rerun-if-env-changed=TLSVPN_VERSION");
     watch_git_revision();
+
+    let version = std::env::var("TLSVPN_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| git(&["describe", "--tags", "--always"]))
+        .or_else(|| std::env::var("CARGO_PKG_VERSION").ok())
+        .unwrap_or_else(|| "dev".to_string());
+    println!("cargo:rustc-env=TLSVPN_VERSION={version}");
 
     let commit = std::env::var("TLSVPN_GIT_COMMIT")
         .ok()

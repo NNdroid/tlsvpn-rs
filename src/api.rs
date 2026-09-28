@@ -770,7 +770,7 @@ mod webui_assets;
 
 // ======================= Web 服务（Basic Auth + CSRF + API） =======================
 
-pub const APP_VERSION: &str = "1.1.0-rs";
+pub const APP_VERSION: &str = env!("TLSVPN_VERSION");
 
 /// 模式相关的统计/控制由 server/client 各自实现
 pub trait WebStatsProvider: Send + Sync {
