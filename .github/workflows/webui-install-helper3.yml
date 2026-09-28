@@ -38,10 +38,27 @@ jobs:
               1,
           )
           exec(compile(script, '<webui-parity-patch>', 'exec'), {'__name__':'__main__'})
+
           main = Path('src/main.rs')
           source = main.read_text()
           if not source.startswith('#![recursion_limit'):
-              main.write_text('#![recursion_limit = "256"]\n' + source)
+              source = '#![recursion_limit = "256"]\n' + source
+          source = source.replace(
+              'if !(1..=3650).contains(&args.traffic_days) {',
+              'if args.traffic_days != 0 && !(1..=3650).contains(&args.traffic_days) {',
+              1,
+          )
+          main.write_text(source)
+
+          api = Path('src/api.rs')
+          source = api.read_text()
+          runtime_struct = '''pub struct RuntimeCtx {\n    pub cfg: RwLock<serde_json::Value>,\n    pub system: serde_json::Value,\n    pub web: WebParityState,\n}\n'''
+          runtime_default = runtime_struct + '''\nimpl Default for RuntimeCtx {\n    fn default() -> Self {\n        Self {\n            cfg: RwLock::new(json!({})),\n            system: json!({}),\n            web: WebParityState::new(""),\n        }\n    }\n}\n'''
+          if runtime_struct not in source:
+              raise SystemExit('RuntimeCtx struct not found for Default compatibility')
+          source = source.replace(runtime_struct, runtime_default, 1)
+          source = source.replace('    auth: String,\n    web_cert:', '    _auth: String,\n    web_cert:', 1)
+          api.write_text(source)
           META
       - name: Format and validate
         run: |
