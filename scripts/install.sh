@@ -327,6 +327,9 @@ EOF
         if [[ "$MODE" == "server" && ( "$CERT_MODE" == "lego" || "$CERT_MODE" == "self-signed" ) ]]; then
           v="$(prompt_value "Certificate DNS name or IP" "$CERT_NAME")"; [[ "$v" == "__BACK__" ]] && { step=5; continue; }; CERT_NAME="$v"
           if [[ "$CERT_MODE" == "lego" ]]; then v="$(prompt_value "ACME account email" "$EMAIL")"; [[ "$v" == "__BACK__" ]] && { step=5; continue; }; EMAIL="$v"; fi
+        elif [[ "$MODE" == "server" && "$CERT_MODE" == "existing" ]]; then
+          v="$(prompt_value "Existing certificate file" "$CERT_FILE")"; [[ "$v" == "__BACK__" ]] && { step=5; continue; }; CERT_FILE="$v"
+          v="$(prompt_value "Existing private key file" "$KEY_FILE")"; [[ "$v" == "__BACK__" ]] && { step=5; continue; }; KEY_FILE="$v"
         fi
         step=7 ;;
       7)
@@ -461,8 +464,15 @@ install_tlsvpn_binary() {
   printf '%s\n' "$RELEASE_TAG" >"$STATE_DIR/installed-version"
 }
 
+lego_major() {
+  have lego || { printf '0'; return; }
+  lego --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed -E 's/^v?([0-9]+).*/\1/'
+}
+
 install_lego() {
-  have lego && return 0
+  local old_major="$(lego_major)"
+  [[ "$old_major" =~ ^[0-9]+$ ]] || old_major=0
+  if (( old_major >= 5 )); then return 0; fi
   local lego_arch
   case "$HOST_ARCH" in amd64) lego_arch="amd64";; arm64) lego_arch="arm64";; armv7) lego_arch="armv7";; esac
   local tag version url tmpdir
@@ -478,17 +488,19 @@ install_lego() {
   install -m 0755 "$tmpdir/lego" /usr/local/bin/lego
   rm -rf "$tmpdir"
   /usr/local/bin/lego --version >/dev/null
+  if (( old_major > 0 && old_major < 5 )) && [[ -d "$LEGO_HOME" ]] && find "$LEGO_HOME" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+    info "Migrating lego v4 state to v5 format"
+    /usr/local/bin/lego migrate --path "$LEGO_HOME"
+  fi
 }
 
 lego_args() {
-  local action="$1"
-  LEGO_ARGS=(--path "$LEGO_HOME" --email "$EMAIL" --accept-tos --server "$ACME_SERVER" --domains "$CERT_NAME" --cert.name tlsvpn)
+  LEGO_ARGS=(run --path "$LEGO_HOME" --email "$EMAIL" --accept-tos --server "$ACME_SERVER" --domains "$CERT_NAME" --cert.name tlsvpn)
   if is_ip "$CERT_NAME"; then LEGO_ARGS+=(--profile shortlived); fi
   case "$ACME_CHALLENGE" in
-    http) LEGO_ARGS+=(--http --http.port :80) ;;
-    tls) LEGO_ARGS+=(--tls --tls.port :443) ;;
+    http) LEGO_ARGS+=(--http --http.address :80) ;;
+    tls) LEGO_ARGS+=(--tls --tls.address :443) ;;
   esac
-  LEGO_ARGS+=("$action")
 }
 
 sync_lego_certificate() {
@@ -505,7 +517,7 @@ issue_lego_certificate() {
   install_lego
   run mkdir -p "$LEGO_HOME"
   local -a LEGO_ARGS
-  lego_args run
+  lego_args
   info "Requesting ACME certificate for $CERT_NAME"
   run lego "${LEGO_ARGS[@]}"
   [[ "$DRY_RUN" == "yes" ]] || sync_lego_certificate
@@ -515,9 +527,10 @@ renew_lego_certificate() {
   [[ -n "$CERT_NAME" && -n "$EMAIL" ]] || return 0
   install_lego
   local -a LEGO_ARGS
-  lego_args renew
-  # IP certificates use the short-lived profile; renew while at least two days remain.
-  if is_ip "$CERT_NAME"; then LEGO_ARGS+=(--days 2); else LEGO_ARGS+=(--days 30); fi
+  lego_args
+  # IP certificates are ~6-day short-lived certificates. Check daily and renew
+  # with a two-day threshold; normal DNS certificates keep a wider threshold.
+  if is_ip "$CERT_NAME"; then LEGO_ARGS+=(--renew-days 2); else LEGO_ARGS+=(--renew-days 30); fi
   info "Checking ACME certificate renewal for $CERT_NAME"
   if run lego "${LEGO_ARGS[@]}"; then [[ "$DRY_RUN" == "yes" ]] || sync_lego_certificate; else warn "lego renewal failed; keeping the current certificate."; return 1; fi
 }
@@ -582,8 +595,6 @@ write_config() {
   "brutal": $([[ "$TCP_BRUTAL" == "yes" ]] && echo true || echo false),
   "brutal_up": 100,
   "brutal_down": 500,
-  "traffic_days": 30,
-  "traffic_file": "$CONFIG_DIR/tlsvpn-traffic.json",
   "workers": $WORKERS,
   "mtu": $MTU,
   "tap": "tap0",
@@ -611,8 +622,6 @@ EOF
   "brutal": $([[ "$TCP_BRUTAL" == "yes" ]] && echo true || echo false),
   "brutal_up": 100,
   "brutal_down": 500,
-  "traffic_days": 30,
-  "traffic_file": "$CONFIG_DIR/tlsvpn-traffic.json",
   "workers": $WORKERS,
   "mtu": $MTU,
   "tap": "tap0",
@@ -623,8 +632,6 @@ EOF
 }
 EOF
   fi
-  "$INSTALL_DIR/$PROGRAM" -c "$CONFIG_FILE.tmp" >/dev/null 2>&1 &
-  local pid=$!; sleep 0.4; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true
   mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
   info "Configuration written to $CONFIG_FILE"
@@ -699,6 +706,10 @@ write_state() {
 MODE=$(printf '%q' "$MODE")
 VERSION=$(printf '%q' "$VERSION")
 ARCH=$(printf '%q' "$ARCH")
+INSTALL_DIR=$(printf '%q' "$INSTALL_DIR")
+CONFIG_DIR=$(printf '%q' "$CONFIG_DIR")
+CERT_DIR=$(printf '%q' "$CERT_DIR")
+INSTALLER_COPY=$(printf '%q' "$INSTALLER_COPY")
 CONFIG_FILE=$(printf '%q' "$CONFIG_FILE")
 CERT_MODE=$(printf '%q' "$CERT_MODE")
 CERT_NAME=$(printf '%q' "$CERT_NAME")

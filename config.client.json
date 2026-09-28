@@ -11,6 +11,8 @@
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
+  "traffic_days": 30,
+  "traffic_file": "",
   "socks5": "",
   "tap": "tap0",
   "mac": "",

@@ -1085,7 +1085,6 @@ fn serve_listener(
                 // provider 出的是运行时数据；cfg/system 是启动时固定的上下文，
                 // 在这里并入，避免把静态字段重复写进 server/client 两处实现。
                 let mut stats = provider.stats_json();
-                ctx.web.observe_stats(&stats);
                 if let Some(obj) = stats.as_object_mut() {
                     obj.insert("cfg".to_string(), ctx.cfg.read().clone());
                     let mut system = ctx.system.clone();
@@ -1094,6 +1093,11 @@ fn serve_listener(
                     }
                     obj.insert("system".to_string(), system);
                     obj.insert("brutal_system".to_string(), brutal_system_status());
+                    obj.insert("traffic".to_string(), ctx.web.traffic_json());
+                    let client_traffic = ctx.web.client_traffic_json();
+                    if client_traffic.as_array().map_or(false, |v| !v.is_empty()) {
+                        obj.insert("client_traffic".to_string(), client_traffic);
+                    }
                 }
                 respond_json(request, stats.to_string(), 200);
             }
@@ -1109,7 +1113,13 @@ fn serve_listener(
                 respond_json(request, json!(log_ring_snapshot(after)).to_string(), 200);
             }
             (&Method::Get, "/api/trend") => {
-                respond_json(request, ctx.web.trend_json().to_string(), 200);
+                let range = request
+                    .url()
+                    .split_once('?')
+                    .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("range=")))
+                    .unwrap_or("2m")
+                    .to_string();
+                respond_json(request, ctx.web.trend_json(&range).to_string(), 200);
             }
             (&Method::Get, "/api/events") => {
                 let after = query_u64(request.url(), "after");
@@ -1274,9 +1284,12 @@ fn serve_listener(
                                     let _ =
                                         provider.control("pad_mode", "", &validated.pad_mode, 0);
                                 }
+                                "traffic_days" | "traffic_file" => {}
                                 _ => needs_restart.push(field.clone()),
                             }
                         }
+                        ctx.web
+                            .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
                         if let Some(cfg) = ctx.cfg.write().as_object_mut() {
                             cfg.insert("log_level".into(), json!(validated.loglevel));
                             cfg.insert("pad_mode".into(), json!(crate::crypto::pad_mode_name()));
@@ -1331,6 +1344,22 @@ pub fn web_port(addr: &str) -> u16 {
         Some((_, p)) => p.parse().unwrap_or(8080),
         None => 8080,
     }
+}
+
+/// Start the process-level dashboard/traffic sampler exactly once. It runs even
+/// when the HTTP dashboard is disabled so traffic_days/traffic_file keep the same
+/// process-level semantics as the Go implementation.
+pub fn start_dashboard_sampler(
+    provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
+) {
+    if !ctx.web.try_start_sampler() {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        ctx.web.observe_stats(&provider.stats_json());
+        std::thread::sleep(Duration::from_secs(1));
+    });
 }
 
 /// web.bind=all：直接启动单个 listener（默认行为，不变）。stop 永不置位。

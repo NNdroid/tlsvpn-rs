@@ -12,6 +12,8 @@
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
+  "traffic_days": 30,
+  "traffic_file": "",
   "tap": "tap0",
   "mac": "",
   "web": {
