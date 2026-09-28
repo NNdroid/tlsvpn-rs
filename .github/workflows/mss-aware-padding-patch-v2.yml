@@ -1,0 +1,248 @@
+name: Apply MSS-aware padding patch v2
+
+on:
+  push:
+    branches:
+      - perf/mss-aware-padding-20260928
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply source patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def rep(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"anchor not found in {path}: {old[:100]!r}")
+              p.write_text(s.replace(old, new, 1))
+
+          rep('src/crypto.rs',
+              'const PAD_BUCKETS: [usize; 10] = [128, 256, 384, 512, 768, 1024, 1280, 1600, 2048, 4096];\n',
+              '''const PAD_BUCKETS: [usize; 10] = [128, 256, 384, 512, 768, 1024, 1280, 1600, 2048, 4096];
+
+/// 1500 MTU 下 IPv6/TCP 的保守 MSS；TCP_MAXSEG 不可读时使用。
+pub const FALLBACK_TCP_MSS: usize = 1440;
+/// 为 TLS record header + AEAD expansion 预留空间。32B 覆盖 TLS 1.2
+/// AES-GCM (~29B) 和 TLS 1.3 AEAD (~22B) 的常见开销。
+pub const TLS_RECORD_OVERHEAD_RESERVE: usize = 32;
+
+pub fn mss_padding_record_limit(mss: usize) -> usize {
+    let effective = if mss < 256 { FALLBACK_TCP_MSS } else { mss };
+    effective.saturating_sub(TLS_RECORD_OVERHEAD_RESERVE).max(128)
+}
+''')
+
+          rep('src/crypto.rs', '''pub fn pad_length(wire_len: usize) -> usize {
+    if PAD_MODE_CODE.load(Ordering::Relaxed) == PAD_OFF {
+        0
+    } else {
+        pad_bucket(wire_len)
+    }
+}
+
+/// 填充到固定长度桶；超出最大桶的 jumbo 帧只加小额随机填充，
+/// 不为抗流量分析付过大带宽代价。
+pub fn pad_bucket(wire_len: usize) -> usize {
+    let record_len = 10usize.saturating_add(wire_len);
+    for &b in PAD_BUCKETS.iter() {
+        if record_len < b {
+            return b - record_len;
+        }
+    }
+    RNG.with(|rng| 1 + rng.borrow_mut().gen_range(0, 100))
+}
+''', '''pub fn pad_length(wire_len: usize) -> usize {
+    pad_length_with_limit(wire_len, 0)
+}
+
+pub fn pad_length_with_limit(wire_len: usize, record_limit: usize) -> usize {
+    if PAD_MODE_CODE.load(Ordering::Relaxed) == PAD_OFF {
+        0
+    } else {
+        pad_bucket_with_limit(wire_len, record_limit)
+    }
+}
+
+/// 历史 uncapped helper；真实 socket 发送路径使用 pad_bucket_with_limit。
+pub fn pad_bucket(wire_len: usize) -> usize {
+    pad_bucket_with_limit(wire_len, 0)
+}
+
+/// record_limit>0 时，padding 不得把 TLSVPN record 推过连接的 MSS 预算。
+/// 如果下一个静态 bucket 超过上限，就把上限本身作为最后一个动态 bucket；
+/// record 已达到/超过上限时不再追加 padding。
+pub fn pad_bucket_with_limit(wire_len: usize, record_limit: usize) -> usize {
+    let record_len = 10usize.saturating_add(wire_len);
+    if record_limit > 0 && record_len >= record_limit {
+        return 0;
+    }
+    for &b in PAD_BUCKETS.iter() {
+        let target = if record_limit > 0 { b.min(record_limit) } else { b };
+        if record_len < target {
+            return target - record_len;
+        }
+        if record_limit > 0 && b >= record_limit {
+            return 0;
+        }
+    }
+    if record_limit > 0 {
+        0
+    } else {
+        RNG.with(|rng| 1 + rng.borrow_mut().gen_range(0, 100))
+    }
+}
+''')
+
+          rep('src/crypto.rs', '''    #[test]
+    fn pad_off_never_pads() {
+''', '''    #[test]
+    fn mss_padding_record_limit_is_conservative() {
+        assert_eq!(mss_padding_record_limit(1460), 1428);
+        assert_eq!(mss_padding_record_limit(1440), 1408);
+        assert_eq!(mss_padding_record_limit(0), FALLBACK_TCP_MSS - TLS_RECORD_OVERHEAD_RESERVE);
+    }
+
+    #[test]
+    fn pad_bucket_with_limit_never_crosses_mss_budget() {
+        let limit = mss_padding_record_limit(1460);
+        assert_eq!(pad_bucket_with_limit(1200, limit), 70);
+        assert_eq!(pad_bucket_with_limit(1290, limit), 128);
+        assert_eq!(pad_bucket_with_limit(1400, limit), 18);
+        assert_eq!(pad_bucket_with_limit(1418, limit), 0);
+        assert_eq!(pad_bucket_with_limit(1540, limit), 0);
+        assert_eq!(pad_bucket(1540), 50);
+    }
+
+    #[test]
+    fn pad_off_never_pads() {
+''')
+
+          rep('src/frame.rs', '''pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<&InnerCipher>) {
+    let data_len = data.len();
+''', '''pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<&InnerCipher>) {
+    append_padded_frame_with_limit(buf, seq, data, ic, 0);
+}
+
+pub fn append_padded_frame_with_limit(
+    buf: &mut Vec<u8>,
+    seq: u32,
+    data: &[u8],
+    ic: Option<&InnerCipher>,
+    record_limit: usize,
+) {
+    let data_len = data.len();
+''')
+          rep('src/frame.rs', '    let pad_len = crate::crypto::pad_length(data_len + enc_tag);\n',
+              '    let pad_len = crate::crypto::pad_length_with_limit(data_len + enc_tag, record_limit);\n')
+          rep('src/frame.rs', '''pub fn write_stream_frame(buf: &mut Vec<u8>, frame: &[u8]) {
+    buf.clear();
+    append_padded_frame(buf, 0, frame, None);
+}
+''', '''pub fn write_stream_frame(buf: &mut Vec<u8>, frame: &[u8]) {
+    write_stream_frame_with_limit(buf, frame, 0);
+}
+
+pub fn write_stream_frame_with_limit(buf: &mut Vec<u8>, frame: &[u8], record_limit: usize) {
+    buf.clear();
+    append_padded_frame_with_limit(buf, 0, frame, None, record_limit);
+}
+''')
+
+          rep('src/net.rs', '''#[cfg(target_os = "linux")]
+pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> u32 {
+''', '''#[cfg(target_os = "linux")]
+pub fn get_tcp_mss<S: AsRawFd>(stream: &S) -> usize {
+    let fd = stream.as_raw_fd();
+    let mut mss: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&mss) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mut mss as *mut _ as *mut _,
+            &mut len,
+        )
+    };
+    if rc == 0 && mss > 0 { mss as usize } else { 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_tcp_mss<S>(_stream: &S) -> usize { 0 }
+
+#[cfg(target_os = "linux")]
+pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> u32 {
+''')
+
+          rep('src/client.rs', '''    *ci.remote.lock() = raw.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    *ci.state.lock() = "connecting".into();
+''', '''    *ci.remote.lock() = raw.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    *ci.state.lock() = "connecting".into();
+    let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&raw));
+''')
+          rep('src/client.rs', '    write_stream_frame(&mut send_buf, &req_json);\n',
+              '    write_stream_frame_with_limit(&mut send_buf, &req_json, pad_record_limit);\n')
+          rep('src/client.rs', '                append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);\n', '''                append_padded_frame_with_limit(
+                    &mut send_buf,
+                    f.seq,
+                    f.data.as_slice(),
+                    ic_ref,
+                    pad_record_limit,
+                );
+''')
+          rep('src/client.rs', '            append_padded_frame(&mut send_buf, 0, &[], None);\n',
+              '            append_padded_frame_with_limit(&mut send_buf, 0, &[], None, pad_record_limit);\n')
+
+          rep('src/server.rs', '    send_buf: Vec<u8>,\n    ic_rx: Option<Arc<InnerCipher>>,\n',
+              '    send_buf: Vec<u8>,\n    pad_record_limit: usize,\n    ic_rx: Option<Arc<InnerCipher>>,\n')
+          rep('src/server.rs', '            let (tx, rx) = bounded(1024);\n',
+              '            let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&socket));\n            let (tx, rx) = bounded(1024);\n')
+          rep('src/server.rs', '                    send_buf: Vec::with_capacity(70 * 1024),\n                    ic_rx: None,\n',
+              '                    send_buf: Vec::with_capacity(70 * 1024),\n                    pad_record_limit,\n                    ic_rx: None,\n')
+          rep('src/server.rs', '                append_padded_frame(&mut sess.send_buf, 0, &[], None);\n', '''                append_padded_frame_with_limit(
+                    &mut sess.send_buf,
+                    0,
+                    &[],
+                    None,
+                    sess.pad_record_limit,
+                );
+''')
+          rep('src/server.rs', '        append_padded_frame(&mut sess.send_buf, f.seq, f.data.as_slice(), ic_ref);\n', '''        append_padded_frame_with_limit(
+            &mut sess.send_buf,
+            f.seq,
+            f.data.as_slice(),
+            ic_ref,
+            sess.pad_record_limit,
+        );
+''')
+          PY
+          cargo fmt
+
+      - name: Test
+        run: |
+          cargo test --verbose
+          RUSTFLAGS='-C target-cpu=native' cargo test --release bench_protocol_throughput -- --ignored --nocapture
+
+      - name: Commit final source changes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/mss-aware-padding-patch.yml .github/workflows/mss-aware-padding-patch-v2.yml
+          git add -A
+          git commit -m 'perf: make bucket padding MSS-aware'
+          git push origin HEAD:perf/mss-aware-padding-20260928
