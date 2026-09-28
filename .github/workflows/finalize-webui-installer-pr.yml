@@ -20,10 +20,11 @@ jobs:
         run: |
           python3 scripts/finalize_parity_patch.py
           python3 scripts/fix_finalize_range.py
-      - name: Remove one-shot helpers
+          # GITHUB_TOKEN cannot update workflow files. Keep the validated product
+          # patch here and apply workflow-only changes through the repository API.
+          git checkout -- .github/workflows/crypto-interop.yml
+      - name: Remove temporary patch scripts
         run: |
-          git rm .github/workflows/finalize-webui-installer.yml
-          git rm .github/workflows/finalize-webui-installer-pr.yml
           git rm scripts/finalize_parity_patch.py
           git rm scripts/fix_finalize_range.py
       - name: Validate product changes
@@ -34,8 +35,6 @@ jobs:
           scripts/install.sh --help >/dev/null
           cargo test --all-targets
           cargo check --release
-          grep -Fq 'webui/app.js' .github/workflows/crypto-interop.yml
-          ! grep -Eq 'grep .*src/api\.rs' .github/workflows/crypto-interop.yml
       - name: Commit product changes
         run: |
           git config user.name 'github-actions[bot]'
