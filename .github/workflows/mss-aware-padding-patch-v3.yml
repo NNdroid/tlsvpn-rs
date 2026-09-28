@@ -1,0 +1,37 @@
+name: Apply MSS-aware padding patch v3
+
+on:
+  push:
+    branches:
+      - perf/mss-aware-padding-20260928
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply patch
+        run: python3 .github/scripts/apply_mss_padding.py
+      - name: Format
+        run: cargo fmt
+      - name: Test
+        run: |
+          cargo test --verbose
+          RUSTFLAGS='-C target-cpu=native' cargo test --release bench_protocol_throughput -- --ignored --nocapture
+      - name: Commit final source changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/mss-aware-padding-patch.yml
+          git rm .github/workflows/mss-aware-padding-patch-v2.yml
+          git rm .github/workflows/mss-aware-padding-patch-v3.yml
+          git rm .github/scripts/apply_mss_padding.py
+          git add -A
+          git commit -m 'perf: make bucket padding MSS-aware'
+          git push origin HEAD:perf/mss-aware-padding-20260928
