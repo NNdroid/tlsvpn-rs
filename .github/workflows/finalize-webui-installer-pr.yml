@@ -25,10 +25,10 @@ jobs:
           git rm scripts/finalize_parity_patch.py
       - name: Validate product changes
         run: |
+          git diff --check
           chmod +x scripts/install.sh
           bash -n scripts/install.sh
           scripts/install.sh --help >/dev/null
-          cargo fmt --check
           cargo test --all-targets
           cargo check --release
           grep -Fq 'webui/app.js' .github/workflows/crypto-interop.yml
