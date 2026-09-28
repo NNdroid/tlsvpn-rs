@@ -7,6 +7,12 @@ on:
     paths:
       - scripts/perf_opt_patch.py
       - .github/workflows/perf-opt-patch.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/perf_opt_patch.py
+      - .github/workflows/perf-opt-patch.yml
 
 permissions:
   contents: write
