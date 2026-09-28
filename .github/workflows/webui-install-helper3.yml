@@ -57,7 +57,11 @@ jobs:
           if runtime_struct not in source:
               raise SystemExit('RuntimeCtx struct not found for Default compatibility')
           source = source.replace(runtime_struct, runtime_default, 1)
-          source = source.replace('    auth: String,\n    web_cert:', '    _auth: String,\n    web_cert:', 1)
+          source = source.replace(
+              '        let expected_auth = ctx.web.current_auth();',
+              '        let dynamic_auth = ctx.web.current_auth();\n        let expected_auth = if dynamic_auth.is_empty() { auth.clone() } else { dynamic_auth };',
+              1,
+          )
           api.write_text(source)
           META
       - name: Format and validate
