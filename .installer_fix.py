@@ -58,16 +58,12 @@ anchor = '''        "--non-interactive",
 '''
 replacement = '''        "--non-interactive",
         "back",
-        "os_id=\"$(. /etc/os-release; printf",
+        r#"os_id="$(. /etc/os-release; printf"#,
         "Invalid TLSVPN release tag:",
         "systemctl cat tlsvpn.service",
 '''
 assert s.count(anchor) == 1
 s = s.replace(anchor, replacement)
-anchor = '''    for marker in [
-        "install_action",
-'''
-# Add a direct namespace-pollution regression assertion after the marker loop.
 needle = '''        assert!(installer.contains(marker), "installer missing {marker}");
     }
 }
