@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# Keep this helper one-shot and scoped to the remaining audited README sentence.
 p = Path("README.md")
 s = p.read_text()
 old = 'Windows and macOS clients work with `"tap": "mem"` (no kernel TAP); interface addressing and policy routing are Linux features.'
