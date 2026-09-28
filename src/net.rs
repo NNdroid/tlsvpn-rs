@@ -488,6 +488,32 @@ pub fn apply_tcp_keepalive<S: AsRawFd>(_stream: &S) {
 }
 
 #[cfg(target_os = "linux")]
+pub fn get_tcp_mss<S: AsRawFd>(stream: &S) -> usize {
+    let fd = stream.as_raw_fd();
+    let mut mss: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&mss) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mut mss as *mut _ as *mut _,
+            &mut len,
+        )
+    };
+    if rc == 0 && mss > 0 {
+        mss as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_tcp_mss<S>(_stream: &S) -> usize {
+    0
+}
+
+#[cfg(target_os = "linux")]
 pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> u32 {
     let fd = stream.as_raw_fd();
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };

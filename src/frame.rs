@@ -11,6 +11,16 @@ use crate::utils::*;
 /// （协议约定，接收端以此区分控制帧与数据帧）。GCM 模式密文后附 16B 标签，
 /// 线路 dataLen = 明文长 + tagLen（对齐 Go appendPaddedFrame）。
 pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<&InnerCipher>) {
+    append_padded_frame_with_limit(buf, seq, data, ic, 0);
+}
+
+pub fn append_padded_frame_with_limit(
+    buf: &mut Vec<u8>,
+    seq: u32,
+    data: &[u8],
+    ic: Option<&InnerCipher>,
+    record_limit: usize,
+) {
     let data_len = data.len();
     let enc_tag = match ic {
         Some(c) if seq != 0 && data_len > 0 => c.tag_len(),
@@ -19,7 +29,7 @@ pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<
     // 填充按线路长度计算（明文 + GCM 标签），不是明文长度：
     // GCM 密文比明文多 16B 标签，按明文长度分桶会把同一线路长度
     // 的帧划进不同的桶，破坏 bucket 模式的"固定长度分布"。
-    let pad_len = crate::crypto::pad_length(data_len + enc_tag);
+    let pad_len = crate::crypto::pad_length_with_limit(data_len + enc_tag, record_limit);
 
     let start_idx = buf.len();
     let needed = 10 + data_len + enc_tag + pad_len;
@@ -58,8 +68,12 @@ pub fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<
 
 /// 发送无需去重的控制帧（seq=0，明文），对齐 Go writeStreamFrame
 pub fn write_stream_frame(buf: &mut Vec<u8>, frame: &[u8]) {
+    write_stream_frame_with_limit(buf, frame, 0);
+}
+
+pub fn write_stream_frame_with_limit(buf: &mut Vec<u8>, frame: &[u8], record_limit: usize) {
     buf.clear();
-    append_padded_frame(buf, 0, frame, None);
+    append_padded_frame_with_limit(buf, 0, frame, None, record_limit);
 }
 
 pub struct FrameScanner {

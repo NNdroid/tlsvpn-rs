@@ -246,6 +246,7 @@ struct MioSession {
     last_rx: Instant,
     rtt_timer: Instant,
     send_buf: Vec<u8>,
+    pad_record_limit: usize,
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
     write_stalled: Option<Instant>,
@@ -1240,6 +1241,7 @@ fn worker_loop(
             {
                 continue;
             }
+            let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&socket));
             let (tx, rx) = bounded(1024);
             let backend = Arc::new(Backend {
                 ch: tx,
@@ -1279,6 +1281,7 @@ fn worker_loop(
                     last_rx: Instant::now(),
                     rtt_timer: Instant::now(),
                     send_buf: Vec::with_capacity(70 * 1024),
+                    pad_record_limit,
                     ic_rx: None,
                     session_epoch: 0,
                     write_stalled: None,
@@ -1354,7 +1357,13 @@ fn worker_loop(
                 && !sess.tls.wants_write()
             {
                 sess.send_buf.clear();
-                append_padded_frame(&mut sess.send_buf, 0, &[], None);
+                append_padded_frame_with_limit(
+                    &mut sess.send_buf,
+                    0,
+                    &[],
+                    None,
+                    sess.pad_record_limit,
+                );
                 if sess.tls.writer().write_all(&sess.send_buf).is_ok() {
                     sess.last_keepalive = Instant::now();
                 }
@@ -1827,7 +1836,13 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
-        append_padded_frame(&mut sess.send_buf, f.seq, f.data.as_slice(), ic_ref);
+        append_padded_frame_with_limit(
+            &mut sess.send_buf,
+            f.seq,
+            f.data.as_slice(),
+            ic_ref,
+            sess.pad_record_limit,
+        );
         f.data.release();
         pulled += 1;
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
