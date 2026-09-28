@@ -116,8 +116,10 @@ impl FrameScanner {
             return Ok(None);
         }
 
-        let data_len = BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
-        let pad_len = BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
+        let data_len =
+            BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
+        let pad_len =
+            BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
         let seq = BigEndian::read_u32(&self.buffer[self.offset + 6..self.offset + 10]);
 
         if data_len > self.max_data_len {
@@ -191,6 +193,7 @@ impl FrameScanner {
             }
         }
     }
+
 }
 
 /// AsyncPort/backend 内部的 payload 所有权。
@@ -348,11 +351,7 @@ mod tests {
         append_frame_head(&mut burst, 3, 0, 12);
         burst.extend_from_slice(b"two");
 
-        let mut reader = OneBurstReader {
-            data: burst,
-            sent: false,
-            reads: 0,
-        };
+        let mut reader = OneBurstReader { data: burst, sent: false, reads: 0 };
         let mut scanner = FrameScanner::new();
 
         let (first, first_seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
