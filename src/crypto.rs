@@ -126,6 +126,19 @@ pub static PAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 小帧填充目标桶（覆盖 MTU 1500 常见帧及其含标签长度）
 const PAD_BUCKETS: [usize; 10] = [128, 256, 384, 512, 768, 1024, 1280, 1600, 2048, 4096];
 
+/// 1500 MTU 下 IPv6/TCP 的保守 MSS；TCP_MAXSEG 不可读时使用。
+pub const FALLBACK_TCP_MSS: usize = 1440;
+/// 为 TLS record header + AEAD expansion 预留空间。32B 覆盖 TLS 1.2
+/// AES-GCM (~29B) 和 TLS 1.3 AEAD (~22B) 的常见开销。
+pub const TLS_RECORD_OVERHEAD_RESERVE: usize = 32;
+
+pub fn mss_padding_record_limit(mss: usize) -> usize {
+    let effective = if mss < 256 { FALLBACK_TCP_MSS } else { mss };
+    effective
+        .saturating_sub(TLS_RECORD_OVERHEAD_RESERVE)
+        .max(128)
+}
+
 /// 切换填充策略（非法值回落 bucket），返回实际生效的策略名。
 /// 空串也算非法 → bucket；配置层的"空串即 bucket"改写必须在此之前完成。
 pub fn set_pad_mode(mode: &str) -> String {
@@ -150,23 +163,48 @@ pub fn pad_mode_name() -> String {
 /// 当前策略下该线路长度应加多少填充。
 /// wire_len 必须是线路长度（明文 + GCM 标签），不是明文长度。
 pub fn pad_length(wire_len: usize) -> usize {
+    pad_length_with_limit(wire_len, 0)
+}
+
+pub fn pad_length_with_limit(wire_len: usize, record_limit: usize) -> usize {
     if PAD_MODE_CODE.load(Ordering::Relaxed) == PAD_OFF {
         0
     } else {
-        pad_bucket(wire_len)
+        pad_bucket_with_limit(wire_len, record_limit)
     }
 }
 
-/// 填充到固定长度桶；超出最大桶的 jumbo 帧只加小额随机填充，
-/// 不为抗流量分析付过大带宽代价。
+/// 历史 uncapped helper；真实 socket 发送路径使用 pad_bucket_with_limit。
 pub fn pad_bucket(wire_len: usize) -> usize {
+    pad_bucket_with_limit(wire_len, 0)
+}
+
+/// record_limit>0 时，padding 不得把 TLSVPN record 推过连接的 MSS 预算。
+/// 如果下一个静态 bucket 超过上限，就把上限本身作为最后一个动态 bucket；
+/// record 已达到/超过上限时不再追加 padding。
+pub fn pad_bucket_with_limit(wire_len: usize, record_limit: usize) -> usize {
     let record_len = 10usize.saturating_add(wire_len);
+    if record_limit > 0 && record_len >= record_limit {
+        return 0;
+    }
     for &b in PAD_BUCKETS.iter() {
-        if record_len < b {
-            return b - record_len;
+        let target = if record_limit > 0 {
+            b.min(record_limit)
+        } else {
+            b
+        };
+        if record_len < target {
+            return target - record_len;
+        }
+        if record_limit > 0 && b >= record_limit {
+            return 0;
         }
     }
-    RNG.with(|rng| 1 + rng.borrow_mut().gen_range(0, 100))
+    if record_limit > 0 {
+        0
+    } else {
+        RNG.with(|rng| 1 + rng.borrow_mut().gen_range(0, 100))
+    }
 }
 
 /// 校验 pad_mode 取值（配置加载层，对齐 Go Config.Validate）。
@@ -734,6 +772,27 @@ mod tests {
         let _ = set_pad_mode(mode);
         f();
         let _ = set_pad_mode(&prev);
+    }
+
+    #[test]
+    fn mss_padding_record_limit_is_conservative() {
+        assert_eq!(mss_padding_record_limit(1460), 1428);
+        assert_eq!(mss_padding_record_limit(1440), 1408);
+        assert_eq!(
+            mss_padding_record_limit(0),
+            FALLBACK_TCP_MSS - TLS_RECORD_OVERHEAD_RESERVE
+        );
+    }
+
+    #[test]
+    fn pad_bucket_with_limit_never_crosses_mss_budget() {
+        let limit = mss_padding_record_limit(1460);
+        assert_eq!(pad_bucket_with_limit(1200, limit), 70);
+        assert_eq!(pad_bucket_with_limit(1290, limit), 128);
+        assert_eq!(pad_bucket_with_limit(1400, limit), 18);
+        assert_eq!(pad_bucket_with_limit(1418, limit), 0);
+        assert_eq!(pad_bucket_with_limit(1540, limit), 0);
+        assert_eq!(pad_bucket(1540), 50);
     }
 
     #[test]

@@ -1185,6 +1185,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     };
     *ci.remote.lock() = raw.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     *ci.state.lock() = "connecting".into();
+    let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&raw));
 
     // 1. 先只计算 Brutal 预算，不在 TLS / TLSVPN 握手前切拥塞控制。
     // Brutal 是数据面优化；与 Go 一致，必须等应用层 HandshakeResp 成功后再启用。
@@ -1292,7 +1293,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     };
     let req_json = serde_json::to_vec(&req).unwrap();
     let mut send_buf = Vec::with_capacity(2 * 1024);
-    write_stream_frame(&mut send_buf, &req_json);
+    write_stream_frame_with_limit(&mut send_buf, &req_json, pad_record_limit);
     if tls.writer().write_all(&send_buf).is_err() {
         *ci.last_error.lock() = "handshake write failed".into();
         return Duration::ZERO;
@@ -1816,7 +1817,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             while let Ok(f) = rx.try_recv() {
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                append_padded_frame(&mut send_buf, f.seq, f.data.as_slice(), ic_ref);
+                append_padded_frame_with_limit(
+                    &mut send_buf,
+                    f.seq,
+                    f.data.as_slice(),
+                    ic_ref,
+                    pad_record_limit,
+                );
                 f.data.release();
                 tx_packets_batch += 1;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
@@ -1829,7 +1836,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             && !tls.wants_write()
             && last_keepalive.elapsed() > Duration::from_secs(4)
         {
-            append_padded_frame(&mut send_buf, 0, &[], None);
+            append_padded_frame_with_limit(&mut send_buf, 0, &[], None, pad_record_limit);
         }
         if !send_buf.is_empty() {
             let wire_bytes = send_buf.len() as u64;
