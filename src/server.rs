@@ -195,7 +195,7 @@ pub struct ClientSession {
     pub stat: Arc<ClientStat>,
     pub port: Arc<AsyncPort>,
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
-    pub dedup: Arc<Mutex<DeDuplicator>>,
+    pub dedup: Arc<DeDuplicator>,
     pub fec_enc_k: i64,
     pub mac: String,
     pub peer_info: RwLock<Option<PeerInfo>>,
@@ -1001,7 +1001,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
     std::thread::spawn(move || {
         loop {
-            let mut frame = acquire_frame_vec(tap_read_size);
+            let mut frame = acquire_frame_vec_overwrite(tap_read_size);
             match dev_reader.recv(&mut frame) {
                 Ok(n) if n > 0 => {
                     frame.truncate(n);
@@ -1595,6 +1595,10 @@ fn process_plain_frames(
     // 共享统计按一次 TLS plaintext drain 聚合，降低多 worker 写同一 cache line 的频率。
     let mut rx_bytes_batch = 0u64;
     let mut rx_packets_batch = 0u64;
+    let mut batch_session: Option<Arc<ClientSession>> = None;
+    let mut batch_fec_dec: Option<Arc<FecDecoder>> = None;
+    let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
+    let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
 
     loop {
         match sess.scanner.read_frame(&mut sess.tls.reader()) {
@@ -1664,13 +1668,19 @@ fn process_plain_frames(
                     }
                     let fec_dec = epoch.fec_dec.clone();
                     drop(epoch);
+                    if batch_session.is_none() {
+                        batch_session = Some(c_sess.clone());
+                    }
+                    if batch_fec_dec.is_none() {
+                        batch_fec_dec = fec_dec.clone();
+                    }
                     let data = Arc::new(data);
 
                     if seq == 0 {
                         if let Some(dec) = &fec_dec {
                             if fec::is_parity_frame(&data) {
                                 let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    deliver_to_vswitch(&c_sess, core, s, f, reorder_ready);
+                                    reorder_input.push((s, f));
                                 };
                                 dec.on_parity(&data, &mut sink);
                                 release_shared_frame(data);
@@ -1679,17 +1689,25 @@ fn process_plain_frames(
                         }
                     }
 
-                    if let Some(dec) = &fec_dec {
-                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                            deliver_to_vswitch(&c_sess, core, s, f, reorder_ready);
-                        };
-                        dec.on_data(seq, &data, &mut sink);
+                    if fec_dec.is_some() {
+                        fec_data_batch.push((seq, data.clone()));
                     }
 
-                    if !c_sess.dedup.lock().is_duplicate(seq) {
-                        deliver_to_vswitch(&c_sess, core, seq, data, reorder_ready);
+                    if !c_sess.dedup.is_duplicate(seq) {
+                        reorder_input.push((seq, data));
                     } else {
                         release_shared_frame(data);
+                    }
+
+                    if fec_data_batch.len() >= 64 || reorder_input.len() >= 64 {
+                        flush_server_rx_batch(
+                            &c_sess,
+                            core,
+                            batch_fec_dec.as_ref(),
+                            &mut fec_data_batch,
+                            &mut reorder_input,
+                            reorder_ready,
+                        );
                     }
                 }
             }
@@ -1712,6 +1730,17 @@ fn process_plain_frames(
         }
     }
 
+    if let Some(c_sess) = batch_session.as_ref() {
+        flush_server_rx_batch(
+            c_sess,
+            core,
+            batch_fec_dec.as_ref(),
+            &mut fec_data_batch,
+            &mut reorder_input,
+            reorder_ready,
+        );
+    }
+
     if rx_packets_batch != 0 {
         if let Some(s) = &sess.client_session {
             s.stat.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
@@ -1722,15 +1751,34 @@ fn process_plain_frames(
     }
 }
 
-fn deliver_to_vswitch(
+fn flush_server_rx_batch(
     c_sess: &Arc<ClientSession>,
     core: &Arc<ServerCore>,
-    seq: u32,
-    frame: Arc<Vec<u8>>,
+    fec_dec: Option<&Arc<FecDecoder>>,
+    fec_data: &mut Vec<(u32, Arc<Vec<u8>>)>,
+    reorder_input: &mut Vec<(u32, Arc<Vec<u8>>)>,
     ready: &mut Vec<Arc<Vec<u8>>>,
 ) {
+    if let Some(dec) = fec_dec {
+        if !fec_data.is_empty() {
+            let mut sink = |seq: u32, frame: Arc<Vec<u8>>| {
+                reorder_input.push((seq, frame));
+            };
+            dec.on_data_batch(fec_data, &mut sink);
+        }
+    }
+    fec_data.clear();
+    if reorder_input.is_empty() {
+        return;
+    }
+
     ready.clear();
-    c_sess.reorder_buf.lock().insert_into(seq, frame, ready);
+    {
+        let mut reorder = c_sess.reorder_buf.lock();
+        for (seq, frame) in reorder_input.drain(..) {
+            reorder.insert_into(seq, frame, ready);
+        }
+    }
     for ordered in ready.drain(..) {
         if c_sess.mac_bin != [0u8; 6] {
             core.vswitch
@@ -1928,7 +1976,7 @@ fn rotate_session_epoch(
         old.reset();
     }
     session.reorder_buf.lock().reset();
-    session.dedup.lock().reset();
+    session.dedup.reset();
     if session.fec_enc_k > 0 {
         session.port.reset_epoch(session.fec_enc_k as usize, fec_tx);
     } else {
@@ -2283,7 +2331,7 @@ fn handle_handshake(
                 stat,
                 port,
                 reorder_buf: Arc::new(Mutex::new(ReorderBuffer::new())),
-                dedup: Arc::new(Mutex::new(DeDuplicator::new())),
+                dedup: Arc::new(DeDuplicator::new()),
                 fec_enc_k,
                 mac,
                 peer_info: RwLock::new(req.peer_info.as_ref().map(normalize_peer_info)),

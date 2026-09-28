@@ -22,7 +22,8 @@ pub const FEC_MAGIC: u8 = 0xFE;
 pub const FEC_MIN_GROUP: usize = 2;
 pub const FEC_MAX_GROUP: usize = 64;
 const FEC_MAX_PENDING_GROUPS: usize = 512;
-const FEC_DONE_CACHE: usize = 64;
+const FEC_DONE_CACHE: usize = 256;
+const FEC_DONE_MASK: usize = FEC_DONE_CACHE - 1;
 
 pub fn clamp_fec_group(k: usize) -> usize {
     k.clamp(FEC_MIN_GROUP, FEC_MAX_GROUP)
@@ -34,16 +35,8 @@ pub fn clamp_fec_group(k: usize) -> usize {
 /// 都必须给出同一个结论。
 pub fn normalize_fec_group_bounds(min: i64, max: i64) -> (i64, i64) {
     (
-        if min == 0 {
-            FEC_MIN_GROUP as i64
-        } else {
-            min
-        },
-        if max == 0 {
-            FEC_MAX_GROUP as i64
-        } else {
-            max
-        },
+        if min == 0 { FEC_MIN_GROUP as i64 } else { min },
+        if max == 0 { FEC_MAX_GROUP as i64 } else { max },
     )
 }
 
@@ -175,7 +168,6 @@ unsafe fn xor_combine_avx2(out: &mut [u8], parity: &[u8], acc: &[u8]) {
     }
 }
 
-
 // ---------- NEON 路径（AArch64 baseline） ----------
 
 #[cfg(target_arch = "aarch64")]
@@ -224,6 +216,7 @@ pub struct FecEncoder {
     seqs: Vec<u32>,
     lens: Vec<usize>,
     acc: Vec<u8>,
+    active_len: usize,
     ic: Option<Arc<InnerCipher>>,
     parity_sent: u64,
 }
@@ -237,6 +230,7 @@ impl FecEncoder {
             lens: Vec::with_capacity(k),
             // 常见 Ethernet payload 一次扩到 2KB 档，之后复用。
             acc: Vec::with_capacity(2048),
+            active_len: 0,
             ic,
             // encoder 本身已由 AsyncPort mutex 串行访问，无需再做原子计数。
             parity_sent: 0,
@@ -258,7 +252,8 @@ impl FecEncoder {
         if data.len() > self.acc.len() {
             self.acc.resize(data.len(), 0);
         }
-        xor_into(&mut self.acc, data);
+        self.active_len = self.active_len.max(data.len());
+        xor_into(&mut self.acc[..data.len()], data);
         if self.seqs.len() < self.k {
             return None;
         }
@@ -271,13 +266,12 @@ impl FecEncoder {
     fn reset(&mut self) {
         self.seqs.clear();
         self.lens.clear();
-        for b in self.acc.iter_mut() {
-            *b = 0;
-        }
+        self.acc[..self.active_len].fill(0);
+        self.active_len = 0;
     }
 
     fn build_parity(&mut self) -> Vec<u8> {
-        let max_len = self.acc.len();
+        let max_len = self.active_len;
         let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
         let mut buf = acquire_frame_vec(6 + 4 * self.lens.len() + max_len + tag_len);
         buf[0] = FEC_MAGIC;
@@ -288,7 +282,7 @@ impl FecEncoder {
             BigEndian::write_u32(&mut buf[off..off + 4], *l as u32);
             off += 4;
         }
-        buf[off..off + max_len].copy_from_slice(&self.acc);
+        buf[off..off + max_len].copy_from_slice(&self.acc[..max_len]);
         if let Some(ic) = &self.ic {
             // 校验帧线路负载 = 描述符 + 加密后的异或载荷，以 groupStart 为 seq
             ic.seal_in_place(
@@ -314,7 +308,7 @@ struct FecGroupState {
 
 struct FecDecoderInner {
     groups: HashMap<u32, FecGroupState>,
-    done: Vec<u32>,
+    done: [u32; FEC_DONE_CACHE],
     recovered: u64,
     lost: u64,
 }
@@ -334,7 +328,7 @@ impl FecDecoder {
             ic,
             inner: Mutex::new(FecDecoderInner {
                 groups: HashMap::with_capacity(64),
-                done: Vec::with_capacity(FEC_DONE_CACHE),
+                done: [0; FEC_DONE_CACHE],
                 recovered: 0,
                 lost: 0,
             }),
@@ -348,7 +342,7 @@ impl FecDecoder {
                 release_frame_vec(parity);
             }
         }
-        inner.done.clear();
+        inner.done.fill(0);
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -361,9 +355,40 @@ impl FecDecoder {
         if frame.is_empty() || seq == 0 {
             return;
         }
-        let start = self.group_start_of(seq);
         let mut inner = self.inner.lock();
-        if is_done(&inner.done, start) {
+        self.on_data_locked(&mut inner, seq, frame, out);
+    }
+
+    /// 批量记录同一次 TLS plaintext drain 得到的数据帧。逻辑与 on_data 完全
+    /// 相同，但整批只获取一次 decoder mutex，避免多连接高 PPS 时 cache-line
+    /// ping-pong 和 parking_lot lock/unlock 成为吞吐瓶颈。
+    pub fn on_data_batch(
+        &self,
+        frames: &[(u32, Arc<Vec<u8>>)],
+        out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for (seq, frame) in frames {
+            if *seq == 0 || frame.is_empty() {
+                continue;
+            }
+            self.on_data_locked(&mut inner, *seq, frame, out);
+        }
+    }
+
+    #[inline]
+    fn on_data_locked(
+        &self,
+        inner: &mut FecDecoderInner,
+        seq: u32,
+        frame: &Arc<Vec<u8>>,
+        out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+    ) {
+        let start = self.group_start_of(seq);
+        if is_done(&inner.done, start, self.k) {
             return;
         }
         {
@@ -371,7 +396,7 @@ impl FecDecoder {
             let bit = seq - start;
             let mask = 1u64 << bit;
             if g.got_mask & mask != 0 {
-                return; // 重复到达
+                return;
             }
             g.got_mask |= mask;
             if frame.len() > g.acc.len() {
@@ -379,7 +404,7 @@ impl FecDecoder {
             }
             xor_into(&mut g.acc, frame);
         }
-        try_recover(&mut inner, start, out);
+        try_recover(inner, start, self.k, out);
     }
 
     /// 处理一个校验帧负载（已解密线路帧 seq=0）。
@@ -441,7 +466,7 @@ impl FecDecoder {
         }
 
         let mut inner = self.inner.lock();
-        if is_done(&inner.done, start) {
+        if is_done(&inner.done, start, self.k) {
             release_frame_vec(pb);
             return;
         }
@@ -455,7 +480,7 @@ impl FecDecoder {
             g.lens = lens;
             g.parity = Some(pb);
         }
-        try_recover(&mut inner, start, out);
+        try_recover(&mut inner, start, self.k, out);
     }
 
     fn group_start_of(&self, seq: u32) -> u32 {
@@ -463,15 +488,20 @@ impl FecDecoder {
     }
 }
 
-fn is_done(done: &[u32], start: u32) -> bool {
-    done.contains(&start)
+#[inline]
+fn done_slot(start: u32, k: usize) -> usize {
+    (((start - 1) / k as u32) as usize) & FEC_DONE_MASK
 }
 
-fn mark_done(done: &mut Vec<u32>, start: u32) {
-    done.push(start);
-    if done.len() > FEC_DONE_CACHE {
-        let drop = done.len() - FEC_DONE_CACHE;
-        done.drain(..drop);
+#[inline]
+fn is_done(done: &[u32; FEC_DONE_CACHE], start: u32, k: usize) -> bool {
+    start != 0 && done[done_slot(start, k)] == start
+}
+
+#[inline]
+fn mark_done(done: &mut [u32; FEC_DONE_CACHE], start: u32, k: usize) {
+    if start != 0 {
+        done[done_slot(start, k)] = start;
     }
 }
 
@@ -497,7 +527,12 @@ fn entry<'a>(groups: &'a mut HashMap<u32, FecGroupState>, start: u32) -> &'a mut
 }
 
 /// 组内恰好缺 1 帧且校验帧已到 → 异或恢复并输出（对齐 tryRecoverLocked）
-fn try_recover(inner: &mut FecDecoderInner, start: u32, out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {
+fn try_recover(
+    inner: &mut FecDecoderInner,
+    start: u32,
+    k: usize,
+    out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+) {
     // 阶段一：只读检查 + 计算恢复帧
     let mut rec: Option<(Vec<u8>, usize)> = None;
     {
@@ -545,7 +580,7 @@ fn try_recover(inner: &mut FecDecoderInner, start: u32, out: &mut dyn FnMut(u32,
             inner.lost += lost_n;
             release_frame_vec(parity);
         }
-        mark_done(&mut inner.done, start);
+        mark_done(&mut inner.done, start, k);
     }
 
     // 阶段三：输出恢复帧
@@ -598,6 +633,38 @@ mod tests {
         }
         let got = recovered.lock().unwrap();
         (got.len(), dec.stats().0 as usize, dec.stats().1 as usize)
+    }
+
+    #[test]
+    fn fec_batch_data_matches_single_frame_recovery() {
+        let k = 4;
+        let mut enc = FecEncoder::new(k, None);
+        let dec = FecDecoder::new(k, None);
+        let mut data_batch = Vec::new();
+        let mut parity = Vec::new();
+        for i in 0..8usize {
+            let seq = (i + 1) as u32;
+            let payload = vec![(i as u8) + 1; 256 + i];
+            if i != 2 && i != 6 {
+                data_batch.push((seq, Arc::new(payload.clone())));
+            }
+            if let Some(p) = enc.add(seq, &payload) {
+                parity.push(p);
+            }
+        }
+        let mut recovered = Vec::new();
+        dec.on_data_batch(&data_batch, &mut |seq, frame| {
+            recovered.push((seq, frame.len()));
+        });
+        for p in &parity {
+            dec.on_parity(p, &mut |seq, frame| recovered.push((seq, frame.len())));
+        }
+        for p in parity {
+            release_frame_vec(p);
+        }
+        recovered.sort_unstable();
+        assert_eq!(recovered, vec![(3, 258), (7, 262)]);
+        assert_eq!(dec.stats(), (2, 0));
     }
 
     #[test]

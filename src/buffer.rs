@@ -2,7 +2,10 @@ use lazy_static::lazy_static;
 use std::cell::RefCell;
 
 use crate::utils::FastRand;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const HOT_FRAME_CLASS: usize = 2048;
@@ -45,27 +48,52 @@ thread_local! {
 }
 
 #[inline]
-pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
+fn acquire_frame_vec_recycled(len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
     let Some(idx) = frame_class_index(len) else {
-        return vec![0u8; len];
+        return Vec::with_capacity(len);
     };
     let class = FRAME_CLASSES[idx];
-    let mut buf = FRAME_POOLS
+    FRAME_POOLS
         .with(|pools| pools.borrow_mut()[idx].pop())
-        .unwrap_or_else(|| Vec::with_capacity(class));
+        .unwrap_or_else(|| Vec::with_capacity(class))
+}
+
+/// Acquire a zero-filled frame buffer. Use this only when the caller needs the
+/// old contents cleared before it starts writing.
+#[inline]
+pub fn acquire_frame_vec(len: usize) -> Vec<u8> {
+    let mut buf = acquire_frame_vec_recycled(len);
     buf.resize(len, 0);
+    buf[..len].fill(0);
+    buf
+}
+
+/// Acquire a frame buffer whose first `len` bytes are intentionally unspecified.
+/// The caller must overwrite every byte it reads before observing the buffer.
+/// This avoids an otherwise redundant memset on TAP reads and TLS frame extraction.
+#[inline]
+pub fn acquire_frame_vec_overwrite(len: usize) -> Vec<u8> {
+    let mut buf = acquire_frame_vec_recycled(len);
+    if buf.len() < len {
+        // Only newly exposed bytes need initialization for Vec's safety invariant.
+        // Existing bytes stay untouched because the caller will overwrite them.
+        buf.resize(len, 0);
+    } else {
+        buf.truncate(len);
+    }
     buf
 }
 
 #[inline]
-pub fn release_frame_vec(mut buf: Vec<u8>) {
+pub fn release_frame_vec(buf: Vec<u8>) {
     let Some(idx) = frame_capacity_class(buf.capacity()) else {
         return;
     };
-    buf.clear();
+    // Preserve the logical length instead of clear()+resize() on the next hot-path
+    // acquire. Bytes remain initialized and are overwritten before observation.
     FRAME_POOLS.with(|pools| {
         let mut pools = pools.borrow_mut();
         if pools[idx].len() < FRAME_CLASS_LIMITS[idx] {
@@ -92,38 +120,39 @@ lazy_static! {
 
 // 高速固定窗口去重器（用于 FEC 恢复帧与迟到原始帧）。
 //
-// 重排窗口只有 2048，而去重槽位有 4096（2 的幂）。因此窗口内两个合法
-// 不同 seq 不会落到同一槽位；直接保存完整 seq 即可判断重复，不需要
-// HashSet 的 hash/contains/remove/insert 热路径。
+// 多条物理连接会并发调用去重器。每个槽位使用 AtomicU32 后无需在每包热路径
+// 外再套一层 Mutex。窗口碰撞只会让旧 seq 的重复帧漏过这一层，后续 reorder
+// 仍会按真实 seq 丢弃，不会把不同数据误判成重复。
 const DEDUP_WINDOW: usize = 4096;
 const DEDUP_MASK: usize = DEDUP_WINDOW - 1;
 
 pub struct DeDuplicator {
-    slots: [u32; DEDUP_WINDOW],
+    slots: Box<[AtomicU32]>,
 }
 
 impl DeDuplicator {
     pub fn new() -> Self {
         Self {
-            slots: [0; DEDUP_WINDOW],
+            slots: (0..DEDUP_WINDOW)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 
     #[inline]
-    pub fn is_duplicate(&mut self, seq: u32) -> bool {
+    pub fn is_duplicate(&self, seq: u32) -> bool {
         if seq == 0 {
             return false;
         }
         let idx = (seq as usize) & DEDUP_MASK;
-        if self.slots[idx] == seq {
-            return true;
-        }
-        self.slots[idx] = seq;
-        false
+        self.slots[idx].swap(seq, Ordering::Relaxed) == seq
     }
 
-    pub fn reset(&mut self) {
-        self.slots.fill(0);
+    pub fn reset(&self) {
+        for slot in self.slots.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -176,12 +205,7 @@ impl ReorderBuffer {
     /// 典型无丢包链路每个输入帧都会立即就绪。旧接口每包构造一个
     /// `Vec<Arc<Vec<u8>>>`，造成纯 allocator churn；由调用方长期复用
     /// scratch 后，顺序流不再为重排输出额外分配。
-    pub fn insert_into(
-        &mut self,
-        seq: u32,
-        data: Arc<Vec<u8>>,
-        ready: &mut Vec<Arc<Vec<u8>>>,
-    ) {
+    pub fn insert_into(&mut self, seq: u32, data: Arc<Vec<u8>>, ready: &mut Vec<Arc<Vec<u8>>>) {
         if seq == 0 {
             return;
         }
@@ -252,7 +276,9 @@ impl ReorderBuffer {
         let mut new_bitmap = vec![0u64; new_size / 64];
 
         for idx in 0..old_size {
-            let Some(frame) = self.ring[idx].take() else { continue };
+            let Some(frame) = self.ring[idx].take() else {
+                continue;
+            };
             let seq = self.seq_slots[idx];
             let new_idx = (seq & new_mask) as usize;
             new_ring[new_idx] = Some(frame);
@@ -271,7 +297,9 @@ impl ReorderBuffer {
         self.gap_since = None;
         loop {
             let idx = (self.expected_seq & self.window_mask) as usize;
-            let Some(frame) = self.ring[idx].take() else { break };
+            let Some(frame) = self.ring[idx].take() else {
+                break;
+            };
             self.seq_slots[idx] = 0;
             self.bitmap[idx / 64] &= !(1u64 << (idx % 64));
             if !frame.is_empty() {
@@ -316,7 +344,8 @@ impl ReorderBuffer {
     /// 距离当前缺口 deadline 的剩余时间。无缺口时返回 None，调用方可以让
     /// poller 使用自己的常规定时周期而不为空闲会话轮询。
     pub fn next_timeout(&self) -> Option<Duration> {
-        self.gap_since.map(|since| REORDER_SKIP_DELAY.saturating_sub(since.elapsed()))
+        self.gap_since
+            .map(|since| REORDER_SKIP_DELAY.saturating_sub(since.elapsed()))
     }
 
     /// 缺口 deadline 到达后向前寻找第一个已收到的帧，跳过永久缺失序号。
@@ -352,6 +381,44 @@ impl ReorderBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overwrite_pool_reuses_initialized_storage_without_zero_contract() {
+        let mut buf = acquire_frame_vec_overwrite(1500);
+        buf.fill(0x5a);
+        let cap = buf.capacity();
+        release_frame_vec(buf);
+
+        let buf = acquire_frame_vec_overwrite(1500);
+        assert_eq!(buf.len(), 1500);
+        assert_eq!(buf.capacity(), cap);
+        release_frame_vec(buf);
+
+        let zeroed = acquire_frame_vec(1500);
+        assert!(zeroed.iter().all(|b| *b == 0));
+        release_frame_vec(zeroed);
+    }
+
+    #[test]
+    fn atomic_dedup_handles_concurrent_duplicate_checks() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let d = Arc::new(DeDuplicator::new());
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let d = d.clone();
+            joins.push(thread::spawn(move || d.is_duplicate(12345)));
+        }
+        let duplicate_count = joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .filter(|dup| *dup)
+            .count();
+        assert_eq!(duplicate_count, 7);
+        d.reset();
+        assert!(!d.is_duplicate(12345));
+    }
 
     #[test]
     fn hot_frame_pool_keeps_common_ethernet_capacity_bounded() {
@@ -443,7 +510,14 @@ mod tests {
         let ready = rb.flush_timeout();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].as_slice(), &[3]);
-        assert_eq!(rb.stats(), ReorderStats { gap_events: 1, timeout_flushes: 1, skipped_frames: 1 });
+        assert_eq!(
+            rb.stats(),
+            ReorderStats {
+                gap_events: 1,
+                timeout_flushes: 1,
+                skipped_frames: 1
+            }
+        );
     }
 
     #[test]
@@ -462,7 +536,6 @@ mod tests {
         assert_eq!(ready[0].as_slice(), &[0x5a]);
         assert_eq!(rb.stats().skipped_frames, 4094);
     }
-
 
     #[test]
     fn reorder_growth_uses_smallest_power_of_two_window() {
