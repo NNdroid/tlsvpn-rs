@@ -1,0 +1,34 @@
+name: Installer regression fix helper
+
+on:
+  push:
+    branches:
+      - fix/installer-os-release-version
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply installer fix
+        run: python3 .installer_fix.py
+      - name: Validate
+        run: |
+          bash -n scripts/install.sh
+          cargo test --test dashboard_script_test installer_has_required_lifecycle_and_platform_contract -- --exact
+          cargo check --release
+          git diff --check
+      - name: Commit product changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/install.sh tests/dashboard_script_test.rs
+          git commit -m 'fix(installer): isolate os-release version variables'
+          git push origin HEAD:fix/installer-os-release-version
