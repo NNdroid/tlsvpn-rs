@@ -11,6 +11,7 @@ fn webui_matches_shared_static_asset_contract() {
     let index = fs::read_to_string(root.join("index.html")).expect("index.html");
     let app = fs::read_to_string(root.join("app.js")).expect("app.js");
     let css = fs::read_to_string(root.join("style.css")).expect("style.css");
+    let frameviz = fs::read_to_string(root.join("frameviz.js")).expect("frameviz.js");
 
     assert!(index.contains("/favicon.ico"), "missing local favicon link");
     assert!(
@@ -31,8 +32,28 @@ fn webui_matches_shared_static_asset_contract() {
         "missing platform icon styles"
     );
 
+    for marker in [
+        "Frame format example",
+        "帧格式示例",
+        "訊框格式範例",
+        "AES-256-GCM",
+        "AES-128-GCM",
+        "ChaCha20-Poly1305",
+        "XChaCha20-Poly1305",
+        "1514 B",
+        "1530 B",
+        "60 B → 1600 B",
+        "4 B BE",
+        "seq=0",
+        "1 MiB",
+    ] {
+        assert!(frameviz.contains(marker), "frameviz missing {marker:?}");
+    }
+
     for file in [
         "favicon.ico",
+        "frameviz.js",
+        "frameviz-zh-tw.js",
         "icons/os-linux.svg",
         "icons/os-windows.svg",
         "icons/os-macos.svg",
@@ -55,6 +76,8 @@ fn rust_embed_table_covers_primary_assets() {
         "/index.html",
         "/style.css",
         "/app.js",
+        "/frameviz.js",
+        "/frameviz-zh-tw.js",
         "/favicon.ico",
         "/icons/os-linux.svg",
     ] {
