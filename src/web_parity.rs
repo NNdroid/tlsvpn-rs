@@ -1,16 +1,22 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 const EVENT_CAP: usize = 500;
-const TREND_CAP: usize = 120;
+const TREND_RECENT_CAP: usize = 120;
+const TREND_MINUTE_CAP: usize = 1440;
+const DEFAULT_TRAFFIC_DAYS: usize = 30;
+const MAX_TRAFFIC_DAYS: usize = 3650;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const TRAFFIC_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct WebSession {
@@ -118,12 +124,10 @@ impl EventHub {
         while inner.ring.len() > EVENT_CAP {
             inner.ring.pop_front();
         }
-        inner
-            .subscribers
-            .retain(|tx| match tx.try_send(event.clone()) {
-                Ok(()) | Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Disconnected(_)) => false,
-            });
+        inner.subscribers.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     pub fn snapshot(&self, after: u64) -> Vec<DashboardEvent> {
@@ -221,7 +225,11 @@ struct TrendState {
     last_at: Option<Instant>,
     last_up: u64,
     last_down: u64,
-    points: VecDeque<TrendPoint>,
+    minute_at: Option<Instant>,
+    minute_up: u64,
+    minute_down: u64,
+    recent: VecDeque<TrendPoint>,
+    minutes: VecDeque<TrendPoint>,
 }
 
 impl TrendState {
@@ -231,6 +239,9 @@ impl TrendState {
             self.last_at = Some(now);
             self.last_up = up;
             self.last_down = down;
+            self.minute_at = Some(now);
+            self.minute_up = up;
+            self.minute_down = down;
             return;
         };
         let elapsed = now.duration_since(last_at).as_secs_f64();
@@ -242,13 +253,240 @@ impl TrendState {
         self.last_at = Some(now);
         self.last_up = up;
         self.last_down = down;
-        self.points.push_back(TrendPoint {
+        self.recent.push_back(TrendPoint {
             unix: unix_seconds(),
             up_bps: up_delta as f64 / elapsed,
             down_bps: down_delta as f64 / elapsed,
         });
-        while self.points.len() > TREND_CAP {
-            self.points.pop_front();
+        while self.recent.len() > TREND_RECENT_CAP {
+            self.recent.pop_front();
+        }
+
+        let minute_at = self.minute_at.unwrap_or(now);
+        let minute_elapsed = now.duration_since(minute_at).as_secs_f64();
+        if minute_elapsed >= 60.0 {
+            let minute_up = up.saturating_sub(self.minute_up);
+            let minute_down = down.saturating_sub(self.minute_down);
+            self.minutes.push_back(TrendPoint {
+                unix: (unix_seconds() / 60) * 60,
+                up_bps: minute_up as f64 / minute_elapsed,
+                down_bps: minute_down as f64 / minute_elapsed,
+            });
+            self.minute_at = Some(now);
+            self.minute_up = up;
+            self.minute_down = down;
+            while self.minutes.len() > TREND_MINUTE_CAP {
+                self.minutes.pop_front();
+            }
+        }
+    }
+
+    fn snapshot(&self, range: &str) -> Value {
+        match range {
+            "1h" => {
+                let start = self.minutes.len().saturating_sub(60);
+                let points: Vec<TrendPoint> = self.minutes.iter().skip(start).cloned().collect();
+                json!({"step_sec": 60, "points": points})
+            }
+            "24h" => {
+                let all: Vec<TrendPoint> = self.minutes.iter().cloned().collect();
+                let mut points = Vec::new();
+                for chunk in all.chunks(5) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let n = chunk.len() as f64;
+                    points.push(TrendPoint {
+                        unix: chunk.last().map(|p| p.unix).unwrap_or(0),
+                        up_bps: chunk.iter().map(|p| p.up_bps).sum::<f64>() / n,
+                        down_bps: chunk.iter().map(|p| p.down_bps).sum::<f64>() / n,
+                    });
+                }
+                json!({"step_sec": 300, "points": points})
+            }
+            _ => {
+                let points: Vec<TrendPoint> = self.recent.iter().cloned().collect();
+                json!({"step_sec": 1, "points": points})
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TrafficDay {
+    up: u64,
+    down: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TrafficFile {
+    #[allow(dead_code)]
+    today: String,
+    #[serde(default)]
+    days: BTreeMap<String, TrafficDay>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientTrafficFile {
+    #[allow(dead_code)]
+    today: String,
+    #[serde(default)]
+    days: BTreeMap<String, BTreeMap<String, TrafficDay>>,
+}
+
+#[derive(Debug)]
+struct TrafficState {
+    days: usize,
+    file: PathBuf,
+    client_file: PathBuf,
+    today: String,
+    buckets: BTreeMap<String, TrafficDay>,
+    client_buckets: BTreeMap<String, BTreeMap<String, TrafficDay>>,
+    last_up: u64,
+    last_down: u64,
+    client_last: HashMap<String, (u64, u64)>,
+    last_flush: Instant,
+}
+
+impl TrafficState {
+    fn new(config_path: &Path, cfg: &Value) -> Self {
+        let days = cfg
+            .get("traffic_days")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TRAFFIC_DAYS as u64)
+            .clamp(1, MAX_TRAFFIC_DAYS as u64) as usize;
+        let file = configured_traffic_file(config_path, cfg);
+        let client_file = client_traffic_file(&file);
+        let buckets = read_json::<TrafficFile>(&file)
+            .map(|v| v.days)
+            .unwrap_or_default();
+        let client_buckets = read_json::<ClientTrafficFile>(&client_file)
+            .map(|v| v.days)
+            .unwrap_or_default();
+        let mut out = Self {
+            days,
+            file,
+            client_file,
+            today: local_day(),
+            buckets,
+            client_buckets,
+            last_up: 0,
+            last_down: 0,
+            client_last: HashMap::new(),
+            last_flush: Instant::now(),
+        };
+        out.trim();
+        out
+    }
+
+    fn apply_config(&mut self, days: i64, file: &str) {
+        self.days = days.clamp(1, MAX_TRAFFIC_DAYS as i64) as usize;
+        if !file.is_empty() {
+            self.file = PathBuf::from(file);
+            self.client_file = client_traffic_file(&self.file);
+        }
+        self.trim();
+    }
+
+    fn observe(&mut self, stats: &Value) {
+        let today = local_day();
+        self.today = today.clone();
+        let (up, down) = aggregate_bytes(stats);
+        let up_delta = up.saturating_sub(self.last_up);
+        let down_delta = down.saturating_sub(self.last_down);
+        self.last_up = up;
+        self.last_down = down;
+        let bucket = self.buckets.entry(today.clone()).or_default();
+        bucket.up = bucket.up.saturating_add(up_delta);
+        bucket.down = bucket.down.saturating_add(down_delta);
+
+        if stats.get("mode").and_then(Value::as_str) == Some("server") {
+            if let Some(clients) = stats.get("clients").and_then(Value::as_object) {
+                for (id, client) in clients {
+                    let rx = client.get("rx_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let tx = client.get("tx_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let prev = self.client_last.get(id).copied().unwrap_or((0, 0));
+                    let entry = self
+                        .client_buckets
+                        .entry(today.clone())
+                        .or_default()
+                        .entry(id.clone())
+                        .or_default();
+                    entry.up = entry.up.saturating_add(rx.saturating_sub(prev.0));
+                    entry.down = entry.down.saturating_add(tx.saturating_sub(prev.1));
+                    self.client_last.insert(id.clone(), (rx, tx));
+                }
+            }
+        }
+
+        self.trim();
+        if self.last_flush.elapsed() >= TRAFFIC_FLUSH_INTERVAL {
+            self.persist();
+            self.last_flush = Instant::now();
+        }
+    }
+
+    fn trim(&mut self) {
+        while self.buckets.len() > self.days {
+            let Some(first) = self.buckets.keys().next().cloned() else {
+                break;
+            };
+            self.buckets.remove(&first);
+            self.client_buckets.remove(&first);
+        }
+        while self.client_buckets.len() > self.days {
+            let Some(first) = self.client_buckets.keys().next().cloned() else {
+                break;
+            };
+            self.client_buckets.remove(&first);
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let daily: Vec<Value> = self
+            .buckets
+            .iter()
+            .map(|(date, day)| json!({"date":date,"up":day.up,"down":day.down}))
+            .collect();
+        let today = self.buckets.get(&self.today).cloned().unwrap_or_default();
+        json!({
+            "days": self.days,
+            "today": self.today,
+            "up": today.up,
+            "down": today.down,
+            "daily": daily,
+        })
+    }
+
+    fn client_snapshot(&self) -> Value {
+        let mut by_client: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for (date, clients) in &self.client_buckets {
+            for (id, day) in clients {
+                by_client
+                    .entry(id.clone())
+                    .or_default()
+                    .push(json!({"date":date,"up":day.up,"down":day.down}));
+            }
+        }
+        Value::Array(
+            by_client
+                .into_iter()
+                .map(|(id, daily)| json!({"id":id,"daily":daily}))
+                .collect(),
+        )
+    }
+
+    fn persist(&self) {
+        if self.file.as_os_str().is_empty() {
+            return;
+        }
+        let aggregate = json!({"today":self.today,"days":self.buckets});
+        if let Err(e) = atomic_write_json(&self.file, &aggregate) {
+            warn!("daily traffic persistence failed: {}", e);
+        }
+        let clients = json!({"today":self.today,"days":self.client_buckets});
+        if let Err(e) = atomic_write_json(&self.client_file, &clients) {
+            warn!("client traffic persistence failed: {}", e);
         }
     }
 }
@@ -259,21 +497,29 @@ pub struct WebParityState {
     source_config: RwLock<Value>,
     needs_restart: RwLock<Vec<String>>,
     trend: Mutex<TrendState>,
+    traffic: Mutex<TrafficState>,
+    last_clients: Mutex<HashSet<String>>,
+    sampler_started: AtomicBool,
     pub events: EventHub,
     sessions: SessionStore,
 }
 
 impl WebParityState {
     pub fn new(config_path: &str) -> Self {
-        let source_config = std::fs::read_to_string(config_path)
+        let config_path = PathBuf::from(config_path);
+        let source_config = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .unwrap_or_else(|| json!({}));
+        let traffic = TrafficState::new(&config_path, &source_config);
         Self {
-            config_path: PathBuf::from(config_path),
+            config_path,
             source_config: RwLock::new(source_config),
             needs_restart: RwLock::new(Vec::new()),
             trend: Mutex::new(TrendState::default()),
+            traffic: Mutex::new(traffic),
+            last_clients: Mutex::new(HashSet::new()),
+            sampler_started: AtomicBool::new(false),
             events: EventHub::default(),
             sessions: SessionStore::default(),
         }
@@ -324,21 +570,33 @@ impl WebParityState {
         self.needs_restart.read().clone()
     }
 
-    pub fn observe_stats(&self, stats: &Value) {
-        let up = stats
-            .get("global_tx_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let down = stats
-            .get("global_rx_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        self.trend.lock().observe(up, down);
+    pub fn try_start_sampler(&self) -> bool {
+        self.sampler_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
-    pub fn trend_json(&self) -> Value {
-        let points: Vec<TrendPoint> = self.trend.lock().points.iter().cloned().collect();
-        json!({"step_sec": 1, "points": points})
+    pub fn observe_stats(&self, stats: &Value) {
+        let (up, down) = aggregate_bytes(stats);
+        self.trend.lock().observe(up, down);
+        self.traffic.lock().observe(stats);
+        self.observe_client_events(stats);
+    }
+
+    pub fn trend_json(&self, range: &str) -> Value {
+        self.trend.lock().snapshot(range)
+    }
+
+    pub fn traffic_json(&self) -> Value {
+        self.traffic.lock().snapshot()
+    }
+
+    pub fn client_traffic_json(&self) -> Value {
+        self.traffic.lock().client_snapshot()
+    }
+
+    pub fn apply_traffic_config(&self, days: i64, file: &str) {
+        self.traffic.lock().apply_config(days, file);
     }
 
     pub fn create_session(&self, auth: &str) -> Result<String, String> {
@@ -352,22 +610,48 @@ impl WebParityState {
     pub fn revoke_session(&self, token: &str) {
         self.sessions.revoke(token)
     }
+
+    fn observe_client_events(&self, stats: &Value) {
+        let current: HashSet<String> = stats
+            .get("clients")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut previous = self.last_clients.lock();
+        for id in current.difference(&previous) {
+            self.events
+                .emit("connect", "info", id, "Client connected");
+        }
+        for id in previous.difference(&current) {
+            self.events
+                .emit("disconnect", "warn", id, "Client disconnected");
+        }
+        *previous = current;
+    }
 }
 
 pub fn atomic_write_json(path: &Path, value: &Value) -> Result<(), String> {
-    let mut data = serde_json::to_vec_pretty(value).map_err(|e| format!("marshal config: {e}"))?;
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create parent directory: {e}"))?;
+        }
+    }
+    let mut data = serde_json::to_vec_pretty(value).map_err(|e| format!("marshal json: {e}"))?;
     data.push(b'\n');
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, data).map_err(|e| format!("write temp config: {e}"))?;
+    std::fs::write(&tmp, data).map_err(|e| format!("write temp file: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod temp config: {e}"))?;
+            .map_err(|e| format!("chmod temp file: {e}"))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("replace config: {e}")
+        format!("replace file: {e}")
     })?;
     Ok(())
 }
@@ -403,6 +687,57 @@ fn diff_value(prefix: &str, old: &Value, new: &Value, out: &mut Vec<String>) {
     }
 }
 
+fn aggregate_bytes(stats: &Value) -> (u64, u64) {
+    let mode = stats.get("mode").and_then(Value::as_str).unwrap_or("");
+    let tx = stats
+        .get("global_tx_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let rx = stats
+        .get("global_rx_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if mode == "server" {
+        (rx, tx)
+    } else {
+        (tx, rx)
+    }
+}
+
+fn configured_traffic_file(config_path: &Path, cfg: &Value) -> PathBuf {
+    if let Some(file) = cfg.get("traffic_file").and_then(Value::as_str) {
+        if !file.is_empty() {
+            return PathBuf::from(file);
+        }
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tlsvpn-traffic.json")
+}
+
+fn client_traffic_file(file: &Path) -> PathBuf {
+    if file.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tlsvpn-traffic");
+    let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    parent.join(format!("{stem}-clients.{ext}"))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
 fn preserve_empty_string(candidate: &mut Value, current: &Value, path: &[&str]) {
     let candidate_value = get_path(candidate, path).and_then(Value::as_str);
     if candidate_value.map_or(true, str::is_empty) {
@@ -434,6 +769,26 @@ fn set_pointer_string(value: &mut Value, path: &[&str], text: &str) {
 }
 
 fn wall_clock_hms() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let mut raw: libc::time_t = 0;
+        unsafe {
+            libc::time(&mut raw as *mut _);
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&raw as *const _, &mut tm as *mut _).is_null() {
+                return format!(
+                    "{:02}:{:02}:{:02}.{:03}",
+                    tm.tm_hour,
+                    tm.tm_min,
+                    tm.tm_sec,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_millis()
+                );
+            }
+        }
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -445,6 +800,40 @@ fn wall_clock_hms() -> String {
         secs % 60,
         now.subsec_millis()
     )
+}
+
+fn local_day() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let mut raw: libc::time_t = 0;
+        unsafe {
+            libc::time(&mut raw as *mut _);
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&raw as *const _, &mut tm as *mut _).is_null() {
+                return format!(
+                    "{:04}-{:02}-{:02}",
+                    tm.tm_year + 1900,
+                    tm.tm_mon + 1,
+                    tm.tm_mday
+                );
+            }
+        }
+    }
+    utc_day(unix_seconds())
+}
+
+fn utc_day(unix: i64) -> String {
+    let z = unix.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn unix_seconds() -> i64 {
@@ -492,5 +881,37 @@ mod tests {
         let a = json!({"log_level":"info","web":{"addr":":8080"}});
         let b = json!({"log_level":"debug","web":{"addr":":8081"}});
         assert_eq!(diff_paths(&a, &b), vec!["log_level", "web.addr"]);
+    }
+
+    #[test]
+    fn traffic_snapshot_matches_go_shape_and_direction() {
+        let dir = std::env::temp_dir();
+        let config = dir.join(format!("tlsvpn-traffic-test-{}.json", std::process::id()));
+        let file = dir.join(format!("tlsvpn-traffic-data-{}.json", std::process::id()));
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({"traffic_days":7,"traffic_file":file})).unwrap(),
+        )
+        .unwrap();
+        let state = WebParityState::new(config.to_str().unwrap());
+        state.observe_stats(&json!({
+            "mode":"client","global_tx_bytes":1000,"global_rx_bytes":400,
+            "clients":{"local":{"tx_bytes":1000,"rx_bytes":400}}
+        }));
+        let tr = state.traffic_json();
+        assert_eq!(tr["days"], 7);
+        assert_eq!(tr["up"], 1000);
+        assert_eq!(tr["down"], 400);
+        assert!(tr["daily"].as_array().unwrap().len() >= 1);
+        let _ = std::fs::remove_file(config);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn trend_ranges_have_go_compatible_step_sizes() {
+        let state = WebParityState::new("/definitely/missing/config.json");
+        assert_eq!(state.trend_json("2m")["step_sec"], 1);
+        assert_eq!(state.trend_json("1h")["step_sec"], 60);
+        assert_eq!(state.trend_json("24h")["step_sec"], 300);
     }
 }
