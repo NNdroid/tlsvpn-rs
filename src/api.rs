@@ -1,13 +1,14 @@
 use crate::peer_info::PeerInfo;
+use crate::web_parity::{atomic_write_json, diff_paths, WebParityState};
 use base64ct::{Base64, Encoding};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Method, Response, Server as HttpServer};
+use tiny_http::{Header, Method, Response, Server as HttpServer, StatusCode};
 use tracing::{info, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -582,10 +583,21 @@ pub fn rss_mb() -> f64 {
 /// 生效配置与宿主信息的扁平快照。main 在启动时构建一次：Rust 版没有配置热更，
 /// 配置只在启动时读一遍，所以这里不需要锁。每次 /api/stats 都并入同一份拷贝，
 /// 让面板的"状态"页能直接展示当前实际生效的开关，而不是让运维去翻配置文件。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct RuntimeCtx {
-    pub cfg: serde_json::Value,
+    pub cfg: RwLock<serde_json::Value>,
     pub system: serde_json::Value,
+    pub web: WebParityState,
+}
+
+impl Default for RuntimeCtx {
+    fn default() -> Self {
+        Self {
+            cfg: RwLock::new(json!({})),
+            system: json!({}),
+            web: WebParityState::new(""),
+        }
+    }
 }
 
 impl RuntimeCtx {
@@ -603,6 +615,8 @@ impl RuntimeCtx {
             "brutal": args.brutal,
             "brutal_up": args.brutal_up,
             "brutal_down": args.brutal_down,
+            "traffic_days": args.traffic_days,
+            "traffic_file": args.traffic_file,
             "socks5": !args.socks5.is_empty(),
             "fec": args.fec,
             "fec_group": args.fec_group,
@@ -645,8 +659,9 @@ impl RuntimeCtx {
             cfg["fec_group_max"] = serde_json::json!(args.fec_group_max);
         }
         Self {
-            cfg,
+            cfg: RwLock::new(cfg),
             system: system_info(cfg_path),
+            web: WebParityState::new(cfg_path),
         }
     }
 }
@@ -794,26 +809,71 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn check_basic_auth(auth_spec: &str, req: &tiny_http::Request) -> bool {
-    if auth_spec.is_empty() {
-        return true;
-    }
+fn basic_auth_credential(req: &tiny_http::Request) -> Option<String> {
     let header = req
         .headers()
         .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
-    let Some(encoded) = header.strip_prefix("Basic ") else {
-        return false;
+        .find(|h| h.field.equiv("Authorization"))?
+        .value
+        .as_str();
+    let encoded = header.strip_prefix("Basic ")?;
+    let decoded = Base64::decode_vec(encoded.trim()).ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+fn cookie_value(req: &tiny_http::Request, name: &str) -> String {
+    let Some(raw) = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Cookie"))
+        .map(|h| h.value.as_str())
+    else {
+        return String::new();
     };
-    let Ok(decoded) = Base64::decode_vec(encoded.trim()) else {
-        return false;
+    for part in raw.split(';') {
+        if let Some((k, v)) = part.trim().split_once('=') {
+            if k == name {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn dashboard_authenticated(ctx: &RuntimeCtx, req: &tiny_http::Request, auth: &str) -> bool {
+    if auth.is_empty() {
+        return true;
+    }
+    let token = cookie_value(req, "tlsvpn_session");
+    if ctx.web.session_valid(&token, auth) {
+        return true;
+    }
+    basic_auth_credential(req)
+        .map(|got| ct_eq(&got, auth))
+        .unwrap_or(false)
+}
+
+fn dashboard_cookie(token: &str, secure: bool, clear: bool) -> Header {
+    let mut value = if clear {
+        "tlsvpn_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".to_string()
+    } else {
+        format!("tlsvpn_session={token}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax")
     };
-    let Ok(cred) = String::from_utf8(decoded) else {
-        return false;
-    };
-    ct_eq(&cred, auth_spec)
+    if secure {
+        value.push_str("; Secure");
+    }
+    http_header("Set-Cookie", &value)
+}
+
+fn query_u64(url: &str, name: &str) -> u64 {
+    url.split_once('?')
+        .and_then(|(_, q)| {
+            q.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                (k == name).then(|| v.parse::<u64>().ok()).flatten()
+            })
+        })
+        .unwrap_or(0)
 }
 
 /// 读 web.cert / web.key 组装 HTTPS 凭据。
@@ -900,16 +960,114 @@ fn serve_listener(
         };
         let url = request.url().split('?').next().unwrap_or("").to_string();
 
-        // 仪表盘页面与 API 一致地受认证保护
-        if !check_basic_auth(&auth, &request) {
-            let resp = Response::from_string("Unauthorized")
-                .with_status_code(401)
-                .with_header(http_header(
-                    "WWW-Authenticate",
-                    r#"Basic realm="tlsvpn dashboard""#,
-                ));
-            let _ = request.respond(resp);
-            continue;
+        // Browser authentication matches the Go dashboard: web.auth remains the
+        // credential source, but successful login uses an HttpOnly SameSite cookie.
+        // Explicit Basic Auth remains accepted for scripts without emitting a browser
+        // WWW-Authenticate challenge.
+        let dynamic_auth = ctx.web.current_auth();
+        let expected_auth = if dynamic_auth.is_empty() {
+            auth.clone()
+        } else {
+            dynamic_auth
+        };
+        if !expected_auth.is_empty() {
+            match url.as_str() {
+                "/api/login" => {
+                    if request.method() != &Method::Post {
+                        respond_json(
+                            request,
+                            json!({"error":"method not allowed"}).to_string(),
+                            405,
+                        );
+                        continue;
+                    }
+                    const MAX_LOGIN: usize = 8 * 1024;
+                    if request.body_length().map_or(false, |n| n > MAX_LOGIN) {
+                        respond_json(request, json!({"error":"invalid request"}).to_string(), 400);
+                        continue;
+                    }
+                    let mut body = String::new();
+                    if request
+                        .as_reader()
+                        .take((MAX_LOGIN + 1) as u64)
+                        .read_to_string(&mut body)
+                        .is_err()
+                        || body.len() > MAX_LOGIN
+                    {
+                        respond_json(request, json!({"error":"invalid request"}).to_string(), 400);
+                        continue;
+                    }
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct LoginReq {
+                        username: String,
+                        password: String,
+                    }
+                    let Ok(login) = serde_json::from_str::<LoginReq>(&body) else {
+                        respond_json(request, json!({"error":"invalid request"}).to_string(), 400);
+                        continue;
+                    };
+                    if !ct_eq(&(login.username + ":" + &login.password), &expected_auth) {
+                        std::thread::sleep(Duration::from_millis(150));
+                        respond_json(
+                            request,
+                            json!({"error":"invalid username or password"}).to_string(),
+                            401,
+                        );
+                        continue;
+                    }
+                    match ctx.web.create_session(&expected_auth) {
+                        Ok(token) => {
+                            let resp = Response::from_string(r#"{"status":"ok"}"#)
+                                .with_header(http_header("Content-Type", "application/json"))
+                                .with_header(http_header("Cache-Control", "no-store"))
+                                .with_header(dashboard_cookie(&token, tls, false));
+                            let _ = request.respond(resp);
+                        }
+                        Err(e) => respond_json(request, json!({"error":e}).to_string(), 500),
+                    }
+                    continue;
+                }
+                "/api/logout" => {
+                    if request.method() != &Method::Post {
+                        respond_json(
+                            request,
+                            json!({"error":"method not allowed"}).to_string(),
+                            405,
+                        );
+                        continue;
+                    }
+                    ctx.web
+                        .revoke_session(&cookie_value(&request, "tlsvpn_session"));
+                    let resp = Response::from_string(r#"{"status":"ok"}"#)
+                        .with_header(http_header("Content-Type", "application/json"))
+                        .with_header(http_header("Cache-Control", "no-store"))
+                        .with_header(dashboard_cookie("", tls, true));
+                    let _ = request.respond(resp);
+                    continue;
+                }
+                "/api/auth/status" => {
+                    let ok = dashboard_authenticated(&ctx, &request, &expected_auth);
+                    respond_json(request, json!({"authenticated":ok}).to_string(), 200);
+                    continue;
+                }
+                _ => {}
+            }
+            let login_asset = matches!(
+                url.as_str(),
+                "/login" | "/login.html" | "/login.css" | "/login.js"
+            );
+            if !login_asset && !dashboard_authenticated(&ctx, &request, &expected_auth) {
+                if url.starts_with("/api/") || url == "/metrics" {
+                    respond_json(request, json!({"error":"unauthorized"}).to_string(), 401);
+                } else {
+                    let resp = Response::from_string("")
+                        .with_status_code(303)
+                        .with_header(http_header("Location", "/login"));
+                    let _ = request.respond(resp);
+                }
+                continue;
+            }
         }
 
         if request.method() == &Method::Get {
@@ -928,9 +1086,18 @@ fn serve_listener(
                 // 在这里并入，避免把静态字段重复写进 server/client 两处实现。
                 let mut stats = provider.stats_json();
                 if let Some(obj) = stats.as_object_mut() {
-                    obj.insert("cfg".to_string(), ctx.cfg.clone());
-                    obj.insert("system".to_string(), ctx.system.clone());
+                    obj.insert("cfg".to_string(), ctx.cfg.read().clone());
+                    let mut system = ctx.system.clone();
+                    if let Some(sys) = system.as_object_mut() {
+                        sys.insert("needs_restart".to_string(), json!(ctx.web.needs_restart()));
+                    }
+                    obj.insert("system".to_string(), system);
                     obj.insert("brutal_system".to_string(), brutal_system_status());
+                    obj.insert("traffic".to_string(), ctx.web.traffic_json());
+                    let client_traffic = ctx.web.client_traffic_json();
+                    if client_traffic.as_array().map_or(false, |v| !v.is_empty()) {
+                        obj.insert("client_traffic".to_string(), client_traffic);
+                    }
                 }
                 respond_json(request, stats.to_string(), 200);
             }
@@ -946,23 +1113,81 @@ fn serve_listener(
                 respond_json(request, json!(log_ring_snapshot(after)).to_string(), 200);
             }
             (&Method::Get, "/api/trend") => {
-                respond_json(request, r#"{"step_sec":1,"points":[]}"#.to_string(), 200);
+                let range = request
+                    .url()
+                    .split_once('?')
+                    .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("range=")))
+                    .unwrap_or("2m")
+                    .to_string();
+                respond_json(request, ctx.web.trend_json(&range).to_string(), 200);
             }
             (&Method::Get, "/api/events") => {
-                // EventSource receives JSON and closes; the Go frontend then falls back
-                // to its polling path. Empty is the truthful state until Rust gets an
-                // event ring equivalent to Go events.go.
-                respond_json(request, "[]".to_string(), 200);
+                let after = query_u64(request.url(), "after");
+                let polling = request
+                    .url()
+                    .split_once('?')
+                    .map(|(_, q)| q.split('&').any(|part| part == "stream=0"))
+                    .unwrap_or(false);
+                if polling {
+                    respond_json(
+                        request,
+                        json!(ctx.web.events.snapshot(after)).to_string(),
+                        200,
+                    );
+                } else {
+                    let stream = ctx.web.events.stream(after);
+                    let headers = vec![
+                        http_header("Content-Type", "text/event-stream"),
+                        http_header("Cache-Control", "no-cache, no-store"),
+                        http_header("Connection", "keep-alive"),
+                        http_header("X-Accel-Buffering", "no"),
+                    ];
+                    std::thread::spawn(move || {
+                        let response = Response::new(StatusCode(200), headers, stream, None, None);
+                        let _ = request.respond(response);
+                    });
+                }
             }
             (&Method::Get, "/api/config") => {
-                respond_json(request, ctx.cfg.to_string(), 200);
+                let body = serde_json::to_string_pretty(&ctx.web.redacted_config())
+                    .unwrap_or_else(|_| "{}".to_string());
+                respond_json(request, body, 200);
             }
             (&Method::Post, "/api/config") => {
-                respond_json(
-                    request,
-                    json!({"error":"runtime config save/apply is not supported by the Rust backend yet"}).to_string(),
-                    501,
-                );
+                const MAX_CONFIG_BODY: usize = 1024 * 1024;
+                let mut content = String::new();
+                if request
+                    .as_reader()
+                    .take((MAX_CONFIG_BODY + 1) as u64)
+                    .read_to_string(&mut content)
+                    .is_err()
+                    || content.len() > MAX_CONFIG_BODY
+                {
+                    respond_json(
+                        request,
+                        json!({"error":"invalid config body"}).to_string(),
+                        400,
+                    );
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+                    respond_json(request, json!({"error":"bad json"}).to_string(), 400);
+                    continue;
+                };
+                let merged = ctx.web.merge_preserving_secrets(value);
+                match crate::validate_config_value(
+                    &merged,
+                    ctx.web.config_path().to_string_lossy().as_ref(),
+                ) {
+                    Ok(_) => match atomic_write_json(ctx.web.config_path(), &merged) {
+                        Ok(()) => {
+                            ctx.web.replace_config(merged);
+                            respond_json(request, r#"{"status":"ok"}"#.to_string(), 200);
+                        }
+                        Err(e) => respond_json(request, json!({"error":e}).to_string(), 400),
+                    },
+                    Err(e) => respond_json(request, json!({"error":e}).to_string(), 400),
+                }
             }
             (&Method::Get, "/metrics") => {
                 let resp = Response::from_string(provider.metrics_text())
@@ -1013,14 +1238,88 @@ fn serve_listener(
                     level: String,
                     #[serde(default)]
                     ttl_minutes: i64,
+                    #[serde(default)]
+                    config: Option<serde_json::Value>,
                 }
                 let Ok(creq) = serde_json::from_str::<ControlReq>(&content) else {
                     respond_json(request, json!({"error": "bad json"}).to_string(), 400);
                     continue;
                 };
+                if creq.action == "save" || creq.action == "save_apply" {
+                    let Some(candidate) = creq.config else {
+                        respond_json(
+                            request,
+                            json!({"error":"config is required"}).to_string(),
+                            400,
+                        );
+                        continue;
+                    };
+                    let apply = creq.action == "save_apply";
+                    let old = ctx.web.current_config();
+                    let merged = ctx.web.merge_preserving_secrets(candidate);
+                    let validated = match crate::validate_config_value(
+                        &merged,
+                        ctx.web.config_path().to_string_lossy().as_ref(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            respond_json(request, json!({"error":e}).to_string(), 400);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = atomic_write_json(ctx.web.config_path(), &merged) {
+                        respond_json(request, json!({"error":e}).to_string(), 400);
+                        continue;
+                    }
+                    let changed = diff_paths(&old, &merged);
+                    let mut needs_restart = Vec::new();
+                    if apply {
+                        for field in &changed {
+                            match field.as_str() {
+                                "log_level" => {
+                                    let _ =
+                                        provider.control("loglevel", "", &validated.loglevel, 0);
+                                }
+                                "pad_mode" => {
+                                    let _ =
+                                        provider.control("pad_mode", "", &validated.pad_mode, 0);
+                                }
+                                "traffic_days" | "traffic_file" => {}
+                                _ => needs_restart.push(field.clone()),
+                            }
+                        }
+                        ctx.web
+                            .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
+                        if let Some(cfg) = ctx.cfg.write().as_object_mut() {
+                            cfg.insert("log_level".into(), json!(validated.loglevel));
+                            cfg.insert("pad_mode".into(), json!(crate::crypto::pad_mode_name()));
+                            cfg.insert("traffic_days".into(), json!(validated.traffic_days));
+                            cfg.insert("traffic_file".into(), json!(validated.traffic_file));
+                        }
+                    }
+                    ctx.web.replace_config(merged);
+                    ctx.web.set_needs_restart(needs_restart.clone());
+                    ctx.web.events.emit(
+                        "config",
+                        "info",
+                        "",
+                        &format!("{} (needs_restart: {:?})", creq.action, needs_restart),
+                    );
+                    respond_json(
+                        request,
+                        json!({"status":"ok","needs_restart":needs_restart}).to_string(),
+                        200,
+                    );
+                    continue;
+                }
                 match provider.control(&creq.action, &creq.client_id, &creq.level, creq.ttl_minutes)
                 {
-                    Ok(()) => respond_json(request, r#"{"status": "ok"}"#.to_string(), 200),
+                    Ok(()) => {
+                        ctx.web
+                            .events
+                            .emit("control", "info", &creq.client_id, &creq.action);
+                        respond_json(request, r#"{"status": "ok"}"#.to_string(), 200)
+                    }
                     Err(e) => respond_json(request, json!({"error": e}).to_string(), 400),
                 }
             }
@@ -1045,6 +1344,22 @@ pub fn web_port(addr: &str) -> u16 {
         Some((_, p)) => p.parse().unwrap_or(8080),
         None => 8080,
     }
+}
+
+/// Start the process-level dashboard/traffic sampler exactly once. It runs even
+/// when the HTTP dashboard is disabled so traffic_days/traffic_file keep the same
+/// process-level semantics as the Go implementation.
+pub fn start_dashboard_sampler(
+    provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
+) {
+    if !ctx.web.try_start_sampler() {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        ctx.web.observe_stats(&provider.stats_json());
+        std::thread::sleep(Duration::from_secs(1));
+    });
 }
 
 /// web.bind=all：直接启动单个 listener（默认行为，不变）。stop 永不置位。

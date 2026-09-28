@@ -87,3 +87,92 @@ fn rust_embed_table_covers_primary_assets() {
         );
     }
 }
+
+#[test]
+fn rust_webui_backend_matches_go_management_contract() {
+    let api = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"))
+        .expect("api.rs");
+    let parity =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web_parity.rs"))
+            .expect("web_parity.rs");
+    for marker in [
+        "tlsvpn_session",
+        "/api/login",
+        "/api/logout",
+        "/api/auth/status",
+        "text/event-stream",
+        "save_apply",
+        "needs_restart",
+        "redacted_config",
+    ] {
+        assert!(
+            api.contains(marker) || parity.contains(marker),
+            "missing WebUI backend contract marker {marker}"
+        );
+    }
+    assert!(!api.contains("runtime config save/apply is not supported"));
+}
+
+#[test]
+fn installer_has_required_lifecycle_and_platform_contract() {
+    let installer =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .expect("install.sh");
+    for marker in [
+        "install_action",
+        "upgrade_action",
+        "uninstall_action",
+        "rollback_action",
+        "maintenance_action",
+        "debian|ubuntu",
+        "rocky",
+        "alpine",
+        "cert-mode",
+        "lego",
+        "self-signed",
+        "XanMod",
+        "tcp-brutal",
+        "tlsvpn-maintenance.timer",
+        "--non-interactive",
+        "back",
+    ] {
+        assert!(installer.contains(marker), "installer missing {marker}");
+    }
+}
+
+
+#[test]
+fn rust_webui_exposes_go_traffic_and_background_trend_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let api = fs::read_to_string(root.join("src/api.rs")).expect("api.rs");
+    let server = fs::read_to_string(root.join("src/server.rs")).expect("server.rs");
+    let client = fs::read_to_string(root.join("src/client.rs")).expect("client.rs");
+    for marker in [
+        "start_dashboard_sampler",
+        "traffic_json",
+        "client_traffic",
+        "trend_json(&range)",
+        "apply_traffic_config",
+    ] {
+        assert!(api.contains(marker), "missing dashboard traffic/trend marker {marker}");
+    }
+    assert!(server.contains("\"global_tx_bytes\": global_tx_bytes"));
+    assert!(client.contains("self.tx_bytes.load(Ordering::Relaxed)"));
+}
+
+#[test]
+fn installer_uses_safe_lego_v5_and_persists_custom_paths() {
+    let installer = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
+    )
+    .expect("install.sh");
+    assert!(!installer.contains("-c \"$CONFIG_FILE.tmp\" >/dev/null 2>&1 &"));
+    assert!(installer.contains("LEGO_ARGS=(run --path"));
+    assert!(installer.contains("--renew-days"));
+    assert!(installer.contains("--http.address"));
+    assert!(installer.contains("--tls.address"));
+    assert!(installer.contains("lego migrate --path"));
+    for state_key in ["INSTALL_DIR=$(printf", "CONFIG_DIR=$(printf", "CERT_DIR=$(printf"] {
+        assert!(installer.contains(state_key), "installer state missing {state_key}");
+    }
+}

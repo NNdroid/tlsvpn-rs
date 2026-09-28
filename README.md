@@ -103,7 +103,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 
 </details>
 
-The wire-facing defaults are kept aligned with Go, but the full config surfaces differ. Rust-only `workers` and `mtu` belong only in Rust-specific files; Go-only `traffic_days` and `traffic_file` are not accepted by Rust. `client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode also requires explicit `server.cert`/`server.key`, whereas Go can generate and persist a self-signed pair.
+The wire-facing defaults are kept aligned with Go, but the full config surfaces differ. Rust-only `workers` and `mtu` belong only in Rust-specific files; `traffic_days` and `traffic_file` are shared with Go and drive the same persistent daily-traffic dashboard view. `client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode also requires explicit `server.cert`/`server.key`, whereas Go can generate and persist a self-signed pair.
 
 Session resume tokens are a mandatory protocol-v2 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
 
@@ -119,6 +119,8 @@ Session resume tokens are a mandatory protocol-v2 property and are always enable
 | `pad_mode` | `bucket` | — | Full-record padding: `bucket` maps every record to a fixed size with positive padding; only `off` permits zero padding |
 | `brutal` | `false` | — | TCP Brutal congestion control (Linux `tcp_brutal` module) |
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
+| `traffic_days` | `30` | — | Daily traffic retention in local-calendar days (`1`–`3650`), hot-applicable from the dashboard |
+| `traffic_file` | `tlsvpn-traffic.json` beside the config | — | Persistent aggregate traffic store; per-client history uses the sibling `-clients.json` file |
 | `workers` | `0` | — | **Rust-only extension** — Go rejects this key. Worker event-loop threads (0 = auto, one per CPU up to 8) |
 | `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU, validated in the `576`–`9000` range. Use the same intended L2 MTU on both tunnel endpoints |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
@@ -166,9 +168,36 @@ Keys that belong to the other mode are accepted but have no effect (a server ign
 
 ## Dashboard
 
-Off by default; set `web.addr` to enable it. Rust embeds the same static WebUI asset set as Go (including zh-CN/zh-TW/en/de/fr/ja, local OS/arch icons, the current frame-format visualizer and favicon), while retaining the Rust backend/auth model. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Stats, per-connection details, FEC counters, MAC/IP-pool state, ban/kick controls, log tail with live level switching and Prometheus `/metrics` are backed by Rust APIs. Browser/API access uses HTTP Basic Auth from `web.auth`, and mutating control calls require `X-Requested-With: tlsvpn`.
+Off by default; set `web.addr` to enable it. Rust embeds the same static WebUI asset set as Go (including zh-CN/zh-TW/en/de/fr/ja, local OS/arch icons, the current frame-format visualizer and favicon), while retaining the Rust backend/auth model. Served over HTTPS whenever `web.cert`/`web.key` are set, plain HTTP otherwise. Stats, per-connection details, FEC counters, MAC/IP-pool state, ban/kick controls, log tail with live level switching and Prometheus `/metrics` are backed by Rust APIs. Browser access uses the same HttpOnly session-cookie login flow as Go; Basic Auth from `web.auth` remains accepted for scripts, and mutating control calls require `X-Requested-With: tlsvpn`.
 
-Current backend parity limits are explicit: `/api/trend` returns an empty compatibility series, `/api/events` returns an empty compatibility list rather than Go's event stream, and `POST /api/config` returns HTTP 501 because runtime config persistence/hot-apply is not implemented in Rust yet. `GET /api/config` is available for display. The shared frontend therefore looks aligned with Go, but those three backend capabilities are not yet equivalent.
+The dashboard backend follows the Go contract as well: browser login uses the same HttpOnly session-cookie flow (Basic Auth remains available to scripts), `/api/trend` keeps background 2-minute/1-hour/24-hour rings, `/api/events` provides SSE plus polling recovery, `/api/stats` includes persistent aggregate and per-client daily traffic, and the settings editor reads/writes the source JSON with PSK/Web-auth/SOCKS credentials redacted and preserved. `save_apply` hot-applies log level and padding immediately and reports every other changed path in `needs_restart`. Rust accepts Go's `traffic_days`/`traffic_file` configuration keys in addition to its `workers`/`mtu` extensions.
+
+## One-click installer
+
+`scripts/install.sh` is an English-only interactive/CLI installer for Debian, Ubuntu, Rocky/RHEL-family and Alpine Linux. It supports `install`, `upgrade`, `uninstall`, `rollback`, `maintenance` and `status`, keeps rollback snapshots of TLSVPN-managed files, installs systemd or OpenRC services, and can create a daily maintenance timer. Run it without an action for the wizard; type `back` at wizard prompts to move to the previous step.
+
+```bash
+# Interactive
+sudo bash scripts/install.sh
+
+# ACME/lego with a normal DNS name
+sudo bash scripts/install.sh install --mode server --psk 'REPLACE-ME' \
+  --cert-mode lego --cert-name vpn.example.com --email admin@example.com
+
+# ACME/lego with a public IP identifier (RFC 8738 / short-lived profile)
+sudo bash scripts/install.sh install --mode server --psk 'REPLACE-ME' \
+  --cert-mode lego --cert-name 203.0.113.10 --email admin@example.com
+
+# Client plus optional tuning/components
+sudo bash scripts/install.sh install --mode client --server vpn.example.com:4000 \
+  --psk 'REPLACE-ME' --tcp-brutal yes --optimize-kernel yes
+
+sudo bash scripts/install.sh upgrade
+sudo bash scripts/install.sh rollback
+sudo bash scripts/install.sh uninstall --purge
+```
+
+Certificates can use lego/ACME, self-signed, or an existing cert/key pair. Daily maintenance renews lego certificates and checks GitHub Releases for a newer TLSVPN binary. XanMod is intentionally automated only on Debian/Ubuntu x86_64; tcp-brutal is optional and skipped on Alpine, and the installer warns about known-risk newer XanMod combinations unless `--force-tcp-brutal` is explicitly supplied. XanMod packages are never automatically removed on uninstall because removing a running kernel is unsafe.
 
 ## Notes
 

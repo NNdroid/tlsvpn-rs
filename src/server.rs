@@ -545,6 +545,14 @@ impl WebStatsProvider for ServerCore {
             .values()
             .map(|s| s.stat.active_conns.load(Ordering::Relaxed).max(0) as usize)
             .sum();
+        let global_tx_bytes: u64 = sessions
+            .values()
+            .map(|s| s.stat.tx_bytes.load(Ordering::Relaxed))
+            .sum();
+        let global_rx_bytes: u64 = sessions
+            .values()
+            .map(|s| s.stat.rx_bytes.load(Ordering::Relaxed))
+            .sum();
         let mut min_up = u64::MAX;
         let mut max_up = 0u64;
         let mut min_down = u64::MAX;
@@ -594,8 +602,8 @@ impl WebStatsProvider for ServerCore {
             "uptime_sec": self.started_at.elapsed().as_secs(),
             "active_clients": sessions.len(),
             "clients": clients,
-            "global_tx_bytes": 0,
-            "global_rx_bytes": 0,
+            "global_tx_bytes": global_tx_bytes,
+            "global_rx_bytes": global_rx_bytes,
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": dropped,
@@ -1076,6 +1084,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             });
         }
     }
+
+    crate::api::start_dashboard_sampler(core.clone(), ctx.clone());
 
     if !args.web.is_empty() {
         match args.web_bind.as_str() {

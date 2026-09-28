@@ -507,8 +507,8 @@ impl WebStatsProvider for Client {
             "uptime_sec": self.started_at.elapsed().as_secs(),
             "active_clients": 1,
             "clients": {"local": local},
-            "global_tx_bytes": 0,
-            "global_rx_bytes": 0,
+            "global_tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
+            "global_rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
@@ -953,6 +953,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         network_setup: Mutex::new(()),
     };
     let client = Arc::new(client);
+
+    crate::api::start_dashboard_sampler(client.clone(), ctx.clone());
 
     if !args.web.is_empty() {
         match args.web_bind.as_str() {
