@@ -28,11 +28,7 @@ fn hash_psk(psk: &str) -> String {
 fn gcm_key(psk: &str, domain: &str) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(psk.as_bytes());
-    let label: &[u8] = if domain == "fec" {
-        b"_enc_key_fec"
-    } else {
-        b"_enc_key"
-    };
+    let label: &[u8] = if domain == "fec" { b"_enc_key_fec" } else { b"_enc_key" };
     h.update(label);
     h.finalize().to_vec()
 }
@@ -67,13 +63,7 @@ fn gcm_domain_ciphertext(
 fn generate_golden_vectors() {
     use serde_json::json;
 
-    let psks = [
-        "",
-        "test_psk",
-        "my_super_secret_test_key",
-        "中文密钥🔑",
-        "a",
-    ];
+    let psks = ["", "test_psk", "my_super_secret_test_key", "中文密钥🔑", "a"];
     let psk_hashes: Vec<_> = psks
         .iter()
         .map(|psk| json!({ "psk": psk, "hash": hash_psk(psk) }))

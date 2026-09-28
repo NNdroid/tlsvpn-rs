@@ -147,6 +147,7 @@ fn installer_has_required_lifecycle_and_platform_contract() {
     );
 }
 
+
 #[test]
 fn rust_webui_exposes_go_traffic_and_background_trend_contract() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -160,10 +161,7 @@ fn rust_webui_exposes_go_traffic_and_background_trend_contract() {
         "trend_json(&range)",
         "apply_traffic_config",
     ] {
-        assert!(
-            api.contains(marker),
-            "missing dashboard traffic/trend marker {marker}"
-        );
+        assert!(api.contains(marker), "missing dashboard traffic/trend marker {marker}");
     }
     assert!(server.contains("\"global_tx_bytes\": global_tx_bytes"));
     assert!(client.contains("self.tx_bytes.load(Ordering::Relaxed)"));
@@ -171,23 +169,17 @@ fn rust_webui_exposes_go_traffic_and_background_trend_contract() {
 
 #[test]
 fn installer_uses_safe_lego_v5_and_persists_custom_paths() {
-    let installer =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
-            .expect("install.sh");
+    let installer = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
+    )
+    .expect("install.sh");
     assert!(!installer.contains("-c \"$CONFIG_FILE.tmp\" >/dev/null 2>&1 &"));
     assert!(installer.contains("LEGO_ARGS=(run --path"));
     assert!(installer.contains("--renew-days"));
     assert!(installer.contains("--http.address"));
     assert!(installer.contains("--tls.address"));
     assert!(installer.contains("lego migrate --path"));
-    for state_key in [
-        "INSTALL_DIR=$(printf",
-        "CONFIG_DIR=$(printf",
-        "CERT_DIR=$(printf",
-    ] {
-        assert!(
-            installer.contains(state_key),
-            "installer state missing {state_key}"
-        );
+    for state_key in ["INSTALL_DIR=$(printf", "CONFIG_DIR=$(printf", "CERT_DIR=$(printf"] {
+        assert!(installer.contains(state_key), "installer state missing {state_key}");
     }
 }
