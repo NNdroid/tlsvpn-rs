@@ -95,6 +95,8 @@
     if (el) el.innerHTML = out.join('');
   };
 
+  // assigned_bytes/assigned_batches are lifetime monotonic counters. Convert
+  // them into deltas over the actual refresh interval before showing rate/share.
   const schedPrev = {};
   const schedView = {};
   let schedLastAt = 0;
@@ -152,6 +154,9 @@
       s._assign_bps = v.assignBps;
       s._batch_ps = v.batchPs;
       s._share_pct = v.share;
+      // backend eta_us is the last scheduling-decision estimate and can remain
+      // stale after a drain. Show queue-drain ETA from current queue + rate EWMA.
+      // Before the first rate sample, mirror the scheduler's 200 Mbps fallback.
       const rateBytes = num(s.rate_mbps) > 0 ? num(s.rate_mbps) * 1000000 / 8 : 25000000;
       s._queue_eta_us = rateBytes > 0 ? num(s.queued_bytes) * 1000000 / rateBytes : 0;
       totalAssignBps += v.assignBps;
