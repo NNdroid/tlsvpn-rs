@@ -9,7 +9,7 @@ fn metric_formula_contract() {
         "Math.ceil(v.length * 0.95) - 1",
         "const reorder = data.reorder || {}",
         "const dataTxPackets = Math.max(0, c.txPackets - parityTx)",
-        "const txAttempts = dataTxPackets + queueDropped",
+        "const txAttempts = c.txPackets + dropped",
         "c.rxBytes / c.rxPackets",
         "parityTx / dataTxPackets * 100",
         "const missing = recovered + lost",
@@ -25,8 +25,9 @@ fn metric_formula_contract() {
         "recovered / parityTx",
         "recovered / num(fec.parity_tx)",
         "parityTx / c.txPackets",
+        "const txAttempts = dataTxPackets + dropped",
     ] {
-        assert!(!js.contains(wrong), "mixed-domain FEC formula reintroduced: {wrong:?}");
+        assert!(!js.contains(wrong), "mixed-domain metric formula reintroduced: {wrong:?}");
     }
 }
 
