@@ -7,6 +7,10 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
             include_bytes!("../webui/app.js"),
             "application/javascript; charset=utf-8",
         )),
+        "/metrics.js" => Some((
+            include_bytes!("../webui/metrics.js"),
+            "application/javascript; charset=utf-8",
+        )),
         "/favicon.ico" => Some((include_bytes!("../webui/favicon.ico"), "image/x-icon")),
         "/frameviz-zh-tw.js" => Some((
             include_bytes!("../webui/frameviz-zh-tw.js"),
