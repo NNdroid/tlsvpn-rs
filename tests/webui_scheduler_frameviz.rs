@@ -1,7 +1,9 @@
 use std::fs;
+use std::path::PathBuf;
 
 fn read(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+    fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
 #[test]
