@@ -20,6 +20,7 @@ pub mod peer_info;
 pub mod server;
 pub mod socks5;
 pub mod tap;
+pub mod tcp_cork;
 pub mod utils;
 pub mod web_parity;
 

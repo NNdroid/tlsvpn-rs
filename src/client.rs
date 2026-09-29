@@ -21,6 +21,7 @@ use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::socks5::{split_host_port, Socks5Proxy};
 use crate::tap::{MemTap, TapDevice};
+use crate::tcp_cork::TlsBatchCork;
 
 // 重连退避参数（对齐 Go）：1s 起指数增长封顶 30s；持续在线 30s 以上
 // 视为稳定连接，断开后退避归零
@@ -1585,6 +1586,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     *ci.last_error.lock() = String::new();
 
     // 8. 主事件循环：读事件 → 解帧处理；拉取端口通道 → 成帧发送；保活。
+    // TLS/TLSVPN 握手已完成后才允许 TCP_CORK 参与数据面。
+    let mut batch_cork = TlsBatchCork::new(&sock);
     let mut scanner = FrameScanner::new();
     let mut last_keepalive = Instant::now();
     let mut last_rx = Instant::now();
@@ -1634,6 +1637,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if let Some(wait) = reorder_wait {
             poll_timeout = poll_timeout.min(wait);
         }
+        if let Some(wait) = batch_cork.next_timeout(now) {
+            poll_timeout = poll_timeout.min(wait);
+        }
         // BackendNotify coalesces producer wakeups. One wake can therefore
         // represent more than one TLS plaintext batch. If frames remain
         // queued after the previous 32 KiB drain and rustls is not blocked
@@ -1644,6 +1650,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             close_reason = format!("mio poll failed: {e}");
             break;
         }
+        batch_cork.maybe_flush(&sock, Instant::now());
 
         let mut woken = false;
         let mut readable = false;
@@ -1843,6 +1850,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         if !send_buf.is_empty() {
             let wire_bytes = send_buf.len() as u64;
+            if tx_packets_batch != 0 {
+                batch_cork.before_write(&sock, send_buf.len());
+            }
             if let Err(e) = tls.writer().write_all(&send_buf) {
                 close_reason = format!("tls plaintext writer failed: {e}");
                 break;
@@ -1929,6 +1939,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
     warn!("[Conn {}] data loop closing: {}", conn_index, close_reason);
 
+    batch_cork.close(&sock);
     tls.send_close_notify();
     while tls.wants_write() {
         match tls.write_tls(&mut sock) {
