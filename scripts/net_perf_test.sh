@@ -22,6 +22,7 @@
 #   PORT                    tunnel TCP port (default 18600)
 #   PSK                     tunnel secret (default: openssl rand -hex 16)
 #   IPERF_MIN_MBPS          throughput assert threshold (default 100)
+#   PERF_CONNS              parallel TLSVPN connections (default 4)
 #   LIBRESPEED_CLI          path to librespeed-cli (optional)
 #   LIBRESPEED_SRV_BIN      librespeed backend binary (optional;
 #                           default "speedtest-backend" if on PATH)
@@ -37,10 +38,18 @@ CLI_V4="10.77.0.2"
 GW_V6="fd77::1"
 CLI_V6="fd77::2"
 IPERF_MIN_MBPS="${IPERF_MIN_MBPS:-100}"
+PERF_CONNS="${PERF_CONNS:-4}"
 FLAVOR_SRV="${FLAVOR_SRV:-rs}"
 FLAVOR_CLI="${FLAVOR_CLI:-rs}"
 TAP_SRV="tap_t0"
 TAP_CLI="tap_t1"
+WEB_ADDR="127.0.0.1:18780"
+WEB_AUTH="perf:tlsvpn"
+
+case "$PERF_CONNS" in
+  1|2|4) ;;
+  *) echo "[netperf] invalid PERF_CONNS=$PERF_CONNS (expected 1, 2 or 4)"; exit 2 ;;
+esac
 
 # Keep tunnel endpoints in separate network namespaces. If both tunnel IPs
 # live in one namespace, Linux table local can satisfy ping/iperf without TAP.
@@ -272,11 +281,62 @@ traceroute_check() {
 }
 
 # ---------------------------------------------------------------------------
+# Adaptive multipath diagnostics. Upload is scheduled by the client; download
+# is scheduled by the server. Every configured path must carry real payload,
+# and no single path may monopolize more than 80% of assigned bytes.
+# ---------------------------------------------------------------------------
+scheduler_diag() {
+  local direction="$1" ns role
+  [[ "$PERF_CONNS" -gt 1 ]] || return 0
+  if [[ "$direction" == "upload" ]]; then
+    ns="$NS_CLI"; role="client"
+  else
+    ns="$NS_SRV"; role="server"
+  fi
+
+  ip netns exec "$ns" python3 - "$WEB_ADDR" "$WEB_AUTH" "$PERF_CONNS" "$role" "$direction" <<'PY'
+import base64, json, sys, time, urllib.request
+addr, auth, want_s, role, direction = sys.argv[1:]
+want = int(want_s)
+req = urllib.request.Request(
+    "http://" + addr + "/api/stats",
+    headers={"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()},
+)
+last = None
+for _ in range(30):
+    try:
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            data = json.load(r)
+        break
+    except Exception as exc:
+        last = exc
+        time.sleep(0.05)
+else:
+    raise SystemExit(f"scheduler stats unavailable from {role}: {last}")
+rows = data.get("conns", []) if role == "client" else data.get("server_conns", [])
+rows = [r for r in rows if isinstance(r.get("scheduler"), dict)][:want]
+if len(rows) < want:
+    raise SystemExit(f"scheduler telemetry has {len(rows)}/{want} paths for {role}")
+assigned = [int((r.get("scheduler") or {}).get("assigned_bytes", 0) or 0) for r in rows]
+total = sum(assigned)
+if total <= 0:
+    raise SystemExit(f"scheduler assigned no bytes: {assigned}")
+used = sum(v > 0 for v in assigned)
+shares = [v / total for v in assigned]
+print(f"[netperf] scheduler {direction}/{role}: assigned={assigned} shares={[round(x, 4) for x in shares]}")
+if used != want:
+    raise SystemExit(f"adaptive scheduler used {used}/{want} paths: {assigned}")
+if max(shares) > 0.80:
+    raise SystemExit(f"adaptive scheduler path monopoly {max(shares) * 100:.1f}%: {shares}")
+PY
+}
+
+# ---------------------------------------------------------------------------
 # iperf3: server binds the tunnel gateway IP; client tests through tunnel.
 # Namespace-isolated tunnel endpoints measure the tunnel stack overhead itself.
 # ---------------------------------------------------------------------------
 iperf_one_way() {
-  local label="$1" extra="${2:-}"
+  local label="$1" extra="${2:-}" direction="${3:-upload}"
   local json mbps
   json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
@@ -309,6 +369,10 @@ iperf_one_way() {
       grep -E '"(error|bytes|bits_per_second|retransmits)"' | tail -24 |
       sed 's/^/[netperf]     /' || true
   fi
+  if ! scheduler_diag "$direction"; then
+    fail "adaptive scheduler utilization gate failed ($direction, conns=$PERF_CONNS)"
+    return 1
+  fi
 }
 
 iperf_check() {
@@ -319,8 +383,8 @@ iperf_check() {
   ip netns exec "$NS_SRV" iperf3 -s -B "$GW_V4" -p "$((PORT + 1))" >/dev/null 2>&1 &
   PIDS+=($!)
   sleep 0.5
-  iperf_one_way "upload (cli→srv)"
-  iperf_one_way "download (srv→cli)" "-R"
+  iperf_one_way "upload (cli→srv)" "" upload
+  iperf_one_way "download (srv→cli)" "-R" download
   kill "${PIDS[-1]}" 2>/dev/null || true
   PIDS=("${PIDS[@]:0:${#PIDS[@]}-1}")
 }
@@ -366,13 +430,14 @@ JSONEOF
 run_group() {
   SRV_DIR=$(mktemp -d)
 
-  log "--- group: ${FLAVOR_SRV}_srv <- ${FLAVOR_CLI}_cli (real TAP) ---"
+  log "--- group: ${FLAVOR_SRV}_srv <- ${FLAVOR_CLI}_cli (real TAP, conns=$PERF_CONNS) ---"
 
   # 两实现 flags 均已移除（2026-09-19）：键名两边一致，服务端配置共用一份
   local scfg="$SRV_DIR/srv.json"
   impl_config "$scfg" server "$UNDERLAY_SRV:$PORT" \
     '"encrypt": true' \
     '"log_level": "debug"' \
+    "\"web\": {\"addr\": \"$WEB_ADDR\", \"bind\": \"all\", \"auth\": \"$WEB_AUTH\"}" \
     "\"tap\": \"$TAP_SRV\"" \
     "\"server\": {\"cert\": \"$SRV_DIR/e2e_cert.pem\", \"key\": \"$SRV_DIR/e2e_key.pem\", \"v4_cidr\": \"$SUBNET_V4\", \"v6_cidr\": \"fd77::/64\"}"
 
@@ -412,14 +477,16 @@ run_group() {
     impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
+      "\"web\": {\"addr\": \"$WEB_ADDR\", \"bind\": \"all\", \"auth\": \"$WEB_AUTH\"}" \
       "\"tap\": \"$TAP_CLI\"" \
-      "\"client\": {\"cert_sha256\": \"$fp\", \"insecure\": true}"
+      "\"client\": {\"cert_sha256\": \"$fp\", \"insecure\": true, \"conns\": $PERF_CONNS}"
   else
     impl_config "$ccfg" client "$UNDERLAY_SRV:$PORT" \
       '"encrypt": true' \
       '"log_level": "info"' \
+      "\"web\": {\"addr\": \"$WEB_ADDR\", \"bind\": \"all\", \"auth\": \"$WEB_AUTH\"}" \
       "\"tap\": \"$TAP_CLI\"" \
-      "\"client\": {\"cert_sha256\": \"$fp\"}"
+      "\"client\": {\"cert_sha256\": \"$fp\", \"conns\": $PERF_CONNS}"
   fi
   ip netns exec "$NS_CLI" "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
   PIDS+=($!)
