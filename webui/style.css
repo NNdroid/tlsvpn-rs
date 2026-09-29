@@ -749,3 +749,6 @@ tbody tr[data-open]{cursor:pointer}
 .platform-summary{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
 .platform-icons-only{display:inline-flex;gap:4px;align-items:center;margin-top:3px}
 .platform-icons-only .platform-icon{width:15px;height:15px;flex-basis:15px}
+
+/* Adaptive multipath scheduler diagnostics */
+.sched-cell{display:flex;flex-direction:column;gap:3px;min-width:132px}.sched-cell small{white-space:nowrap;font-size:.72rem}.sched-summary{white-space:nowrap}

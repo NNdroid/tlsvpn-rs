@@ -156,6 +156,7 @@ pub struct ConnInfo {
     pub linked_at: AtomicI64,
     // 本连接的内核实际状态；不能再用“无错误字符串”推断已生效。
     pub brutal: Mutex<BrutalApplyResult>,
+    pub scheduler: Mutex<Option<Arc<crate::adaptive_multipath::SchedulerBackendState>>>,
 }
 
 impl ConnInfo {
@@ -171,12 +172,19 @@ impl ConnInfo {
             retries: AtomicU64::new(0),
             linked_at: AtomicI64::new(0),
             brutal: Mutex::new(BrutalApplyResult::default()),
+            scheduler: Mutex::new(None),
         }
     }
 
     fn snapshot(&self, index: usize) -> serde_json::Value {
         let linked_at = self.linked_at.load(Ordering::Relaxed);
         let brutal = self.brutal.lock().clone();
+        let scheduler = self
+            .scheduler
+            .lock()
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
         serde_json::json!({
             "index": index,
             "target": self.target,
@@ -194,6 +202,7 @@ impl ConnInfo {
             "brutal_version": brutal.version,
             "brutal_group_id": brutal.group_id,
             "brutal_rule_managed": brutal.rule_managed,
+            "scheduler": scheduler,
             "age_sec": if linked_at > 0 {
                 (now_unix_ms() / 1000).saturating_sub(linked_at) as u64
             } else {
@@ -1568,6 +1577,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let rtt_cache = Arc::new(AtomicU32::new(50000));
     let (tx, rx) = bounded(1024);
     let backend = Arc::new(Backend {
+        scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tx.clone(),
         rtt_cache: rtt_cache.clone(),
         notify: Some(Arc::new(BackendNotify::new(
@@ -1578,6 +1588,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         ))),
     });
     cl.tx_port.register_backend(backend.clone());
+    *ci.scheduler.lock() = Some(backend.scheduler.clone());
 
     cl.live_conns.fetch_add(1, Ordering::Relaxed);
     *ci.rtt_cache.lock() = rtt_cache.clone();
@@ -1588,6 +1599,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // 8. 主事件循环：读事件 → 解帧处理；拉取端口通道 → 成帧发送；保活。
     // TLS/TLSVPN 握手已完成后才允许 TCP_CORK 参与数据面。
     let mut batch_cork = TlsBatchCork::new(&sock);
+    batch_cork.bind_carry_state(backend.scheduler.carry_pending.clone());
     let mut scanner = FrameScanner::new();
     let mut last_keepalive = Instant::now();
     let mut last_rx = Instant::now();
@@ -1600,6 +1612,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let proxied = cl.socks5.is_some();
     let mut conn_closed = false;
     let mut close_reason = String::new();
+    let mut queued_payload_pending = 0u64;
 
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
@@ -1824,6 +1837,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 n.consume_wake();
             }
             while let Ok(f) = rx.try_recv() {
+                let payload_len = f.data.as_slice().len() as u64;
                 let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
                 last_frame_start = Some(append_unpadded_frame(
                     &mut send_buf,
@@ -1832,6 +1846,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     ic_ref,
                 ));
                 f.data.release();
+                queued_payload_pending = queued_payload_pending.saturating_add(payload_len);
                 tx_packets_batch += 1;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
@@ -1910,6 +1925,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
+        if !tls.wants_write() && queued_payload_pending != 0 {
+            backend.scheduler.complete_queued(queued_payload_pending);
+            backend.scheduler.observe_delivered(queued_payload_pending);
+            queued_payload_pending = 0;
+        }
+
         if write_blocked && !tls.wants_write() && !conn_closed {
             if let Err(reg_err) =
                 poll.registry()
@@ -1949,6 +1970,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     }
 
     cl.tx_port.unregister_backend(&tx);
+    *ci.scheduler.lock() = None;
     cl.live_conns.fetch_sub(1, Ordering::Relaxed);
     *ci.state.lock() = "retrying".into();
     linked_at.elapsed()

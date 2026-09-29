@@ -252,6 +252,7 @@ struct MioSession {
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
     write_stalled: Option<Instant>,
+    queued_payload_pending: u64,
     brutal_applied: bool,
 }
 
@@ -556,6 +557,21 @@ impl WebStatsProvider for ServerCore {
             .values()
             .map(|s| s.stat.rx_bytes.load(Ordering::Relaxed))
             .sum();
+        let mut server_conns = Vec::new();
+        for s in sessions.values() {
+            for (idx, (rtt, scheduler)) in s.port.scheduler_paths().into_iter().enumerate() {
+                server_conns.push(serde_json::json!({
+                    "client_id": s.stat.client_id,
+                    "remote": format!("path #{}", idx + 1),
+                    "state": "up",
+                    "rtt_ms": rtt / 1000,
+                    "tx_bytes": scheduler.assigned_bytes,
+                    "rx_bytes": 0,
+                    "age_sec": 0,
+                    "scheduler": scheduler,
+                }));
+            }
+        }
         let mut min_up = u64::MAX;
         let mut max_up = 0u64;
         let mut min_down = u64::MAX;
@@ -616,6 +632,7 @@ impl WebStatsProvider for ServerCore {
             "ip_pool": {"v4_used": v4_used, "v4_total": v4_total, "v6_used": v6_used},
             "banned": banned,
             "mac_table": macs,
+            "server_conns": server_conns,
             "negotiate": negotiate,
         })
     }
@@ -985,6 +1002,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
     tap_port.register_backend(Arc::new(Backend {
+        scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tap_tx,
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
@@ -1250,6 +1268,7 @@ fn worker_loop(
             let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&socket));
             let (tx, rx) = bounded(1024);
             let backend = Arc::new(Backend {
+                scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: Some(Arc::new(BackendNotify::new(
@@ -1292,6 +1311,7 @@ fn worker_loop(
                     ic_rx: None,
                     session_epoch: 0,
                     write_stalled: None,
+                    queued_payload_pending: 0,
                     brutal_applied: false,
                 },
             );
@@ -1640,6 +1660,10 @@ fn process_plain_frames(
                             sess.handshake_done = true;
                             sess.scanner.set_max_data_len(MAX_DATA_LENGTH);
                             sess.batch_cork = TlsBatchCork::new(&sess.socket);
+                            if let Some(backend) = &sess.tx_backend {
+                                sess.batch_cork
+                                    .bind_carry_state(backend.scheduler.carry_pending.clone());
+                            }
                         }
                         HandshakeOutcome::Close => {
                             *close = true;
@@ -1842,9 +1866,11 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     // write_all() can fail with WriteZero before ciphertext is drained.
     const TLS_WRITE_BATCH_BYTES: usize = STREAM_TLS_BATCH_SOFT_LIMIT;
     let mut pulled = 0u64;
+    let mut pulled_payload = 0u64;
     let mut last_frame_start = None;
     sess.send_buf.clear();
     while let Ok(f) = sess.rx.try_recv() {
+        let payload_len = f.data.as_slice().len() as u64;
         let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
         last_frame_start = Some(append_unpadded_frame(
             &mut sess.send_buf,
@@ -1853,6 +1879,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
             ic_ref,
         ));
         f.data.release();
+        pulled_payload = pulled_payload.saturating_add(payload_len);
         pulled += 1;
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
@@ -1878,6 +1905,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
             *close = true;
             return;
         }
+        sess.queued_payload_pending = sess.queued_payload_pending.saturating_add(pulled_payload);
         sess.send_buf.clear();
     }
     drain_tls(sess, close);
@@ -1908,6 +1936,17 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
     }
     if !sess.tls.wants_write() {
         sess.write_stalled = None;
+        if sess.queued_payload_pending != 0 {
+            if let Some(backend) = &sess.tx_backend {
+                backend
+                    .scheduler
+                    .complete_queued(sess.queued_payload_pending);
+                backend
+                    .scheduler
+                    .observe_delivered(sess.queued_payload_pending);
+            }
+            sess.queued_payload_pending = 0;
+        }
     }
 }
 

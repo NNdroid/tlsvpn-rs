@@ -8,7 +8,7 @@ const I18N={
 	ev:{title:'事件',clear:'清空',empty:'暂无事件',live:'实时推送',reconn:'重连中',poll:'轮询模式',all:'全部',info:'信息',warn:'告警',error:'错误',t_connect:'客户端上线',t_off:'会话销毁',t_kick:'强制断开',t_ban:'封禁',t_unban:'解除封禁',t_deny:'访问拒绝',t_limit:'连接限流',t_up:'隧道建立',t_down:'隧道中断',t_reconnect:'强制重连',t_config:'配置变更',t_loglevel:'日志级别',t_gc:'内存回收',t_unknown:'事件',cleared:'事件已清空'},
 	sc:{score:'安全度',lvOk:'正常',lvWarn:'注意',lvFail:'异常',lvSkip:'不适用',all_ok:'全部安全项已开启且无异常',open:'{n} 项待处理',total:'{n} 项检查',not_set:'未配置',c_auth:'认证',c_enc:'加密',c_tls:'TLS',c_acl:'访问控制',c_detect:'检测',c_mgmt:'管理面',a_psk:'PSK 传输加密',a_token:'会话令牌',a_epoch:'密钥代际',a_maxsess:'会话上限',a_noverify:'证书校验',e_on:'内层加密',e_algo:'算法与下限',e_algo_off:'协商结果',e_session:'会话密钥加密',e_fec:'FEC 分组',e_pad:'填充模式',t_ver:'协议版本',t_suite:'加密套件',t_exp:'证书有效期',t_self:'自签名证书',t_sni:'SNI 伪装',c_ban:'封禁条目',c_conns:'并发上限',m_auth:'面板认证',m_https:'HTTPS',m_bind:'监听地址',m_restart:'待重启项',days:'天',kinds:'{n} 种',self_signed:'自签名',none:'无',unlimited:'无限制',skipped:'已跳过',plaintext:'未加密',brutfail:'内核不支持'},
 	tp:{title:'拓扑',host:'主机',local:'本机',conns_n:'{n} 条连接',peer:'对端',endpoints_srv:'在线客户端 {n}',vswitch:'虚拟交换机',egress:'出口',tap:'TAP 网卡',up:'链路 UP',mtu:'MTU',err:'错误',drop:'丢弃',rules:'规则 / 路由',age:'快照',routes:'内核路由',conns:'连接',clients:'客户端',sess:'会话水位',pool:'地址池',mem:'内存',spoof:'伪造源 MAC',reject:'拒绝连接',ban:'封禁',mac:'MAC 表',reconn:'重连',brutal:'Brutal',v4:'IPv4',v6:'IPv6',mac2:'MAC',polroute:'策略路由',byt:'发送 / 接收',remote:'远端',live:'活跃连接',rtt:'RTT',fec:'FEC',enc:'加密',sni:'SNI',tls:'TLS',alpn:'ALPN',target:'目标',state:'状态',empty_srv:'暂无在线客户端',empty_cli:'暂无连接',addr:'地址',cipher:'套件',exp:'证书',server:'服务端',p_tls:'TLS',p_psk:'PSK',p_enc:'内层',p_fec:'FEC',p_vsw:'交换',p_pad:'填充'},
- th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (发)',rx:'RX (收)',txs:'↑ 速率',rxs:'↓ 速率',fec:'FEC',enc:'加密',brutal:'Brutal',ops:'操作',kick:'踢出',ban:'封禁',unban:'解封',owner:'客户端',target:'目标',remote:'对端',state:'状态',rtt:'RTT',retries:'重试',age:'在线',epoch:'密钥代际',sni:'SNI',err:'最近错误'},
+ th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (发)',rx:'RX (收)',txs:'↑ 速率',rxs:'↓ 速率',fec:'FEC',enc:'加密',brutal:'Brutal',ops:'操作',kick:'踢出',ban:'封禁',unban:'解封',owner:'客户端',target:'目标',remote:'对端',state:'状态',rtt:'RTT',scheduler:'调度',retries:'重试',age:'在线',epoch:'密钥代际',sni:'SNI',err:'最近错误'},
  m:{port:'端口',seen:'最近活跃'},bans:{id_ph:'ClientID（可短前缀）',min_ph:'分钟（留空=永久）',add:'封禁',refresh:'刷新',left:'剩余'},
  logs:{level:'级别',autoscroll:'自动滚动',clear:'清屏',download:'下载日志'},
  ui:{cancel:'取消',confirm:'确认'},goto:{traffic:'查看流量明细',logs:'查看错误日志'},menu_tip:'更多选项',no_logs:'暂无日志',page:{showing:'显示 {a}–{b} / 共 {n} 条',of:'第 {x} / {y} 页',prev:'上一页',next:'下一页',size:'{n} 条 / 页',all:'全部'},
@@ -16,7 +16,8 @@ const I18N={
  toast:{kick:'已强制断开客户端',ban:'已封禁客户端',unban:'已解除封禁',gc:'已触发 GC',reconnect:'已触发重连',loglevel:'日志级别已更新',saved:'配置已保存',applied:'配置已保存并应用',fail:'操作失败',need_id:'请输入 ClientID',clear:'日志已清空',download:'日志已导出'},
  filter_ph:'输入关键字过滤…',filter_none:'无匹配结果',filter_clear:'清除过滤',filter_tip:'按 / 快速聚焦',no_clients:'暂无客户端',no_conns:'无连接',no_macs:'尚未学习到 MAC',no_bans:'无封禁记录',srv_only:'仅服务端模式提供',
  perm:'永久',confirm_kick:'确定要强制断开该客户端吗？',confirm_ban:'确定封禁该客户端吗？',need_id:'请输入 ClientID',
- st:{up:'up',connecting:'connecting',skip:'未生效'},
+ sched:{active:'活跃',standby:'待命',paths:'{a}/{n} 活跃',queue:'队列',carry:'尾包等待'},
+  st:{up:'up',connecting:'connecting',skip:'未生效'},
  badge:{dup:'复制',off:'关闭',ctr:'CTR',plain:'明文'},
  u:{day:'天',hour:'时',min:'分',sec:'秒'},updated:'更新于 {n}',footer:'数据每 {n} 秒刷新',refresh_tip:'刷新间隔',
 	tls_http:'HTTP（建议启用 HTTPS）',mode_local:'本机',theme_tip:'主题（跟随系统）',theme:{sys:'Auto',light:'Light',dark:'Dark'},
@@ -40,7 +41,7 @@ const I18N={
 	ev:{title:'Events',clear:'Clear',empty:'No events yet',live:'Live stream',reconn:'Reconnecting',poll:'Polling',all:'All',info:'Info',warn:'Warning',error:'Error',t_connect:'Client online',t_off:'Session destroyed',t_kick:'Forced disconnect',t_ban:'Banned',t_unban:'Unbanned',t_deny:'Access denied',t_limit:'Connection rate limited',t_up:'Tunnel established',t_down:'Tunnel down',t_reconnect:'Forced reconnect',t_config:'Config changed',t_loglevel:'Log level',t_gc:'Memory reclaim',t_unknown:'Event',cleared:'Events cleared'},
 	sc:{score:'Security',lvOk:'OK',lvWarn:'Warn',lvFail:'Fail',lvSkip:'N/A',all_ok:'All security checks enabled and healthy',open:'{n} item(s) to address',total:'{n} checks',not_set:'Not set',c_auth:'Authentication',c_enc:'Encryption',c_tls:'TLS',c_acl:'Access control',c_detect:'Detection',c_mgmt:'Management',a_psk:'PSK transmission cipher',a_token:'Session token',a_epoch:'Key generation',a_maxsess:'Session limit',a_noverify:'Certificate verification',e_on:'Inner cipher',e_algo:'Cipher and floor',e_algo_off:'Negotiated result',e_session:'Session key cipher',e_fec:'FEC group',e_pad:'Padding mode',t_ver:'Protocol version',t_suite:'Cipher suite',t_exp:'Certificate expiry',t_self:'Self-signed certificate',t_sni:'SNI camouflage',c_ban:'Ban entries',c_conns:'Concurrency limit',m_auth:'Dashboard auth',m_https:'HTTPS',m_bind:'Listen address',m_restart:'Pending restarts',days:'days',kinds:'{n} kind(s)',self_signed:'Self-signed',none:'None',unlimited:'Unlimited',skipped:'Skipped',plaintext:'Unencrypted',brutfail:'Kernel unsupported'},
 	tp:{title:'Topology',host:'Host',local:'Local',conns_n:'{n} connection(s)',peer:'Peer',endpoints_srv:'Online clients {n}',vswitch:'Virtual switch',egress:'Egress',tap:'TAP interface',up:'Link UP',mtu:'MTU',err:'Errors',drop:'Drops',rules:'Rules / routes',age:'Snapshot',routes:'Kernel routes',conns:'Connections',clients:'Clients',sess:'Session water level',pool:'Address pool',mem:'Memory',spoof:'Spoofed src MAC',reject:'Rejected connections',ban:'Bans',mac:'MAC table',reconn:'Reconnects',brutal:'Brutal',v4:'IPv4',v6:'IPv6',mac2:'MAC',polroute:'Policy routing',byt:'TX / RX',remote:'Remote',live:'Active connections',rtt:'RTT',fec:'FEC',enc:'Cipher',sni:'SNI',tls:'TLS',alpn:'ALPN',target:'Target',state:'State',empty_srv:'No online clients',empty_cli:'No connections',addr:'Address',cipher:'Suite',exp:'Certificate',server:'Server',p_tls:'TLS',p_psk:'PSK',p_enc:'Inner',p_fec:'FEC',p_vsw:'Switch',p_pad:'Padding'},
- th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX',rx:'RX',txs:'↑ Rate',rxs:'↓ Rate',fec:'FEC',enc:'Encrypt',brutal:'Brutal',ops:'Actions',kick:'Kick',ban:'Ban',unban:'Unban',owner:'Client',target:'Target',remote:'Remote',state:'State',rtt:'RTT',retries:'Retries',age:'Uptime',epoch:'Epoch',sni:'SNI',err:'Last error'},
+ th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX',rx:'RX',txs:'↑ Rate',rxs:'↓ Rate',fec:'FEC',enc:'Encrypt',brutal:'Brutal',ops:'Actions',kick:'Kick',ban:'Ban',unban:'Unban',owner:'Client',target:'Target',remote:'Remote',state:'State',rtt:'RTT',scheduler:'Scheduler',retries:'Retries',age:'Uptime',epoch:'Epoch',sni:'SNI',err:'Last error'},
  m:{port:'Port',seen:'Last seen'},bans:{id_ph:'ClientID (short prefix ok)',min_ph:'Minutes (empty = permanent)',add:'Ban',refresh:'Refresh',left:'Remaining'},
  logs:{level:'Level',autoscroll:'Auto scroll',clear:'Clear',download:'Download'},
  ui:{cancel:'Cancel',confirm:'Confirm'},goto:{traffic:'Open traffic detail',logs:'Open error logs'},menu_tip:'More options',no_logs:'No log lines yet',page:{showing:'Showing {a}–{b} of {n}',of:'Page {x} of {y}',prev:'Previous',next:'Next',size:'{n} per page',all:'All'},
@@ -48,7 +49,8 @@ const I18N={
  toast:{kick:'Client force-disconnected',ban:'Client banned',unban:'Ban lifted',gc:'GC triggered',reconnect:'Reconnect triggered',loglevel:'Log level updated',saved:'Config saved',applied:'Config saved & applied',fail:'Action failed',need_id:'Please enter a ClientID',clear:'Logs cleared',download:'Logs exported'},
  filter_ph:'Type to filter…',filter_none:'No matches',filter_clear:'Clear filter',filter_tip:'Press / to focus',no_clients:'No clients yet',no_conns:'No connections',no_macs:'No MACs learned yet',no_bans:'No banned clients',srv_only:'Server mode only',
  perm:'Permanent',confirm_kick:'Force-disconnect this client?',confirm_ban:'Ban this client?',need_id:'Please enter a ClientID',
- st:{up:'up',connecting:'connecting',skip:'Skipped'},
+ sched:{active:'Active',standby:'Standby',paths:'{a}/{n} active',queue:'Queue',carry:'Tail carry'},
+  st:{up:'up',connecting:'connecting',skip:'Skipped'},
  badge:{dup:'Dup',off:'Off',ctr:'CTR',plain:'Plain'},
  u:{day:'d',hour:'h',min:'m',sec:'s'},updated:'Updated at {n}',footer:'Refreshing every {n}s',refresh_tip:'Refresh interval',
 	tls_http:'HTTP (HTTPS recommended)',mode_local:'local',theme_tip:'Theme (follow system)',theme:{sys:'Auto',light:'Light',dark:'Dark'},
@@ -66,7 +68,7 @@ const I18N={
 'de':{kpi:{active:'Aktive Clients',tcp:'TCP-Verbindungen',tx:'Gesendet',rx:'Empfangen',uptime:'Laufzeit',version:'Version',gc:'GC ausführen',fec:'FEC wiederhergestellt / verloren',parity:'Paritätsframes',dropped:'Verworfen (Queue)',reorder:'Reorder übersprungen',mem:'Speicher',goroutines:'Goroutines:',pool:'IPv4-Pool',v6used:'IPv6 zugewiesen:',pps:'Paktrate',cpu:'Prozess-CPU',cores:'Kerne:',overhead:'FEC-Overhead'},
  chart:{title:'Durchsatz',win:'(letzte 120 s)',r2m:'2 Min',r1h:'1 Std',r24h:'24 Std'},legend:{up:'Uplink',down:'Downlink',rtt:'RTT (Ø)'},
  tab:{clients:'Clients',conns:'Verbindungen',macs:'MAC-Tabelle',bans:'Sperren',traffic:'Traffic',status:'Laufzeitstatus',diag:'Diagnostics',sc:'Sicherheit',tp:'Topologie',ev:'Ereignisse',logs:'Protokolle',settings:'Einstellungen'},
- th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (S)',rx:'RX (E)',txs:'↑ Rate',rxs:'↓ Rate',fec:'FEC',enc:'Verschlüsselung',brutal:'Brutal',ops:'Aktionen',kick:'Trennen',ban:'Sperren',unban:'Entsperren',owner:'Client',target:'Ziel',remote:'Gegenstelle',state:'Status',rtt:'RTT',retries:'Wiederholungen',age:'Online',epoch:'Schlüssel-Epoche',sni:'SNI',err:'Letzter Fehler'},
+ th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (S)',rx:'RX (E)',txs:'↑ Rate',rxs:'↓ Rate',fec:'FEC',enc:'Verschlüsselung',brutal:'Brutal',ops:'Aktionen',kick:'Trennen',ban:'Sperren',unban:'Entsperren',owner:'Client',target:'Ziel',remote:'Gegenstelle',state:'Status',rtt:'RTT',scheduler:'Scheduler',retries:'Wiederholungen',age:'Online',epoch:'Schlüssel-Epoche',sni:'SNI',err:'Letzter Fehler'},
  m:{port:'Port',seen:'Zuletzt aktiv'},bans:{id_ph:'ClientID (Präfix ok)',min_ph:'Minuten (leer = dauerhaft)',add:'Sperren',refresh:'Aktualisieren',left:'Restlaufzeit'},
  logs:{level:'Level',autoscroll:'Auto-Scroll',clear:'Leeren',download:'Download'},
  ui:{cancel:'Abbrechen',confirm:'Bestätigen'},goto:{traffic:'Traffic-Details öffnen',logs:'Fehlerprotokoll öffnen'},menu_tip:'Weitere Optionen',no_logs:'Keine Protokolleinträge',page:{showing:'{a}–{b} von {n} Einträgen',of:'Seite {x} von {y}',prev:'Zurück',next:'Weiter',size:'{n} pro Seite',all:'Alle'},
@@ -74,7 +76,8 @@ const I18N={
  toast:{kick:'Client getrennt',ban:'Client gesperrt',unban:'Sperre aufgehoben',gc:'GC ausgelöst',reconnect:'Neuverbindung ausgelöst',loglevel:'Log-Level aktualisiert',saved:'Konfiguration gespeichert',applied:'Gespeichert & angewendet',fail:'Aktion fehlgeschlagen',need_id:'Bitte ClientID eingeben',clear:'Protokolle geleert',download:'Protokoll exportiert'},
  filter_ph:'Zum Filtern eingeben…',filter_none:'Keine Treffer',filter_clear:'Filter löschen',filter_tip:'/ zum Fokussieren',no_clients:'Keine Clients',no_conns:'Keine Verbindungen',no_macs:'Noch keine MACs gelernt',no_bans:'Keine Sperren',srv_only:'Nur im Server-Modus',
  perm:'Dauerhaft',confirm_kick:'Diesen Client wirklich trennen?',confirm_ban:'Diesen Client sperren?',need_id:'Bitte ClientID eingeben',
- st:{up:'aktiv',connecting:'verbinde',skip:'Übergangen'},
+ sched:{active:'Aktiv',standby:'Standby',paths:'{a}/{n} aktiv',queue:'Warteschlange',carry:'Tail-Carry'},
+  st:{up:'aktiv',connecting:'verbinde',skip:'Übergangen'},
  badge:{dup:'Dup',off:'Aus',ctr:'CTR',plain:'Klartext'},
  u:{day:'T',hour:'Std',min:'Min',sec:'Sek'},updated:'Aktualisiert um {n}',footer:'Aktualisierung alle {n}s',refresh_tip:'Aktualisierungsintervall',
  tls_http:'HTTP (HTTPS empfohlen)',mode_local:'lokal',theme_tip:'Design (System folgen)',theme:{sys:'Auto',light:'Hell',dark:'Dunkel'},
@@ -98,7 +101,7 @@ const I18N={
 'fr':{kpi:{active:'Clients actifs',tcp:'Connexions TCP',tx:'Total envoyé',rx:'Total reçu',uptime:'Disponibilité',version:'Version',gc:'GC maintenant',fec:'FEC récupérés / perdus',parity:'Trames de parité',dropped:'Abandons (file)',reorder:'Réordonnancement ignoré',mem:'Mémoire',goroutines:'Goroutines :',pool:'Pool IPv4',v6used:'IPv6 allouées :',pps:'Taux de paquets',overhead:'Surcharge FEC',cpu:'CPU du processus',cores:'Cœurs :'},
  chart:{title:'Débit',win:'(120 dernières s)',r2m:'2 min',r1h:'1 h',r24h:'24 h'},legend:{up:'Montant',down:'Descendant',rtt:'RTT (moy.)'},
  tab:{clients:'Clients',conns:'Connexions',macs:'Table MAC',bans:'Bannissements',traffic:'Trafic',status:'État runtime',diag:'Diagnostic',sc:'Sécurité',tp:'Topologie',ev:'Événements',logs:'Journaux',settings:'Paramètres'},
- th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (env.)',rx:'RX (rec.)',txs:'↑ Débit',rxs:'↓ Débit',fec:'FEC',enc:'Chiffrement',brutal:'Brutal',ops:'Actions',kick:'Éjecter',ban:'Bannir',unban:'Débannir',owner:'Client',target:'Cible',remote:'Distant',state:'État',rtt:'RTT',retries:'Réessais',age:'En ligne',epoch:'Époque de clé',sni:'SNI',err:'Dernière erreur'},
+ th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX (env.)',rx:'RX (rec.)',txs:'↑ Débit',rxs:'↓ Débit',fec:'FEC',enc:'Chiffrement',brutal:'Brutal',ops:'Actions',kick:'Éjecter',ban:'Bannir',unban:'Débannir',owner:'Client',target:'Cible',remote:'Distant',state:'État',rtt:'RTT',scheduler:'Ordonnanceur',retries:'Réessais',age:'En ligne',epoch:'Époque de clé',sni:'SNI',err:'Dernière erreur'},
  m:{port:'Port',seen:'Dernière activité'},bans:{id_ph:'ClientID (préfixe accepté)',min_ph:'Minutes (vide = permanent)',add:'Bannir',refresh:'Rafraîchir',left:'Restant'},
  logs:{level:'Niveau',autoscroll:'Défilement auto',clear:'Effacer',download:'Télécharger'},
  ui:{cancel:'Annuler',confirm:'Confirmer'},goto:{traffic:'Ouvrir les détails de trafic',logs:'Ouvrir les journaux d’erreur'},menu_tip:'Plus d’options',no_logs:'Aucune entrée de journal',page:{showing:'{a}–{b} sur {n}',of:'Page {x} sur {y}',prev:'Précédent',next:'Suivant',size:'{n} par page',all:'Tout'},
@@ -106,7 +109,8 @@ const I18N={
  toast:{kick:'Client déconnecté',ban:'Client banni',unban:'Bannissement levé',gc:'GC déclenché',reconnect:'Reconnexion déclenchée',loglevel:'Niveau de log mis à jour',saved:'Config enregistrée',applied:'Enregistré & appliqué',fail:'Échec de l’action',need_id:'Veuillez saisir un ClientID',clear:'Journaux effacés',download:'Journal téléchargé'},
  filter_ph:'Taper pour filtrer…',filter_none:'Aucun résultat',filter_clear:'Effacer le filtre',filter_tip:'/ pour le focus',no_clients:'Aucun client',no_conns:'Aucune connexion',no_macs:'Aucune MAC apprise',no_bans:'Aucun bannissement',srv_only:'Mode serveur uniquement',
  perm:'Permanent',confirm_kick:'Déconnecter ce client de force ?',confirm_ban:'Bannir ce client ?',need_id:'Veuillez saisir un ClientID',
- st:{up:'actif',connecting:'connexion',skip:'Ignoré'},
+ sched:{active:'Actif',standby:'Veille',paths:'{a}/{n} actives',queue:'File',carry:'Reliquat'},
+  st:{up:'actif',connecting:'connexion',skip:'Ignoré'},
  badge:{dup:'Dup',off:'Désactivé',ctr:'CTR',plain:'Clair'},
  u:{day:'j',hour:'h',min:'min',sec:'s'},updated:'Actualisé à {n}',footer:"Actualisation toutes les {n}s",refresh_tip:"Intervalle d'actualisation",
  tls_http:'HTTP (HTTPS recommandé)',mode_local:'local',theme_tip:"Thème (suivre le système)",theme:{sys:'Auto',light:'Clair',dark:'Sombre'},
@@ -130,7 +134,7 @@ const I18N={
 'ja':{kpi:{active:'アクティブクライアント',tcp:'TCP 接続',tx:'送信合計',rx:'受信合計',uptime:'稼働時間',version:'バージョン',gc:'即時 GC',fec:'FEC 復元 / 確定ロスト',parity:'パリティフレーム',dropped:'廃棄（キュー）',reorder:'並べ替えスキップ',mem:'メモリ',goroutines:'Goroutines:',pool:'IPv4 プール',v6used:'IPv6 割り当て:',pps:'パケット速度',overhead:'FEC オーバーヘッド',cpu:'プロセス CPU',cores:'コア:'},
  chart:{title:'スループット',win:'（過去 120 秒）',r2m:'2 分',r1h:'1 時間',r24h:'24 時間'},legend:{up:'上り',down:'下り',rtt:'RTT（平均）'},
  tab:{clients:'クライアント',conns:'接続明細',macs:'MAC テーブル',bans:'禁止',traffic:'トラフィック',status:'稼働状態',diag:'診断',sc:'セキュリティ',tp:'トポロジー',ev:'イベント',logs:'ログ',settings:'設定'},
- th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX（送）',rx:'RX（受）',txs:'↑ 速度',rxs:'↓ 速度',fec:'FEC',enc:'暗号化',brutal:'Brutal',ops:'操作',kick:'切断',ban:'禁止',unban:'解除',owner:'クライアント',target:'接続先',remote:'対向',state:'状態',rtt:'RTT',retries:'再試行',age:'経過時間',epoch:'鍵世代',sni:'SNI',err:'最新エラー'},
+ th:{id:'ID',v4:'IPv4',v6:'IPv6',mac:'MAC',tcp:'TCP',tx:'TX（送）',rx:'RX（受）',txs:'↑ 速度',rxs:'↓ 速度',fec:'FEC',enc:'暗号化',brutal:'Brutal',ops:'操作',kick:'切断',ban:'禁止',unban:'解除',owner:'クライアント',target:'接続先',remote:'対向',state:'状態',rtt:'RTT',scheduler:'スケジューラ',retries:'再試行',age:'経過時間',epoch:'鍵世代',sni:'SNI',err:'最新エラー'},
  m:{port:'ポート',seen:'最終アクティブ'},bans:{id_ph:'ClientID（前方一致可）',min_ph:'分数（空欄=永久）',add:'禁止',refresh:'更新',left:'残り'},
  logs:{level:'レベル',autoscroll:'自動スクロール',clear:'クリア',download:'ダウンロード'},
  ui:{cancel:'キャンセル',confirm:'確認'},goto:{traffic:'トラフィック詳細を表示',logs:'エラーログを表示'},menu_tip:'その他のオプション',no_logs:'ログはまだありません',page:{showing:'{n} 件中 {a}–{b}',of:'ページ {x} / {y}',prev:'前へ',next:'次へ',size:'{n} 件 / ページ',all:'すべて'},
@@ -138,7 +142,8 @@ const I18N={
  toast:{kick:'クライアントを強制切断しました',ban:'クライアントを禁止しました',unban:'禁止を解除しました',gc:'GC を実行しました',reconnect:'再接続を依頼しました',loglevel:'ログレベルを更新しました',saved:'設定を保存しました',applied:'設定を保存・適用しました',fail:'操作に失敗しました',need_id:'ClientID を入力してください',clear:'ログをクリアしました',download:'ログをエクスポートしました'},
  filter_ph:'入力して絞り込み…',filter_none:'該当なし',filter_clear:'フィルタ解除',filter_tip:'/ でフォーカス',no_clients:'クライアントなし',no_conns:'接続なし',no_macs:'学習済み MAC なし',no_bans:'禁止レコードなし',srv_only:'サーバーモードのみ',
  perm:'永久',confirm_kick:'このクライアントを強制切断しますか？',confirm_ban:'このクライアントを禁止しますか？',need_id:'ClientID を入力してください',
- st:{up:'up',connecting:'connecting',skip:'未適用'},
+ sched:{active:'稼働',standby:'待機',paths:'{a}/{n} 稼働',queue:'キュー',carry:'テール待機'},
+  st:{up:'up',connecting:'connecting',skip:'未適用'},
  badge:{dup:'複製',off:'オフ',ctr:'CTR',plain:'平文'},
  u:{day:'日',hour:'時間',min:'分',sec:'秒'},updated:'更新時刻 {n}',footer:'{n} 秒ごとに更新',refresh_tip:'更新間隔',
  tls_http:'HTTP（HTTPS 推奨）',mode_local:'ローカル',theme_tip:'テーマ（システムに従う）',theme:{sys:'Auto',light:'Light',dark:'Dark'},
@@ -1774,13 +1779,31 @@ function exportCSV(which){
   csvDownload('tlsvpn-'+which+'-'+ts+'.csv',rows);
 }
 
+
+function fmtSchedulerEta(us){
+  us=Number(us||0);
+  if(!us)return '-';
+  if(us<1000)return Math.round(us)+' us';
+  return (us/1000).toFixed(us<10000?2:1)+' ms';
+}
+function schedulerCell(s){
+  if(!s)return '<span class="dim">-</span>';
+  const cls=s.active?'b-on':'b-off';
+  const state=s.active?t('sched.active'):t('sched.standby');
+  const rate=Number(s.rate_mbps||0);
+  const meta=t('sched.queue')+' '+fmtBytes(s.queued_bytes||0)+' · '+
+    (rate?rate.toFixed(rate<10?1:0)+' Mbps':'-')+' · ETA '+fmtSchedulerEta(s.eta_us||0)+
+    (s.carry_pending?' · '+t('sched.carry'):'')+' · '+t('th.tx')+' '+fmtBytes(s.assigned_bytes||0)+' / '+Number(s.assigned_batches||0);
+  return '<div class="sched-cell"><span class="badge '+cls+'">'+esc(state)+'</span><small class="dim">'+esc(meta)+'</small></div>';
+}
+
 function renderConnsTable(data,fresh){
   const tb=document.getElementById('conns-body');
   let rows=[];
   if(data.mode==='server'){
-    (data.server_conns||[]).forEach(c=>rows.push({key:c.client_id+'|'+c.remote,owner:shortId(c.client_id,10),fullId:c.client_id,target:'',remote:c.remote,state:'up',rtt:c.rtt_ms,tx:c.tx_bytes,rx:c.rx_bytes,age:c.age_sec,epoch:c.session_epoch||0,err:'',enc:c.enc_algo,fec:c.fec||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_cli_tx_mbps||0,down:c.brutal_srv_tx_mbps||0}));
+    (data.server_conns||[]).forEach(c=>rows.push({key:c.client_id+'|'+c.remote,owner:shortId(c.client_id,10),fullId:c.client_id,target:'',remote:c.remote,state:'up',rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,age:c.age_sec,epoch:c.session_epoch||0,err:'',enc:c.enc_algo,fec:c.fec||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_cli_tx_mbps||0,down:c.brutal_srv_tx_mbps||0}));
   }else{
-    (data.conns||[]).forEach((c,i)=>rows.push({key:i+'|'+(c.target||'')+'|'+(c.remote||''),owner:'local',fullId:null,target:c.target,remote:c.remote,state:c.state,rtt:c.rtt_ms,tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:data.session_epoch||0,err:c.last_error||'',enc:data.enc_algo,fec:data.fec_mode||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0}));
+    (data.conns||[]).forEach((c,i)=>rows.push({key:i+'|'+(c.target||'')+'|'+(c.remote||''),owner:'local',fullId:null,target:c.target,remote:c.remote,state:c.state,rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:data.session_epoch||0,err:c.last_error||'',enc:data.enc_algo,fec:data.fec_mode||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0}));
   }
   // 速率差分：fresh=true 仅在拿到新快照时（fetchStats），过滤重渲染沿用缓存
   const now=Date.now();
@@ -1806,6 +1829,12 @@ function renderConnsTable(data,fresh){
   // 质量指标基于过滤前的全量行：过滤条件不该改变统计口径。
   // 注意这里绝不能调 exportCSV —— 本函数每 2 秒跑一次，导出只能由按钮触发
   renderConnQuality(data,rttStats(rows));
+  const ss=document.getElementById('scheduler-summary');
+  if(ss){
+    const active=rows.filter(function(r){return r.sched&&r.sched.active;}).length;
+    const queued=rows.reduce(function(n,r){return n+Number((r.sched&&r.sched.queued_bytes)||0);},0);
+    ss.textContent=t('sched.paths').replace('{a}',active).replace('{n}',rows.length)+' · '+t('sched.queue')+' '+fmtBytes(queued);
+  }
   rows=sortRows('conns',rows);
   syncSortUI('conns');
   // 服务端模式的"目标"列恒为占位符，整列隐藏；客户端模式有真实目标地址，保持可见
@@ -1832,7 +1861,7 @@ function renderConnsTable(data,fresh){
     const cerr=r.err||r.brutErr;
     const errCell=cerr?'<span style="color:var(--err)" title="'+esc(cerr)+'">'+esc(String(cerr).slice(0,40))+'</span>':'<span style="color:var(--sub)">-</span>';
     return '<tr><td class="num dim">'+hi(esc(r.owner),f)+'</td><td class="num hide-srv">'+hi(esc(r.target||'-'),f)+'</td><td class="num">'+hi(esc(r.remote||'-'),f)+'</td><td title="'+esc(brutTip)+'">'+st+'</td>'+
-      '<td class="num">'+rtt+'</td><td class="num">'+fmtBytes(r.tx)+'</td><td class="num">'+fmtBytes(r.rx)+'</td>'+
+      '<td class="num">'+rtt+'</td><td class="hide-sm">'+schedulerCell(r.sched)+'</td><td class="num">'+fmtBytes(r.tx)+'</td><td class="num">'+fmtBytes(r.rx)+'</td>'+
       '<td class="hide-sm num speed">'+fmtBytes(r.sx,true)+'</td><td class="hide-sm num speed dn">'+fmtBytes(r.sr,true)+'</td>'+
       '<td class="hide-sm dim" title="'+esc(sniMeta)+'">'+(r.sni?hi(esc(r.sni),f):'<span style="color:var(--sub)">-</span>')+'</td>'+
       '<td class="hide-sm num dim">'+(r.age?fmtDur(r.age):'-')+'</td>'+
@@ -1840,7 +1869,7 @@ function renderConnsTable(data,fresh){
       '<td class="hide-sm">'+encBadge(r.enc)+'</td><td class="hide-sm">'+badge(r.fec)+'</td>'+
       '<td class="hide-sm" title="'+esc(brutTip)+'">'+brut+'</td>'+
       '<td class="hide-sm">'+errCell+'</td><td>'+ops+'</td></tr>';
-  }).join('')||emptyTableRow('conns',17,all);
+  }).join('')||emptyTableRow('conns',18,all);
   setCount('conn-count',f,total,all);
   renderPager('conns',total);
 }

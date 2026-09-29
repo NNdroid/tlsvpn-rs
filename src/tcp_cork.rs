@@ -1,5 +1,7 @@
 use crate::net::{get_tcp_mss, get_tcp_rtt};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const RTT_THRESHOLD_US: u32 = 1_000;
@@ -64,9 +66,22 @@ pub(crate) struct TlsBatchCork {
     progress: usize,
     delay: Duration,
     deadline: Option<Instant>,
+    carry_state: Option<Arc<AtomicBool>>,
 }
 
 impl TlsBatchCork {
+    pub(crate) fn bind_carry_state(&mut self, state: Arc<AtomicBool>) {
+        state.store(self.corked, Ordering::Release);
+        self.carry_state = Some(state);
+    }
+
+    #[inline]
+    fn publish_carry(&self, value: bool) {
+        if let Some(state) = &self.carry_state {
+            state.store(value, Ordering::Release);
+        }
+    }
+
     #[inline]
     pub(crate) fn disabled() -> Self {
         Self {
@@ -76,6 +91,7 @@ impl TlsBatchCork {
             progress: 0,
             delay: Duration::from_micros(MAX_DELAY_US),
             deadline: None,
+            carry_state: None,
         }
     }
 
@@ -103,6 +119,7 @@ impl TlsBatchCork {
                 progress: 0,
                 delay,
                 deadline: None,
+                carry_state: None,
             }
         }
     }
@@ -134,9 +151,11 @@ impl TlsBatchCork {
         if !self.corked {
             if setter(true).is_err() {
                 self.enabled = false;
+                self.publish_carry(false);
                 return;
             }
             self.corked = true;
+            self.publish_carry(true);
             self.progress = 0;
             self.deadline = Some(now + self.delay);
         }
@@ -179,6 +198,7 @@ impl TlsBatchCork {
             self.enabled = false;
         }
         self.corked = false;
+        self.publish_carry(false);
         self.progress = 0;
         self.deadline = None;
     }
@@ -206,6 +226,7 @@ mod tests {
             progress: 0,
             delay,
             deadline: None,
+            carry_state: None,
         }
     }
 
