@@ -222,9 +222,6 @@ const I18N={
   }
 
   I18N['zh-TW'] = clone(I18N['zh-CN']);
-  if (typeof LANG !== 'undefined' && LANG === 'zh-TW' && typeof applyI18n === 'function') {
-    applyI18n();
-  }
 })();
 
 (() => {
