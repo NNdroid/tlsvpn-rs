@@ -25,6 +25,7 @@ use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::tap::{MemTap, TapDevice};
+use crate::tcp_cork::TlsBatchCork;
 use crate::utils::*;
 
 // ======================= IP 地址池（对齐 Go assignIPsLocked 语义） =======================
@@ -247,6 +248,7 @@ struct MioSession {
     rtt_timer: Instant,
     send_buf: Vec<u8>,
     pad_record_limit: usize,
+    batch_cork: TlsBatchCork,
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
     write_stalled: Option<Instant>,
@@ -1206,11 +1208,15 @@ fn worker_loop(
         // 无重排缺口时保持 250ms 运维巡检；出现缺口后把 poll deadline 收紧到
         // 该会话的精确剩余时间，避免固定 250ms 盲等或 5ms 空转。
         let mut poll_timeout = Duration::from_millis(250);
+        let poll_now = Instant::now();
         for sess in mio_sessions.values() {
             if let Some(c_sess) = &sess.client_session {
                 if let Some(wait) = c_sess.reorder_buf.lock().next_timeout() {
                     poll_timeout = poll_timeout.min(wait);
                 }
+            }
+            if let Some(wait) = sess.batch_cork.next_timeout(poll_now) {
+                poll_timeout = poll_timeout.min(wait);
             }
         }
         poll.poll(&mut events, Some(poll_timeout)).unwrap();
@@ -1282,6 +1288,7 @@ fn worker_loop(
                     rtt_timer: Instant::now(),
                     send_buf: Vec::with_capacity(70 * 1024),
                     pad_record_limit,
+                    batch_cork: TlsBatchCork::disabled(),
                     ic_rx: None,
                     session_epoch: 0,
                     write_stalled: None,
@@ -1322,6 +1329,7 @@ fn worker_loop(
         }
 
         for (token, sess) in mio_sessions.iter_mut() {
+            sess.batch_cork.maybe_flush(&sess.socket, Instant::now());
             let idle_time = sess.last_rx.elapsed().as_secs();
             // 15s 无下行数据视为链路死亡（对齐 Go 15s 读超时）。4s 心跳下
             // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
@@ -1631,6 +1639,7 @@ fn process_plain_frames(
                         HandshakeOutcome::Ok => {
                             sess.handshake_done = true;
                             sess.scanner.set_max_data_len(MAX_DATA_LENGTH);
+                            sess.batch_cork = TlsBatchCork::new(&sess.socket);
                         }
                         HandshakeOutcome::Close => {
                             *close = true;
@@ -1854,6 +1863,8 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     }
 
     if !sess.send_buf.is_empty() {
+        sess.batch_cork
+            .before_write(&sess.socket, sess.send_buf.len());
         if let Some(s) = &sess.client_session {
             if pulled != 0 {
                 s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
@@ -1909,6 +1920,7 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
 // 明确的错误通知，不需要再补。对端已断开时 write_tls 会直接失败，此时
 // 静默放弃即可：连接反正已经没了。
 fn close_session_tls(s: &mut MioSession) {
+    s.batch_cork.close(&s.socket);
     s.tls.send_close_notify();
     while s.tls.wants_write() {
         match s.tls.write_tls(&mut s.socket) {
