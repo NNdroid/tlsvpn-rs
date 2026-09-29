@@ -19,6 +19,10 @@ fn index_html() -> &'static [u8] {
 
 pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     match path {
+        "/i18n.js" => Some((
+            include_bytes!("../webui/i18n.js"),
+            "application/javascript; charset=utf-8",
+        )),
         "/app.js" => Some((
             include_bytes!("../webui/app.js"),
             "application/javascript; charset=utf-8",
@@ -28,10 +32,6 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
             "application/javascript; charset=utf-8",
         )),
         "/favicon.ico" => Some((include_bytes!("../webui/favicon.ico"), "image/x-icon")),
-        "/frameviz-zh-tw.js" => Some((
-            include_bytes!("../webui/frameviz-zh-tw.js"),
-            "application/javascript; charset=utf-8",
-        )),
         "/frameviz.js" => Some((
             include_bytes!("../webui/frameviz.js"),
             "application/javascript; charset=utf-8",
@@ -97,10 +97,6 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         "/style.css" => Some((
             include_bytes!("../webui/style.css"),
             "text/css; charset=utf-8",
-        )),
-        "/zh-tw.js" => Some((
-            include_bytes!("../webui/zh-tw.js"),
-            "application/javascript; charset=utf-8",
         )),
         _ => None,
     }

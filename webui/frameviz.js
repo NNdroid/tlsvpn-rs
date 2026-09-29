@@ -3,16 +3,7 @@
   const root=document.getElementById('pane-status');
   if(!root||document.getElementById('frameviz-card'))return;
 
-  const lang=localStorage.getItem('tlsvpn_lang')||'zh-CN';
-  const L={
-    'zh-CN':{title:'帧格式示例',sub:'当前数据面协议 · 聚合写入 · 非实时抓包',example:'1514 B Ethernet 数据帧（启用内层 AEAD）',header:'帧头',cipher:'密文',tag:'认证标签',tail:'仅 batch 尾帧可选 Padding',batch:'TLS plaintext batch',detail:'协议细节'},
-    'zh-TW':{title:'訊框格式範例',sub:'目前資料面協定 · 聚合寫入 · 非即時封包擷取',example:'1514 B Ethernet 資料幀（啟用內層 AEAD）',header:'訊框標頭',cipher:'密文',tag:'驗證標籤',tail:'僅 batch 尾幀可選 Padding',batch:'TLS plaintext batch',detail:'協定細節'},
-    en:{title:'Frame format example',sub:'Current data plane · aggregated writes · not a live capture',example:'1514 B Ethernet data frame with inner AEAD',header:'Header',cipher:'Ciphertext',tag:'Authentication tag',tail:'Optional padding on batch tail only',batch:'TLS plaintext batch',detail:'Protocol details'},
-    de:{title:'Beispiel für Frame-Format',sub:'Aktueller Datenpfad · aggregierte Writes · kein Live-Mitschnitt',example:'1514-B-Ethernet-Datenframe mit innerem AEAD',header:'Header',cipher:'Chiffretext',tag:'Authentifizierungs-Tag',tail:'Optionales Padding nur am Batch-Ende',batch:'TLS-Plaintext-Batch',detail:'Protokolldetails'},
-    fr:{title:'Exemple de format de trame',sub:'Plan de données actuel · écritures agrégées · pas une capture en direct',example:'Trame Ethernet 1514 o avec AEAD interne',header:'En-tête',cipher:'Texte chiffré',tag:'Tag d’authentification',tail:'Padding optionnel en fin de batch',batch:'Batch TLS en clair',detail:'Détails du protocole'},
-    ja:{title:'フレーム形式の例',sub:'現在のデータプレーン · 集約 Write · ライブキャプチャではありません',example:'内部 AEAD を使用する 1514 B Ethernet データフレーム',header:'ヘッダー',cipher:'暗号文',tag:'認証タグ',tail:'batch 末尾のみ任意 Padding',batch:'TLS plaintext batch',detail:'プロトコル詳細'}
-  };
-  const s=L[lang]||L.en;
+  const s=FRAMEVIZ_I18N[LANG]||FRAMEVIZ_I18N.en;
   const card=document.createElement('div');
   card.id='frameviz-card';
   card.className='st-block frameviz-card';
