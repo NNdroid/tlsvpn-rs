@@ -146,6 +146,7 @@ impl ServerCertVerifier for CertHashVerifier {
 
 pub struct ConnInfo {
     pub target: String,
+    pub conn_id: Mutex<String>,
     pub remote: Mutex<String>,
     pub state: Mutex<String>,
     pub last_error: Mutex<String>,
@@ -163,6 +164,7 @@ impl ConnInfo {
     fn new(target: String) -> Self {
         Self {
             target,
+            conn_id: Mutex::new(String::new()),
             remote: Mutex::new(String::new()),
             state: Mutex::new("connecting".into()),
             last_error: Mutex::new(String::new()),
@@ -187,6 +189,7 @@ impl ConnInfo {
             .unwrap_or_default();
         serde_json::json!({
             "index": index,
+            "conn_id": self.conn_id.lock().clone(),
             "target": self.target,
             "remote": self.remote.lock().clone(),
             "state": self.state.lock().clone(),
@@ -1272,9 +1275,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // 3. 握手请求（对齐 Go）
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
     let session_token = cl.session.lock().session_token.clone();
+    let conn_id = uuid::Uuid::new_v4().to_string();
+    *ci.conn_id.lock() = conn_id.clone();
     let req = HandshakeReq {
         protocol_version: 2,
         client_instance: instance_id,
+        conn_id: conn_id.clone(),
         client_id: cl.client_id.clone(),
         psk: hash_psk(&cl.psk),
         mac: cl.mac.clone(),
@@ -1579,6 +1585,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let backend = Arc::new(Backend {
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tx.clone(),
+        conn_id: Arc::new(Mutex::new(conn_id.clone())),
         rtt_cache: rtt_cache.clone(),
         notify: Some(Arc::new(BackendNotify::new(
             conn_waker.clone(),
