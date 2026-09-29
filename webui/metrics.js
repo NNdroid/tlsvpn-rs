@@ -58,13 +58,18 @@
 
   // dgRun historically read skipped_frames/gap_events from drop_breakdown even
   // though the backend publishes those fields in data.reorder. Preserve the
-  // rest of dgRun unchanged and feed the two values from the correct snapshot.
+  // rest of dgRun unchanged and feed each value from the matching source. The
+  // top-level dropped_frames fallback also keeps Rust's queue-drop diagnostic
+  // useful while older stats payloads do not contain drop_breakdown.
   const legacyDgRun = dgRun;
   dgRun = function (data) {
     if (!data || typeof data !== 'object') return legacyDgRun(data);
     const fixed = Object.assign({}, data);
     const reorder = data.reorder || {};
-    fixed.drop_breakdown = Object.assign({}, data.drop_breakdown || {}, {
+    const breakdown = data.drop_breakdown || {};
+    fixed.drop_breakdown = Object.assign({}, breakdown, {
+      backpressure: breakdown.backpressure === undefined ? num(data.dropped_frames) : num(breakdown.backpressure),
+      reorder: breakdown.reorder === undefined ? num(reorder.dropped_frames) : num(breakdown.reorder),
       skipped_frames: num(reorder.skipped_frames),
       gap_events: num(reorder.gap_events)
     });
