@@ -23,6 +23,7 @@ const FEC_MAGIC: u8 = 0xFE;
 struct HandshakeReq {
     protocol_version: i64,
     client_instance: String,
+    conn_id: String,
     client_id: String,
     psk: String,
     mac: String,
@@ -535,6 +536,7 @@ fn main() {
     let req = HandshakeReq {
         protocol_version: 2,
         client_instance: "interop-probe-instance-00000001".into(),
+        conn_id: uuid::Uuid::new_v4().to_string(),
         client_id: client_id.clone(),
         psk: hash_psk(&psk),
         mac: mac.clone(),

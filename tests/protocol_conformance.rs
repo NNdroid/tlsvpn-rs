@@ -272,6 +272,8 @@ struct HandshakeReqShape {
     protocol_version: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     client_instance: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    conn_id: String,
     client_id: String,
     psk: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -412,6 +414,7 @@ fn test_handshake_req_field_names() {
     let full = HandshakeReqShape {
         protocol_version: 2,
         client_instance: "instance-1".into(),
+        conn_id: "00000000-0000-4000-8000-000000000001".into(),
         client_id: "c".into(),
         psk: "p".into(),
         mac: "m".into(),
@@ -519,6 +522,7 @@ fn test_golden_handshake_keys_match_rust() {
     let req_full = HandshakeReqShape {
         protocol_version: 2,
         client_instance: "instance-1".into(),
+        conn_id: "00000000-0000-4000-8000-000000000001".into(),
         session_token: "t".into(),
         mac: "m".into(),
         ipv4: "1".into(),
@@ -607,6 +611,7 @@ fn test_omitempty_semantics() {
     for k in [
         "protocol_version",
         "client_instance",
+        "conn_id",
         "mac",
         "ipv4",
         "ipv6",

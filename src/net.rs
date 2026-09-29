@@ -1186,6 +1186,7 @@ impl BackendNotify {
 
 pub struct Backend {
     pub ch: Sender<VPNFrame>,
+    pub conn_id: Arc<Mutex<String>>,
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
     pub scheduler: Arc<SchedulerBackendState>,
@@ -1287,6 +1288,18 @@ impl AsyncPort {
             .read()
             .iter()
             .map(|b| (b.rtt_cache.load(Ordering::Relaxed), b.scheduler.snapshot()))
+            .collect()
+    }
+
+    pub fn diagnostic_paths(&self) -> Vec<(String, u32, SchedulerSnapshot)> {
+        self.backends
+            .read()
+            .iter()
+            .map(|b| (
+                b.conn_id.lock().clone(),
+                b.rtt_cache.load(Ordering::Relaxed),
+                b.scheduler.snapshot(),
+            ))
             .collect()
     }
 
@@ -1921,6 +1934,7 @@ mod tests {
             Arc::new(Backend {
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
             }),
@@ -1948,6 +1962,7 @@ mod tests {
         let backend = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx.clone(),
+                conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
@@ -1993,6 +2008,7 @@ mod tests {
         let b0 = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx0.clone(),
+                conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
@@ -2000,6 +2016,7 @@ mod tests {
         let b1 = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx1,
+                conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
         });
@@ -2050,12 +2067,14 @@ mod tests {
         let a = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_a,
+                conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(250_000)),
             notify: None,
         });
         let b = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_b,
+                conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(240_000)),
             notify: None,
         });

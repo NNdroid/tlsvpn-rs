@@ -559,9 +559,10 @@ impl WebStatsProvider for ServerCore {
             .sum();
         let mut server_conns = Vec::new();
         for s in sessions.values() {
-            for (idx, (rtt, scheduler)) in s.port.scheduler_paths().into_iter().enumerate() {
+            for (idx, (conn_id, rtt, scheduler)) in s.port.diagnostic_paths().into_iter().enumerate() {
                 server_conns.push(serde_json::json!({
                     "client_id": s.stat.client_id,
+                    "conn_id": conn_id,
                     "remote": format!("path #{}", idx + 1),
                     "state": "up",
                     "rtt_ms": rtt / 1000,
@@ -1004,6 +1005,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     tap_port.register_backend(Arc::new(Backend {
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tap_tx,
+        conn_id: Arc::new(Mutex::new(String::new())),
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
     }));
@@ -1270,6 +1272,7 @@ fn worker_loop(
             let backend = Arc::new(Backend {
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: Some(Arc::new(BackendNotify::new(
                     loop_waker.clone(),
@@ -2072,8 +2075,21 @@ fn handle_handshake(
         warn!("Handshake data parse failed; engaging camouflage tar pit.");
         return HandshakeOutcome::TarpitClose;
     };
+    let conn_id = match uuid::Uuid::parse_str(req.conn_id.trim()) {
+        Ok(v) => v.to_string(),
+        Err(_) if req.conn_id.trim().is_empty() => String::new(),
+        Err(_) => {
+            debug!("ignoring malformed conn_id from client {}", req.client_id);
+            String::new()
+        }
+    };
+    req.conn_id = conn_id.clone();
+    if let Some(backend) = sess.tx_backend.as_ref() {
+        *backend.conn_id.lock() = conn_id.clone();
+    }
     debug!(
-        "<= handshake request client={} proto={} instance={} fec={}/{} enc={}/{} token_present={}",
+        "<= handshake request conn_id={} client={} proto={} instance={} fec={}/{} enc={}/{} token_present={}",
+        conn_id,
         req.client_id,
         req.protocol_version,
         req.client_instance,
