@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
+use crate::adaptive_multipath::{
+    AdaptiveBackend, AdaptivePortState, SchedulerBackendState, SchedulerSnapshot,
+};
 use crate::buffer::{release_frame_vec, release_shared_frame};
 use crate::crypto::*;
 use crate::fec::FecEncoder;
@@ -1185,6 +1188,26 @@ pub struct Backend {
     pub ch: Sender<VPNFrame>,
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
+    pub scheduler: Arc<SchedulerBackendState>,
+}
+
+impl AdaptiveBackend for Backend {
+    #[inline]
+    fn scheduler_state(&self) -> &SchedulerBackendState {
+        &self.scheduler
+    }
+    #[inline]
+    fn scheduler_rtt_us(&self) -> u32 {
+        self.rtt_cache.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn scheduler_queue_len(&self) -> usize {
+        self.ch.len()
+    }
+    #[inline]
+    fn scheduler_queue_capacity(&self) -> usize {
+        self.ch.capacity().unwrap_or(4096)
+    }
 }
 
 /// 异步聚合端口，分发行为对齐 Go AsyncPort.dispatchBatch：
@@ -1197,8 +1220,7 @@ pub struct AsyncPort {
     // 后端列表在读锁保护期间索引稳定；用原子索引代替每包
     // Mutex<Weak<Backend>> + upgrade/Arc 比较。
     preferred: AtomicUsize,
-    schedule_tick: AtomicU32,
-    data_cursor: AtomicUsize,
+    adaptive: AdaptivePortState,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
     encoder_enabled: AtomicBool,
@@ -1214,8 +1236,7 @@ impl AsyncPort {
             tx_seq: AtomicU32::new(0),
             backends: RwLock::new(Vec::new()),
             preferred: AtomicUsize::new(usize::MAX),
-            schedule_tick: AtomicU32::new(0),
-            data_cursor: AtomicUsize::new(0),
+            adaptive: AdaptivePortState::default(),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
             encoder_enabled: AtomicBool::new(false),
@@ -1234,7 +1255,6 @@ impl AsyncPort {
     pub fn reset_epoch(&self, k: usize, ic: Option<Arc<InnerCipher>>) {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
-        self.data_cursor.store(0, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
         let enabled = k >= crate::fec::FEC_MIN_GROUP;
         if !enabled {
@@ -1260,6 +1280,14 @@ impl AsyncPort {
 
     pub fn parity_sent(&self) -> u64 {
         self.parity_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_paths(&self) -> Vec<(u32, SchedulerSnapshot)> {
+        self.backends
+            .read()
+            .iter()
+            .map(|b| (b.rtt_cache.load(Ordering::Relaxed), b.scheduler.snapshot()))
+            .collect()
     }
 
     pub fn register_backend(&self, backend: Arc<Backend>) {
@@ -1289,6 +1317,8 @@ impl AsyncPort {
         seq: u32,
         data: FramePayload,
     ) -> Result<(), FramePayload> {
+        let bytes = data.as_slice().len() as u64;
+        b.scheduler.add_queued(bytes);
         match b.ch.try_send(VPNFrame { seq, data }) {
             Ok(()) => {
                 if let Some(n) = &b.notify {
@@ -1297,6 +1327,7 @@ impl AsyncPort {
                 Ok(())
             }
             Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => {
+                b.scheduler.complete_queued(bytes);
                 Err(frame.data)
             }
         }
@@ -1322,12 +1353,16 @@ impl AsyncPort {
         seq: u32,
         data: FramePayload,
     ) -> Option<usize> {
+        let bytes = data.as_slice().len() as u64;
         let mut data = data;
 
         if let Some(idx) = preferred_idx {
             if idx < backends.len() {
                 match self.try_send_payload_to(&backends[idx], seq, data) {
-                    Ok(()) => return Some(idx),
+                    Ok(()) => {
+                        backends[idx].scheduler.note_assigned(bytes);
+                        return Some(idx);
+                    }
                     Err(returned) => data = returned,
                 }
             }
@@ -1338,7 +1373,10 @@ impl AsyncPort {
                 continue;
             }
             match self.try_send_payload_to(b, seq, data) {
-                Ok(()) => return Some(idx),
+                Ok(()) => {
+                    b.scheduler.note_assigned(bytes);
+                    return Some(idx);
+                }
                 Err(returned) => data = returned,
             }
         }
@@ -1393,54 +1431,19 @@ impl AsyncPort {
         Some(selected)
     }
 
-    const MULTIPATH_STRIPE_BACKLOG: usize = 32;
-
-    /// 低负载保持 sticky MinRTT；只有当前可用路径已经出现持续队列积压时，
-    /// 才在 RTT/score 接近最佳值的健康路径间轮转。Rust 没有 Go AsyncPort 的
-    /// 输入队列，因此用 backend backlog 作为 bulk-pressure 信号。
-    fn selected_data_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
-        if backends.is_empty() {
-            return None;
-        }
-        if backends.len() == 1 {
-            self.preferred.store(0, Ordering::Relaxed);
-            return Some(0);
-        }
-
+    /// Adaptive byte-aware data-path selection. Parity keeps the legacy health picker.
+    fn selected_data_backend_index(
+        &self,
+        backends: &[Arc<Backend>],
+        incoming_bytes: u64,
+    ) -> Option<usize> {
         let current = self.preferred.load(Ordering::Relaxed);
-        let under_pressure = current < backends.len()
-            && backends[current].ch.len() >= Self::MULTIPATH_STRIPE_BACKLOG;
-
-        if !under_pressure {
-            let tick = self.schedule_tick.fetch_add(1, Ordering::Relaxed);
-            if (tick & 0x0f) != 0
-                && current < backends.len()
-                && Self::backend_score(&backends[current]).is_some()
-            {
-                return Some(current);
-            }
-            return self.pick_backend_index(backends);
+        let preferred = (current < backends.len()).then_some(current);
+        let picked = self.adaptive.pick(backends, preferred, incoming_bytes);
+        if let Some(idx) = picked {
+            self.preferred.store(idx, Ordering::Relaxed);
         }
-
-        let best = self.pick_backend_index(backends)?;
-        let best_rtt = backends[best].rtt_cache.load(Ordering::Relaxed);
-        let slack = 5_000u32.max(best_rtt / 4);
-        let max_rtt = best_rtt as u64 + slack as u64;
-        let best_score = Self::backend_score(&backends[best]).unwrap_or(best_rtt);
-        let max_score = best_score as u64 + slack as u64;
-
-        let start = self.data_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
-        for offset in 0..backends.len() {
-            let idx = (start + offset) % backends.len();
-            let Some(score) = Self::backend_score(&backends[idx]) else {
-                continue;
-            };
-            let rtt = backends[idx].rtt_cache.load(Ordering::Relaxed);
-            if rtt as u64 <= max_rtt && score as u64 <= max_score {
-                return Some(idx);
-            }
-        }
-        Some(best)
+        picked
     }
 
     /// parity 只需被会话级 decoder 收到一份。多连接时从轮转游标开始，
@@ -1496,6 +1499,7 @@ impl AsyncPort {
             frame.release();
             return;
         }
+        let incoming_bytes = frame.as_slice().len() as u64;
         let backends = self.backends.read();
         if backends.is_empty() {
             self.drop_n(1);
@@ -1526,7 +1530,7 @@ impl AsyncPort {
             None
         };
 
-        let selected_idx = self.selected_data_backend_index(&backends);
+        let selected_idx = self.selected_data_backend_index(&backends, incoming_bytes);
         let data_idx = self.send_data_payload_to_any(&backends, selected_idx, seq, frame);
 
         if let Some(par) = parity {
@@ -1915,6 +1919,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(256);
         (
             Arc::new(Backend {
+                scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
@@ -1941,6 +1946,7 @@ mod tests {
         let port = AsyncPort::new("pre-seq-backpressure".into());
         let (tx, rx) = crossbeam_channel::bounded(4);
         let backend = Arc::new(Backend {
+            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx.clone(),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
@@ -1985,12 +1991,14 @@ mod tests {
 
         let (tx0, rx0) = crossbeam_channel::bounded(4);
         let b0 = Arc::new(Backend {
+            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx0.clone(),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
         let (tx1, rx1) = crossbeam_channel::bounded(8);
         let b1 = Arc::new(Backend {
+            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx1,
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
@@ -2040,11 +2048,13 @@ mod tests {
         let (tx_a, _rx_a) = crossbeam_channel::bounded(32);
         let (tx_b, _rx_b) = crossbeam_channel::bounded(32);
         let a = Arc::new(Backend {
+            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_a,
             rtt_cache: Arc::new(AtomicU32::new(250_000)),
             notify: None,
         });
         let b = Arc::new(Backend {
+            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_b,
             rtt_cache: Arc::new(AtomicU32::new(240_000)),
             notify: None,
@@ -2097,17 +2107,14 @@ mod tests {
         while let Ok(f) = r0.try_recv() {
             f.data.release();
         }
+        b0.scheduler.complete_queued(12 * 1400);
 
-        // 给三条相近 RTT 路径制造相同的持续 backlog；之后 bulk 流量应该
-        // 在候选路径间轮转，而不是仍把所有帧压到 preferred。
+        // 新调度器按 queued bytes + 输入速率扩 active-set，而不是按 channel
+        // 里的 frame 数判断 bulk。给三条相近 RTT 路径制造相同 byte pressure，
+        // 要求 active-set 扩到 3 路，并让后续真实 frame 在多路径间公平推进。
+        let synthetic = crate::adaptive_multipath::ACTIVE3_PRESSURE / 3 + 4096;
         for b in [&b0, &b1, &b2] {
-            for _ in 0..(AsyncPort::MULTIPATH_STRIPE_BACKLOG + 4) {
-                b.ch.try_send(VPNFrame {
-                    seq: 0,
-                    data: FramePayload::Owned(Vec::new()),
-                })
-                .unwrap();
-            }
+            b.scheduler.add_queued(synthetic);
         }
         let before = [r0.len(), r1.len(), r2.len()];
         for _ in 0..24 {
@@ -2115,10 +2122,18 @@ mod tests {
         }
         let after = [r0.len(), r1.len(), r2.len()];
         let used = (0..3).filter(|&i| after[i] > before[i]).count();
+        assert_eq!(
+            port.adaptive.active_paths.load(Ordering::Relaxed),
+            3,
+            "adaptive pressure should expand to all three eligible paths"
+        );
         assert!(
             used >= 2,
-            "bulk pressure should use multiple comparable paths: before={before:?} after={after:?}"
+            "adaptive byte pressure should use multiple comparable paths: before={before:?} after={after:?}"
         );
+        for b in [&b0, &b1, &b2] {
+            b.scheduler.complete_queued(synthetic);
+        }
 
         for rx in [&r0, &r1, &r2] {
             while let Ok(f) = rx.try_recv() {

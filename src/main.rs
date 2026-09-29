@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod adaptive_multipath;
 pub mod api;
 pub mod buffer;
 pub mod client;
