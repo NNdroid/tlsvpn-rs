@@ -32,6 +32,8 @@ pub struct HandshakeReq {
     pub protocol_version: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_instance: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub conn_id: String,
     pub client_id: String,
     pub psk: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
