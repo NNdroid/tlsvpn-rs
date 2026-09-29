@@ -1186,6 +1186,7 @@ impl BackendNotify {
 
 pub struct Backend {
     pub ch: Sender<VPNFrame>,
+    pub conn_id: Arc<Mutex<String>>,
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
     pub scheduler: Arc<SchedulerBackendState>,
@@ -1287,6 +1288,18 @@ impl AsyncPort {
             .read()
             .iter()
             .map(|b| (b.rtt_cache.load(Ordering::Relaxed), b.scheduler.snapshot()))
+            .collect()
+    }
+
+    pub fn diagnostic_paths(&self) -> Vec<(String, u32, SchedulerSnapshot)> {
+        self.backends
+            .read()
+            .iter()
+            .map(|b| (
+                b.conn_id.lock().clone(),
+                b.rtt_cache.load(Ordering::Relaxed),
+                b.scheduler.snapshot(),
+            ))
             .collect()
     }
 
