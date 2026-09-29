@@ -35,7 +35,8 @@
     </div>
     <div class="fv-batch"><div class="fv-sub">${s.batch} · soft limit 12 KiB · maximum TLS plaintext 16 KiB</div><div class="fv-scroll"><div class="fv-batch-row"><span>Frame #42 · padLen=0</span><span>Frame #43 · padLen=0</span><span>Final frame · padLen=N</span></div></div></div>
     <div class="fv-flow">Ethernet → AEAD (+16 B) → 10 B TLSVPN header → aggregate frames → optional MSS-alignment tail padding → TLS Write</div>
-    <div class="fv-note">seq=0 handshake/control/heartbeat frames bypass inner AEAD. Standalone control frames may still use bucket/off padding selected by pad_mode; the aggregated data plane does not bucket-pad every frame.</div>`;
+    <div class="fv-note">seq=0 handshake/control/heartbeat frames bypass inner AEAD. Standalone control frames may still use bucket/off padding selected by pad_mode; the aggregated data plane does not bucket-pad every frame.</div>
+    <div class="fv-note">Legacy migration note: the old per-frame bucket example “60 B → 1600 B” is no longer the data-plane behavior; it is retained here only to identify obsolete documentation.</div>`;
   const host=root.querySelector('.st-grid')||root.querySelector('.status-grid')||root;
   host.appendChild(card);
 })();
