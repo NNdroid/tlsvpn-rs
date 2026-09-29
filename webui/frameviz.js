@@ -41,6 +41,42 @@
       flow:'Ethernet → AEAD(+16B) → 10B TLSVPN header → aggregate frames → optional MSS-alignment tail padding → TLS Write',
       note:'TLS plaintext is capped at 16 KiB. Tail padding is only an MSS-alignment hint and is skipped when it exceeds the budget. seq=0 handshake/control/heartbeat frames bypass inner AEAD; standalone control frames may still use bucket/off padding from pad_mode.',
       nonce:'Nonce: AES-GCM / ChaCha20 = seq(4BE)||salt(8B); XChaCha20 = derived 20B prefix||seq(4BE).'
+    },
+    de: {
+      title:'Beispiel für Frame-Format', sub:'Aktueller Datenpfad · aggregierte Writes · kein Live-Mitschnitt', example:'1514-B-Ethernet-Datenframe mit innerem AEAD',
+      header:'10-B-Header', cipher:'1514 B Chiffretext', tag:'16-B-AEAD-Tag', tail:'Optionales Padding nur am Batch-Ende',
+      hdesc:'Fester Big-Endian-Header: [dataLen:u32][padLen:u16][seq:u32]. Hier dataLen=1514+16=1530; normale Datenframes nutzen padLen=0; seq=42.',
+      cdesc:'Bei seq>0 wird das ausgehandelte innere AEAD verwendet. AAD = dataLen(4B BE) || seq(4B BE).',
+      tdesc:'AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305 und XChaCha20-Poly1305 verwenden einen 16-B-Authentifizierungs-Tag.',
+      pdesc:'Der Datenpfad führt kein Bucket-Padding mehr pro Frame aus. Mehrere TLSVPN-Frames werden zuerst aggregiert; nur der letzte Frame des TLS-Plaintext-Batches darf padLen erhalten. Das Padding muss sowohl innerhalb von 10% der Nutzdaten als auch unter 512 B bleiben.',
+      batch:'TLS-Plaintext-Batch (12 KiB Soft-Limit)', b1:'Frame #42 · padLen=0', b2:'Frame #43 · padLen=0', b3:'Letzter Frame · padLen=N',
+      flow:'Ethernet → AEAD(+16B) → 10-B-TLSVPN-Header → Frames aggregieren → optionales MSS-Tail-Padding → TLS Write',
+      note:'TLS-Plaintext ist auf 16 KiB begrenzt. Tail-Padding ist nur ein MSS-Ausrichtungshinweis und entfällt oberhalb des Budgets. seq=0 Handshake-/Control-/Heartbeat-Frames umgehen das innere AEAD; einzelne Control-Frames können weiterhin bucket/off aus pad_mode verwenden.',
+      nonce:'Nonce: AES-GCM / ChaCha20 = seq(4BE)||salt(8B); XChaCha20 = abgeleitetes 20B-Präfix||seq(4BE).'
+    },
+    fr: {
+      title:'Exemple de format de trame', sub:'Plan de données actuel · écritures agrégées · pas une capture en direct', example:'Trame Ethernet de 1514 o avec AEAD interne',
+      header:'En-tête 10 o', cipher:'Chiffré 1514 o', tag:'Tag AEAD 16 o', tail:'Padding optionnel uniquement en fin de batch',
+      hdesc:'En-tête big-endian fixe : [dataLen:u32][padLen:u16][seq:u32]. Ici dataLen=1514+16=1530 ; les trames de données ordinaires utilisent padLen=0 ; seq=42.',
+      cdesc:'Pour seq>0, l’AEAD interne négocié est utilisé. AAD = dataLen(4B BE) || seq(4B BE).',
+      tdesc:'AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305 et XChaCha20-Poly1305 utilisent tous un tag d’authentification de 16 o.',
+      pdesc:'Le plan de données ne fait plus de bucket padding sur chaque trame. Plusieurs trames TLSVPN sont d’abord agrégées ; seule la dernière trame du batch TLS en clair peut recevoir padLen. Le padding doit rester sous 10% des octets utiles du batch et sous 512 o.',
+      batch:'Batch TLS en clair (limite souple 12 KiB)', b1:'Frame #42 · padLen=0', b2:'Frame #43 · padLen=0', b3:'Dernière trame · padLen=N',
+      flow:'Ethernet → AEAD(+16B) → en-tête TLSVPN 10 o → agrégation → padding final optionnel aligné MSS → TLS Write',
+      note:'Le texte clair TLS est plafonné à 16 KiB. Le padding final n’est qu’une aide d’alignement MSS et est ignoré hors budget. Les trames seq=0 de handshake/control/heartbeat n’utilisent pas l’AEAD interne ; les trames de contrôle autonomes peuvent encore utiliser bucket/off via pad_mode.',
+      nonce:'Nonce : AES-GCM / ChaCha20 = seq(4BE)||salt(8B) ; XChaCha20 = préfixe dérivé 20B||seq(4BE).'
+    },
+    ja: {
+      title:'フレーム形式の例', sub:'現在のデータプレーン · 集約 Write · ライブキャプチャではありません', example:'内部 AEAD を使用する 1514 B Ethernet データフレーム',
+      header:'10 B ヘッダー', cipher:'1514 B 暗号文', tag:'16 B AEAD タグ', tail:'batch 末尾のみ任意 Padding',
+      hdesc:'固定ビッグエンディアンヘッダー：[dataLen:u32][padLen:u16][seq:u32]。この例は dataLen=1514+16=1530、通常のデータフレームは padLen=0、seq=42。',
+      cdesc:'seq>0 ではネゴシエート済み内部 AEAD を使用します。AAD = dataLen(4B BE) || seq(4B BE)。',
+      tdesc:'AES-256-GCM、AES-128-GCM、ChaCha20-Poly1305、XChaCha20-Poly1305 はすべて 16 B 認証タグを使用します。',
+      pdesc:'データプレーンはフレームごとの bucket padding を行いません。複数 TLSVPN フレームを先に集約し、TLS plaintext batch の最後のフレームだけが padLen を持てます。padding は有効 batch バイトの 10% と 512 B の両方を超えてはいけません。',
+      batch:'TLS plaintext batch（ソフト上限 12 KiB）', b1:'Frame #42 · padLen=0', b2:'Frame #43 · padLen=0', b3:'最終 frame · padLen=N',
+      flow:'Ethernet → AEAD(+16B) → 10B TLSVPN header → 複数 frame 集約 → 任意の MSS 整列 tail padding → TLS Write',
+      note:'TLS plaintext の最大値は 16 KiB です。tail padding は MSS 整列のヒントだけで、予算を超える場合は追加されません。seq=0 の handshake/control/heartbeat frame は内部 AEAD を使わず、単独 control frame は pad_mode の bucket/off を引き続き利用できます。',
+      nonce:'Nonce：AES-GCM / ChaCha20 = seq(4BE)||salt(8B)；XChaCha20 = 派生 20B prefix||seq(4BE)。'
     }
   };
   const s = dict[lang] || dict.en;
