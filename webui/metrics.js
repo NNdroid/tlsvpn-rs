@@ -24,13 +24,16 @@
 
   function qualityStats(data) {
     const c = aggregateClientCounters(data || {});
-    const queueDropped = num(data && data.dropped_frames);
+    const dropped = num(data && data.dropped_frames);
     const fec = data && data.fec ? data.fec : {};
     const parityTx = num(fec.parity_tx);
-    // tx_packets counts every successfully written tunnel frame, including FEC
-    // parity. Subtract parity before comparing with data-frame queue drops.
+    // tx_packets counts successfully written tunnel frames including FEC parity.
+    // parity_tx lets us estimate the original data-frame count for FEC overhead.
     const dataTxPackets = Math.max(0, c.txPackets - parityTx);
-    const txAttempts = dataTxPackets + queueDropped;
+    // dropped_frames is also an all-tunnel-frame counter: data batches and parity
+    // delivery failures can both increment it. Keep the drop denominator in that
+    // same all-frame domain rather than subtracting parity.
+    const txAttempts = c.txPackets + dropped;
     const recovered = num(fec.recovered);
     const lost = num(fec.lost);
     const missing = recovered + lost;
@@ -43,7 +46,7 @@
       // TX bytes are wire batches (framing/padding included), so combining TX
       // and RX here would mix two different byte domains.
       avgPacketBytes: c.rxPackets > 0 ? c.rxBytes / c.rxPackets : null,
-      queueDropPct: txAttempts > 0 ? queueDropped / txAttempts * 100 : null,
+      txDropPct: txAttempts > 0 ? dropped / txAttempts * 100 : null,
       // FEC overhead means extra parity relative to original data, not parity as
       // a fraction of the already-expanded total. K=4 therefore reports ~25%.
       fecOverheadPct: dataTxPackets > 0 ? parityTx / dataTxPackets * 100 : null,
@@ -68,7 +71,7 @@
   // dgRun historically read skipped_frames/gap_events from drop_breakdown even
   // though the backend publishes those fields in data.reorder. Preserve the
   // rest of dgRun unchanged and feed each value from the matching source. The
-  // top-level dropped_frames fallback also keeps Rust's queue-drop diagnostic
+  // top-level dropped_frames fallback also keeps Rust's TX-drop diagnostic
   // useful while older stats payloads do not contain drop_breakdown.
   const legacyDgRun = dgRun;
   dgRun = function (data) {
@@ -98,8 +101,8 @@
     if (q.avgPacketBytes !== null) {
       out.push(chip(t('ov.avgpkt'), fmtBytes(Math.round(q.avgPacketBytes))));
     }
-    if (q.queueDropPct !== null) {
-      const d = q.queueDropPct;
+    if (q.txDropPct !== null) {
+      const d = q.txDropPct;
       out.push(chip(t('ov.drop_pct'), d.toFixed(3) + '%', d > 1 ? 'bad' : (d > 0 ? 'warn' : 'good')));
     }
     const fec = data && data.fec ? data.fec : {};
@@ -120,26 +123,32 @@
     if (I18N['zh-CN']) {
       I18N['zh-CN'].ov.fec_eff = 'FEC 恢复率';
       I18N['zh-CN'].ov.avgpkt = '平均接收帧大小';
+      I18N['zh-CN'].ov.drop_pct = '发送丢帧率';
     }
     if (I18N['zh-TW']) {
       I18N['zh-TW'].ov.fec_eff = 'FEC 復原率';
       I18N['zh-TW'].ov.avgpkt = '平均接收幀大小';
+      I18N['zh-TW'].ov.drop_pct = '傳送丟幀率';
     }
     if (I18N.en) {
       I18N.en.ov.fec_eff = 'FEC recovery rate';
       I18N.en.ov.avgpkt = 'Avg RX frame size';
+      I18N.en.ov.drop_pct = 'TX frame drop rate';
     }
     if (I18N.de) {
       I18N.de.ov.fec_eff = 'FEC-Wiederherstellungsrate';
       I18N.de.ov.avgpkt = 'Ø RX-Framegröße';
+      I18N.de.ov.drop_pct = 'TX-Frame-Verlustrate';
     }
     if (I18N.fr) {
       I18N.fr.ov.fec_eff = 'Taux de récupération FEC';
       I18N.fr.ov.avgpkt = 'Taille moy. trame RX';
+      I18N.fr.ov.drop_pct = 'Taux de perte TX';
     }
     if (I18N.ja) {
       I18N.ja.ov.fec_eff = 'FEC 復元率';
       I18N.ja.ov.avgpkt = '平均 RX フレームサイズ';
+      I18N.ja.ov.drop_pct = 'TX フレーム損失率';
     }
   } catch (_) {}
 })();
