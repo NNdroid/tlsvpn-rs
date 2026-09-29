@@ -42,7 +42,9 @@ fn embedded_index_loads_metric_corrections_after_app() {
     );
 
     let html = fs::read_to_string(root.join("webui/index.html")).expect("webui/index.html");
+    let i18n = html.find("<script src=\"i18n.js\"></script>").expect("i18n.js script");
     let app = html.find("<script src=\"app.js\"></script>").expect("app.js script");
+    assert!(i18n < app, "i18n.js must load before app.js");
     // webui_assets injects metrics.js at </body>, therefore it is guaranteed to
     // execute after the static app.js script already present in index.html.
     let body_end = html.find("</body>").expect("body end");

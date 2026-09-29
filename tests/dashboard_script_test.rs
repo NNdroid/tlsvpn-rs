@@ -10,82 +10,39 @@ fn webui_matches_shared_static_asset_contract() {
     let root = webui();
     let index = fs::read_to_string(root.join("index.html")).expect("index.html");
     let app = fs::read_to_string(root.join("app.js")).expect("app.js");
+    let i18n = fs::read_to_string(root.join("i18n.js")).expect("i18n.js");
     let css = fs::read_to_string(root.join("style.css")).expect("style.css");
     let frameviz = fs::read_to_string(root.join("frameviz.js")).expect("frameviz.js");
-
-    assert!(index.contains("/favicon.ico"), "missing local favicon link");
-    assert!(
-        index.contains("src=\"app.js\""),
-        "index must load shared app.js"
-    );
-    assert!(
-        index.contains("data-v=\"zh-TW\""),
-        "Rust rendered index must include Go's zh-TW injection"
-    );
-    assert!(
-        app.contains("platformAssetName"),
-        "missing local OS/arch icon mapper"
-    );
-    assert!(app.contains("/api/stats"), "dashboard must use stats API");
-    assert!(
-        css.contains("platform-badge"),
-        "missing platform icon styles"
-    );
-
-    for marker in [
-        "Frame format example",
-        "帧格式示例",
-        "訊框格式範例",
-        "AES-256-GCM",
-        "AES-128-GCM",
-        "ChaCha20-Poly1305",
-        "XChaCha20-Poly1305",
-        "1514 B",
-        "1530 B",
-        "60 B → 1600 B",
-        "4 B BE",
-        "seq=0",
-        "1 MiB",
-    ] {
+    assert!(index.contains("/favicon.ico"));
+    let i18n_pos = index.find("src=\"i18n.js\"").expect("i18n.js script");
+    let app_pos = index.find("src=\"app.js\"").expect("app.js script");
+    assert!(i18n_pos < app_pos, "i18n.js must load before app.js");
+    assert!(index.contains("data-v=\"zh-TW\""));
+    assert!(!index.contains("zh-tw.js") && !index.contains("frameviz-zh-tw.js"));
+    assert!(!app.contains("const I18N={"));
+    for marker in ["const I18N={", "const FRAMEVIZ_I18N=", "'zh-CN'", "'zh-TW'", "'de'", "'fr'", "'ja'", "Frame format example", "FEC recovery rate"] {
+        assert!(i18n.contains(marker), "i18n.js missing {marker:?}");
+    }
+    assert!(app.contains("platformAssetName"));
+    assert!(app.contains("/api/stats"));
+    assert!(css.contains("platform-badge"));
+    for marker in ["FRAMEVIZ_I18N[LANG]", "AES-256-GCM", "AES-128-GCM", "ChaCha20-Poly1305", "XChaCha20-Poly1305", "1514 B", "1530 B", "12 KiB", "16 KiB", "padLen=0", "4 B BE", "seq=0", "1 MiB"] {
         assert!(frameviz.contains(marker), "frameviz missing {marker:?}");
     }
-
-    for file in [
-        "favicon.ico",
-        "frameviz.js",
-        "frameviz-zh-tw.js",
-        "icons/os-linux.svg",
-        "icons/os-windows.svg",
-        "icons/os-macos.svg",
-        "icons/os-android.svg",
-        "icons/arch-x86_64.svg",
-        "icons/arch-arm64.svg",
-        "icons/arch-riscv64.svg",
-    ] {
+    for file in ["favicon.ico", "i18n.js", "frameviz.js", "icons/os-linux.svg", "icons/os-windows.svg", "icons/os-macos.svg", "icons/os-android.svg", "icons/arch-x86_64.svg", "icons/arch-arm64.svg", "icons/arch-riscv64.svg"] {
         let meta = fs::metadata(root.join(file)).unwrap_or_else(|e| panic!("missing {file}: {e}"));
         assert!(meta.len() > 0, "empty asset: {file}");
     }
+    for old in ["zh-tw.js", "frameviz-zh-tw.js"] { assert!(!root.join(old).exists(), "obsolete asset remains: {old}"); }
 }
 
 #[test]
 fn rust_embed_table_covers_primary_assets() {
-    let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/webui_assets.rs"))
-        .expect("webui_assets.rs");
-    for route in [
-        "/",
-        "/index.html",
-        "/style.css",
-        "/app.js",
-        "/frameviz.js",
-        "/frameviz-zh-tw.js",
-        "/favicon.ico",
-        "/icons/os-linux.svg",
-    ] {
-        assert!(
-            src.contains(&format!("\"{route}\"")),
-            "embed table missing {route}"
-        );
+    let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/webui_assets.rs")).expect("webui_assets.rs");
+    for route in ["/", "/index.html", "/style.css", "/i18n.js", "/app.js", "/frameviz.js", "/metrics.js", "/favicon.ico", "/icons/os-linux.svg"] {
+        assert!(src.contains(&format!("\"{route}\"")), "embed table missing {route}");
     }
+    assert!(!src.contains("/zh-tw.js") && !src.contains("/frameviz-zh-tw.js"));
 }
 
 #[test]

@@ -186,49 +186,4 @@
     const tip = t('sched.cumulative') + ': ' + fmtBytes(num(s.assigned_bytes)) + ' / ' + num(s.assigned_batches) + ' ' + t('sched.batch_unit');
     return '<div class="sched-cell" title="' + esc(tip) + '"><span class="badge ' + cls + '">' + esc(state) + '</span><small class="dim">' + esc(meta) + '</small></div>';
   };
-
-  function setSchedWords(obj, words) {
-    if (!obj) return;
-    obj.sched = obj.sched || {};
-    Object.keys(words).forEach(function (k) { obj.sched[k] = words[k]; });
-  }
-
-  try {
-    if (I18N['zh-CN']) {
-      I18N['zh-CN'].ov.fec_eff = 'FEC 恢复率';
-      I18N['zh-CN'].ov.avgpkt = '平均接收帧大小';
-      I18N['zh-CN'].ov.drop_pct = '发送丢帧率';
-      setSchedWords(I18N['zh-CN'], {assign:'分配', capacity:'路径容量', qeta:'队列 ETA', batches:'批次', cumulative:'累计分配', batch_unit:'批', alloc_total:'调度'});
-    }
-    if (I18N['zh-TW']) {
-      I18N['zh-TW'].ov.fec_eff = 'FEC 復原率';
-      I18N['zh-TW'].ov.avgpkt = '平均接收幀大小';
-      I18N['zh-TW'].ov.drop_pct = '傳送丟幀率';
-      setSchedWords(I18N['zh-TW'], {assign:'分配', capacity:'路徑容量', qeta:'佇列 ETA', batches:'批次', cumulative:'累計分配', batch_unit:'批', alloc_total:'排程'});
-    }
-    if (I18N.en) {
-      I18N.en.ov.fec_eff = 'FEC recovery rate';
-      I18N.en.ov.avgpkt = 'Avg RX frame size';
-      I18N.en.ov.drop_pct = 'TX frame drop rate';
-      setSchedWords(I18N.en, {assign:'assigned', capacity:'path capacity', qeta:'queue ETA', batches:'batches', cumulative:'lifetime assigned', batch_unit:'batches', alloc_total:'scheduled'});
-    }
-    if (I18N.de) {
-      I18N.de.ov.fec_eff = 'FEC-Wiederherstellungsrate';
-      I18N.de.ov.avgpkt = 'Ø RX-Framegröße';
-      I18N.de.ov.drop_pct = 'TX-Frame-Verlustrate';
-      setSchedWords(I18N.de, {assign:'Zuweisung', capacity:'Pfadkapazität', qeta:'Queue-ETA', batches:'Batches', cumulative:'kumuliert', batch_unit:'Batches', alloc_total:'geplant'});
-    }
-    if (I18N.fr) {
-      I18N.fr.ov.fec_eff = 'Taux de récupération FEC';
-      I18N.fr.ov.avgpkt = 'Taille moy. trame RX';
-      I18N.fr.ov.drop_pct = 'Taux de perte TX';
-      setSchedWords(I18N.fr, {assign:'affecté', capacity:'capacité chemin', qeta:'ETA file', batches:'lots', cumulative:'cumul affecté', batch_unit:'lots', alloc_total:'planifié'});
-    }
-    if (I18N.ja) {
-      I18N.ja.ov.fec_eff = 'FEC 復元率';
-      I18N.ja.ov.avgpkt = '平均 RX フレームサイズ';
-      I18N.ja.ov.drop_pct = 'TX フレーム損失率';
-      setSchedWords(I18N.ja, {assign:'割当', capacity:'パス容量', qeta:'キュー ETA', batches:'バッチ', cumulative:'累積割当', batch_unit:'バッチ', alloc_total:'スケジュール'});
-    }
-  } catch (_) {}
 })();
