@@ -8,7 +8,10 @@ fn metric_formula_contract() {
     for want in [
         "Math.ceil(v.length * 0.95) - 1",
         "const reorder = data.reorder || {}",
-        "const txAttempts = c.txPackets + queueDropped",
+        "const dataTxPackets = Math.max(0, c.txPackets - parityTx)",
+        "const txAttempts = dataTxPackets + queueDropped",
+        "c.rxBytes / c.rxPackets",
+        "parityTx / dataTxPackets * 100",
         "const missing = recovered + lost",
         "recovered / missing * 100",
     ] {
@@ -18,10 +21,13 @@ fn metric_formula_contract() {
         !js.contains("data.quality"),
         "quality values must be derived from real counters"
     );
-    assert!(
-        !(js.contains("parity_tx") && js.contains("fecRecoveryPct")),
-        "FEC recovery rate must not use locally transmitted parity"
-    );
+    for wrong in [
+        "recovered / parityTx",
+        "recovered / num(fec.parity_tx)",
+        "parityTx / c.txPackets",
+    ] {
+        assert!(!js.contains(wrong), "mixed-domain FEC formula reintroduced: {wrong:?}");
+    }
 }
 
 #[test]
