@@ -24,20 +24,29 @@
 
   function qualityStats(data) {
     const c = aggregateClientCounters(data || {});
-    const packets = c.txPackets + c.rxPackets;
-    const bytes = c.txBytes + c.rxBytes;
     const queueDropped = num(data && data.dropped_frames);
-    const txAttempts = c.txPackets + queueDropped;
     const fec = data && data.fec ? data.fec : {};
+    const parityTx = num(fec.parity_tx);
+    // tx_packets counts every successfully written tunnel frame, including FEC
+    // parity. Subtract parity before comparing with data-frame queue drops.
+    const dataTxPackets = Math.max(0, c.txPackets - parityTx);
+    const txAttempts = dataTxPackets + queueDropped;
     const recovered = num(fec.recovered);
     const lost = num(fec.lost);
     const missing = recovered + lost;
     return {
-      packets: packets,
-      avgPacketBytes: packets > 0 ? bytes / packets : null,
-      // dropped_frames is the TX/input-queue drop counter. Keep the denominator
-      // in the same domain: successful TX frames + queue-dropped TX frames.
+      txPackets: c.txPackets,
+      rxPackets: c.rxPackets,
+      dataTxPackets: dataTxPackets,
+      parityTx: parityTx,
+      // RX bytes and RX packets are counted at the same decoded-frame boundary.
+      // TX bytes are wire batches (framing/padding included), so combining TX
+      // and RX here would mix two different byte domains.
+      avgPacketBytes: c.rxPackets > 0 ? c.rxBytes / c.rxPackets : null,
       queueDropPct: txAttempts > 0 ? queueDropped / txAttempts * 100 : null,
+      // FEC overhead means extra parity relative to original data, not parity as
+      // a fraction of the already-expanded total. K=4 therefore reports ~25%.
+      fecOverheadPct: dataTxPackets > 0 ? parityTx / dataTxPackets * 100 : null,
       // recovered/lost are both receive-side FEC outcomes. Do not divide them by
       // locally transmitted parity, which is the opposite traffic direction.
       fecRecoveryPct: missing > 0 ? recovered / missing * 100 : null
@@ -98,18 +107,39 @@
       const p = q.fecRecoveryPct;
       out.push(chip(t('ov.fec_eff'), p.toFixed(1) + '%', num(fec.lost) > 0 ? 'warn' : 'good'));
     }
+    const fecOverhead = document.getElementById('fec-overhead');
+    if (fecOverhead) {
+      fecOverhead.innerText = q.fecOverheadPct === null ? '-' : q.fecOverheadPct.toFixed(1) + '%';
+    }
     const el = document.getElementById('conn-quality');
     if (el) el.innerHTML = out.join('');
   };
 
-  // The old label said “efficiency” even though the corrected statistic is the
-  // receive-side recovered/(recovered+lost) ratio.
+  // Correct labels for the corrected domains.
   try {
-    if (I18N['zh-CN']) I18N['zh-CN'].ov.fec_eff = 'FEC 恢复率';
-    if (I18N['zh-TW']) I18N['zh-TW'].ov.fec_eff = 'FEC 復原率';
-    if (I18N.en) I18N.en.ov.fec_eff = 'FEC recovery rate';
-    if (I18N.de) I18N.de.ov.fec_eff = 'FEC-Wiederherstellungsrate';
-    if (I18N.fr) I18N.fr.ov.fec_eff = 'Taux de récupération FEC';
-    if (I18N.ja) I18N.ja.ov.fec_eff = 'FEC 復元率';
+    if (I18N['zh-CN']) {
+      I18N['zh-CN'].ov.fec_eff = 'FEC 恢复率';
+      I18N['zh-CN'].ov.avgpkt = '平均接收帧大小';
+    }
+    if (I18N['zh-TW']) {
+      I18N['zh-TW'].ov.fec_eff = 'FEC 復原率';
+      I18N['zh-TW'].ov.avgpkt = '平均接收幀大小';
+    }
+    if (I18N.en) {
+      I18N.en.ov.fec_eff = 'FEC recovery rate';
+      I18N.en.ov.avgpkt = 'Avg RX frame size';
+    }
+    if (I18N.de) {
+      I18N.de.ov.fec_eff = 'FEC-Wiederherstellungsrate';
+      I18N.de.ov.avgpkt = 'Ø RX-Framegröße';
+    }
+    if (I18N.fr) {
+      I18N.fr.ov.fec_eff = 'Taux de récupération FEC';
+      I18N.fr.ov.avgpkt = 'Taille moy. trame RX';
+    }
+    if (I18N.ja) {
+      I18N.ja.ov.fec_eff = 'FEC 復元率';
+      I18N.ja.ov.avgpkt = '平均 RX フレームサイズ';
+    }
   } catch (_) {}
 })();
