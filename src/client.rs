@@ -1593,6 +1593,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tx.clone(),
+        owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
         conn_id: Arc::new(Mutex::new(conn_id.clone())),
         rtt_cache: rtt_cache.clone(),
         notify: Some(Arc::new(BackendNotify::new(
@@ -1673,7 +1674,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // queued after the previous 32 KiB drain and rustls is not blocked
         // on socket writes, poll nonblocking so we service that backlog
         // immediately while still observing socket readability.
-        poll_timeout = clamp_poll_for_tx_backlog(poll_timeout, !rx.is_empty(), tls.wants_write());
+        poll_timeout = clamp_poll_for_tx_backlog(
+            poll_timeout,
+            !backend_tx_is_empty(Some(backend.as_ref()), &rx),
+            tls.wants_write(),
+        );
         if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
             close_reason = format!("mio poll failed: {e}");
             break;
@@ -1861,18 +1866,21 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
-            while let Ok(f) = rx.try_recv() {
-                let payload_len = f.data.as_slice().len() as u64;
-                let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                last_frame_start = Some(append_unpadded_frame(
-                    &mut send_buf,
-                    f.seq,
-                    f.data.as_slice(),
-                    ic_ref,
-                ));
-                f.data.release();
-                queued_payload_pending = queued_payload_pending.saturating_add(payload_len);
-                tx_packets_batch += 1;
+            while let Some(batch) = try_recv_backend_batch(Some(backend.as_ref()), &rx) {
+                let batch_bytes = batch.bytes;
+                let batch_frames = batch.frames.len() as u64;
+                for f in batch.frames {
+                    let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
+                    last_frame_start = Some(append_unpadded_frame(
+                        &mut send_buf,
+                        f.seq,
+                        f.data.as_slice(),
+                        ic_ref,
+                    ));
+                    f.data.release();
+                }
+                queued_payload_pending = queued_payload_pending.saturating_add(batch_bytes);
+                tx_packets_batch += batch_frames;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
                 }

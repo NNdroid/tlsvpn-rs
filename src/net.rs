@@ -1,10 +1,10 @@
-use crossbeam_channel::{Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use dashmap::{mapref::entry::Entry, DashMap};
 use mio;
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::adaptive_multipath::{
 use crate::buffer::release_frame_vec;
 use crate::crypto::*;
 use crate::fec::FecEncoder;
-use crate::frame::{FramePayload, VPNFrame};
+use crate::frame::{FramePayload, VPNFrame, VPNFrameBatch};
 use crate::protocol::{FecModeControl, FecTxModeState};
 use crate::utils::*;
 
@@ -1185,9 +1185,110 @@ impl BackendNotify {
     }
 }
 
+const OWNED_BATCH_MAX_FRAMES: usize = 8;
+const OWNED_BATCH_MAX_BYTES: u64 = 8 * 1024;
+
+struct OwnedBatchQueueInner {
+    batches: VecDeque<VPNFrameBatch>,
+    frames: usize,
+}
+
+/// Bounded ownership queue used by real TLS backends. Producers append a frame
+/// to the current tail batch when possible; the TLS writer atomically takes a
+/// complete batch. Capacity is still expressed in frames to preserve the old
+/// channel backpressure semantics seen by the adaptive scheduler.
+pub struct OwnedBatchQueue {
+    inner: Mutex<OwnedBatchQueueInner>,
+    capacity_frames: usize,
+}
+
+impl OwnedBatchQueue {
+    pub fn new(capacity_frames: usize) -> Self {
+        Self {
+            inner: Mutex::new(OwnedBatchQueueInner {
+                batches: VecDeque::new(),
+                frames: 0,
+            }),
+            capacity_frames: capacity_frames.max(1),
+        }
+    }
+
+    #[inline]
+    pub fn try_push(&self, frame: VPNFrame, bytes: u64) -> Result<(), VPNFrame> {
+        let mut inner = self.inner.lock();
+        if inner.frames >= self.capacity_frames {
+            return Err(frame);
+        }
+        let can_append = inner
+            .batches
+            .back()
+            .map(|batch| {
+                batch.frames.len() < OWNED_BATCH_MAX_FRAMES
+                    && batch.bytes.saturating_add(bytes) <= OWNED_BATCH_MAX_BYTES
+            })
+            .unwrap_or(false);
+        if can_append {
+            inner.batches.back_mut().unwrap().push(frame, bytes);
+        } else {
+            inner
+                .batches
+                .push_back(VPNFrameBatch::from_frame(frame, bytes));
+        }
+        inner.frames += 1;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_pop(&self) -> Option<VPNFrameBatch> {
+        let mut inner = self.inner.lock();
+        let batch = inner.batches.pop_front()?;
+        inner.frames = inner.frames.saturating_sub(batch.frames.len());
+        Some(batch)
+    }
+
+    #[inline]
+    pub fn len_frames(&self) -> usize {
+        self.inner.lock().frames
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().frames == 0
+    }
+
+    #[inline]
+    pub fn capacity_frames(&self) -> usize {
+        self.capacity_frames
+    }
+}
+
+/// Receive one ownership batch from a real backend; legacy/test backends are
+/// wrapped as a one-frame batch so cold-path tests keep their existing channel.
+#[inline]
+pub fn try_recv_backend_batch(
+    backend: Option<&Backend>,
+    legacy_rx: &Receiver<VPNFrame>,
+) -> Option<VPNFrameBatch> {
+    if let Some(queue) = backend.and_then(|b| b.owned_batches.as_deref()) {
+        return queue.try_pop();
+    }
+    let frame = legacy_rx.try_recv().ok()?;
+    let bytes = frame.data.as_slice().len() as u64;
+    Some(VPNFrameBatch::from_frame(frame, bytes))
+}
+
+#[inline]
+pub fn backend_tx_is_empty(backend: Option<&Backend>, legacy_rx: &Receiver<VPNFrame>) -> bool {
+    if let Some(queue) = backend.and_then(|b| b.owned_batches.as_deref()) {
+        return queue.is_empty();
+    }
+    legacy_rx.is_empty()
+}
+
 pub struct Backend {
     pub fec_fence_gen: AtomicU64,
     pub ch: Sender<VPNFrame>,
+    pub owned_batches: Option<Arc<OwnedBatchQueue>>,
     pub conn_id: Arc<Mutex<String>>,
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
@@ -1205,11 +1306,17 @@ impl AdaptiveBackend for Backend {
     }
     #[inline]
     fn scheduler_queue_len(&self) -> usize {
-        self.ch.len()
+        self.owned_batches
+            .as_deref()
+            .map(OwnedBatchQueue::len_frames)
+            .unwrap_or_else(|| self.ch.len())
     }
     #[inline]
     fn scheduler_queue_capacity(&self) -> usize {
-        self.ch.capacity().unwrap_or(4096)
+        self.owned_batches
+            .as_deref()
+            .map(OwnedBatchQueue::capacity_frames)
+            .unwrap_or_else(|| self.ch.capacity().unwrap_or(4096))
     }
 }
 
@@ -1342,6 +1449,20 @@ impl AsyncPort {
     ) -> Result<(), FramePayload> {
         let bytes = data.as_slice().len() as u64;
         b.scheduler.add_queued(bytes);
+        if let Some(queue) = &b.owned_batches {
+            return match queue.try_push(VPNFrame { seq, data }, bytes) {
+                Ok(()) => {
+                    if let Some(n) = &b.notify {
+                        n.wake();
+                    }
+                    Ok(())
+                }
+                Err(frame) => {
+                    b.scheduler.complete_queued(bytes);
+                    Err(frame.data)
+                }
+            };
+        }
         match b.ch.try_send(VPNFrame { seq, data }) {
             Ok(()) => {
                 if let Some(n) = &b.notify {
@@ -1373,8 +1494,7 @@ impl AsyncPort {
                 // Channel enqueue completed before publication. Any thread that
                 // observes this generation can only enqueue governed data after
                 // the control record already exists in this backend FIFO.
-                b.fec_fence_gen
-                    .store(control.generation, Ordering::Release);
+                b.fec_fence_gen.store(control.generation, Ordering::Release);
             }
         }
         self.try_send_payload_to(b, seq, data)
@@ -1587,13 +1707,8 @@ impl AsyncPort {
         };
 
         let selected_idx = self.selected_data_backend_index(&backends, incoming_bytes);
-        let data_idx = self.send_data_payload_to_any(
-            &backends,
-            selected_idx,
-            seq,
-            frame,
-            current_control,
-        );
+        let data_idx =
+            self.send_data_payload_to_any(&backends, selected_idx, seq, frame, current_control);
 
         if let Some(par) = parity {
             if backends.len() < 2 {
@@ -1988,6 +2103,7 @@ mod tests {
                 fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                owned_batches: None,
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
@@ -2017,6 +2133,7 @@ mod tests {
             fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx.clone(),
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
@@ -2064,6 +2181,7 @@ mod tests {
             fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx0.clone(),
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
@@ -2073,6 +2191,7 @@ mod tests {
             fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx1,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
@@ -2125,6 +2244,7 @@ mod tests {
             fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_a,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(250_000)),
             notify: None,
@@ -2133,6 +2253,7 @@ mod tests {
             fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_b,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(240_000)),
             notify: None,
@@ -2302,9 +2423,7 @@ mod tests {
         let (preferred, preferred_rx) = make_backend();
         let (fallback, fallback_rx) = make_backend();
 
-        preferred
-            .fec_fence_gen
-            .store(0, Ordering::Release);
+        preferred.fec_fence_gen.store(0, Ordering::Release);
         fallback.fec_fence_gen.store(0, Ordering::Release);
 
         // Publish a sender-authoritative SUSPEND without relying on scheduler
@@ -2425,7 +2544,8 @@ mod tests {
             .iter()
             .find(|frame| {
                 frame.seq == 0
-                    && frame.data.as_slice().first() == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
+                    && frame.data.as_slice().first()
+                        == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
             })
             .map(|frame| FecModeControl::parse(frame.data.as_slice()).unwrap())
             .expect("2->1 must emit FEC_MODE SUSPEND");
@@ -2446,7 +2566,8 @@ mod tests {
             .iter()
             .find(|frame| {
                 frame.seq == 0
-                    && frame.data.as_slice().first() == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
+                    && frame.data.as_slice().first()
+                        == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
             })
             .map(|frame| FecModeControl::parse(frame.data.as_slice()).unwrap())
             .expect("1->2 must emit FEC_MODE RESUME");

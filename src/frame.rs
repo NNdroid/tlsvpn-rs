@@ -347,6 +347,47 @@ pub struct VPNFrame {
     pub data: FramePayload,
 }
 
+/// Owned backend handoff unit. `bytes` is authoritative payload accounting and
+/// is accumulated once while frames enter the batch, so TLS writers do not
+/// rescan frame lengths after ownership transfer.
+pub struct VPNFrameBatch {
+    pub frames: Vec<VPNFrame>,
+    pub bytes: u64,
+}
+
+impl VPNFrameBatch {
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            frames: Vec::with_capacity(capacity),
+            bytes: 0,
+        }
+    }
+
+    #[inline]
+    pub fn from_frame(frame: VPNFrame, bytes: u64) -> Self {
+        let mut batch = Self::with_capacity(8);
+        batch.push(frame, bytes);
+        batch
+    }
+
+    #[inline]
+    pub fn push(&mut self, frame: VPNFrame, bytes: u64) {
+        self.frames.push(frame);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

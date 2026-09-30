@@ -559,7 +559,9 @@ impl WebStatsProvider for ServerCore {
             .sum();
         let mut server_conns = Vec::new();
         for s in sessions.values() {
-            for (idx, (conn_id, rtt, scheduler)) in s.port.diagnostic_paths().into_iter().enumerate() {
+            for (idx, (conn_id, rtt, scheduler)) in
+                s.port.diagnostic_paths().into_iter().enumerate()
+            {
                 server_conns.push(serde_json::json!({
                     "client_id": s.stat.client_id,
                     "conn_id": conn_id,
@@ -1006,6 +1008,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tap_tx,
+        owned_batches: None,
         conn_id: Arc::new(Mutex::new(String::new())),
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
@@ -1274,6 +1277,7 @@ fn worker_loop(
                 fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: Some(Arc::new(BackendNotify::new(
@@ -1881,18 +1885,21 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     let mut pulled_payload = 0u64;
     let mut last_frame_start = None;
     sess.send_buf.clear();
-    while let Ok(f) = sess.rx.try_recv() {
-        let payload_len = f.data.as_slice().len() as u64;
-        let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
-        last_frame_start = Some(append_unpadded_frame(
-            &mut sess.send_buf,
-            f.seq,
-            f.data.as_slice(),
-            ic_ref,
-        ));
-        f.data.release();
-        pulled_payload = pulled_payload.saturating_add(payload_len);
-        pulled += 1;
+    while let Some(batch) = try_recv_backend_batch(sess.tx_backend.as_deref(), &sess.rx) {
+        let batch_bytes = batch.bytes;
+        let batch_frames = batch.frames.len() as u64;
+        for f in batch.frames {
+            let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
+            last_frame_start = Some(append_unpadded_frame(
+                &mut sess.send_buf,
+                f.seq,
+                f.data.as_slice(),
+                ic_ref,
+            ));
+            f.data.release();
+        }
+        pulled_payload = pulled_payload.saturating_add(batch_bytes);
+        pulled = pulled.saturating_add(batch_frames);
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
         }
