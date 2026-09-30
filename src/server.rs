@@ -1885,7 +1885,13 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     let mut pulled_payload = 0u64;
     let mut last_frame_start = None;
     sess.send_buf.clear();
-    while let Some(batch) = try_recv_backend_batch(sess.tx_backend.as_deref(), &sess.rx) {
+    while let Some(batch) = try_recv_backend_batch(
+        sess.tx_backend.as_deref(),
+        &sess.rx,
+        MAX_TLS_PLAINTEXT_RECORD
+            .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
+            .saturating_sub(sess.send_buf.len()),
+    ) {
         let batch_bytes = batch.bytes;
         let batch_frames = batch.frames.len() as u64;
         for f in batch.frames {

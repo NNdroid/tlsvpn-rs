@@ -1859,14 +1859,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
         let mut last_frame_start = None;
-        if !tls.wants_write() && (woken || !rx.is_empty()) {
+        if !tls.wants_write() && (woken || !backend_tx_is_empty(Some(backend.as_ref()), &rx)) {
             if let Some(n) = &backend.notify {
                 // Only clear pending when we are actually going to drain the
                 // backend queue. If TLS is socket-backpressured, leave pending
                 // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
-            while let Some(batch) = try_recv_backend_batch(Some(backend.as_ref()), &rx) {
+            while let Some(batch) = try_recv_backend_batch(
+                Some(backend.as_ref()),
+                &rx,
+                MAX_TLS_PLAINTEXT_RECORD
+                    .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
+                    .saturating_sub(send_buf.len()),
+            ) {
                 let batch_bytes = batch.bytes;
                 let batch_frames = batch.frames.len() as u64;
                 for f in batch.frames {

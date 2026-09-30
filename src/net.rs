@@ -1187,6 +1187,10 @@ impl BackendNotify {
 
 const OWNED_BATCH_MAX_FRAMES: usize = 8;
 const OWNED_BATCH_MAX_BYTES: u64 = 8 * 1024;
+// Conservative framing allowance: 10-byte TLSVPN header + up to a 16-byte
+// inner AEAD tag, rounded up so a batch accepted under the budget cannot push
+// the rustls plaintext buffer past its hard record limit.
+const OWNED_BATCH_WIRE_OVERHEAD_PER_FRAME: usize = 32;
 
 struct OwnedBatchQueueInner {
     batches: VecDeque<VPNFrameBatch>,
@@ -1239,8 +1243,18 @@ impl OwnedBatchQueue {
     }
 
     #[inline]
-    pub fn try_pop(&self) -> Option<VPNFrameBatch> {
+    pub fn try_pop_fitting(&self, wire_budget: usize) -> Option<VPNFrameBatch> {
         let mut inner = self.inner.lock();
+        let front = inner.batches.front()?;
+        let estimated_wire = (front.bytes as usize).saturating_add(
+            front
+                .frames
+                .len()
+                .saturating_mul(OWNED_BATCH_WIRE_OVERHEAD_PER_FRAME),
+        );
+        if estimated_wire > wire_budget {
+            return None;
+        }
         let batch = inner.batches.pop_front()?;
         inner.frames = inner.frames.saturating_sub(batch.frames.len());
         Some(batch)
@@ -1268,9 +1282,10 @@ impl OwnedBatchQueue {
 pub fn try_recv_backend_batch(
     backend: Option<&Backend>,
     legacy_rx: &Receiver<VPNFrame>,
+    wire_budget: usize,
 ) -> Option<VPNFrameBatch> {
     if let Some(queue) = backend.and_then(|b| b.owned_batches.as_deref()) {
-        return queue.try_pop();
+        return queue.try_pop_fitting(wire_budget);
     }
     let frame = legacy_rx.try_recv().ok()?;
     let bytes = frame.data.as_slice().len() as u64;
@@ -2092,6 +2107,61 @@ pub type SharedFlag = Arc<AtomicBool>;
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    fn owned_test_frame(seq: u32, bytes: usize) -> VPNFrame {
+        VPNFrame {
+            seq,
+            data: FramePayload::Owned(vec![seq as u8; bytes]),
+        }
+    }
+
+    #[test]
+    fn owned_batch_queue_coalesces_and_preserves_accounting() {
+        let queue = OwnedBatchQueue::new(16);
+        assert!(queue.try_push(owned_test_frame(1, 1200), 1200).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 1300), 1300).is_ok());
+        assert_eq!(queue.len_frames(), 2);
+
+        let batch = queue.try_pop_fitting(4096).expect("batch must fit");
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.bytes, 2500);
+        assert_eq!(batch.frames[0].seq, 1);
+        assert_eq!(batch.frames[1].seq, 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn owned_batch_queue_keeps_front_when_wire_budget_is_too_small() {
+        let queue = OwnedBatchQueue::new(16);
+        assert!(queue.try_push(owned_test_frame(7, 1400), 1400).is_ok());
+        assert!(queue.try_push(owned_test_frame(8, 1400), 1400).is_ok());
+
+        assert!(queue.try_pop_fitting(2800).is_none());
+        assert_eq!(
+            queue.len_frames(),
+            2,
+            "failed fit must not consume ownership"
+        );
+
+        let batch = queue
+            .try_pop_fitting(4096)
+            .expect("larger budget must drain");
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.bytes, 2800);
+    }
+
+    #[test]
+    fn owned_batch_queue_capacity_remains_frame_based() {
+        let queue = OwnedBatchQueue::new(2);
+        assert!(queue.try_push(owned_test_frame(1, 64), 64).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 64), 64).is_ok());
+        let rejected = queue
+            .try_push(owned_test_frame(3, 64), 64)
+            .expect_err("third frame must hit frame capacity");
+        assert_eq!(rejected.seq, 3);
+        rejected.data.release();
+        assert_eq!(queue.len_frames(), 2);
+    }
 
     /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
     type TestBackend = (Arc<Backend>, crossbeam_channel::Receiver<VPNFrame>);
