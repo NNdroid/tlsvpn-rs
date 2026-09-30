@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 
 const root = path.resolve('webui');
 const openStreams = new Set();
+const legacyPollHits = [];
 
 function renderedIndex(src) {
   let html = src;
@@ -53,17 +54,15 @@ const server = http.createServer(async (req, res) => {
       res.end(renderedIndex(src));
       return;
     }
-    if (u.pathname === '/api/events') {
+    if (u.pathname === '/api/stream') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+      const emit = (name, value) => res.write(`event: ${name}\ndata: ${JSON.stringify(value)}\n\n`);
+      emit('stats', statsFixture()); emit('trend', { step_sec: 1, points: [] }); emit('logs', []); emit('events', []);
       res.write(': browser-smoke\n\n');
-      openStreams.add(res);
-      res.on('close', () => openStreams.delete(res));
-      return;
+      openStreams.add(res); res.on('close', () => openStreams.delete(res)); return;
     }
-    if (u.pathname === '/api/stats') {
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify(statsFixture()));
-      return;
+    if (['/api/stats','/api/trend','/api/logs','/api/events'].includes(u.pathname)) {
+      legacyPollHits.push(u.pathname); res.writeHead(418, { 'content-type': 'application/json' }); res.end('{"error":"legacy polling forbidden"}'); return;
     }
     if (u.pathname === '/api/auth/status') {
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -110,7 +109,7 @@ page.on('response', response => {
 });
 page.on('requestfailed', request => {
   const url = request.url();
-  if (url.startsWith(origin) && !url.includes('/api/events')) {
+  if (url.startsWith(origin) && !url.includes('/api/stream')) {
     failures.push(`[${activeLang}] request failed: ${url} (${request.failure()?.errorText || 'unknown'})`);
   }
 });
@@ -137,6 +136,7 @@ for (const lang of ['zh-CN', 'zh-TW', 'en', 'de', 'fr', 'ja']) {
   if (!state.framevizCard) failures.push(`[${lang}] frame visualizer did not render`);
 }
 
+if (legacyPollHits.length) failures.push('legacy polling requests observed: '+legacyPollHits.join(', '));
 await browser.close();
 for (const stream of openStreams) stream.end();
 await new Promise(resolve => server.close(resolve));
@@ -145,4 +145,4 @@ if (failures.length) {
   console.error('\nWebUI browser smoke failed:\n' + failures.map(x => ` - ${x}`).join('\n'));
   process.exit(1);
 }
-console.log('WebUI browser smoke passed: no page errors, console errors, or static asset failures across all locales.');
+console.log('WebUI browser smoke passed: SSE-only transport, no legacy polling, page errors, console errors, or static asset failures across all locales.');

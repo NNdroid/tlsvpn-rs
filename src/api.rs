@@ -896,6 +896,76 @@ fn load_web_ssl(cert: &str, key: &str) -> Result<tiny_http::SslConfig, String> {
 /// `ready` 若在 bind 前给出，bind 结果会在进入 accept 循环前回报
 /// （true=成功），供 web.bind=tunnel 的重绑管理器逐个采纳。单监听模式
 /// 传 None：失败直接记 error，因为没有下一轮会重试。
+
+fn dashboard_stats_json(provider: &Arc<dyn WebStatsProvider>, ctx: &Arc<RuntimeCtx>) -> serde_json::Value {
+    let mut stats = provider.stats_json();
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert("cfg".to_string(), ctx.cfg.read().clone());
+        let mut system = ctx.system.clone();
+        if let Some(sys) = system.as_object_mut() {
+            sys.insert("needs_restart".to_string(), json!(ctx.web.needs_restart()));
+        }
+        obj.insert("system".to_string(), system);
+        obj.insert("brutal_system".to_string(), brutal_system_status());
+        obj.insert("traffic".to_string(), ctx.web.traffic_json());
+        let client_traffic = ctx.web.client_traffic_json();
+        if client_traffic.as_array().map_or(false, |v| !v.is_empty()) {
+            obj.insert("client_traffic".to_string(), client_traffic);
+        }
+    }
+    stats
+}
+
+fn sse_json<T: serde::Serialize>(out: &mut Vec<u8>, event: &str, value: &T) {
+    if let Ok(data) = serde_json::to_string(value) {
+        out.extend_from_slice(format!("event: {event}\ndata: {data}\n\n").as_bytes());
+    }
+}
+
+struct DashboardStream {
+    provider: Arc<dyn WebStatsProvider>,
+    ctx: Arc<RuntimeCtx>,
+    interval: Duration,
+    range: String,
+    log_after: u64,
+    event_after: u64,
+    pending: Vec<u8>,
+    first: bool,
+}
+
+impl DashboardStream {
+    fn new(provider: Arc<dyn WebStatsProvider>, ctx: Arc<RuntimeCtx>, interval: Duration, range: String, log_after: u64, event_after: u64) -> Self {
+        Self { provider, ctx, interval, range, log_after, event_after, pending: Vec::new(), first: true }
+    }
+
+    fn refill(&mut self) {
+        if !self.first { std::thread::sleep(self.interval); }
+        self.first = false;
+        let mut out = Vec::with_capacity(32 * 1024);
+        sse_json(&mut out, "stats", &dashboard_stats_json(&self.provider, &self.ctx));
+        sse_json(&mut out, "trend", &self.ctx.web.trend_json(&self.range));
+        let logs = log_ring_snapshot(self.log_after);
+        if let Some(seq) = logs.last().and_then(|v| v.get("seq")).and_then(|v| v.as_u64()) { self.log_after = seq; }
+        if !logs.is_empty() { sse_json(&mut out, "logs", &logs); }
+        let events = self.ctx.web.events.snapshot(self.event_after);
+        if let Some(last) = events.last() { self.event_after = last.seq; }
+        if !events.is_empty() { sse_json(&mut out, "events", &events); }
+        out.extend_from_slice(b": ping\n\n");
+        self.pending = out;
+    }
+}
+
+impl Read for DashboardStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() { return Ok(0); }
+        if self.pending.is_empty() { self.refill(); }
+        let n = buf.len().min(self.pending.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
 fn serve_listener(
     addr: String,
     auth: String,
@@ -1084,24 +1154,28 @@ fn serve_listener(
 
         match (request.method(), url.as_str()) {
             (&Method::Get, "/api/stats") => {
-                // provider 出的是运行时数据；cfg/system 是启动时固定的上下文，
-                // 在这里并入，避免把静态字段重复写进 server/client 两处实现。
-                let mut stats = provider.stats_json();
-                if let Some(obj) = stats.as_object_mut() {
-                    obj.insert("cfg".to_string(), ctx.cfg.read().clone());
-                    let mut system = ctx.system.clone();
-                    if let Some(sys) = system.as_object_mut() {
-                        sys.insert("needs_restart".to_string(), json!(ctx.web.needs_restart()));
-                    }
-                    obj.insert("system".to_string(), system);
-                    obj.insert("brutal_system".to_string(), brutal_system_status());
-                    obj.insert("traffic".to_string(), ctx.web.traffic_json());
-                    let client_traffic = ctx.web.client_traffic_json();
-                    if client_traffic.as_array().map_or(false, |v| !v.is_empty()) {
-                        obj.insert("client_traffic".to_string(), client_traffic);
-                    }
-                }
-                respond_json(request, stats.to_string(), 200);
+                respond_json(request, dashboard_stats_json(&provider, &ctx).to_string(), 200);
+            }
+            (&Method::Get, "/api/stream") => {
+                let interval_ms = query_u64(request.url(), "interval_ms").clamp(250, 10_000);
+                let range = request.url().split_once('?')
+                    .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("range=")))
+                    .filter(|v| matches!(*v, "2m" | "1h" | "24h"))
+                    .unwrap_or("2m").to_string();
+                let stream = DashboardStream::new(
+                    provider.clone(), ctx.clone(), Duration::from_millis(interval_ms), range,
+                    query_u64(request.url(), "log_after"), query_u64(request.url(), "event_after"),
+                );
+                let headers = vec![
+                    http_header("Content-Type", "text/event-stream"),
+                    http_header("Cache-Control", "no-cache, no-store"),
+                    http_header("Connection", "keep-alive"),
+                    http_header("X-Accel-Buffering", "no"),
+                ];
+                std::thread::spawn(move || {
+                    let response = Response::new(StatusCode(200), headers, stream, None, None);
+                    let _ = request.respond(response);
+                });
             }
             (&Method::Get, "/api/logs") => {
                 let after: u64 = request
