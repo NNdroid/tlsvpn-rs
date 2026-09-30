@@ -1,0 +1,29 @@
+name: Apply WebUI all-SSE migration
+on:
+  push:
+    branches: [feature/webui-all-sse]
+    paths:
+      - scripts/apply_webui_all_sse.py
+      - .github/workflows/apply-webui-all-sse.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/webui-all-sse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Apply migration
+        run: python3 scripts/apply_webui_all_sse.py
+      - name: Commit generated changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "feat(webui): move dashboard refresh entirely to SSE"
+          git push origin HEAD:feature/webui-all-sse
