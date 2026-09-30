@@ -51,6 +51,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: NNdroid/tlsvpn
+        ref: perf/single-path-fec-bypass
         path: go-impl
 
     - name: Build Rust implementation and probe
