@@ -6,6 +6,14 @@ import { chromium } from 'playwright';
 const root = path.resolve('webui');
 const openStreams = new Set();
 const legacyPollHits = [];
+const framevizExpect = {
+  'zh-CN': ['协议头 (header)', '固定 10 B 大端序头。', '最后一帧 · padLen=N', '旧版迁移说明：'],
+  'zh-TW': ['協定標頭 (header)', '固定 10 B 大端序標頭。', '最後一幀 · padLen=N', '舊版遷移說明：'],
+  en: ['Protocol header', 'Fixed 10 B big-endian header.', 'Final frame · padLen=N', 'Legacy migration note:'],
+  de: ['Protokoll-Header', 'Fester 10-B-Big-Endian-Header.', 'Letzter Frame · padLen=N', 'Migrationshinweis:'],
+  fr: ['En-tête du protocole', 'En-tête big-endian fixe de 10 o.', 'Dernière trame · padLen=N', 'Note de migration :'],
+  ja: ['プロトコルヘッダー', '固定 10 B のビッグエンディアンヘッダーです。', '最終フレーム · padLen=N', '移行メモ：']
+};
 
 function renderedIndex(src) {
   let html = src;
@@ -126,7 +134,8 @@ for (const lang of ['zh-CN', 'zh-TW', 'en', 'de', 'fr', 'ja']) {
     translateType: typeof t,
     framevizType: typeof FRAMEVIZ_I18N,
     documentLang: document.documentElement.lang,
-    framevizCard: !!document.getElementById('frameviz-card')
+    framevizCard: !!document.getElementById('frameviz-card'),
+    framevizText: document.getElementById('frameviz-card')?.innerText || ''
   }));
   if (state.langType !== 'string') failures.push(`[${lang}] LANG is ${state.langType}`);
   if (state.i18nType !== 'object') failures.push(`[${lang}] I18N is ${state.i18nType}`);
@@ -134,6 +143,14 @@ for (const lang of ['zh-CN', 'zh-TW', 'en', 'de', 'fr', 'ja']) {
   if (state.framevizType !== 'object') failures.push(`[${lang}] FRAMEVIZ_I18N is ${state.framevizType}`);
   if (state.documentLang !== lang) failures.push(`[${lang}] document lang is ${state.documentLang}`);
   if (!state.framevizCard) failures.push(`[${lang}] frame visualizer did not render`);
+  for (const expected of framevizExpect[lang]) {
+    if (!state.framevizText.includes(expected)) failures.push(`[${lang}] frame visualizer missing localized text: ${expected}`);
+  }
+  if (lang !== 'en') {
+    for (const leaked of ['Fixed 10 B big-endian header.', 'Final frame · padLen=N', 'Legacy migration note:']) {
+      if (state.framevizText.includes(leaked)) failures.push(`[${lang}] frame visualizer leaked English text: ${leaked}`);
+    }
+  }
 }
 
 if (legacyPollHits.length) failures.push('legacy polling requests observed: '+legacyPollHits.join(', '));
@@ -145,4 +162,4 @@ if (failures.length) {
   console.error('\nWebUI browser smoke failed:\n' + failures.map(x => ` - ${x}`).join('\n'));
   process.exit(1);
 }
-console.log('WebUI browser smoke passed: SSE-only transport, no legacy polling, page errors, console errors, or static asset failures across all locales.');
+console.log('WebUI browser smoke passed: SSE-only transport, no browser/static-asset errors, and fully localized FrameViz rendering across all locales.');
