@@ -10,7 +10,7 @@ fn index_html() -> &'static [u8] {
             include_str!("../webui/index.html")
                 .replace(
                     "</body>",
-                    "<script src=\"metrics.js\"></script>\n</body>",
+                    "<script src=\"metrics.js\"></script>\n<script src=\"stream.js\"></script>\n</body>",
                 )
                 .into_bytes()
         })
@@ -29,6 +29,10 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         )),
         "/metrics.js" => Some((
             include_bytes!("../webui/metrics.js"),
+            "application/javascript; charset=utf-8",
+        )),
+        "/stream.js" => Some((
+            include_bytes!("../webui/stream.js"),
             "application/javascript; charset=utf-8",
         )),
         "/favicon.ico" => Some((include_bytes!("../webui/favicon.ico"), "image/x-icon")),

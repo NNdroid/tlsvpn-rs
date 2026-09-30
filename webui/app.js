@@ -44,7 +44,6 @@ function showPane(id){
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.pane===id));
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
   document.getElementById('pane-'+id).classList.add('on');
-  if(id==='logs')startLogPoll();else stopLogPoll();
   // 事件在后台一直攒着，面板不在前台时不渲染；切过来补一次全量绘制
   if(id==='events')evRender(false);
   if(id==='events')evRender(false);
@@ -212,14 +211,10 @@ if(REFRESH_S!==2&&REFRESH_S!==5&&REFRESH_S!==10){
   REFRESH_S=(ms===2000||ms===5000||ms===10000)?ms/1000:2;
 }
 let REFRESH=REFRESH_S*1000;
-let statsTimer=null;
 function setRefresh(sec){REFRESH_S=sec;REFRESH=sec*1000;localStorage.setItem('tlsvpn_refresh',String(sec));
   setSeg('refresh-seg',String(sec));
   document.getElementById('footer-text').textContent=t('footer').replace('{n}',sec);
-  restartLoop();}
-function restartLoop(){if(statsTimer)clearInterval(statsTimer);statsTimer=setInterval(fetchStats,REFRESH);
-  // 2 分钟视图跟着面板刷新周期走，刷新间隔改了也要同步换掉趋势定时器
-  if(chartRange==='2m')startTrendTimer();}
+  if(window.tlsvpnStreamRestart)window.tlsvpnStreamRestart();}
 
 // 用带凭据的地址（http://admin:xx@host/ 打开面板）时，Chrome 拒绝构造任何 fetch——
 // "Request cannot be constructed from a URL that includes credentials"——于是每一轮轮询都抛
@@ -827,11 +822,9 @@ let lastStats=null,lastStatsT=0,lastSpeeds={},lastTraffic=null,lastClientTraffic
 let prevPps={tx:0,rx:0,ok:false},prevConns={},lastConnsT=0,lastConnSpeeds={};
 // 异常提醒条手动关闭后，在下一个不同的告警组合出现前不再自动弹回
 let alertOff=false,alertSig='';
-async function fetchStats(){
+function applyStats(data){
+  if(!data)return;
   try{
-    const res=await fetch(url('/api/stats'),AUTH_HDR);
-    if(res.status===401){showUnauthorized();return;}
-    const data=await res.json();
     lastStats=data;
     lastStatsT=Date.now();
     const upd=document.getElementById('updated-at');
@@ -914,7 +907,7 @@ async function fetchStats(){
     document.getElementById('meta').innerText=meta.join(' · ');
 
 	renderConnsTable(data,true);renderMacsTable(data);renderBansTable(data);renderTraffic(data);renderStatus(data);
-  }catch(e){console.error('stats fetch failed',e);}
+  }catch(e){console.error('stats render failed',e);}
 }
 
 // 过滤输入时不重新拉取：对最近一次快照重渲染各表格
@@ -1921,7 +1914,6 @@ function drawerToLogs(){
   const clr=document.getElementById('log-filter-clear');
   if(clr)clr.classList.add('show');
   applyLogFilter();
-  pollLogs();
 }
 // 跳到流量页并选中该客户端；旧服务端不下发 client_traffic 时保留"全部"
 function drawerToTraffic(){
@@ -2094,7 +2086,7 @@ async function saveConfig(apply){
     if(apply){
       st.textContent=t('set.applied')+(data.needs_restart&&data.needs_restart.length?(' · '+t('set.restart_nr')+' '+data.needs_restart.join(', ')):'');
       toast(t('toast.applied'),'ok');
-      setTimeout(fetchStats,500);
+      setTimeout(function(){if(window.tlsvpnStreamRestart)window.tlsvpnStreamRestart();},500);
     }else{
       st.textContent=t('set.saved');
       toast(t('toast.saved'),'ok');
@@ -2106,8 +2098,8 @@ async function saveConfig(apply){
 // 事件本体在后端内存环形缓冲（events.go）：/api/events 默认推 SSE，?stream=0 给增量 JSON。
 // 浏览器 EventSource 带不了 Authorization 头，-web-auth 生效时直接走轮询；
 // seq 由服务端单调编号，SSE 重连回放与轮询续传都不会重也不会丢。
-let evItems=[],evSeq=0,evES=null,evTimer=null,evBad=0,evLvl='all',evMode='';
-const EV_MAX=300,EV_POLL_MS=2500;
+let evItems=[],evSeq=0,evLvl='all',evMode='reconn';
+const EV_MAX=300;
 // 类型 → 图标路径。这里必须是对象而不是数组：词法守卫按「前一个有效字符」判断花括号
 // 是不是对象字面量（只认 ( = , : ? ! & | + - * 与 return/yield），数组里的 {…} 会被当成
 // 块作用域，属性冒号就被误读成三元冒号，整段脚本直接失效。
@@ -2168,9 +2160,9 @@ function evLive(){
   const box=document.getElementById('ev-live');
   if(!box)return;
   let cls='';
-  let txt=t('ev.poll');
+  let txt=t('ev.reconn');
   if(evMode==='sse'){cls='ok';txt=t('ev.live');}
-  else if(evMode==='reconn'){cls='warn';txt=t('ev.reconn');}
+  else{cls='warn';txt=t('ev.reconn');}
   box.className='ev-live'+(cls?' '+cls:'');
   const tx=document.getElementById('ev-live-t');
   if(tx)tx.textContent=txt;
@@ -2184,93 +2176,13 @@ function evPush(e){
   // 面板不在前台时只攒着，切过去再画，省掉隐藏容器上的重排
   if(evPaneOn())evRender(true);
 }
-function evOpenSSE(){
-  evBad=0;
-  evMode='sse';
+function evStreamState(mode){
+  evMode=mode||'reconn';
   evLive();
-  let es=null;
-  try{es=new EventSource(url('/api/events?after='+evSeq));}catch(e){es=null;}
-  if(!es){evPollStart();return;}
-  evES=es;
-  // 4 秒内没建成就换轮询。不能用「错误计数」：EventSource 自带重连，
-  // 每次失败后 3 秒再试会各触发一次 error，计数永远到不了阈值，面板就一直挂着"重连中"。
-  let grace=setTimeout(function(){
-    try{evES.close();}catch(e){}
-    evES=null;
-    evPollStart();
-  },4000);
-  evES.onopen=function(){
-    clearTimeout(grace);
-    grace=null;
-    evMode='sse';
-    evLive();
-  };
-  evES.onerror=function(){
-    if(evMode==='off')return;
-    evMode='reconn';
-    evLive();
-  };
-  evES.addEventListener('message',function(m){
-    let e=null;
-    try{e=JSON.parse(m.data);}catch(err){e=null;}
-    if(e)evPush(e);
-  });
 }
-function evPollStart(){
-  if(evTimer)clearInterval(evTimer);
-  evBad=0;
-  evMode='poll';
-  evLive();
-  evPoll();
-  evTimer=setInterval(evPoll,EV_POLL_MS);
-}
-async function evPoll(){
-  let res=null;
-  try{
-    res=await fetch(url('/api/events?stream=0&after='+evSeq),AUTH_HDR);
-    if(res.status===404||res.status===405){
-      // 服务端比这个端点老：别再每 2.5 秒问一次了，直接退成只读空态
-      evStop();
-      evLiveOff();
-      return;
-    }
-    if(!res.ok)return;
-  }catch(e){return;}
-  let list=null;
-  try{list=await res.json();}catch(e){list=null;}
-  if(!list){
-    // 老服务端没有这个路由时会落到静态首页：别对着 HTML 无限轮询
-    evBad++;
-    if(evBad>=2){evStop();evLiveOff();}
-    return;
-  }
-  evBad=0;
-  if(!list.length)return;
-  for(let i=0;i<list.length;i++)evPush(list[i]);
-}
-// 事件端点不存在（老服务端）时的中性状态：不假装在轮询
-function evLiveOff(){
-  const box=document.getElementById('ev-live');
-  if(!box)return;
-  evMode='off';
-  box.className='ev-live';
-  const tx=document.getElementById('ev-live-t');
-  if(tx)tx.textContent=t('ev.empty');
-}
-function evStart(){
-  evStop();
-  // EventSource 无法附加自定义头：带凭据访问面板时直接走轮询，别在认证失败上来回重试
-  if(AUTH_HDR.Authorization||!('EventSource' in window)){
-    evPollStart();
-    return;
-  }
-  evOpenSSE();
-}
-function evStop(){
-  if(evES){try{evES.close();}catch(e){}evES=null;}
-  if(evTimer){clearInterval(evTimer);evTimer=null;}
-  evMode='';
-  evLive();
+function applyEvents(list){
+  if(!Array.isArray(list))return;
+  list.forEach(evPush);
 }
 function setEvLvl(v){
   evLvl=v;
@@ -2783,14 +2695,12 @@ function renderTopo(data){
   host.innerHTML=tpChain(data)+tpFlow(left,mid,right);
 }
 
-let logSeq=0,logTimer=null,logFilter='';
-function startLogPoll(){stopLogPoll();pollLogs();logTimer=setInterval(pollLogs,2000);}
-function stopLogPoll(){if(logTimer){clearInterval(logTimer);logTimer=null;}}
-async function pollLogs(){
+let logSeq=0,logFilter='';
+function applyLogs(lines){
+  if(!Array.isArray(lines)||!lines.length)return;
+  lines=lines.filter(function(l){return l&&l.seq>logSeq;});
+  if(!lines.length)return;
   try{
-    const res=await fetch(url('/api/logs?after='+logSeq),AUTH_HDR);
-    if(!res.ok)return;
-    const lines=await res.json();
     if(!lines.length)return;
     const box=document.getElementById('logbox');
     if(box.querySelector('.empty-box'))box.innerHTML='';
@@ -2798,7 +2708,7 @@ async function pollLogs(){
     logSeq=lines[lines.length-1].seq;
     applyLogFilter();
     if(document.getElementById('autoscroll').checked)box.scrollTop=box.scrollHeight;
-  }catch(e){}
+  }catch(e){console.error('log render failed',e);}
 }
 // 日志过滤：本地隐藏不匹配的行，缓冲不丢，计数显示 命中/总数
 function applyLogFilter(){
@@ -2820,7 +2730,7 @@ function logEmptyBox(){
     '<div>'+esc(t('no_logs'))+'</div></div>';
 }
 function clearLog(){
-  logSeq=0;logFilter='';
+  logFilter='';
   const inp=document.getElementById('log-filter');
   const clr=document.getElementById('log-filter-clear');
   if(inp)inp.value='';
@@ -2874,35 +2784,20 @@ PREFERS_DARK.addEventListener('change',function(){if(THEME==='system')applyTheme
 ['clients','conns','macs'].forEach(attachSearch);
 bindChartHover('chart',redrawChart);
 bindChartHover('traffic-chart',function(){renderTrafficView();});
-let chartRange='2m',trendTimer=null,trendData=null;
-// 2 分钟视图的数据由服务端缓存：TrafficAccounting 里 1 秒粒度 × 120 的环形缓冲
-// 经 /api/trend?range=2m 吐出，任何设备刚打开面板就拿到完整的最近 2 分钟，
-// 不必再靠本机逐次轮询攒 60 个样本。1h/24h 是分钟粒度、变化慢，仍保持低频。
-function trendPollMs(){return chartRange==='2m'?REFRESH:30000;}
-function startTrendTimer(){
-  if(trendTimer){clearInterval(trendTimer);trendTimer=null;}
-  trendTimer=setInterval(fetchTrend,trendPollMs());
-}
+let chartRange='2m',trendData=null;
+// 趋势数据与统计快照共用 /api/stream SSE；切换范围时重建长连接，
+// 浏览器不再定时请求 /api/trend。
 function setRange(v){
   chartRange=v;setSeg('range-seg',v);
-  trendData=null; // 先清掉，切换时不会画出上一个区间的数据
-  if(trendTimer){clearInterval(trendTimer);trendTimer=null;}
-  redrawChart(); // 立刻换视图，不留上一次区间的旧画面等下一轮 fetchTrend
-  fetchTrend();
-  startTrendTimer();
+  trendData=null;
+  redrawChart();
+  if(window.tlsvpnStreamRestart)window.tlsvpnStreamRestart();
 }
-async function fetchTrend(){
-  const want=chartRange;
-  try{
-    const res=await fetch(url('/api/trend?range='+want),AUTH_HDR);
-    if(!res.ok)return;
-    const d=await res.json();
-    if(chartRange!==want)return; // 请求在途时切了区间，这次响应不再上画
-    // 旧服务端不认识 range=2m，会退回分钟粒度：不采纳，继续用本地轮询增量
-    if(want==='2m'&&d.step_sec!==1){trendData=null;return;}
-    trendData=d;
-    drawTrendChart(d.points||[]);
-  }catch(e){}
+function applyTrend(d){
+  if(!d)return;
+  if(chartRange==='2m'&&d.step_sec!==1){trendData=null;return;}
+  trendData=d;
+  drawTrendChart(d.points||[]);
 }
 // 图表重绘统一入口：服务端数据到手就用它，冷启动还没拿到时退回本地轮询增量
 function redrawChart(){
@@ -2937,8 +2832,7 @@ document.getElementById('evbox').addEventListener('click',function(ev){
   const el=ev.target.closest('.ev-cl');
   if(el)openClient(el.dataset.cid);
 });
-setRefresh(REFRESH_S);setRange(chartRange);fetchStats();
-evStart();
+setRefresh(REFRESH_S);setRange(chartRange);
 window.addEventListener('resize',redrawChart);
 
 

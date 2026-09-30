@@ -24,7 +24,7 @@ fn webui_matches_shared_static_asset_contract() {
         assert!(i18n.contains(marker), "i18n.js missing {marker:?}");
     }
     assert!(app.contains("platformAssetName"));
-    assert!(app.contains("/api/stats"));
+    assert!(!app.contains("fetch(url(\'/api/stats\')"));
     assert!(css.contains("platform-badge"));
     for marker in ["FRAMEVIZ_I18N[LANG]", "AES-256-GCM", "AES-128-GCM", "ChaCha20-Poly1305", "XChaCha20-Poly1305", "1514 B", "1530 B", "12 KiB", "16 KiB", "padLen=0", "4 B BE", "seq=0", "1 MiB"] {
         assert!(frameviz.contains(marker), "frameviz missing {marker:?}");
@@ -39,7 +39,7 @@ fn webui_matches_shared_static_asset_contract() {
 #[test]
 fn rust_embed_table_covers_primary_assets() {
     let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/webui_assets.rs")).expect("webui_assets.rs");
-    for route in ["/", "/index.html", "/style.css", "/i18n.js", "/app.js", "/frameviz.js", "/metrics.js", "/favicon.ico", "/icons/os-linux.svg"] {
+    for route in ["/", "/index.html", "/style.css", "/i18n.js", "/app.js", "/frameviz.js", "/metrics.js", "/stream.js", "/favicon.ico", "/icons/os-linux.svg"] {
         assert!(src.contains(&format!("\"{route}\"")), "embed table missing {route}");
     }
     assert!(!src.contains("/zh-tw.js") && !src.contains("/frameviz-zh-tw.js"));
