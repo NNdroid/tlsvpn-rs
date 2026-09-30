@@ -40,8 +40,8 @@ def patch_net():
     #[test]
     fn owned_batch_queue_coalesces_and_preserves_accounting() {
         let queue = OwnedBatchQueue::new(16);
-        queue.try_push(owned_test_frame(1, 1200), 1200).unwrap();
-        queue.try_push(owned_test_frame(2, 1300), 1300).unwrap();
+        assert!(queue.try_push(owned_test_frame(1, 1200), 1200).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 1300), 1300).is_ok());
         assert_eq!(queue.len_frames(), 2);
 
         let batch = queue.try_pop_fitting(4096).expect("batch must fit");
@@ -55,8 +55,8 @@ def patch_net():
     #[test]
     fn owned_batch_queue_keeps_front_when_wire_budget_is_too_small() {
         let queue = OwnedBatchQueue::new(16);
-        queue.try_push(owned_test_frame(7, 1400), 1400).unwrap();
-        queue.try_push(owned_test_frame(8, 1400), 1400).unwrap();
+        assert!(queue.try_push(owned_test_frame(7, 1400), 1400).is_ok());
+        assert!(queue.try_push(owned_test_frame(8, 1400), 1400).is_ok());
 
         assert!(queue.try_pop_fitting(2800).is_none());
         assert_eq!(queue.len_frames(), 2, "failed fit must not consume ownership");
@@ -69,8 +69,8 @@ def patch_net():
     #[test]
     fn owned_batch_queue_capacity_remains_frame_based() {
         let queue = OwnedBatchQueue::new(2);
-        queue.try_push(owned_test_frame(1, 64), 64).unwrap();
-        queue.try_push(owned_test_frame(2, 64), 64).unwrap();
+        assert!(queue.try_push(owned_test_frame(1, 64), 64).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 64), 64).is_ok());
         let rejected = queue
             .try_push(owned_test_frame(3, 64), 64)
             .expect_err("third frame must hit frame capacity");
@@ -81,10 +81,6 @@ def patch_net():
 '''
     s = replace_once(s, marker, tests, "owned queue regression tests")
     p.write_text(s)
-
-
-def budget_expr(buf):
-    return f"MAX_TLS_PLAINTEXT_RECORD.saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT).saturating_sub({buf}.len())"
 
 
 def patch_client():
