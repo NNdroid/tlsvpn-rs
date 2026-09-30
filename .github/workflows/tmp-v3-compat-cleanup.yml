@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+          cache: false
       - name: Remove protocol-v2 compatibility paths
         shell: bash
         run: |
@@ -42,7 +43,7 @@ jobs:
           s = p.read_text()
           s = re.sub(r'^#   E2E_RS_OLD_BIN.*\n', '', s, flags=re.M)
           if 'The "old" builds exist only' in s:
-              s = sub1(s, r'# The "old" builds exist only to exercise the mixed-version phases\..*?by design\), ~850s\.\n', '', 'remove old-build e2e paragraph')
+              s = sub1(s, r'# The "old" builds exist only.*?\n\n', '', 'remove old-build e2e paragraph')
           s = re.sub(r'^E2E_(?:RS_OLD_BIN|RS_OLD_PROBE|GO_OLD_BIN)=.*\n', '', s, flags=re.M)
           s = sub1(s, r'\n# True when the env var named by \$1 is set and the file it points to exists\..*?\n}\n', '\n', 'remove e2e_have')
           p.write_text(s)
@@ -50,7 +51,7 @@ jobs:
           p = Path('scripts/e2e_accept.sh')
           s = p.read_text()
           s = re.sub(r'^#   P[34].*\n', '', s, flags=re.M)
-          s = re.sub(r'^# P3 .*\n# .*\n# .*\n', '', s, count=1, flags=re.M)
+          s = re.sub(r'^# P3 .*?(?=^# Env)', '', s, count=1, flags=re.M | re.S)
           prefix = '\n'.join([
               '# run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC CLI_EXTRA [SRV_CFG]',
               '# SRV/CLI values: rs | go. TLSVPN protocol v3 is mandatory on both sides.',
@@ -114,8 +115,14 @@ jobs:
       - name: Strict v3 source gate
         shell: bash
         run: |
-          ! grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy session_token|server\.remove\("session_token"\)' scripts src AGENTS.md .github/workflows/rust.yml
-          ! grep -R --line-number --include='*.rs' -E 'protocol_version:[[:space:]]*2|protocol_version[[:space:]]*[!=]=[[:space:]]*2' src tests examples
+          if grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy session_token|server\.remove\("session_token"\)' scripts src AGENTS.md .github/workflows/rust.yml; then
+            echo 'v2 compatibility scaffolding remains'
+            exit 1
+          fi
+          if grep -R --line-number --include='*.rs' -E 'protocol_version:[[:space:]]*2|protocol_version[[:space:]]*[!=]=[[:space:]]*2' src tests examples; then
+            echo 'protocol version 2 source remains'
+            exit 1
+          fi
           grep -Fq 'pub const PROTOCOL_VERSION: i64 = 3;' src/protocol.rs
           python3 - <<'PY'
           import json
@@ -134,7 +141,7 @@ jobs:
       - name: Build current Go and Rust probes
         run: |
           cargo build --examples
-          (cd go-impl && go build -o bin/tlsvpn .)
+          (cd go-impl && mkdir -p bin && go build -o bin/tlsvpn .)
           (cd go-impl && go build -C interop -o probe .)
       - name: Current-v3 acceptance matrix
         env:
