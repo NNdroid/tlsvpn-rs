@@ -1,0 +1,62 @@
+name: Temporary owned backend batch
+
+on:
+  push:
+    branches: [ "protocol/v3-dynamic-fec" ]
+    paths:
+      - ".github/workflows/tmp-owned-batch.yml"
+      - "scripts/tmp_owned_batch.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: protocol/v3-dynamic-fec
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply owned batch patch
+        run: |
+          python3 scripts/tmp_owned_batch.py
+          cargo fmt --all
+          git diff --check
+          git diff --stat
+
+      - name: Compile all targets
+        run: cargo check --all-targets
+
+      - name: Core tests
+        run: cargo test --all-targets --verbose
+
+      - name: Ownership and scheduler focused tests
+        run: |
+          cargo test --verbose owned
+          cargo test --verbose scheduler
+          cargo test --verbose fec
+
+      - name: Verify production path uses owned batches
+        run: |
+          grep -q 'pub struct VPNFrameBatch' src/frame.rs
+          grep -q 'pub struct OwnedBatchQueue' src/net.rs
+          grep -q 'owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024)))' src/client.rs
+          grep -q 'owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024)))' src/server.rs
+          grep -q 'try_recv_backend_batch(Some(backend.as_ref()), &rx)' src/client.rs
+          grep -q 'try_recv_backend_batch(sess.tx_backend.as_deref(), &sess.rx)' src/server.rs
+
+      - name: Commit production patch
+        run: |
+          git config user.name "NNdroid"
+          git config user.email "99177648+NNdroid@users.noreply.github.com"
+          git add src/frame.rs src/net.rs src/client.rs src/server.rs
+          git commit -m "perf: batch owned frames per TLS backend"
+          git push origin HEAD:protocol/v3-dynamic-fec
