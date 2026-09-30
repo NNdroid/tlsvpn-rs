@@ -35,8 +35,9 @@ jobs:
           s = p.read_text()
           s = s.replace('    let mut raw_value: serde_json::Value =\n', '    let raw_value: serde_json::Value =\n', 1)
           s = sub1(s, r'\n    // server\.session_token 已从配置契约删除：resume token 是 protocol v3 的强制属性。.*?\n    }\n\n    let mut cfg:', '\n    let mut cfg:', 'remove Rust legacy session_token config shim')
-          if 'server.remove("session_token")' in s:
-              raise SystemExit('src/main.rs still strips session_token')
+          s = sub1(s, r'\n    #\[test\]\n    fn legacy_session_token_is_accepted_but_ignored\(\) \{.*?\n    }\n\n    #\[test\]\n    fn config_file_still_rejects_unknown_fields', '\n    #[test]\n    fn removed_session_token_config_is_rejected() {\n        let mut v: serde_json::Value = serde_json::from_str(GO_SERVER_CONFIG).unwrap();\n        v["server"]["session_token"] = serde_json::json!(false);\n        let path = std::env::temp_dir().join(format!("tlsvpn-removed-session-token-{}.json", std::process::id()));\n        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();\n        let err = load_config_file(path.to_str().unwrap()).unwrap_err();\n        let _ = std::fs::remove_file(&path);\n        assert!(err.contains("unknown field"), "removed server.session_token must be rejected: {err}");\n    }\n\n    #[test]\n    fn config_file_still_rejects_unknown_fields', 'replace legacy token acceptance test')
+          if 'server.remove("session_token")' in s or 'legacy_session_token' in s:
+              raise SystemExit('src/main.rs still contains legacy session_token compatibility')
           p.write_text(s)
 
           p = Path('scripts/e2e_lib.sh')
@@ -101,6 +102,13 @@ jobs:
               s = s.replace(old, new, 1)
           p.write_text(s)
 
+          p = Path('scripts/e2e_test.sh')
+          s = p.read_text()
+          s = s.replace('#   accept  总验收矩阵（v3 安全配置 / 可选调优 / 旧版拒绝 / 兼容字段）', '#   accept  总验收矩阵（protocol v3 安全配置 / 可选调优）')
+          s = re.sub(r'^#   E2E_RS_OLD_BIN.*\n', '', s, flags=re.M)
+          s = sub1(s, r'\nif e2e_have E2E_RS_OLD_BIN.*?\nfi\n', '\n', 'remove old binary status display')
+          p.write_text(s)
+
           p = Path('AGENTS.md')
           s = p.read_text()
           s = re.sub(r'Fresh-checkout reference run: 86 pass / 0 fail / 7 skip \(the skips are\n?mixed-version cases gated on `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`,\n?`E2E_GO_OLD_BIN`, which are absent on a clean checkout by design\), ~850s\.', 'Fresh-checkout acceptance runs exercise only protocol-v3 implementations and require no historical binaries.', s)
@@ -115,7 +123,7 @@ jobs:
       - name: Strict v3 source gate
         shell: bash
         run: |
-          if grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy session_token|server\.remove\("session_token"\)' scripts src AGENTS.md .github/workflows/rust.yml; then
+          if grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy_session_token|legacy session_token|server\.remove\("session_token"\)|accepted_but_ignored' scripts src AGENTS.md .github/workflows/rust.yml; then
             echo 'v2 compatibility scaffolding remains'
             exit 1
           fi
@@ -129,7 +137,7 @@ jobs:
           g=json.load(open('testdata/protocol_golden.json'))
           assert g['version'] == 3, g['version']
           PY
-          bash -n scripts/e2e_accept.sh scripts/e2e_lib.sh
+          bash -n scripts/e2e_accept.sh scripts/e2e_lib.sh scripts/e2e_test.sh
       - name: Rust tests
         run: cargo test --all-targets --verbose
       - name: Checkout Go v3 counterpart
