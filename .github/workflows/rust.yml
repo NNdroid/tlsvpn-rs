@@ -56,10 +56,9 @@ jobs:
       env:
         TLSVPN_GOLDEN: "testdata/protocol_golden.json"
       run: |
-        # This branch mirrors the still-open Go protocol-v3 PR, so validate
-        # against that branch until it is merged into the Go release line.
+        # This branch tracks the merged Go protocol-v3 line.
         curl -fsSL -o testdata/protocol_golden.json \
-          "https://raw.githubusercontent.com/NNdroid/tlsvpn/research/dynamic-rx-fec-bypass/testdata/protocol_golden.json" \
+          "https://raw.githubusercontent.com/NNdroid/tlsvpn/perf/single-path-fec-bypass/testdata/protocol_golden.json" \
           || echo "golden vector fetch failed — running without cross-check"
         cargo test --verbose --test protocol_conformance
 
@@ -93,7 +92,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: NNdroid/tlsvpn
-        ref: research/dynamic-rx-fec-bypass
+        ref: perf/single-path-fec-bypass
         path: go-impl
 
     - name: Record the Go commit this run builds
@@ -164,7 +163,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: NNdroid/tlsvpn
-        ref: research/dynamic-rx-fec-bypass
+        ref: perf/single-path-fec-bypass
         path: go-impl
 
     - name: Record the Go commit this run builds
