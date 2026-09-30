@@ -6,6 +6,7 @@ on:
       - protocol/v3-dynamic-fec
     paths:
       - scripts/apply_protocol_v3_dynamic_fec.py
+      - scripts/fix_protocol_v3_generated.py
       - .github/workflows/apply_protocol_v3.yml
   workflow_dispatch:
 
@@ -28,35 +29,7 @@ jobs:
       - name: Apply protocol v3 + dynamic FEC migration
         run: |
           python3 scripts/apply_protocol_v3_dynamic_fec.py
-          # Fix two source-generation edges before validation. The transformer is
-          # one-shot and is removed after the validated source commit.
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p=Path('src/net.rs')
-          s=p.read_text()
-          needle='match self.try_send_payload_to_fenced(b, seq, data, control) {'
-          if needle not in s:
-              raise SystemExit('generated net.rs fenced send token not found')
-          # The first occurrence is the ordinary send_payload_to helper. Only the
-          # later fallback-loop occurrence should remain FEC-fenced.
-          s=s.replace(needle, 'match self.try_send_payload_to(b, seq, data) {', 1)
-          s=s.replace('use crate::buffer::{release_frame_vec, release_shared_frame};',
-                      'use crate::buffer::release_frame_vec;',1)
-          p.write_text(s)
-
-          p=Path('src/fec.rs')
-          s=p.read_text()
-          s=s.replace('let mut complete = false;', 'let complete;', 1)
-          s=s.replace('.map_err(|e| format!("FEC_PARITY AEAD failure: {e}"))?;',
-                      '.map_err(|_| "FEC_PARITY AEAD failure".to_string())?;',1)
-          p.write_text(s)
-
-          p=Path('src/server.rs')
-          s=p.read_text().replace('use crate::fec::{self, FecDecoder};',
-                                  'use crate::fec::FecDecoder;',1)
-          p.write_text(s)
-          PY
+          python3 scripts/fix_protocol_v3_generated.py
           # Integration tests/examples are separate crate roots and therefore
           # cannot resolve crate::protocol from the tlsvpn binary crate.
           sed -i 's/crate::protocol::PROTOCOL_VERSION/3/g' tests/protocol_conformance.rs examples/interop_client.rs
@@ -74,6 +47,8 @@ jobs:
           controls={v['name']:v['payload_hex'] for v in g['control_frames']}
           assert controls['fec_mode_suspend'] == '02010000010203040506070800000009'
           assert controls['fec_parity_k2'].startswith('01')
+          assert 'peer_info' in g['handshake_req_keys']
+          assert 'peer_info' in g['handshake_resp_keys']
           PY
 
       - name: Reject legacy protocol semantics
@@ -87,6 +62,7 @@ jobs:
           grep -Fq '0x01  FEC_PARITY' docs/protocol_v3.md
           grep -Fq '0x02  FEC_MODE' docs/protocol_v3.md
           grep -Fq 'Physical path failure and rejoin' docs/protocol_v3.md
+          grep -Fq 'does **not** preserve wire compatibility with v2' docs/protocol_v3.md
 
       - name: Build
         shell: bash
