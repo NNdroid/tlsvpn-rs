@@ -28,6 +28,36 @@ jobs:
       - name: Apply protocol v3 + dynamic FEC migration
         run: |
           python3 scripts/apply_protocol_v3_dynamic_fec.py
+          # Fix two source-generation edges before validation. The transformer is
+          # one-shot and is removed after the validated source commit.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('src/net.rs')
+          s=p.read_text()
+          old='''    fn send_payload_to(&self, b: &Backend, seq: u32, data: FramePayload) -> u64 {
+              match self.try_send_payload_to_fenced(b, seq, data, control) {'''
+          new='''    fn send_payload_to(&self, b: &Backend, seq: u32, data: FramePayload) -> u64 {
+              match self.try_send_payload_to(b, seq, data) {'''
+          if old not in s:
+              raise SystemExit('generated net.rs send_payload_to edge not found')
+          s=s.replace(old,new,1)
+          s=s.replace('use crate::buffer::{release_frame_vec, release_shared_frame};',
+                      'use crate::buffer::release_frame_vec;',1)
+          p.write_text(s)
+
+          p=Path('src/fec.rs')
+          s=p.read_text()
+          s=s.replace('let mut complete = false;', 'let complete;', 1)
+          s=s.replace('.map_err(|e| format!("FEC_PARITY AEAD failure: {e}"))?;',
+                      '.map_err(|_| "FEC_PARITY AEAD failure".to_string())?;',1)
+          p.write_text(s)
+
+          p=Path('src/server.rs')
+          s=p.read_text().replace('use crate::fec::{self, FecDecoder};',
+                                  'use crate::fec::FecDecoder;',1)
+          p.write_text(s)
+          PY
           # Integration tests/examples are separate crate roots and therefore
           # cannot resolve crate::protocol from the tlsvpn binary crate.
           sed -i 's/crate::protocol::PROTOCOL_VERSION/3/g' tests/protocol_conformance.rs examples/interop_client.rs
