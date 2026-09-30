@@ -60,14 +60,21 @@ jobs:
           grep -Fq 'Physical path failure and rejoin' docs/protocol_v3.md
 
       - name: Build
-        run: cargo check --all-targets --verbose
+        shell: bash
+        run: |
+          set +e
+          cargo check --all-targets --message-format=short >cargo-check.log 2>&1
+          status=$?
+          grep -E '(^|: )(error|warning)(\[|:)|error:|warning:' cargo-check.log || true
+          tail -n 40 cargo-check.log
+          exit $status
 
       - name: Test protocol v3 and dynamic FEC
         env:
           TLSVPN_GOLDEN: ${{ github.workspace }}/testdata/protocol_golden.json
         run: |
-          cargo test --verbose
-          cargo test --test protocol_conformance --verbose
+          cargo test
+          cargo test --test protocol_conformance
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
