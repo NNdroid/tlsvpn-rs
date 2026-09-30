@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # e2e_accept.sh — 总验收矩阵：档 A/B/C/D 落地后的跨语言互测。
 #
-#   P1 安全配置   —— pad_mode=bucket + min_enc=gcm + protocol v2
-#   P2 可选调优关闭 —— padding=off / 无 min_enc，但 protocol v2 仍强制
-#   P3 新旧混装   —— 默认必须拒绝缺少 protocol v2 的旧对端
+#   P1 安全配置   —— pad_mode=bucket + min_enc=gcm + protocol v3
+#   P2 可选调优关闭 —— padding=off / 无 min_enc，但 protocol v3 仍强制
+#   P3 新旧混装   —— 默认必须拒绝缺少 protocol v3 的旧对端
 #   P4 旧配置迁移 —— legacy session_token=false 可读取，但不得改变 v2 令牌保护
 #
 # 用自包含探针（--tap mem），协议级验证，不需要 CAP_NET_ADMIN。
@@ -182,7 +182,7 @@ if e2e_have E2E_RS_OLD_BIN && e2e_have E2E_RS_OLD_PROBE && e2e_have E2E_GO_OLD_B
 fi
 
 echo "=================================================================="
-echo " P1  安全配置：pad_mode=bucket + min_enc=gcm + protocol v2"
+echo " P1  安全配置：pad_mode=bucket + min_enc=gcm + protocol v3"
 echo "     探针声明 enc_algo=2(GCM)，满足 min_enc 下限"
 echo "=================================================================="
 run_case "rs->rs 全开"      rs rs bucket gcm "" "--enc-algo 2"
@@ -194,7 +194,7 @@ go_cfg_now 1 "" bucket gcm; run_case "go(cfg)->go" go go "" "" "" "-enc-algo 2" 
 
 echo ""
 echo "=================================================================="
-echo " P2  可选调优关闭：padding=off / 无 min_enc；protocol v2 与随机令牌仍强制"
+echo " P2  可选调优关闭：padding=off / 无 min_enc；protocol v3 与随机令牌仍强制"
 echo "=================================================================="
 run_case "rs->rs 全关"  rs rs off "" "" ""
 run_case "rs->go 全关"  rs go off "" "" ""
@@ -203,7 +203,7 @@ run_case "go->go 全关"  go go "" "" "" ""
 
 echo ""
 echo "=================================================================="
-echo " P3  新旧混装：默认拒绝缺少 protocol v2 / key epoch 的旧对端"
+echo " P3  新旧混装：默认拒绝缺少 protocol v3 / key epoch 的旧对端"
 echo "=================================================================="
 if [ "$HAVE_OLD" = 1 ]; then
   run_case "rsNEW->goOLD 拒绝"  rs goold off "" "" "" "" fail
@@ -225,7 +225,7 @@ run_case "goNEW->goNEW"  go go "" "" "" ""
 echo ""
 echo "=================================================================="
 echo " P4  旧配置迁移：legacy session_token=false 可读，但不能关闭随机令牌"
-echo "     当前配置契约已删除该字段；这里仅验证升级兼容，安全语义由 protocol v2 固定。"
+echo "     当前配置契约已删除该字段；这里仅验证升级兼容，安全语义由 protocol v3 固定。"
 echo "=================================================================="
 go_cfg_now 1 false "" ""; run_case "goNEW(legacy-token=false)->rsNEW" go rs "" "" "" "" "$CFGF"
 go_cfg_now 1 false "" ""; run_case "rsNEW(legacy-token=false)->goNEW" rs go "" "" "" "" "$CFGF"

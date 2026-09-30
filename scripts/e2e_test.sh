@@ -2,8 +2,8 @@
 # e2e_test.sh — 跨语言 e2e 的唯一入口。
 #
 # 跑五个套件：
-#   accept  总验收矩阵（v2 安全配置 / 可选调优 / 旧版拒绝 / 兼容字段）
-#   tok     protocol v2：同 MAC 两台真实客户端，验证跨实例接管被拒
+#   accept  总验收矩阵（v3 安全配置 / 可选调优 / 旧版拒绝 / 兼容字段）
+#   tok     protocol v3：同 MAC 两台真实客户端，验证跨实例接管被拒
 #   pad     pad_mode：off / bucket 两档 + 非法值
 #   minenc  min_enc："" / gcm 下限，含未知算法 ID 回归
 #   cfg     配置维度：v4/v6 网段 / client.conns / web.auth / web.cert+web.key
@@ -100,10 +100,10 @@ suite_accept() {
 }
 
 suite_tok() {
-  # Session token 是 protocol v2 固定能力；四种跨语言组合都必须拒绝同 MAC 的新实例劫持。
+  # Session token 是 protocol v3 固定能力；四种跨语言组合都必须拒绝同 MAC 的新实例劫持。
   local -a jobs=("rs rs" "rs go" "go rs" "go go")
   local i=0 s c fails=0
-  echo "  protocol v2：4 组跨语言固定 session-token 接管拒绝"
+  echo "  protocol v3：4 组跨语言固定 session-token 接管拒绝"
   for spec in "${jobs[@]}"; do
     set -- $spec; s="$1"; c="$2"
     SRV="$s" CLI="$c" PORT="$((PORT_BASE_TOK + i * 10))" \
@@ -176,13 +176,13 @@ suite_minenc() {
 }
 
 suite_cfg() {
-  # 前 6 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
+  # 前 7 个是互通类：固定协议、只动配置，断言配置真的生效。跑全 4 种实现组合
   # （rs/rs、rs/go、go/rs、go/go），因为「配置生效」必须跨语言成立。
   # 后 7 个是校验类：进程必须以非零退出并给出对应错误，两种实现都覆盖。
-  local -a interop=(cidr multi webauth webtls webtunnel logquiet)
+  local -a interop=(cidr multi multifec webauth webtls webtunnel logquiet)
   local -a reject=(badlog badauth badv4 badv6)
   local i=0 s c fails=0 case
-  echo "  互通：6 个配置维度 × 4 种实现组合 = 24 组"
+  echo "  互通：7 个配置维度 × 4 种实现组合 = 28 组"
   for case in "${interop[@]}"; do
     for s in rs go; do
       for c in rs go; do
@@ -193,7 +193,7 @@ suite_cfg() {
       done
     done
   done
-  i=24
+  i=28
   echo "  校验：7 个非法配置 × 2 实现 = 14 组"
   for case in "${reject[@]}"; do
     for s in rs go; do

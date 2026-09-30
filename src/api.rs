@@ -62,7 +62,7 @@ pub struct HandshakeReq {
     pub encrypt: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub enc_algo: i64,
-    // 客户端回带上一次收到的会话令牌（hex）。protocol v2 固定要求
+    // 客户端回带上一次收到的会话令牌（hex）。protocol v3 固定要求
     // 新进程接管既有会话时携带正确令牌；首次接入时为空串。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_token: String,
@@ -140,11 +140,11 @@ pub struct HandshakeResp {
     pub enc_salt: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enc_salt2: String,
-    // 本次会话的重连接入令牌（hex）；protocol v2 固定下发，
+    // 本次会话的重连接入令牌（hex）；protocol v3 固定下发，
     // 客户端须在下一次同一 client_id 的握手里回带。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_token: String,
-    // 新客户端把缺失视为旧服务端；旧客户端由 serde 默认忽略未知字段，支持滚动升级。
+    // 新客户端把缺失视为不完整服务端；不完整客户端由 serde 默认忽略未知字段，支持滚动升级。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TLSHandshakeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,8 +157,8 @@ mod peer_info_protocol_tests {
 
     #[test]
     fn peer_info_is_optional_and_round_trips() {
-        let old = r#"{"protocol_version":2,"client_id":"x","psk":"y"}"#;
-        let req: HandshakeReq = serde_json::from_str(old).unwrap();
+        let without_peer_info = r#"{"protocol_version":3,"client_id":"x","psk":"y"}"#;
+        let req: HandshakeReq = serde_json::from_str(without_peer_info).unwrap();
         assert!(req.peer_info.is_none());
 
         let mut req = req;
@@ -1633,7 +1633,7 @@ mod tests {
         let current: HandshakeResp = serde_json::from_str(old_wire).unwrap();
         assert!(current.tls.is_none());
 
-        // new writer -> old reader：serde 默认忽略未知字段，旧客户端继续读取核心字段。
+        // new writer -> old reader：serde 默认忽略未知字段，不完整客户端继续读取核心字段。
         #[derive(serde::Deserialize)]
         struct LegacyHandshakeResp {
             success: bool,

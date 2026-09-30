@@ -2,11 +2,11 @@
 // 跨语言协议一致性测试
 // ============================================================
 //
-// 读取 Go 侧生成的黄金向量文件，逐项比对 Rust 实现是否产生完全相同的结果。
+// 读取从 Go PR 同步进本仓库的黄金向量文件，逐项比对 Rust 实现是否产生完全相同的结果。
 // 任一项不符即代表两端无法互通。
 //
 // 运行：
-//   TLSVPN_GOLDEN=../tlsvpn/testdata/protocol_golden.json cargo test --test protocol_conformance
+//   TLSVPN_GOLDEN=testdata/protocol_golden.json cargo test --test protocol_conformance
 //
 // 若未设置 TLSVPN_GOLDEN，会尝试默认相对路径；找不到则跳过（不算失败），
 // 以免在只有 Rust 仓库的环境里误报。
@@ -19,8 +19,9 @@ use std::path::PathBuf;
 
 #[derive(Deserialize)]
 struct GoldenVectors {
-    #[allow(dead_code)]
     version: u32,
+    #[serde(default)]
+    control_frames: Vec<ControlFrameVec>,
     psk_hashes: Vec<PSKHashVec>,
     gcm_domain_vectors: Vec<GcmDomainVec>,
     frame_headers: Vec<FrameHeaderVec>,
@@ -52,6 +53,12 @@ struct FrameHeaderVec {
     pad_len: u16,
     seq: u32,
     header_hex: String,
+}
+
+#[derive(Deserialize)]
+struct ControlFrameVec {
+    name: String,
+    payload_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -133,9 +140,9 @@ fn load_golden() -> Option<GoldenVectors> {
         .ok()
         .or_else(|| {
             let candidates = [
+                "testdata/protocol_golden.json",
                 "../tlsvpn/testdata/protocol_golden.json",
                 "../../tlsvpn/testdata/protocol_golden.json",
-                "testdata/protocol_golden.json",
             ];
             candidates.iter().map(PathBuf::from).find(|p| p.exists())
         })?;
@@ -161,7 +168,7 @@ macro_rules! golden_or_skip {
             None => {
                 eprintln!(
                     "跳过：未找到黄金向量文件。请设置 TLSVPN_GOLDEN 环境变量指向 \
-                     Go 侧生成的 testdata/protocol_golden.json"
+                     已同步的 testdata/protocol_golden.json"
                 );
                 return;
             }
@@ -170,6 +177,25 @@ macro_rules! golden_or_skip {
 }
 
 // ---------- 测试用例 ----------
+
+#[test]
+fn test_protocol_v3_typed_controls_match_go() {
+    let g = golden_or_skip!();
+    assert_eq!(g.version, 3, "Go golden contract must be protocol v3");
+    let controls: std::collections::HashMap<_, _> = g
+        .control_frames
+        .iter()
+        .map(|v| (v.name.as_str(), v.payload_hex.as_str()))
+        .collect();
+    assert_eq!(
+        controls.get("fec_mode_suspend").copied(),
+        Some("02010000010203040506070800000009")
+    );
+    let parity = controls
+        .get("fec_parity_k2")
+        .expect("missing fec_parity_k2 golden control");
+    assert!(parity.starts_with("01"), "FEC_PARITY must use control kind 0x01");
+}
 
 #[test]
 fn test_psk_hash_matches_go() {
@@ -304,6 +330,8 @@ struct HandshakeReqShape {
     enc_algo: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     session_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_info: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -392,6 +420,8 @@ struct HandshakeRespShape {
     session_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tls: Option<TlsHandshakeInfoShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_info: Option<serde_json::Value>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -412,7 +442,7 @@ fn test_handshake_req_field_names() {
     let g = golden_or_skip!();
 
     let full = HandshakeReqShape {
-        protocol_version: 2,
+        protocol_version: 3,
         client_instance: "instance-1".into(),
         conn_id: "00000000-0000-4000-8000-000000000001".into(),
         client_id: "c".into(),
@@ -431,6 +461,7 @@ fn test_handshake_req_field_names() {
         encrypt: true,
         enc_algo: 2,
         session_token: "t".into(),
+        peer_info: Some(serde_json::json!({"implementation":"rust"})),
     };
     let val: serde_json::Value = serde_json::to_value(&full).unwrap();
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
@@ -452,7 +483,7 @@ fn test_handshake_req_field_names() {
 fn test_handshake_resp_field_names() {
     // Rust 端 Resp 的完整字段集合（与 Go frame.go 的 HandshakeResp 对齐）
     let full = HandshakeRespShape {
-        protocol_version: 2,
+        protocol_version: 3,
         session_epoch: 1,
         success: true,
         message: "OK".into(),
@@ -474,6 +505,7 @@ fn test_handshake_resp_field_names() {
         enc_salt2: "b".into(),
         session_token: "t".into(),
         tls: Some(full_tls_info_shape()),
+        peer_info: Some(serde_json::json!({"implementation":"rust"})),
     };
     let val: serde_json::Value = serde_json::to_value(&full).unwrap();
     let mut keys: Vec<String> = val.as_object().unwrap().keys().cloned().collect();
@@ -496,6 +528,7 @@ fn test_handshake_resp_field_names() {
         "ipv6",
         "message",
         "padding",
+        "peer_info",
         "protocol_version",
         "session_epoch",
         "session_id",
@@ -520,7 +553,7 @@ fn test_golden_handshake_keys_match_rust() {
     let g = golden_or_skip!();
 
     let req_full = HandshakeReqShape {
-        protocol_version: 2,
+        protocol_version: 3,
         client_instance: "instance-1".into(),
         conn_id: "00000000-0000-4000-8000-000000000001".into(),
         session_token: "t".into(),
@@ -537,10 +570,11 @@ fn test_golden_handshake_keys_match_rust() {
         fec_group: 4,
         encrypt: true,
         enc_algo: 2,
+        peer_info: Some(serde_json::json!({"implementation":"rust"})),
         ..Default::default()
     };
     let resp_full = HandshakeRespShape {
-        protocol_version: 2,
+        protocol_version: 3,
         session_epoch: 1,
         success: true,
         message: "OK".into(),
@@ -562,6 +596,7 @@ fn test_golden_handshake_keys_match_rust() {
         enc_salt2: "b".into(),
         session_token: "t".into(),
         tls: Some(full_tls_info_shape()),
+        peer_info: Some(serde_json::json!({"implementation":"rust"})),
     };
     for (what, golden, shape) in [
         (
@@ -625,8 +660,8 @@ fn test_omitempty_semantics() {
         "fec_group",
         "encrypt",
         "enc_algo",
-        // 旧版客户端不发 session_token：空串必须省略，服务端才收得到"无令牌"
         "session_token",
+        "peer_info",
     ] {
         assert!(
             !obj.contains_key(k),

@@ -60,10 +60,14 @@ impl FecModeControl {
 }
 
 pub fn control_kind(payload: &[u8]) -> Result<u8, String> {
-    payload
+    let kind = payload
         .first()
         .copied()
-        .ok_or_else(|| "empty payload is KEEPALIVE, not a typed control".to_string())
+        .ok_or_else(|| "empty payload is KEEPALIVE, not a typed control".to_string())?;
+    match kind {
+        CONTROL_KIND_FEC_PARITY | CONTROL_KIND_FEC_MODE => Ok(kind),
+        _ => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
+    }
 }
 
 #[inline]
@@ -271,14 +275,106 @@ mod tests {
             "02010000010203040506070800000009"
         );
         assert_eq!(FecModeControl::parse(&wire).unwrap(), c);
+
+        let mut malformed = wire;
+        malformed[0] = 0;
+        assert!(FecModeControl::parse(&malformed).is_err());
+        malformed = wire;
+        malformed[3] = 1;
+        assert!(FecModeControl::parse(&malformed).is_err());
+        assert!(FecModeControl::parse(&wire[..wire.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn v3_control_kind_is_strict() {
+        assert_eq!(control_kind(&[CONTROL_KIND_FEC_PARITY]).unwrap(), 0x01);
+        assert_eq!(control_kind(&[CONTROL_KIND_FEC_MODE]).unwrap(), 0x02);
+        assert!(control_kind(&[0x7f]).is_err());
+        assert!(control_kind(&[]).is_err());
     }
 
     #[test]
     fn mode_boundaries_do_not_wrap_epoch() {
-        assert_eq!(fec_group_start(7, 4), 5);
-        assert_eq!(fec_next_group_start(7, 4), 9);
+        for (seq, group, next) in [
+            (1, 1, 1),
+            (2, 1, 5),
+            (3, 1, 5),
+            (4, 1, 5),
+            (5, 5, 5),
+            (6, 5, 9),
+            (7, 5, 9),
+            (8, 5, 9),
+            (9, 9, 9),
+        ] {
+            assert_eq!(fec_group_start(seq, 4), group);
+            assert_eq!(fec_next_group_start(seq, 4), next);
+        }
         assert_eq!(fec_next_group_start(u32::MAX - 1, 4), 0);
         assert_eq!(fec_next_group_start(u32::MAX, 4), 0);
+    }
+
+    #[test]
+    fn suspend_and_resume_define_exact_bypass_window() {
+        let rx = FecRxFenceState::default();
+        assert!(rx.apply(FecModeControl {
+            generation: 1,
+            op: FEC_MODE_SUSPEND,
+            boundary: 5,
+        }));
+        for seq in 1..5 {
+            assert!(!rx.bypass_data(seq));
+        }
+        for seq in 5..=8 {
+            assert!(rx.bypass_data(seq));
+        }
+        assert!(rx.apply(FecModeControl {
+            generation: 2,
+            op: FEC_MODE_RESUME,
+            boundary: 9,
+        }));
+        assert_eq!(rx.window(), (5, 9));
+        for seq in 5..9 {
+            assert!(rx.bypass_data(seq));
+        }
+        assert!(!rx.bypass_data(9));
+        assert!(rx.bypass_parity(5));
+        assert!(!rx.bypass_parity(9));
+    }
+
+    #[test]
+    fn rapid_transitions_never_regress_generation() {
+        let rx = FecRxFenceState::default();
+        for control in [
+            FecModeControl {
+                generation: 1,
+                op: FEC_MODE_SUSPEND,
+                boundary: 5,
+            },
+            FecModeControl {
+                generation: 2,
+                op: FEC_MODE_RESUME,
+                boundary: 9,
+            },
+            FecModeControl {
+                generation: 3,
+                op: FEC_MODE_SUSPEND,
+                boundary: 13,
+            },
+            FecModeControl {
+                generation: 4,
+                op: FEC_MODE_RESUME,
+                boundary: 17,
+            },
+        ] {
+            assert!(rx.apply(control));
+        }
+        assert!(!rx.apply(FecModeControl {
+            generation: 2,
+            op: FEC_MODE_RESUME,
+            boundary: 9,
+        }));
+        assert_eq!(rx.generation(), 4);
+        assert_eq!(rx.window(), (13, 17));
     }
 
     #[test]

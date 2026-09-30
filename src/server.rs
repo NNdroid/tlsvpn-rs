@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::api::*;
 use crate::buffer::*;
 use crate::crypto::*;
-use crate::fec::{self, FecDecoder};
+use crate::fec::FecDecoder;
 use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
@@ -591,7 +591,7 @@ impl WebStatsProvider for ServerCore {
             min_down = 0;
         }
         let negotiate = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
             "fec": true,
             "fec_group": 4,
             "enc_algo": if self.encrypt { self.enc_algo } else { ENC_ALGO_NONE },
@@ -1003,6 +1003,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
     tap_port.register_backend(Arc::new(Backend {
+        fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tap_tx,
         conn_id: Arc::new(Mutex::new(String::new())),
@@ -1270,6 +1271,7 @@ fn worker_loop(
             let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&socket));
             let (tx, rx) = bounded(1024);
             let backend = Arc::new(Backend {
+                fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
                 conn_id: Arc::new(Mutex::new(String::new())),
@@ -1722,16 +1724,23 @@ fn process_plain_frames(
                     let data = Arc::new(data);
 
                     if seq == 0 {
-                        if let Some(dec) = &fec_dec {
-                            if fec::is_parity_frame(&data) {
-                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    reorder_input.push((s, f));
-                                };
-                                dec.on_parity(&data, &mut sink);
-                                release_shared_frame(data);
-                                continue;
-                            }
+                        let Some(dec) = &fec_dec else {
+                            debug!("protocol v3 typed control without negotiated FEC");
+                            release_shared_frame(data);
+                            *close = true;
+                            break;
+                        };
+                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                            reorder_input.push((s, f));
+                        };
+                        if let Err(e) = dec.on_control(&data, &mut sink) {
+                            debug!("protocol v3 control error: {}", e);
+                            release_shared_frame(data);
+                            *close = true;
+                            break;
                         }
+                        release_shared_frame(data);
+                        continue;
                     }
 
                     if fec_dec.is_some() {
@@ -2156,7 +2165,7 @@ fn handle_handshake(
         );
         return HandshakeOutcome::Close;
     }
-    if req.protocol_version != 2 {
+    if req.protocol_version != crate::protocol::PROTOCOL_VERSION {
         warn!(
             "[{}] connection refused: unsupported protocol_version={}",
             client_id, req.protocol_version
@@ -2453,6 +2462,15 @@ fn handle_handshake(
     // from the previous connection instead of showing a stale host identity.
     *c_sess.peer_info.write() = req.peer_info.as_ref().map(normalize_peer_info);
 
+    {
+        let epoch = c_sess.epoch_state.read();
+        if let Some(dec) = &epoch.fec_dec {
+            dec.set_static_single_path(req.brutal_conns == 1);
+            let reorder = c_sess.reorder_buf.clone();
+            dec.set_reorder_progress(Arc::new(move || reorder.lock().expected_seq_snapshot()));
+        }
+    }
+
     let epoch_snapshot = c_sess.epoch_state.read();
     sess.ic_rx = epoch_snapshot.ic_rx.clone();
     sess.session_epoch = epoch_snapshot.epoch;
@@ -2513,7 +2531,7 @@ fn handle_handshake(
     c_sess.brutal_rx.store(client_tx_rate, Ordering::Relaxed);
 
     let resp = HandshakeResp {
-        protocol_version: req.protocol_version,
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         session_epoch: response_epoch,
         success: true,
         message: "OK".into(),

@@ -18,6 +18,7 @@ pub mod frame;
 pub mod hooks;
 pub mod net;
 pub mod peer_info;
+pub mod protocol;
 pub mod server;
 pub mod socks5;
 pub mod tap;
@@ -197,7 +198,7 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
     let encrypt_present = raw_value.get("encrypt").and_then(|e| e.as_bool()).is_some();
 
-    // server.session_token 已从配置契约删除：resume token 是 protocol v2 的强制属性。
+    // server.session_token 已从配置契约删除：resume token 是 protocol v3 的强制属性。
     // 升级时仍接受旧配置中的该键，但无论 true/false 都忽略；其余未知字段继续由
     // deny_unknown_fields 严格拒绝，避免拼写错误静默失效。
     if let Some(server) = raw_value

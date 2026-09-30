@@ -1,24 +1,25 @@
 // XOR 奇偶校验 FEC，逐行为对齐 Go fec.go：
 //
 // 编码（端口级）：每 K 个数据帧生成 1 个校验帧（负载 = K 个成员明文负载的
-// 逐字节异或），向所有连接广播；数据帧本身仍按 MinRTT 单路分发。
+// 逐字节异或），按 FEC 路径策略发送；数据帧本身仍按 MinRTT 单路分发。
 // 校验帧线路格式（沿用 10 字节头，seq=0、不加密）：
-//   [1B 0xFE][4B groupStart(大端)][1B K][K×4B 成员长度][异或载荷]
+//   [1B kind=0x01][4B groupStart(大端)][1B K][K×4B 成员长度][异或载荷]
 // -encrypt 开启时异或载荷以 groupStart 为 seq 用本方向加密器加密（GCM 附标签）。
 //
 // 解码（会话级）：数据帧到达计入所属组累加器；校验帧到达且组内恰好缺 1 帧
 // 时恢复并按原 seq 注入重排缓冲。组起点固定 ≡ 1 (mod K)。
-// 同组丢 ≥2 帧不可恢复（组保持挂起，由在途上限淘汰），广播重复校验帧按组
+// 同组丢 ≥2 帧不可恢复（组保持挂起，由在途上限淘汰），重复校验帧按组
 // start 去重。与 Go 一致：lost 仅统计"持有校验帧且组终结"时的缺失数。
 use byteorder::{BigEndian, ByteOrder};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::buffer::{acquire_frame_vec, release_frame_vec};
 use crate::crypto::*;
+use crate::protocol::*;
 
-pub const FEC_MAGIC: u8 = 0xFE;
 pub const FEC_MIN_GROUP: usize = 2;
 pub const FEC_MAX_GROUP: usize = 64;
 const FEC_MAX_PENDING_GROUPS: usize = 512;
@@ -204,9 +205,10 @@ unsafe fn xor_combine_neon(out: &mut [u8], parity: &[u8], acc: &[u8]) {
     }
 }
 
-/// 判断一个已解密线路帧是否为 XOR 校验帧（对齐 Go isParityFrame）
+/// Protocol-v3 typed FEC_PARITY discriminator. Receive loops use the strict
+/// FecDecoder::on_control dispatcher rather than silently ignoring other kinds.
 pub fn is_parity_frame(frame: &[u8]) -> bool {
-    frame.len() >= 7 && frame[0] == FEC_MAGIC
+    frame.len() >= 7 && frame[0] == CONTROL_KIND_FEC_PARITY
 }
 
 // ---------- 编码器（端口级，串行调用，无需加锁，对齐 fecEncoder） ----------
@@ -219,6 +221,8 @@ pub struct FecEncoder {
     active_len: usize,
     ic: Option<Arc<InnerCipher>>,
     parity_sent: u64,
+    multipath: bool,
+    armed: bool,
 }
 
 impl FecEncoder {
@@ -234,6 +238,10 @@ impl FecEncoder {
             ic,
             // encoder 本身已由 AsyncPort mutex 串行访问，无需再做原子计数。
             parity_sent: 0,
+            // Direct encoder tests keep immediate-encoding semantics until an
+            // AsyncPort supplies the physical topology.
+            multipath: true,
+            armed: true,
         }
     }
 
@@ -241,11 +249,40 @@ impl FecEncoder {
         self.parity_sent
     }
 
+    pub fn group_size(&self) -> usize {
+        self.k
+    }
+
+    /// Update sender physical topology. A collapse discards any partial group;
+    /// after multipath returns encoding re-arms only on a complete arithmetic
+    /// group boundary so RX and TX cannot disagree about group membership.
+    pub fn set_physical_path_count(&mut self, paths: usize) {
+        let multipath = paths >= 2;
+        if multipath == self.multipath {
+            return;
+        }
+        self.multipath = multipath;
+        if !multipath {
+            if !self.seqs.is_empty() || self.active_len != 0 {
+                self.reset();
+            }
+            self.armed = false;
+        } else {
+            self.armed = false;
+        }
+    }
+
     /// 把一个数据帧计入当前分组；凑满 K 帧时生成校验帧并重置分组。
     /// 返回 Some(parity) 表示校验帧就绪（载荷所有权归调用方，广播后释放）。
     pub fn add(&mut self, seq: u32, data: &[u8]) -> Option<Vec<u8>> {
-        if data.is_empty() {
+        if data.is_empty() || !self.multipath {
             return None;
+        }
+        if !self.armed {
+            if seq == 0 || (seq - 1) % self.k as u32 != 0 {
+                return None;
+            }
+            self.armed = true;
         }
         self.seqs.push(seq);
         self.lens.push(data.len());
@@ -274,7 +311,7 @@ impl FecEncoder {
         let max_len = self.active_len;
         let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
         let mut buf = acquire_frame_vec(6 + 4 * self.lens.len() + max_len + tag_len);
-        buf[0] = FEC_MAGIC;
+        buf[0] = CONTROL_KIND_FEC_PARITY;
         BigEndian::write_u32(&mut buf[1..5], self.seqs[0]);
         buf[5] = self.lens.len() as u8;
         let mut off = 6;
@@ -315,16 +352,30 @@ struct FecDecoderInner {
 
 pub struct FecDecoder {
     k: usize,
+    full_mask: u64,
+    static_single: AtomicBool,
+    pub fence: FecRxFenceState,
+    cleanup_before: AtomicU32,
+    retired_before: AtomicU32,
+    reorder_progress: RwLock<Option<Arc<dyn Fn() -> u32 + Send + Sync>>>,
+    control_mu: Mutex<()>,
     ic: Option<Arc<InnerCipher>>,
     inner: Mutex<FecDecoderInner>,
 }
 
 impl FecDecoder {
-    /// k 必须与对端编码分组大小一致（来自握手协商）；
-    /// ic 为对端→本端方向的解密器（校验帧用 groupStart 作 seq 解密）。
     pub fn new(k: usize, ic: Option<Arc<InnerCipher>>) -> Self {
+        let k = clamp_fec_group(k);
+        let full_mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
         Self {
-            k: clamp_fec_group(k),
+            k,
+            full_mask,
+            static_single: AtomicBool::new(false),
+            fence: FecRxFenceState::default(),
+            cleanup_before: AtomicU32::new(0),
+            retired_before: AtomicU32::new(0),
+            reorder_progress: RwLock::new(None),
+            control_mu: Mutex::new(()),
             ic,
             inner: Mutex::new(FecDecoderInner {
                 groups: HashMap::with_capacity(64),
@@ -335,7 +386,22 @@ impl FecDecoder {
         }
     }
 
-    pub fn reset(&self) {
+    pub fn set_reorder_progress(&self, f: Arc<dyn Fn() -> u32 + Send + Sync>) {
+        *self.reorder_progress.write() = Some(f);
+    }
+
+    pub fn set_static_single_path(&self, single: bool) {
+        if !single {
+            self.static_single.store(false, Ordering::Release);
+            return;
+        }
+        if !self.static_single.swap(true, Ordering::AcqRel) {
+            self.reset_state_preserve_static();
+        }
+    }
+
+    fn reset_state_preserve_static(&self) {
+        let _control = self.control_mu.lock();
         let mut inner = self.inner.lock();
         for (_, mut g) in inner.groups.drain() {
             if let Some(parity) = g.parity.take() {
@@ -343,6 +409,14 @@ impl FecDecoder {
             }
         }
         inner.done.fill(0);
+        self.cleanup_before.store(0, Ordering::Release);
+        self.retired_before.store(0, Ordering::Release);
+        drop(inner);
+        self.fence.reset();
+    }
+
+    pub fn reset(&self) {
+        self.reset_state_preserve_static();
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -350,24 +424,147 @@ impl FecDecoder {
         (inner.recovered, inner.lost)
     }
 
-    /// 记录一个已解密的数据帧。out 为恢复帧输出回调（按原 seq 注入重排缓冲）。
-    pub fn on_data(&self, seq: u32, frame: &Arc<Vec<u8>>, out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {
-        if frame.is_empty() || seq == 0 {
+    pub fn retired_before(&self) -> u32 {
+        self.retired_before.load(Ordering::Acquire)
+    }
+
+    fn atomic_max(dst: &AtomicU32, next: u32) {
+        if next == 0 {
+            return;
+        }
+        let mut old = dst.load(Ordering::Acquire);
+        while next > old {
+            match dst.compare_exchange_weak(old, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    fn drop_groups_in_range(inner: &mut FecDecoderInner, from: u32, until: u32) {
+        if from == 0 {
+            return;
+        }
+        let doomed: Vec<u32> = inner
+            .groups
+            .keys()
+            .copied()
+            .filter(|start| *start >= from && (until == 0 || *start < until))
+            .collect();
+        for start in doomed {
+            if let Some(mut g) = inner.groups.remove(&start) {
+                if let Some(parity) = g.parity.take() {
+                    release_frame_vec(parity);
+                }
+            }
+        }
+    }
+
+    fn maybe_retire_old_groups_locked(&self, inner: &mut FecDecoderInner) {
+        let boundary = self.cleanup_before.load(Ordering::Acquire);
+        if boundary == 0 || self.retired_before.load(Ordering::Acquire) >= boundary {
+            return;
+        }
+        let Some(progress) = self.reorder_progress.read().clone() else {
+            return;
+        };
+        let expected = progress();
+        if expected == 0 || expected < boundary {
+            return;
+        }
+        self.retired_before.store(boundary, Ordering::Release);
+        let doomed: Vec<u32> = inner
+            .groups
+            .keys()
+            .copied()
+            .filter(|start| *start < boundary)
+            .collect();
+        for start in doomed {
+            if let Some(mut g) = inner.groups.remove(&start) {
+                if let Some(parity) = g.parity.take() {
+                    release_frame_vec(parity);
+                }
+            }
+        }
+    }
+
+    fn cleanup_by_reorder_progress(&self) {
+        let boundary = self.cleanup_before.load(Ordering::Acquire);
+        if boundary == 0 || self.retired_before.load(Ordering::Acquire) >= boundary {
             return;
         }
         let mut inner = self.inner.lock();
+        self.maybe_retire_old_groups_locked(&mut inner);
+    }
+
+    fn handle_mode_control(&self, control: FecModeControl) {
+        let _control = self.control_mu.lock();
+        if !self.fence.apply(control) {
+            return;
+        }
+        let (from, until) = self.fence.window();
+        if from == 0 {
+            return;
+        }
+        Self::atomic_max(&self.cleanup_before, from);
+        let mut inner = self.inner.lock();
+        Self::drop_groups_in_range(&mut inner, from, until);
+        self.maybe_retire_old_groups_locked(&mut inner);
+    }
+
+    /// Strict protocol-v3 post-handshake seq=0 dispatcher.
+    pub fn on_control(
+        &self,
+        payload: &[u8],
+        out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+    ) -> Result<(), String> {
+        match control_kind(payload)? {
+            CONTROL_KIND_FEC_PARITY => self.on_parity_strict(payload, out),
+            CONTROL_KIND_FEC_MODE => {
+                let control = FecModeControl::parse(payload)?;
+                self.handle_mode_control(control);
+                Ok(())
+            }
+            kind => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
+        }
+    }
+
+    pub fn on_data(
+        &self,
+        seq: u32,
+        frame: &Arc<Vec<u8>>,
+        out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+    ) {
+        if frame.is_empty() || seq == 0 || self.static_single.load(Ordering::Acquire) {
+            return;
+        }
+        if self.fence.bypass_data(seq) {
+            if seq & 0xff == 0 {
+                self.cleanup_by_reorder_progress();
+            }
+            return;
+        }
+        let retired = self.retired_before.load(Ordering::Acquire);
+        if retired != 0 && seq < retired {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let retired = self.retired_before.load(Ordering::Acquire);
+        if self.static_single.load(Ordering::Acquire)
+            || self.fence.bypass_data(seq)
+            || (retired != 0 && seq < retired)
+        {
+            return;
+        }
         self.on_data_locked(&mut inner, seq, frame, out);
     }
 
-    /// 批量记录同一次 TLS plaintext drain 得到的数据帧。逻辑与 on_data 完全
-    /// 相同，但整批只获取一次 decoder mutex，避免多连接高 PPS 时 cache-line
-    /// ping-pong 和 parking_lot lock/unlock 成为吞吐瓶颈。
     pub fn on_data_batch(
         &self,
         frames: &[(u32, Arc<Vec<u8>>)],
         out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
     ) {
-        if frames.is_empty() {
+        if frames.is_empty() || self.static_single.load(Ordering::Acquire) {
             return;
         }
         let mut inner = self.inner.lock();
@@ -375,11 +572,20 @@ impl FecDecoder {
             if *seq == 0 || frame.is_empty() {
                 continue;
             }
+            if self.fence.bypass_data(*seq) {
+                if *seq & 0xff == 0 {
+                    self.maybe_retire_old_groups_locked(&mut inner);
+                }
+                continue;
+            }
+            let retired = self.retired_before.load(Ordering::Acquire);
+            if retired != 0 && *seq < retired {
+                continue;
+            }
             self.on_data_locked(&mut inner, *seq, frame, out);
         }
     }
 
-    #[inline]
     fn on_data_locked(
         &self,
         inner: &mut FecDecoderInner,
@@ -391,6 +597,7 @@ impl FecDecoder {
         if is_done(&inner.done, start, self.k) {
             return;
         }
+        let complete;
         {
             let g = entry(&mut inner.groups, start);
             let bit = seq - start;
@@ -399,88 +606,107 @@ impl FecDecoder {
                 return;
             }
             g.got_mask |= mask;
-            if frame.len() > g.acc.len() {
-                g.acc.resize(frame.len(), 0);
+            complete = g.got_mask == self.full_mask;
+            if !complete {
+                if frame.len() > g.acc.len() {
+                    g.acc.resize(frame.len(), 0);
+                }
+                xor_into(&mut g.acc, frame);
             }
-            xor_into(&mut g.acc, frame);
+        }
+        if complete {
+            if let Some(mut g) = inner.groups.remove(&start) {
+                if let Some(parity) = g.parity.take() {
+                    release_frame_vec(parity);
+                }
+            }
+            mark_done(&mut inner.done, start, self.k);
+            return;
         }
         try_recover(inner, start, self.k, out);
     }
 
-    /// 处理一个校验帧负载（已解密线路帧 seq=0）。
+    /// Non-strict helper retained for direct unit tests. Network receive loops
+    /// MUST use on_control so malformed typed controls terminate the connection.
     pub fn on_parity(&self, payload: &[u8], out: &mut dyn FnMut(u32, Arc<Vec<u8>>)) {
-        if payload.len() < 7 || payload[0] != FEC_MAGIC {
-            return;
+        let _ = self.on_parity_strict(payload, out);
+    }
+
+    fn on_parity_strict(
+        &self,
+        payload: &[u8],
+        out: &mut dyn FnMut(u32, Arc<Vec<u8>>),
+    ) -> Result<(), String> {
+        if self.static_single.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if payload.len() < 7 || payload[0] != CONTROL_KIND_FEC_PARITY {
+            return Err("malformed FEC_PARITY header".into());
         }
         let start = BigEndian::read_u32(&payload[1..5]);
         let k = payload[5] as usize;
-        if start == 0
-            || k < FEC_MIN_GROUP
-            || k > FEC_MAX_GROUP
-            || k != self.k
-            || (start - 1) % k as u32 != 0
-        {
-            return;
+        if start == 0 || k != self.k || (start - 1) % self.k as u32 != 0 {
+            return Err(format!("invalid FEC_PARITY start={start} k={k}"));
+        }
+        self.cleanup_by_reorder_progress();
+        let retired = self.retired_before.load(Ordering::Acquire);
+        if retired != 0 && start < retired {
+            return Ok(());
         }
         let desc_len = 6 + 4 * k;
         let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
         if payload.len() < desc_len + tag_len {
-            return;
+            return Err("truncated FEC_PARITY descriptor/body".into());
         }
         let mut lens = Vec::with_capacity(k);
         let mut max_len = 0usize;
         for i in 0..k {
             let l = BigEndian::read_u32(&payload[6 + 4 * i..10 + 4 * i]) as usize;
             if l + tag_len > payload.len() - desc_len {
-                return; // 描述符与负载长度自洽性校验失败
+                return Err("invalid FEC_PARITY member length".into());
             }
             lens.push(l);
-            if l > max_len {
-                max_len = l;
-            }
+            max_len = max_len.max(l);
         }
 
         let mut pb = acquire_frame_vec(max_len);
         if let Some(ic) = &self.ic {
-            // 解密校验载荷；AAD 与编码端一致：[加密区域长度(4BE) || groupStart(4BE)]
             let mut aad = [0u8; 8];
             aad[0..4].copy_from_slice(&((max_len + tag_len) as u32).to_be_bytes());
             aad[4..8].copy_from_slice(&start.to_be_bytes());
-            match ic.open_to(
-                &mut pb,
-                &payload[desc_len..desc_len + max_len + tag_len],
-                start,
-                &aad,
-            ) {
-                Ok(plain) => {
-                    let n = plain.len();
-                    pb.truncate(n);
-                }
-                Err(_) => {
-                    release_frame_vec(pb);
-                    return; // GCM 校验失败，整组放弃
-                }
-            }
+            let plain = ic
+                .open_to(
+                    &mut pb,
+                    &payload[desc_len..desc_len + max_len + tag_len],
+                    start,
+                    &aad,
+                )
+                .map_err(|_| "FEC_PARITY AEAD failure".to_string())?;
+            let n = plain.len();
+            pb.truncate(n);
         } else {
             pb.copy_from_slice(&payload[desc_len..desc_len + max_len]);
         }
 
         let mut inner = self.inner.lock();
-        if is_done(&inner.done, start, self.k) {
+        let retired = self.retired_before.load(Ordering::Acquire);
+        if (retired != 0 && start < retired) || is_done(&inner.done, start, self.k) {
             release_frame_vec(pb);
-            return;
+            return Ok(());
         }
         {
             let g = entry(&mut inner.groups, start);
             if g.parity.is_some() {
                 release_frame_vec(pb);
-                return; // 同组重复校验帧（多连接广播副本）
+                return Ok(());
             }
             g.k = k;
             g.lens = lens;
             g.parity = Some(pb);
         }
         try_recover(&mut inner, start, self.k, out);
+        self.maybe_retire_old_groups_locked(&mut inner);
+        Ok(())
     }
 
     fn group_start_of(&self, seq: u32) -> u32 {
@@ -593,6 +819,7 @@ fn try_recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex as StdMutex;
 
     fn run_roundtrip(k: usize, drop_indices: &[usize], encrypt: bool) -> (usize, usize, usize) {
@@ -859,5 +1086,110 @@ mod tests {
             dec.on_parity(&parity.unwrap(), &mut sink);
         }
         assert_eq!(*got.lock().unwrap(), vec![2], "恢复帧应携带原 seq=2");
+    }
+
+    #[test]
+    fn dynamic_rx_bypasses_single_path_interval_and_resumes() {
+        let dec = FecDecoder::new(4, None);
+        let mut sink = |_: u32, _: Arc<Vec<u8>>| {};
+        dec.on_control(
+            &FecModeControl {
+                generation: 1,
+                op: FEC_MODE_SUSPEND,
+                boundary: 5,
+            }
+            .encode(),
+            &mut sink,
+        )
+        .unwrap();
+        for seq in 5..=8 {
+            dec.on_data(seq, &Arc::new(vec![seq as u8]), &mut sink);
+        }
+        assert!(dec.inner.lock().groups.is_empty());
+
+        dec.on_control(
+            &FecModeControl {
+                generation: 2,
+                op: FEC_MODE_RESUME,
+                boundary: 9,
+            }
+            .encode(),
+            &mut sink,
+        )
+        .unwrap();
+        dec.on_data(9, &Arc::new(vec![9]), &mut sink);
+        assert!(dec.inner.lock().groups.contains_key(&9));
+    }
+
+    #[test]
+    fn dynamic_suspend_drops_only_abandoned_groups() {
+        let progress = Arc::new(AtomicU32::new(1));
+        let dec = FecDecoder::new(4, None);
+        let progress_reader = progress.clone();
+        dec.set_reorder_progress(Arc::new(move || progress_reader.load(Ordering::Acquire)));
+        let mut sink = |_: u32, _: Arc<Vec<u8>>| {};
+
+        for seq in [1, 2, 5, 6] {
+            dec.on_data(seq, &Arc::new(vec![seq as u8]), &mut sink);
+        }
+        dec.on_control(
+            &FecModeControl {
+                generation: 1,
+                op: FEC_MODE_SUSPEND,
+                boundary: 5,
+            }
+            .encode(),
+            &mut sink,
+        )
+        .unwrap();
+
+        let inner = dec.inner.lock();
+        assert!(inner.groups.contains_key(&1));
+        assert!(!inner.groups.contains_key(&5));
+    }
+
+    #[test]
+    fn dynamic_old_groups_retire_only_after_reorder_crosses_fence() {
+        let progress = Arc::new(AtomicU32::new(4));
+        let dec = FecDecoder::new(4, None);
+        let progress_reader = progress.clone();
+        dec.set_reorder_progress(Arc::new(move || progress_reader.load(Ordering::Acquire)));
+        let mut sink = |_: u32, _: Arc<Vec<u8>>| {};
+        dec.on_data(1, &Arc::new(vec![1]), &mut sink);
+        dec.on_data(2, &Arc::new(vec![2]), &mut sink);
+        dec.on_control(
+            &FecModeControl {
+                generation: 1,
+                op: FEC_MODE_SUSPEND,
+                boundary: 5,
+            }
+            .encode(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(dec.inner.lock().groups.contains_key(&1));
+
+        progress.store(5, Ordering::Release);
+        dec.cleanup_by_reorder_progress();
+        assert_eq!(dec.retired_before(), 5);
+        assert!(dec.inner.lock().groups.is_empty());
+
+        dec.on_data(1, &Arc::new(vec![1]), &mut sink);
+        assert!(dec.inner.lock().groups.is_empty());
+    }
+
+    #[test]
+    fn protocol_v3_rejects_unknown_and_malformed_controls() {
+        let dec = FecDecoder::new(4, None);
+        let mut sink = |_: u32, _: Arc<Vec<u8>>| {};
+        assert!(dec.on_control(&[0x7f, 1, 2, 3], &mut sink).is_err());
+        let mut bad = FecModeControl {
+            generation: 1,
+            op: FEC_MODE_SUSPEND,
+            boundary: 5,
+        }
+        .encode();
+        bad[2] = 1;
+        assert!(dec.on_control(&bad, &mut sink).is_err());
     }
 }

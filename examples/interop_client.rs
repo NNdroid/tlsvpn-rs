@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 const ENC_SALT_SIZE: usize = 8;
 const GCM_TAG_SIZE: usize = 16;
-const FEC_MAGIC: u8 = 0xFE;
+const CONTROL_KIND_FEC_PARITY: u8 = 0x01;
 
 #[derive(serde::Serialize)]
 struct HandshakeReq {
@@ -534,7 +534,7 @@ fn main() {
     let client_id =
         uuid::Uuid::new_v5(&ns, format!("{}{}", mac.to_lowercase(), psk).as_bytes()).to_string();
     let req = HandshakeReq {
-        protocol_version: 2,
+        protocol_version: 3,
         client_instance: "interop-probe-instance-00000001".into(),
         conn_id: uuid::Uuid::new_v4().to_string(),
         client_id: client_id.clone(),
@@ -567,9 +567,9 @@ fn main() {
     if !resp.success {
         fail(&format!("handshake rejected: {}", resp.message));
     }
-    if resp.protocol_version != Some(2) || resp.session_epoch.unwrap_or(0) == 0 {
+    if resp.protocol_version != Some(3) || resp.session_epoch.unwrap_or(0) == 0 {
         fail(&format!(
-            "server lacks protocol-v2 key epochs: version={:?} epoch={:?}",
+            "server lacks protocol-v3 key epochs: version={:?} epoch={:?}",
             resp.protocol_version, resp.session_epoch
         ));
     }
@@ -662,7 +662,7 @@ fn main() {
             ) {
                 Ok(Some((mut body, seq))) => {
                     if seq == 0 {
-                        if body.len() >= 7 && body[0] == FEC_MAGIC {
+                        if body.len() >= 7 && body[0] == CONTROL_KIND_FEC_PARITY {
                             // 校验帧：解析描述符并用 s2c 盐以 groupStart 解密
                             let start = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
                             let k = body[5] as usize;
@@ -763,7 +763,7 @@ fn main() {
         ) {
             Ok(Some((mut body, seq))) => {
                 if seq == 0 {
-                    if body.len() >= 7 && body[0] == FEC_MAGIC {
+                    if body.len() >= 7 && body[0] == CONTROL_KIND_FEC_PARITY {
                         got_parity += 1;
                         println!("RX: parity frame (len={})", body.len());
                     } else if body.is_empty() {
