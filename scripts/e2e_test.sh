@@ -2,7 +2,7 @@
 # e2e_test.sh — 跨语言 e2e 的唯一入口。
 #
 # 跑五个套件：
-#   accept  总验收矩阵（v3 安全配置 / 可选调优 / 旧版拒绝 / 兼容字段）
+#   accept  总验收矩阵（protocol v3 安全配置 / 可选调优）
 #   tok     protocol v3：同 MAC 两台真实客户端，验证跨实例接管被拒
 #   pad     pad_mode：off / bucket 两档 + 非法值
 #   minenc  min_enc："" / gcm 下限，含未知算法 ID 回归
@@ -17,7 +17,6 @@
 #
 # Env（全部可选，见 scripts/e2e_lib.sh）：
 #   E2E_RS_BIN / E2E_GO_BIN / E2E_RS_PROBE / E2E_GO_PROBE
-#   E2E_RS_OLD_BIN / E2E_RS_OLD_PROBE / E2E_GO_OLD_BIN   特性引入前的构建
 #   E2E_GO_DIR / E2E_CERT / E2E_KEY / E2E_PSK
 #   PORT_BASE_ACCEPT / _TOK / _PAD / _MINENC / _CFG   各套件端口基址
 #   KEEP_TMP=1   保留套件日志目录（默认退出时清理）
@@ -224,11 +223,6 @@ echo "  RS_BIN   $E2E_RS_BIN"
 echo "  GO_BIN   $E2E_GO_BIN"
 echo "  RS_PROBE $E2E_RS_PROBE"
 echo "  GO_PROBE $E2E_GO_PROBE"
-if e2e_have E2E_RS_OLD_BIN && e2e_have E2E_RS_OLD_PROBE && e2e_have E2E_GO_OLD_BIN; then
-  echo "  OLD      $E2E_RS_OLD_BIN / $E2E_GO_OLD_BIN"
-else
-  echo "  OLD      (缺旧版二进制 → accept 的 P3 降级拒绝用例会跳过并计数)"
-fi
 echo "  套件     ${SELECTED[*]}"
 
 TOTAL_START=$(date +%s)
