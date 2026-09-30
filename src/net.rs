@@ -1295,11 +1295,13 @@ impl AsyncPort {
         self.backends
             .read()
             .iter()
-            .map(|b| (
-                b.conn_id.lock().clone(),
-                b.rtt_cache.load(Ordering::Relaxed),
-                b.scheduler.snapshot(),
-            ))
+            .map(|b| {
+                (
+                    b.conn_id.lock().clone(),
+                    b.rtt_cache.load(Ordering::Relaxed),
+                    b.scheduler.snapshot(),
+                )
+            })
             .collect()
     }
 
@@ -1552,9 +1554,13 @@ impl AsyncPort {
                 return;
             }
             self.parity_sent.fetch_add(1, Ordering::Relaxed);
+            let parity_bytes = par.len() as u64;
             let par = FramePayload::Owned(par);
             if let Some(idx) = self.parity_backend_index(&backends, data_idx) {
-                self.send_payload_to(&backends[idx], 0, par);
+                let dropped = self.send_payload_to(&backends[idx], 0, par);
+                if dropped == 0 {
+                    backends[idx].scheduler.note_fec_assigned(parity_bytes);
+                }
             } else {
                 self.drop_n(1);
                 par.release();
@@ -1962,7 +1968,7 @@ mod tests {
         let backend = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx.clone(),
-                conn_id: Arc::new(Mutex::new(String::new())),
+            conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
@@ -2008,7 +2014,7 @@ mod tests {
         let b0 = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx0.clone(),
-                conn_id: Arc::new(Mutex::new(String::new())),
+            conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
@@ -2016,7 +2022,7 @@ mod tests {
         let b1 = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx1,
-                conn_id: Arc::new(Mutex::new(String::new())),
+            conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
         });
@@ -2067,14 +2073,14 @@ mod tests {
         let a = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_a,
-                conn_id: Arc::new(Mutex::new(String::new())),
+            conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(250_000)),
             notify: None,
         });
         let b = Arc::new(Backend {
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_b,
-                conn_id: Arc::new(Mutex::new(String::new())),
+            conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(240_000)),
             notify: None,
         });

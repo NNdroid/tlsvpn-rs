@@ -95,8 +95,11 @@
     if (el) el.innerHTML = out.join('');
   };
 
-  // assigned_bytes/assigned_batches are lifetime monotonic counters. Convert
-  // them into deltas over the actual refresh interval before showing rate/share.
+  // Data scheduler counters and FEC parity counters are lifetime monotonic.
+  // Convert both into deltas over the actual snapshot interval. assigned_* keeps
+  // its original data-only meaning for scheduler tests; the WebUI displays the
+  // actual transport assignment (DATA + FEC), so standby parity paths no longer
+  // look idle while they are carrying real bytes.
   const schedPrev = {};
   const schedView = {};
   let schedLastAt = 0;
@@ -122,15 +125,27 @@
       if (fresh) {
         const assigned = num(s.assigned_bytes);
         const batches = num(s.assigned_batches);
+        const fecAssigned = num(s.fec_assigned_bytes);
+        const fecBatches = num(s.fec_assigned_batches);
         const p = schedPrev[key];
-        const valid = !!p && dt > 0 && assigned >= p.assigned && batches >= p.batches;
-        const dBytes = valid ? assigned - p.assigned : 0;
-        const dBatches = valid ? batches - p.batches : 0;
-        schedPrev[key] = {assigned: assigned, batches: batches};
+        const valid = !!p && dt > 0 &&
+          assigned >= p.assigned && batches >= p.batches &&
+          fecAssigned >= p.fecAssigned && fecBatches >= p.fecBatches;
+        const dDataBytes = valid ? assigned - p.assigned : 0;
+        const dDataBatches = valid ? batches - p.batches : 0;
+        const dFecBytes = valid ? fecAssigned - p.fecAssigned : 0;
+        const dFecBatches = valid ? fecBatches - p.fecBatches : 0;
+        const dBytes = dDataBytes + dFecBytes;
+        const dBatches = dDataBatches + dFecBatches;
+        schedPrev[key] = {assigned: assigned, batches: batches, fecAssigned: fecAssigned, fecBatches: fecBatches};
         const view = {
           sampled: valid,
           assignBps: valid ? dBytes / dt : 0,
           batchPs: valid ? dBatches / dt : 0,
+          dataBps: valid ? dDataBytes / dt : 0,
+          dataBatchPs: valid ? dDataBatches / dt : 0,
+          fecBps: valid ? dFecBytes / dt : 0,
+          fecBatchPs: valid ? dFecBatches / dt : 0,
           deltaBytes: dBytes,
           share: 0
         };
@@ -138,7 +153,10 @@
         samples.push({s: s, view: view});
         totalDelta += dBytes;
       } else {
-        samples.push({s: s, view: schedView[key] || {sampled: false, assignBps: 0, batchPs: 0, deltaBytes: 0, share: 0}});
+        samples.push({s: s, view: schedView[key] || {
+          sampled: false, assignBps: 0, batchPs: 0, dataBps: 0, dataBatchPs: 0,
+          fecBps: 0, fecBatchPs: 0, deltaBytes: 0, share: 0
+        }});
       }
     });
 
@@ -153,10 +171,11 @@
       s._sampled = v.sampled;
       s._assign_bps = v.assignBps;
       s._batch_ps = v.batchPs;
+      s._data_assign_bps = v.dataBps;
+      s._data_batch_ps = v.dataBatchPs;
+      s._fec_assign_bps = v.fecBps;
+      s._fec_batch_ps = v.fecBatchPs;
       s._share_pct = v.share;
-      // backend eta_us is the last scheduling-decision estimate and can remain
-      // stale after a drain. Show queue-drain ETA from current queue + rate EWMA.
-      // Before the first rate sample, mirror the scheduler's 200 Mbps fallback.
       const rateBytes = num(s.rate_mbps) > 0 ? num(s.rate_mbps) * 1000000 / 8 : 25000000;
       s._queue_eta_us = rateBytes > 0 ? num(s.queued_bytes) * 1000000 / rateBytes : 0;
       totalAssignBps += v.assignBps;
@@ -188,7 +207,11 @@
       t('sched.capacity') + ' ' + (capacity ? capacity.toFixed(capacity < 10 ? 1 : 0) + ' Mbps' : '-') + ' · ' +
       t('sched.qeta') + ' ' + eta + ' · ' + t('sched.batches') + ' ' + batchRate +
       (s.carry_pending ? ' · ' + t('sched.carry') : '');
-    const tip = t('sched.cumulative') + ': ' + fmtBytes(num(s.assigned_bytes)) + ' / ' + num(s.assigned_batches) + ' ' + t('sched.batch_unit');
+    const totalBytes = num(s.assigned_bytes) + num(s.fec_assigned_bytes);
+    const totalBatches = num(s.assigned_batches) + num(s.fec_assigned_batches);
+    const tip = t('sched.cumulative') + ': ' + fmtBytes(totalBytes) + ' / ' + totalBatches + ' ' + t('sched.batch_unit') +
+      ' | DATA ' + fmtBytes(num(s.assigned_bytes)) + ' / ' + num(s.assigned_batches) +
+      ' | FEC ' + fmtBytes(num(s.fec_assigned_bytes)) + ' / ' + num(s.fec_assigned_batches);
     return '<div class="sched-cell" title="' + esc(tip) + '"><span class="badge ' + cls + '">' + esc(state) + '</span><small class="dim">' + esc(meta) + '</small></div>';
   };
 })();

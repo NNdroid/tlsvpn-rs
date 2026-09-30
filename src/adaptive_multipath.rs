@@ -74,6 +74,8 @@ pub struct SchedulerBackendState {
     pub carry_pending: Arc<AtomicBool>,
     pub assigned_bytes: AtomicU64,
     pub assigned_batches: AtomicU64,
+    pub fec_assigned_bytes: AtomicU64,
+    pub fec_assigned_batches: AtomicU64,
     pub virtual_finish_ns: AtomicI64,
     sample_bytes: AtomicU64,
     sample_start_us: AtomicU64,
@@ -89,6 +91,8 @@ impl Default for SchedulerBackendState {
             carry_pending: Arc::new(AtomicBool::new(false)),
             assigned_bytes: AtomicU64::new(0),
             assigned_batches: AtomicU64::new(0),
+            fec_assigned_bytes: AtomicU64::new(0),
+            fec_assigned_batches: AtomicU64::new(0),
             virtual_finish_ns: AtomicI64::new(0),
             sample_bytes: AtomicU64::new(0),
             sample_start_us: AtomicU64::new(0),
@@ -114,6 +118,14 @@ impl SchedulerBackendState {
         if n != 0 {
             self.assigned_bytes.fetch_add(n, Ordering::Relaxed);
             self.assigned_batches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn note_fec_assigned(&self, n: u64) {
+        if n != 0 {
+            self.fec_assigned_bytes.fetch_add(n, Ordering::Relaxed);
+            self.fec_assigned_batches.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -183,6 +195,8 @@ impl SchedulerBackendState {
             carry_pending: self.carry_pending.load(Ordering::Relaxed),
             assigned_bytes: self.assigned_bytes.load(Ordering::Relaxed),
             assigned_batches: self.assigned_batches.load(Ordering::Relaxed),
+            fec_assigned_bytes: self.fec_assigned_bytes.load(Ordering::Relaxed),
+            fec_assigned_batches: self.fec_assigned_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -196,6 +210,8 @@ pub struct SchedulerSnapshot {
     pub carry_pending: bool,
     pub assigned_bytes: u64,
     pub assigned_batches: u64,
+    pub fec_assigned_bytes: u64,
+    pub fec_assigned_batches: u64,
 }
 
 pub trait AdaptiveBackend {
@@ -633,5 +649,22 @@ mod tests {
         assert_eq!(s.queued_bytes.load(Ordering::Relaxed), 0);
         s.complete_queued(1400);
         assert_eq!(s.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod fec_assignment_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn fec_assignment_is_reported_separately_from_data() {
+        let s = SchedulerBackendState::default();
+        s.note_assigned(1200);
+        s.note_fec_assigned(300);
+        let snap = s.snapshot();
+        assert_eq!(snap.assigned_bytes, 1200);
+        assert_eq!(snap.assigned_batches, 1);
+        assert_eq!(snap.fec_assigned_bytes, 300);
+        assert_eq!(snap.fec_assigned_batches, 1);
     }
 }
