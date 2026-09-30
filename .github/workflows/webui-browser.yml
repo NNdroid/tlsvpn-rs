@@ -16,6 +16,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Check i18n coverage
+        run: node scripts/check_i18n.mjs
       - name: Install Playwright
         run: |
           npm install --no-save --package-lock=false playwright@1.55.0
