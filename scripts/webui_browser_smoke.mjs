@@ -15,7 +15,7 @@ function renderedIndex(src) {
       '<button data-v="zh-CN" onclick="setLang(\'zh-CN\')">简中</button>\n        <button data-v="zh-TW" onclick="setLang(\'zh-TW\')">繁中</button>'
     );
   }
-  for (const asset of ['frameviz.js', 'metrics.js']) {
+  for (const asset of ['frameviz.js', 'metrics.js', 'stream.js']) {
     if (!html.includes(`src="${asset}"`)) {
       html = html.replace('</body>', `<script src="${asset}"></script>\n</body>`);
     }
