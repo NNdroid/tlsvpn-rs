@@ -35,13 +35,12 @@ jobs:
 
           p=Path('src/net.rs')
           s=p.read_text()
-          old='''    fn send_payload_to(&self, b: &Backend, seq: u32, data: FramePayload) -> u64 {
-              match self.try_send_payload_to_fenced(b, seq, data, control) {'''
-          new='''    fn send_payload_to(&self, b: &Backend, seq: u32, data: FramePayload) -> u64 {
-              match self.try_send_payload_to(b, seq, data) {'''
-          if old not in s:
-              raise SystemExit('generated net.rs send_payload_to edge not found')
-          s=s.replace(old,new,1)
+          needle='match self.try_send_payload_to_fenced(b, seq, data, control) {'
+          if needle not in s:
+              raise SystemExit('generated net.rs fenced send token not found')
+          # The first occurrence is the ordinary send_payload_to helper. Only the
+          # later fallback-loop occurrence should remain FEC-fenced.
+          s=s.replace(needle, 'match self.try_send_payload_to(b, seq, data) {', 1)
           s=s.replace('use crate::buffer::{release_frame_vec, release_shared_frame};',
                       'use crate::buffer::release_frame_vec;',1)
           p.write_text(s)
