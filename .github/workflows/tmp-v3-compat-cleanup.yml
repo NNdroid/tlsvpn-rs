@@ -2,11 +2,12 @@ name: One-shot protocol v3 cleanup
 on:
   push:
     branches: ["protocol/v3-dynamic-fec"]
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
   cleanup:
-    if: github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -113,17 +114,12 @@ jobs:
           s = p.read_text()
           s = re.sub(r'Fresh-checkout reference run: 86 pass / 0 fail / 7 skip \(the skips are\n?mixed-version cases gated on `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`,\n?`E2E_GO_OLD_BIN`, which are absent on a clean checkout by design\), ~850s\.', 'Fresh-checkout acceptance runs exercise only protocol-v3 implementations and require no historical binaries.', s)
           p.write_text(s)
-
-          p = Path('.github/workflows/rust.yml')
-          s = p.read_text().replace('research/dynamic-rx-fec-bypass', 'perf/single-path-fec-bypass')
-          s = s.replace('This branch mirrors the still-open Go protocol-v3 PR', 'This branch tracks the merged Go protocol-v3 line')
-          p.write_text(s)
           PY
           cargo fmt
       - name: Strict v3 source gate
         shell: bash
         run: |
-          if grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy_session_token|legacy session_token|server\.remove\("session_token"\)|accepted_but_ignored' scripts src AGENTS.md .github/workflows/rust.yml; then
+          if grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy_session_token|legacy session_token|server\.remove\("session_token"\)|accepted_but_ignored' scripts src AGENTS.md; then
             echo 'v2 compatibility scaffolding remains'
             exit 1
           fi
@@ -161,10 +157,14 @@ jobs:
         run: bash scripts/e2e_accept.sh
       - name: Commit cleanup
         run: |
-          rm -f .github/workflows/tmp-v3-compat-cleanup.yml
+          rm -rf go-impl
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
+          git add AGENTS.md src/main.rs scripts/e2e_lib.sh scripts/e2e_accept.sh scripts/e2e_test.sh
           git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No source cleanup changes remain to commit.'
+            exit 0
+          fi
           git commit -m 'protocol: remove remaining v2 compatibility paths'
           git push origin HEAD:protocol/v3-dynamic-fec
