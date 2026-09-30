@@ -1,0 +1,173 @@
+name: One-shot protocol v3 cleanup
+on:
+  push:
+    branches: ["protocol/v3-dynamic-fec"]
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: protocol/v3-dynamic-fec
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Remove protocol-v2 compatibility paths
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def sub1(text, pattern, repl, label):
+              out, n = re.subn(pattern, repl, text, count=1, flags=re.S)
+              if n != 1:
+                  raise SystemExit(f'{label}: matched {n}, want 1')
+              return out
+
+          # Strict config parsing: removed server.session_token is now an unknown field.
+          p = Path('src/main.rs')
+          s = p.read_text()
+          s = s.replace('    let mut raw_value: serde_json::Value =\n', '    let raw_value: serde_json::Value =\n', 1)
+          s = sub1(s,
+              r'\n    // server\.session_token 已从配置契约删除：resume token 是 protocol v3 的强制属性。.*?\n    }\n\n    let mut cfg:',
+              '\n    let mut cfg:', 'remove Rust legacy session_token config shim')
+          if 'server.remove("session_token")' in s:
+              raise SystemExit('src/main.rs still strips session_token')
+          p.write_text(s)
+
+          # Remove old-binary knobs/helpers from shared E2E library.
+          p = Path('scripts/e2e_lib.sh')
+          s = p.read_text()
+          s = re.sub(r'^#   E2E_RS_OLD_BIN.*\n', '', s, flags=re.M)
+          s = sub1(s,
+              r'# The "old" builds exist only to exercise the mixed-version phases\..*?by design\), ~850s\.\n',
+              '', 'remove old-build e2e paragraph') if 'The "old" builds exist only' in s else s
+          s = re.sub(r'^E2E_(?:RS_OLD_BIN|RS_OLD_PROBE|GO_OLD_BIN)=.*\n', '', s, flags=re.M)
+          s = sub1(s,
+              r'\n# True when the env var named by \$1 is set and the file it points to exists\..*?\n}\n',
+              '\n', 'remove e2e_have')
+          p.write_text(s)
+
+          # Acceptance matrix: current v3 implementations only; remove mixed-version and old-config phases.
+          p = Path('scripts/e2e_accept.sh')
+          s = p.read_text()
+          s = re.sub(r'^#   P[34].*\n', '', s, flags=re.M)
+          s = re.sub(r'^# P3 .*\n# .*\n# .*\n', '', s, count=1, flags=re.M)
+          s = sub1(s,
+              r'# run_case LABEL.*?  CASE_N=\$\(\(CASE_N \+ 1\)\)',
+              '''# run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC CLI_EXTRA [SRV_CFG]
+# SRV/CLI values: rs | go. TLSVPN protocol v3 is mandatory on both sides.
+# Optional knobs are omitted when empty; an explicit SRV_CFG may override generation.
+run_case() {
+  local label="$1" srv="$2" cli="$3"
+  local srv_pad="$4" srv_minenc="$5"
+  local cli_extra="$6" srv_cfg="${7:-}"
+  local gobin rsbin probebin
+  local sk=$srv ck=$cli
+
+  gobin="$E2E_GO_BIN"
+  rsbin="$E2E_RS_BIN"
+  if [ "$ck" = rs ]; then
+    probebin="$E2E_RS_PROBE"
+  else
+    probebin="$E2E_GO_PROBE"
+  fi
+
+  CASE_N=$((CASE_N + 1))''', 'simplify run_case v3 prefix')
+          s = re.sub(r'^    \[ "\$srv_token" = 1 \] && srvobj\+=.*\n', '', s, flags=re.M)
+          s = sub1(s,
+              r'  if \[ \$ok -eq 1 \]; then\n    if \[ "\$expect" = fail \]; then verdict=UNEXPECTED-PASS; else verdict=PASS; fi\n  else\n    if \[ "\$expect" = fail \]; then verdict=PASS-AS-EXPECTED; else verdict=FAIL; fi\n  fi\n\n  if \[ "\$verdict" = PASS \] \|\| \[ "\$verdict" = PASS-AS-EXPECTED \]; then',
+              '  if [ $ok -eq 1 ]; then verdict=PASS; else verdict=FAIL; fi\n\n  if [ "$verdict" = PASS ]; then', 'remove mixed-version expected-failure verdict')
+          s = s.replace('# go_cfg_now IS_SERVER LEGACY_TOKEN PAD MINENC\n# LEGACY_TOKEN 仅供 P4 验证旧配置迁移；空串表示当前配置契约，不生成该键。\n', '# go_cfg_now IS_SERVER PAD MINENC\n')
+          s = s.replace('  local is_srv="$1" tok="$2" pad="$3" minenc="$4"\n  local d f port mac legacy_token=""\n', '  local is_srv="$1" pad="$2" minenc="$3"\n  local d f port mac\n')
+          s = re.sub(r'^  \[ -n "\$tok" \] && legacy_token=.*\n', '', s, flags=re.M)
+          s = s.replace('"key": "$KEY"$legacy_token}', '"key": "$KEY"}')
+          s = sub1(s,
+              r'\nHAVE_OLD=0\nif e2e_have E2E_RS_OLD_BIN.*?\nfi\n',
+              '\n', 'remove HAVE_OLD detection')
+          s = sub1(s,
+              r'\necho ""\necho "=+"\necho " P3 .*?\nfor d in ',
+              '\nfor d in ', 'remove P3/P4 execution phases')
+
+          replacements = {
+              'run_case "rs->rs 全开"      rs rs bucket gcm "" "--enc-algo 2"': 'run_case "rs->rs 全开"      rs rs bucket gcm "--enc-algo 2"',
+              'run_case "rs->go 全开"      rs go bucket gcm "" "--enc-algo 2"': 'run_case "rs->go 全开"      rs go bucket gcm "--enc-algo 2"',
+              'run_case "go->rs 全开"      go rs "" "" "" "--enc-algo 2"': 'run_case "go->rs 全开"      go rs "" "" "--enc-algo 2"',
+              'run_case "go->go 全开"      go go "" "" "" "-enc-algo 2"': 'run_case "go->go 全开"      go go "" "" "-enc-algo 2"',
+              'go_cfg_now 1 "" bucket gcm; run_case "go(cfg)->rs" go rs "" "" "" "--enc-algo 2" "$CFGF"': 'go_cfg_now 1 bucket gcm; run_case "go(cfg)->rs" go rs "" "" "--enc-algo 2" "$CFGF"',
+              'go_cfg_now 1 "" bucket gcm; run_case "go(cfg)->go" go go "" "" "" "-enc-algo 2" "$CFGF"': 'go_cfg_now 1 bucket gcm; run_case "go(cfg)->go" go go "" "" "-enc-algo 2" "$CFGF"',
+              'run_case "rs->rs 全关"  rs rs off "" "" ""': 'run_case "rs->rs 全关"  rs rs off "" ""',
+              'run_case "rs->go 全关"  rs go off "" "" ""': 'run_case "rs->go 全关"  rs go off "" ""',
+              'run_case "go->rs 全关"  go rs "" "" "" ""': 'run_case "go->rs 全关"  go rs "" "" ""',
+              'run_case "go->go 全关"  go go "" "" "" ""': 'run_case "go->go 全关"  go go "" "" ""',
+          }
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f'missing expected call: {old}')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # Documentation no longer advertises optional historical binaries.
+          p = Path('AGENTS.md')
+          s = p.read_text()
+          s = re.sub(
+              r'Fresh-checkout reference run: 86 pass / 0 fail / 7 skip \(the skips are\n?mixed-version cases gated on `E2E_RS_OLD_BIN`, `E2E_RS_OLD_PROBE`,\n?`E2E_GO_OLD_BIN`, which are absent on a clean checkout by design\), ~850s\.',
+              'Fresh-checkout acceptance runs exercise only protocol-v3 implementations and require no historical binaries.',
+              s)
+          p.write_text(s)
+
+          # Go v3 counterpart is now merged into this target branch.
+          p = Path('.github/workflows/rust.yml')
+          s = p.read_text().replace('research/dynamic-rx-fec-bypass', 'perf/single-path-fec-bypass')
+          s = s.replace('This branch mirrors the still-open Go protocol-v3 PR', 'This branch tracks the merged Go protocol-v3 line')
+          p.write_text(s)
+          PY
+          cargo fmt
+      - name: Strict v3 source gate
+        shell: bash
+        run: |
+          ! grep -R --line-number -E 'E2E_RS_OLD_BIN|E2E_RS_OLD_PROBE|E2E_GO_OLD_BIN|\brsold\b|\bgoold\b|mixed-version|legacy session_token|server\.remove\("session_token"\)' scripts src AGENTS.md .github/workflows/rust.yml
+          ! grep -R --line-number --include='*.rs' -E 'protocol_version:[[:space:]]*2|protocol_version[[:space:]]*[!=]=[[:space:]]*2' src tests examples
+          grep -Fq 'pub const PROTOCOL_VERSION: i64 = 3;' src/protocol.rs
+          python3 - <<'PY'
+          import json
+          g=json.load(open('testdata/protocol_golden.json'))
+          assert g['version'] == 3, g['version']
+          PY
+          bash -n scripts/e2e_accept.sh scripts/e2e_lib.sh
+      - name: Rust tests
+        run: cargo test --all-targets --verbose
+      - name: Checkout Go v3 counterpart
+        uses: actions/checkout@v4
+        with:
+          repository: NNdroid/tlsvpn
+          ref: perf/single-path-fec-bypass
+          path: go-impl
+      - name: Build current Go and Rust probes
+        run: |
+          cargo build --examples
+          (cd go-impl && go build -o bin/tlsvpn .)
+          (cd go-impl && go build -C interop -o probe .)
+      - name: Current-v3 acceptance matrix
+        env:
+          E2E_GO_DIR: ${{ github.workspace }}/go-impl
+          E2E_GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn
+          E2E_GO_PROBE: ${{ github.workspace }}/go-impl/interop/probe
+          E2E_RS_BIN: ${{ github.workspace }}/target/debug/tlsvpn
+          E2E_RS_PROBE: ${{ github.workspace }}/target/debug/examples/interop_client
+        run: bash scripts/e2e_accept.sh
+      - name: Commit cleanup
+        run: |
+          rm -f .github/workflows/tmp-v3-compat-cleanup.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m 'protocol: remove remaining v2 compatibility paths'
+          git push origin HEAD:protocol/v3-dynamic-fec
