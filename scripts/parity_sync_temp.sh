@@ -2,6 +2,7 @@
 set -euo pipefail
 
 GO_DIR="${1:-go-impl}"
+echo "Syncing shared parity from Go main at $(git -C "$GO_DIR" rev-parse --short HEAD)"
 
 shared=(
   webui/app.js
@@ -19,8 +20,6 @@ for f in "${shared[@]}"; do
   cp "$GO_DIR/$f" "$f"
 done
 
-# Binary/icon assets are already identical today; verify rather than silently
-# letting the two repositories drift again.
 cmp "$GO_DIR/webui/favicon.ico" webui/favicon.ico
 while IFS= read -r -d '' f; do
   rel="${f#${GO_DIR}/}"
@@ -39,8 +38,6 @@ done
 node scripts/check_i18n.mjs
 cargo test --test dashboard_script_test --test webui_sse_test
 
-# This helper is deliberately one-shot; the resulting product commit must not
-# leave a self-mutating workflow or patch helper behind.
 rm -f scripts/parity_sync_temp.sh .github/workflows/parity-sync-temp.yml
 
 git add -A
