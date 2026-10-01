@@ -1,6 +1,8 @@
 name: Cross-language Inner AEAD
 
 on:
+  push:
+    branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
     paths:
