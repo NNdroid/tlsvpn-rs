@@ -30,6 +30,7 @@
 # Fixed addressing (defaults): v4 10.77.0.0/24 (gw .1 = server, client .2),
 # v6 fd77::/64 (gw fd77::1, client fd77::2).
 set -uo pipefail
+PERF_METRICS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/perf_metrics.py"
 
 PORT="${PORT:-18600}"
 SUBNET_V4="${SUBNET_V4:-10.77.0.0/24}"
@@ -338,8 +339,16 @@ PY
 iperf_one_way() {
   local label="$1" extra="${2:-}" direction="${3:-upload}"
   local json mbps
+  local metrics_file="$SRV_DIR/metrics-$direction.json"
+  local metrics_args=("$srv_tunnel_pid" "$cli_tunnel_pid" "$NS_SRV" "$NS_CLI" "$TAP_SRV" "$TAP_CLI")
+  python3 "$PERF_METRICS_SCRIPT" start "$metrics_file" "$direction" "${metrics_args[@]}" || {
+    fail "could not sample VPN CPU/TAP counters before $direction"; return 1;
+  }
   json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
+  }
+  python3 "$PERF_METRICS_SCRIPT" finish "$metrics_file" "$direction" "${metrics_args[@]}" || {
+    fail "could not sample VPN CPU/TAP counters after $direction"; return 1;
   }
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
   # 最后一个 bits_per_second 就是最终汇总速率。用 grep+awk 解析，避免
@@ -454,6 +463,7 @@ run_group() {
 
   ip netns exec "$NS_SRV" "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
   local srv_pid=$!
+  local srv_tunnel_pid=$srv_pid
   PIDS+=($srv_pid)
   if ! wait_for_port "$NS_CLI" "$UNDERLAY_SRV" "$PORT" 20; then
     fail "server did not start ($UNDERLAY_SRV:$PORT never opened/reached within 20s)"
@@ -489,6 +499,7 @@ run_group() {
       "\"client\": {\"cert_sha256\": \"$fp\", \"conns\": $PERF_CONNS}"
   fi
   ip netns exec "$NS_CLI" "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
+  local cli_tunnel_pid=$!
   PIDS+=($!)
 
   if ! wait_for_client_ip; then

@@ -23,7 +23,9 @@ jobs:
       run: cargo build --verbose
 
     - name: Test Core Logic
-      run: cargo test --verbose
+      run: |
+        cargo test --verbose
+        python3 -m unittest discover -s tests -p 'test_perf_metrics.py'
 
     - name: Check Linux ARM64 dataplane
       # The primary deployment class includes ARM64 SBCs. This compile check
@@ -79,6 +81,8 @@ jobs:
         git rev-parse HEAD >> perf-results/host.txt
         RUSTFLAGS="-C target-cpu=native" cargo test --release bench_rx_direct_batch \
           -- --ignored --nocapture | tee perf-results/rx-stage.txt
+        RUSTFLAGS="-C target-cpu=native" cargo test --release bench_tap_return_pool \
+          -- --ignored --nocapture | tee perf-results/tap-return.txt
 
     - uses: actions/upload-artifact@v4
       if: always()
@@ -258,7 +262,9 @@ jobs:
       env:
         RS_BIN: ${{ github.workspace }}/dist/tlsvpn
         GO_BIN: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
-      run: sudo -E bash scripts/rx_perf_matrix.sh
+      run: |
+        sudo -E bash scripts/rx_perf_matrix.sh
+        sudo -E bash scripts/tap_recycle_perf.sh
 
     - uses: actions/upload-artifact@v4
       if: always()

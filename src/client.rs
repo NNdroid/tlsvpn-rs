@@ -248,6 +248,10 @@ pub struct SessionState {
 // descriptors are recycled so the handoff itself does not allocate per frame.
 const TAP_DELIVERY_QUEUE: usize = 256;
 const TAP_DELIVERY_BATCH_CAP: usize = 64;
+// Retain only standard-MTU payloads, with at most 512 KiB in the return queue.
+const TAP_RETURN_POOL: usize = 8;
+const TAP_RETURN_FRAMES: usize = 32;
+const TAP_RETURN_MAX_CAPACITY: usize = 2048;
 type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
 
 struct TapDelivery {
@@ -259,13 +263,27 @@ struct TapDelivery {
 
 impl TapDelivery {
     fn new(tap: Arc<dyn TapDevice>) -> Self {
+        let recycle = std::env::var("TLSVPN_RX_RECYCLE").as_deref() != Ok("0");
+        Self::new_with_recycling(tap, recycle)
+    }
+
+    fn new_with_recycling(tap: Arc<dyn TapDevice>, recycle: bool) -> Self {
         let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
-        let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_RETURN_POOL);
         let worker_pool = pool_tx.clone();
         std::thread::spawn(move || {
             while let Ok(mut batch) = rx.recv() {
-                for frame in batch.drain(..) {
-                    let _ = tap.send(&frame);
+                let mut keep = 0;
+                for index in 0..batch.len() {
+                    let _ = tap.send(&batch[index]);
+                    if recycle && keep < TAP_RETURN_FRAMES
+                        && batch[index].capacity() == TAP_RETURN_MAX_CAPACITY
+                    {
+                        batch.swap(keep, index);
+                        keep += 1;
+                    }
+                }
+                for frame in batch.drain(keep..) {
                     release_shared_frame(frame);
                 }
                 let _ = worker_pool.try_send(batch);
@@ -281,9 +299,15 @@ impl TapDelivery {
 
     #[inline]
     fn acquire(&self) -> TapDeliveryBatch {
-        self.pool_rx
+        let mut batch = self.pool_rx
             .try_recv()
-            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP))
+            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP));
+        // This executes on the RX owner, where FrameScanner acquires buffers.
+        // Returning on the TAP worker only warms that worker's thread-local pool.
+        for frame in batch.drain(..) {
+            release_shared_frame(frame);
+        }
+        batch
     }
 
     #[inline]
@@ -2204,6 +2228,98 @@ fn clamp_poll_for_tx_backlog(base: Duration, tx_backlog: bool, tls_wants_write: 
         Duration::ZERO
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tap_return_tests {
+    use super::*;
+    use crate::buffer::acquire_frame_vec_overwrite;
+    use std::sync::mpsc;
+
+    struct RecordingTap(mpsc::Sender<u8>);
+    impl TapDevice for RecordingTap {
+        fn send(&self, data: &[u8]) -> std::io::Result<()> {
+            self.0.send(data[0]).unwrap();
+            Ok(())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn tap_returns_bounded_hot_payloads_to_the_rx_owner_in_order() {
+        let (tx, rx) = mpsc::channel();
+        let delivery = TapDelivery::new_with_recycling(Arc::new(RecordingTap(tx)), true);
+        let mut batch = Vec::new();
+        let mut pointers = Vec::new();
+        for marker in 0..40u8 {
+            let mut frame = acquire_frame_vec_overwrite(1500);
+            frame.fill(marker);
+            if marker < TAP_RETURN_FRAMES as u8 { pointers.push(frame.as_ptr()); }
+            batch.push(Arc::new(frame));
+        }
+        batch.insert(1, Arc::new(vec![0xfe; 9000]));
+        delivery.enqueue(batch);
+        let returned = delivery.pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(returned.len(), TAP_RETURN_FRAMES);
+        assert!(returned.iter().all(|f| f.capacity() == TAP_RETURN_MAX_CAPACITY));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0xfe);
+        for marker in 1..40u8 {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), marker);
+        }
+        delivery.pool_tx.try_send(returned).unwrap();
+        assert!(delivery.acquire().is_empty());
+        for _ in 0..TAP_RETURN_FRAMES {
+            let frame = acquire_frame_vec_overwrite(1500);
+            assert!(pointers.contains(&frame.as_ptr()), "RX must acquire the returned storage");
+        }
+    }
+
+    #[test]
+    fn tap_recycling_negative_control_and_shared_frames_are_safe() {
+        for enabled in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let delivery = TapDelivery::new_with_recycling(Arc::new(RecordingTap(tx)), enabled);
+            let mut buf = acquire_frame_vec_overwrite(1500);
+            buf.fill(0x55);
+            let shared = Arc::new(buf);
+            delivery.enqueue(vec![shared.clone()]);
+            let returned = delivery.pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(returned.len(), usize::from(enabled));
+            delivery.pool_tx.try_send(returned).unwrap();
+            assert!(delivery.acquire().is_empty());
+            assert_eq!(Arc::strong_count(&shared), 1);
+            assert!(shared.iter().all(|b| *b == 0x55));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_tap_return_pool() {
+        use crate::tap::MemTap;
+        for recycle in [false, true] {
+            let delivery = TapDelivery::new_with_recycling(Arc::new(MemTap), recycle);
+            let start = Instant::now();
+            let mut frames = 0u64;
+            while start.elapsed() < Duration::from_secs(1) {
+                let mut batch = delivery.acquire();
+                for _ in 0..16 {
+                    let mut payload = acquire_frame_vec_overwrite(1500);
+                    payload.fill(0x55);
+                    batch.push(Arc::new(payload));
+                }
+                delivery.enqueue(batch);
+                let returned = delivery.pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                delivery.pool_tx.try_send(returned).unwrap();
+                frames += 16;
+            }
+            println!("TAP_RETURN recycle={} pps={:.0} ns/frame={:.1}",
+                u8::from(recycle), frames as f64 / start.elapsed().as_secs_f64(),
+                start.elapsed().as_nanos() as f64 / frames as f64);
+        }
     }
 }
 

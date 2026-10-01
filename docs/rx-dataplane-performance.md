@@ -48,3 +48,28 @@ TX already batches framed plaintext into rustls writes. The dataplane transport
 is TCP/TLS, so UDP sendmmsg/recvmmsg and GRO/GSO do not apply here. ARM64 already
 has a separate `scripts/build.sh a55` artifact and corresponding CI compile check;
 generic release artifacts retain their existing compatibility settings.
+
+## TAP payload return pool
+
+Client RX allocates payloads on the TLS reader, but the TAP worker used to release
+them into its own thread-local pool. Delivered standard-MTU buffers now return
+through the existing batch pool; the RX owner releases them into its frame pool
+when acquiring the next batch. No payload copy or extra channel is added.
+The return queue holds at most eight batches of 32 buffers of capacity 2048
+(512 KiB of payload storage). Jumbo buffers and overflow keep the old release
+path. Shared FEC frames are reused only after unique ownership is available.
+`TLSVPN_RX_RECYCLE=0` restores worker-side release as a negative control.
+
+`scripts/tap_recycle_perf.sh` runs recycle off/on/on/off at batch 16 for rs/rs,
+go/rs, and the unaffected go/go control. The receive buffer return change is in
+the Rust client, so rs/go is covered by the RX matrix but is not a recycling
+target. The same CI artifact contains these logs.
+
+Every iperf measurement now records `VPN_METRICS`: full VPN server/client process
+CPU from /proc utime+stime, and separate logical TAP RX/TX packet rates. CPU is
+percent of one core and may exceed 100 for a multithreaded process; it is not
+iperf's CPU or a whole-host percentage. Monotonic elapsed time covers the transfer
+and endpoint sampling overhead. CPU and packet counter resets fail the sample.
+The TAP return microbenchmark includes producer/worker synchronization and memory
+reuse, but does not model the kernel TAP or TLS crypto. Whole-allocator profiles
+and physical ARM device measurements remain outstanding.
