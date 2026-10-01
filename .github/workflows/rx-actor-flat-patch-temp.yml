@@ -1,0 +1,39 @@
+name: One-shot flat RX actor wiring
+
+on:
+  push:
+    branches:
+      - perf/rx-session-actor
+    paths:
+      - .github/workflows/rx-actor-flat-patch-temp.yml
+      - scripts/rx_actor_flat_patch.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/rx-session-actor
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Patch and validate
+        run: |
+          python3 scripts/rx_actor_flat_patch.py
+          cargo fmt --all
+          cargo test rx_actor -- --nocapture
+          cargo test --test webui_sse_test --test dashboard_script_test
+      - name: Commit product wiring
+        run: |
+          rm -f scripts/rx_actor_flat_patch.py .github/workflows/rx-actor-flat-patch-temp.yml
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'perf: wire reusable flat RX actor batches'
+          git push origin HEAD:perf/rx-session-actor
