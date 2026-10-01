@@ -253,6 +253,11 @@ impl FecEncoder {
         self.k
     }
 
+    #[inline]
+    pub fn armed(&self) -> bool {
+        self.multipath && self.armed
+    }
+
     /// Update sender physical topology. A collapse discards any partial group;
     /// after multipath returns encoding re-arms only on a complete arithmetic
     /// group boundary so RX and TX cannot disagree about group membership.
@@ -422,6 +427,14 @@ impl FecDecoder {
     pub fn stats(&self) -> (u64, u64) {
         let inner = self.inner.lock();
         (inner.recovered, inner.lost)
+    }
+
+    pub fn bypass_snapshot(&self) -> bool {
+        if self.static_single.load(Ordering::Acquire) {
+            return true;
+        }
+        let (from, until) = self.fence.window();
+        from != 0 && until == 0
     }
 
     pub fn retired_before(&self) -> u32 {

@@ -397,6 +397,8 @@ pub struct ServerCore {
     pub brutal_down: u64,
     pub vswitch: Arc<VSwitch>,
     pub sessions: RwLock<HashMap<String, Arc<ClientSession>>>,
+    pub fec_recovered_retired: AtomicU64,
+    pub fec_lost_retired: AtomicU64,
     pub pool: Mutex<IpPool>,
     pub banned: BanList,
     pub registry: StatRegistry,
@@ -436,6 +438,18 @@ impl ServerCore {
         if !Arc::ptr_eq(current, session) {
             return;
         }
+        // Fold the final decoder epoch into the same process-lifetime domain
+        // before removing the session. Decoder rebuilds have already been
+        // accumulated into ClientStat, so add current decoder only once here.
+        let mut recovered = session.stat.fec_recovered_lifetime.load(Ordering::Relaxed);
+        let mut lost = session.stat.fec_lost_lifetime.load(Ordering::Relaxed);
+        if let Some(dec) = &session.epoch_state.read().fec_dec {
+            let (r, l) = dec.stats();
+            recovered = recovered.saturating_add(r);
+            lost = lost.saturating_add(l);
+        }
+        self.fec_recovered_retired.fetch_add(recovered, Ordering::Relaxed);
+        self.fec_lost_retired.fetch_add(lost, Ordering::Relaxed);
         sessions.remove(cid);
         drop(sessions);
         self.vswitch.remove_port(cid);
@@ -471,8 +485,8 @@ impl WebStatsProvider for ServerCore {
     fn stats_json(&self) -> serde_json::Value {
         let sessions = self.sessions.read();
         let mut clients = serde_json::Map::new();
-        let mut rec = 0u64;
-        let mut lost = 0u64;
+        let mut rec = self.fec_recovered_retired.load(Ordering::Relaxed);
+        let mut lost = self.fec_lost_retired.load(Ordering::Relaxed);
         let mut parity = 0u64;
         let mut data_tx = 0u64;
         let mut control_tx = 0u64;
@@ -492,14 +506,17 @@ impl WebStatsProvider for ServerCore {
             control_tx = control_tx.saturating_add(w.control_frames);
             data_wire = data_wire.saturating_add(w.data_wire_bytes);
             parity_wire = parity_wire.saturating_add(w.parity_wire_bytes);
-            let conns = s.stat.active_conns.load(Ordering::Relaxed) as u64;
             if s.fec_enc_k > 0 {
                 enabled_sessions += 1;
-                if conns >= 2 { tx_active_sessions += 1; }
-                if conns <= 1 { rx_bypass_sessions += 1; }
+                if s.port.fec_tx_armed() {
+                    tx_active_sessions += 1;
+                }
             }
             let epoch = s.epoch_state.read();
             if let Some(dec) = &epoch.fec_dec {
+                if dec.bypass_snapshot() {
+                    rx_bypass_sessions += 1;
+                }
                 let (r, l) = dec.stats();
                 rec += r;
                 lost += l;
@@ -994,6 +1011,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         brutal_down: args.brutal_down,
         vswitch: vswitch.clone(),
         sessions: RwLock::new(HashMap::new()),
+        fec_recovered_retired: AtomicU64::new(0),
+        fec_lost_retired: AtomicU64::new(0),
         pool: Mutex::new(pool),
         banned: BanList::new(),
         registry: Arc::new(RwLock::new(HashMap::new())),

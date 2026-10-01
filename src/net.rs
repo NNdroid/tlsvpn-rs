@@ -1413,6 +1413,17 @@ impl AsyncPort {
         self.parity_sent.load(Ordering::Relaxed)
     }
 
+    pub fn fec_tx_armed(&self) -> bool {
+        if !self.encoder_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.encoder
+            .lock()
+            .as_ref()
+            .map(|enc| enc.armed())
+            .unwrap_or(false)
+    }
+
     pub fn scheduler_paths(&self) -> Vec<(u32, SchedulerSnapshot)> {
         self.backends
             .read()

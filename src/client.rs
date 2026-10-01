@@ -533,7 +533,7 @@ impl WebStatsProvider for Client {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
-            "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.fec_mode && self.live_conns.load(Ordering::Relaxed) >= 2 { 1 } else { 0 }, "rx_bypass_sessions": if self.conns_count == 1 { 1 } else { 0 }, "recovered": rec, "lost": lost},
+            "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.tx_port.fec_tx_armed() { 1 } else { 0 }, "rx_bypass_sessions": if self.fec_dec.lock().as_ref().map(|d| d.bypass_snapshot()).unwrap_or(false) { 1 } else { 0 }, "recovered": rec, "lost": lost},
             "padding": {"wire_bytes": pad_wire, "pad_bytes": pad_bytes, "overhead_pct": if pad_wire > 0 { pad_bytes as f64 * 100.0 / pad_wire as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
