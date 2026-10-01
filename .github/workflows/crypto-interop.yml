@@ -1,5 +1,6 @@
 name: Cross-language Inner AEAD
 
+# Main pushes validate the released Rust main against the released Go main.
 on:
   push:
     branches: [ "main", "master" ]
