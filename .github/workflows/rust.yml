@@ -26,6 +26,9 @@ jobs:
       run: |
         cargo test --verbose
         python3 -m unittest discover -s tests -p 'test_perf_metrics.py'
+        python3 -m unittest discover -s tests -p 'test_latency_metrics.py'
+        python3 -m unittest discover -s tests -p 'test_perf_flame.py'
+        cargo test --features alloc-profile --bin tlsvpn
 
     - name: Check Linux ARM64 dataplane
       # The primary deployment class includes ARM64 SBCs. This compile check
@@ -83,6 +86,8 @@ jobs:
           -- --ignored --nocapture | tee perf-results/rx-stage.txt
         RUSTFLAGS="-C target-cpu=native" cargo test --release bench_tap_return_pool \
           -- --ignored --nocapture | tee perf-results/tap-return.txt
+        RUSTFLAGS="-C target-cpu=native" cargo test --release --features alloc-profile bench_owned_tap_delivery \
+          -- --ignored --nocapture | tee perf-results/tap-owned.txt
 
     - uses: actions/upload-artifact@v4
       if: always()
@@ -143,6 +148,10 @@ jobs:
 
     - name: Cross-language e2e (accept / tok / pad / minenc / cfg / peer metadata)
       env:
+        TLSVPN_RX_OWNED: "1"
+        TLSVPN_TX_BATCH: "1"
+        TLSVPN_RX_COMPACT: "1"
+        TLSVPN_SWITCH_BATCH: "1"
         E2E_RS_BIN: ${{ github.workspace }}/dist/tlsvpn
         # E2E_GO_DIR is what E2E_GO_PROBE's default is built from. Left unset it
         # falls back to <repo>/../tlsvpn, which does not exist on a runner — the
@@ -265,6 +274,7 @@ jobs:
       run: |
         sudo -E bash scripts/rx_perf_matrix.sh
         sudo -E bash scripts/tap_recycle_perf.sh
+        sudo -E bash scripts/dataplane_candidates.sh
 
     - name: Profile real-TAP CPU and allocation events (diagnostic binary)
       env:
@@ -273,13 +283,28 @@ jobs:
         CARGO_PROFILE_RELEASE_DEBUG: "1"
         RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
       run: |
-        cargo build --release --features alloc-profile
-        # Software sampling works without a hardware PMU on many VMs.
+        # Independently rebuild the pre-candidate source as a negative control.
+        baseline=aa6f6d18d7b77acf36f4d99b898cbdbe176ba050
+        git fetch origin "$baseline"
+        mkdir -p .zcode/profile-baseline
+        git archive "$baseline" | tar -x -C .zcode/profile-baseline
+        export CARGO_TARGET_DIR="$PWD/target/profile"
         sudo apt-get install -y linux-tools-common linux-tools-generic || true
-        BIN_SRV="$PWD/target/profile/release/tlsvpn" BIN_CLI="$PWD/target/profile/release/tlsvpn" \
-          FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 \
-          PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile" TLSVPN_ALLOC_PROFILE=1 \
+        (cd .zcode/profile-baseline && cargo build --release --features alloc-profile)
+        cp target/profile/release/tlsvpn .zcode/tlsvpn-profile-baseline
+        BIN_SRV="$PWD/.zcode/tlsvpn-profile-baseline" BIN_CLI="$PWD/.zcode/tlsvpn-profile-baseline" \
+          FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 PERF_LATENCY=1 \
+          PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-baseline" TLSVPN_ALLOC_PROFILE=1 \
           sudo -E bash scripts/net_perf_test.sh
+        cargo build --release --features alloc-profile
+        for enabled in 0 1; do
+          BIN_SRV="$PWD/target/profile/release/tlsvpn" BIN_CLI="$PWD/target/profile/release/tlsvpn" \
+            FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 PERF_LATENCY=1 \
+            TLSVPN_RX_OWNED="$enabled" TLSVPN_TX_BATCH="$enabled" \
+            TLSVPN_RX_COMPACT="$enabled" TLSVPN_SWITCH_BATCH="$enabled" \
+            PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-$enabled" TLSVPN_ALLOC_PROFILE=1 \
+            sudo -E bash scripts/net_perf_test.sh
+        done
 
     - uses: actions/upload-artifact@v4
       if: always()

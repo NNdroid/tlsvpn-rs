@@ -350,10 +350,23 @@ iperf_one_way() {
   local metrics_file="$SRV_DIR/metrics-$direction.json"
   local metrics_args=("$srv_tunnel_pid" "$cli_tunnel_pid" "$NS_SRV" "$NS_CLI" "$TAP_SRV" "$TAP_CLI")
   local profiler=""
+  local pinger=""
+  if [[ "${PERF_LATENCY:-0}" == 1 ]]; then
+    ip netns exec "$NS_CLI" ping -n -i 0.05 -c "$((IPERF_SECONDS * 20))" -w "$((IPERF_SECONDS + 2))" "$GW_V4" \
+      > "$SRV_DIR/ping-load-$direction.log" 2>&1 &
+    pinger=$!
+    PIDS+=("$pinger")
+  fi
   if [[ -n "${PERF_PROFILE_DIR:-}" ]]; then
     mkdir -p "$PERF_PROFILE_DIR"
-    if command -v perf >/dev/null 2>&1 && perf stat -e cpu-clock -- true >/dev/null 2>&1; then
-      perf record -F 99 -g --call-graph fp -p "$srv_tunnel_pid,$cli_tunnel_pid" \
+    local perf_tool="${PERF_TOOL:-perf}"
+    if ! "$perf_tool" stat -e cpu-clock -- true >/dev/null 2>&1; then
+      for tool in /usr/lib/linux-tools/*/perf; do
+        if [[ -x "$tool" ]] && "$tool" stat -e cpu-clock -- true >/dev/null 2>&1; then perf_tool="$tool"; break; fi
+      done
+    fi
+    if "$perf_tool" stat -e cpu-clock -- true >/dev/null 2>&1; then
+      "$perf_tool" record -e cpu-clock -F 99 -g --call-graph fp -p "$srv_tunnel_pid,$cli_tunnel_pid" \
         -o "$PERF_PROFILE_DIR/$direction.data" -- sleep "$IPERF_SECONDS" \
         >"$PERF_PROFILE_DIR/$direction-perf.log" 2>&1 &
       profiler=$!
@@ -373,11 +386,18 @@ iperf_one_way() {
   }
   if [[ -n "$profiler" ]]; then
     wait "$profiler" || { fail 'perf record failed'; return 1; }
-    perf report --stdio -i "$PERF_PROFILE_DIR/$direction.data" \
+    "$perf_tool" report --stdio -i "$PERF_PROFILE_DIR/$direction.data" \
       > "$PERF_PROFILE_DIR/$direction-report.txt"
-    perf script -i "$PERF_PROFILE_DIR/$direction.data" \
+    "$perf_tool" script -i "$PERF_PROFILE_DIR/$direction.data" \
       > "$PERF_PROFILE_DIR/$direction-stacks.txt"
+    python3 "$(dirname "$PERF_METRICS_SCRIPT")/perf_flame.py" \
+      "$PERF_PROFILE_DIR/$direction-stacks.txt" "$PERF_PROFILE_DIR/$direction-flame.svg"
     echo "PERF_PROFILE captured direction=$direction"
+  fi
+  if [[ -n "$pinger" ]]; then
+    wait "$pinger" || true
+    python3 "$(dirname "$PERF_METRICS_SCRIPT")/latency_metrics.py" \
+      "$SRV_DIR/ping-load-$direction.log" "$direction" || { fail 'load latency sample invalid'; return 1; }
   fi
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
   # 最后一个 bits_per_second 就是最终汇总速率。用 grep+awk 解析，避免

@@ -1165,6 +1165,8 @@ impl BackendNotify {
 
     #[inline]
     pub fn wake(&self) {
+        #[cfg(feature = "alloc-profile")]
+        crate::alloc_profile::WAKE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         if self
             .pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -1172,6 +1174,8 @@ impl BackendNotify {
         {
             // dirty 队列满时 poller 通常已经被其它 backend 唤醒；即使 token
             // 没排进去，周期巡检仍会 drain。不能在这里阻塞数据面。
+            #[cfg(feature = "alloc-profile")]
+            crate::alloc_profile::WAKE_SYSCALLS.fetch_add(1, Ordering::Relaxed);
             let _ = self.dirty.push(self.token);
             let _ = self.waker.wake();
         }
@@ -1186,6 +1190,13 @@ impl BackendNotify {
 }
 
 const OWNED_BATCH_MAX_FRAMES: usize = 8;
+pub fn tx_batch_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| match std::env::var("TLSVPN_TX_BATCH_SIZE").ok().and_then(|s| s.parse().ok()) {
+        Some(n @ (8 | 16 | 32)) => n,
+        _ => OWNED_BATCH_MAX_FRAMES,
+    })
+}
 const OWNED_BATCH_MAX_BYTES: u64 = 8 * 1024;
 // Conservative framing allowance: 10-byte TLSVPN header + up to a 16-byte
 // inner AEAD tag, rounded up so a batch accepted under the budget cannot push
@@ -1204,6 +1215,7 @@ struct OwnedBatchQueueInner {
 pub struct OwnedBatchQueue {
     inner: Mutex<OwnedBatchQueueInner>,
     capacity_frames: usize,
+    max_batch_frames: usize,
 }
 
 impl OwnedBatchQueue {
@@ -1214,6 +1226,7 @@ impl OwnedBatchQueue {
                 frames: 0,
             }),
             capacity_frames: capacity_frames.max(1),
+            max_batch_frames: tx_batch_size(),
         }
     }
 
@@ -1223,11 +1236,16 @@ impl OwnedBatchQueue {
         if inner.frames >= self.capacity_frames {
             return Err(frame);
         }
+        Self::push_locked(&mut inner, frame, bytes, self.max_batch_frames);
+        Ok(())
+    }
+
+    fn push_locked(inner: &mut OwnedBatchQueueInner, frame: VPNFrame, bytes: u64, max_frames: usize) {
         let can_append = inner
             .batches
             .back()
             .map(|batch| {
-                batch.frames.len() < OWNED_BATCH_MAX_FRAMES
+                batch.frames.len() < max_frames
                     && batch.bytes.saturating_add(bytes) <= OWNED_BATCH_MAX_BYTES
             })
             .unwrap_or(false);
@@ -1239,7 +1257,21 @@ impl OwnedBatchQueue {
                 .push_back(VPNFrameBatch::from_frame(frame, bytes));
         }
         inner.frames += 1;
-        Ok(())
+        #[cfg(feature = "alloc-profile")]
+        crate::alloc_profile::QUEUE_PEAK.fetch_max(inner.frames as u64, Ordering::Relaxed);
+    }
+
+    /// Accept a FIFO prefix under one lock; unaccepted frames retain ownership.
+    pub fn try_push_batch(&self, input: &mut Vec<VPNFrame>) -> (usize, u64) {
+        let mut inner = self.inner.lock();
+        let count = input.len().min(self.capacity_frames.saturating_sub(inner.frames));
+        let mut bytes = 0;
+        for frame in input.drain(..count) {
+            let n = frame.data.len() as u64;
+            bytes += n;
+            Self::push_locked(&mut inner, frame, n, self.max_batch_frames);
+        }
+        (count, bytes)
     }
 
     #[inline]
@@ -1256,6 +1288,8 @@ impl OwnedBatchQueue {
             return None;
         }
         let batch = inner.batches.pop_front()?;
+        #[cfg(feature = "alloc-profile")]
+        crate::alloc_profile::popped(batch.frames.len(), batch.queued_at.elapsed());
         inner.frames = inner.frames.saturating_sub(batch.frames.len());
         Some(batch)
     }
@@ -1688,6 +1722,41 @@ impl AsyncPort {
         self.write_payload(FramePayload::Owned(frame));
     }
 
+    pub fn write_payload_batch(&self, frames: &mut Vec<FramePayload>) {
+        let backends = self.backends.read();
+        let queue = if backends.len() == 1 && !self.encoder_enabled.load(Ordering::Acquire) {
+            backends[0].owned_batches.as_deref()
+        } else { None };
+        let Some(queue) = queue else {
+            drop(backends);
+            for frame in frames.drain(..) { self.write_payload(frame); }
+            return;
+        };
+        let b = &backends[0];
+        let mut inner = queue.inner.lock();
+        let mut accepted = 0;
+        let mut accepted_bytes = 0;
+        for data in frames.drain(..) {
+            if data.is_empty() { data.release(); continue; }
+            if inner.frames >= queue.capacity_frames.saturating_sub(2) {
+                self.drop_n(1); data.release(); continue;
+            }
+            let Some(seq) = self.next_seq() else {
+                self.drop_n(1); data.release(); continue;
+            };
+            let bytes = data.len() as u64;
+            b.scheduler.add_queued(bytes);
+            OwnedBatchQueue::push_locked(&mut inner, VPNFrame { seq, data }, bytes, queue.max_batch_frames);
+            accepted += 1;
+            accepted_bytes += bytes;
+        }
+        b.scheduler.note_assigned(accepted_bytes);
+        drop(inner);
+        if accepted != 0 {
+            if let Some(n) = &b.notify { n.wake(); }
+        }
+    }
+
     fn write_payload(&self, frame: FramePayload) {
         if frame.is_empty() {
             frame.release();
@@ -1937,6 +2006,37 @@ impl VSwitch {
         self.process_frame_inner(src_port_id, Some(registered_mac), frame)
     }
 
+    /// Only contiguous authenticated unicast runs are grouped. Keep the shard
+    /// guard through enqueue, as in the scalar path, so removal cannot send to
+    /// a detached port. Broadcast, unknown destinations and spoofing stay scalar.
+    pub fn process_session_batch(
+        &self, src_port_id: &str, registered_mac: [u8; 6], frames: &mut Vec<Arc<Vec<u8>>>,
+    ) {
+        let mut input = frames.drain(..).peekable();
+        let mut payloads = Vec::with_capacity(8);
+        while let Some(frame) = input.next() {
+            if registered_mac != [0; 6] && frame.len() >= 14
+                && frame[6..12] == registered_mac && frame[0] & 1 == 0 {
+                let mut dst = [0; 6];
+                dst.copy_from_slice(&frame[..6]);
+                if let Some(entry) = self.mac_table.get(&dst) {
+                    if entry.port_id != src_port_id {
+                        if let Some(port) = entry.port.as_ref() {
+                            payloads.push(FramePayload::from_shared(frame));
+                            while input.peek().map(|next| next.len() >= 14
+                                && next[..6] == dst && next[6..12] == registered_mac).unwrap_or(false) {
+                                payloads.push(FramePayload::from_shared(input.next().unwrap()));
+                            }
+                            port.write_payload_batch(&mut payloads);
+                            continue;
+                        }
+                    }
+                }
+            }
+            self.process_session_frame(src_port_id, registered_mac, frame);
+        }
+    }
+
     fn process_frame_inner(
         &self,
         src_port_id: &str,
@@ -2124,6 +2224,70 @@ mod tests {
             seq,
             data: FramePayload::Owned(vec![seq as u8; bytes]),
         }
+    }
+
+    #[test]
+    fn queue_batch_accepts_fifo_prefix_without_losing_rejected_storage() {
+        let queue = OwnedBatchQueue::new(2);
+        let mut input = vec![owned_test_frame(1, 60), owned_test_frame(2, 70), owned_test_frame(3, 80)];
+        let ptr = input[2].data.data_ptr();
+        assert_eq!(queue.try_push_batch(&mut input), (2, 130));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].data.data_ptr(), ptr);
+        let batch = queue.try_pop_fitting(1024).unwrap();
+        assert_eq!(batch.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(batch.bytes, 130);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn port_batch_preserves_owned_buffers_accounting_headroom_and_sequence_limit() {
+        let port = AsyncPort::new("batch-test".into());
+        let (mut backend, _rx) = make_backend();
+        let queue = Arc::new(OwnedBatchQueue::new(4));
+        Arc::get_mut(&mut backend).unwrap().owned_batches = Some(queue.clone());
+        port.register_backend(backend.clone());
+        let first = vec![7; 64];
+        let ptr = first.as_ptr();
+        let mut input = vec![FramePayload::Owned(first), FramePayload::Owned(vec![8; 65]), FramePayload::Owned(vec![9; 66])];
+        port.write_payload_batch(&mut input);
+        assert!(input.is_empty());
+        assert_eq!(queue.len_frames(), 2);
+        assert_eq!(port.tx_seq.load(Ordering::Relaxed), 2);
+        assert_eq!(port.dropped.load(Ordering::Relaxed), 1);
+        let batch = queue.try_pop_fitting(1024).unwrap();
+        assert_eq!(batch.frames[0].data.data_ptr(), ptr);
+        assert_eq!(batch.bytes, 129);
+        assert_eq!(batch.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), [1, 2]);
+        backend.scheduler.complete_queued(batch.bytes);
+        assert_eq!(backend.scheduler.snapshot().queued_bytes, 0);
+        port.tx_seq.store(u32::MAX - 1, Ordering::Release);
+        port.write_payload_batch(&mut vec![FramePayload::Owned(vec![1]), FramePayload::Owned(vec![2])]);
+        assert!(port.is_sequence_exhausted());
+        assert_eq!(queue.try_pop_fitting(1024).unwrap().frames[0].seq, u32::MAX);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn session_switch_batch_keeps_order_and_rejects_spoofed_frames() {
+        let vs = VSwitch::new();
+        let port = Arc::new(AsyncPort::new("B".into()));
+        let (backend, rx) = make_backend();
+        port.register_backend(backend);
+        vs.add_port("B".into(), port);
+        let src = [2, 0, 0, 0, 0, 1];
+        let dst = [2, 0, 0, 0, 0, 2];
+        vs.add_static_mac("B".into(), dst);
+        let mut input = vec![eth_frame(&dst, &src, &[1]), eth_frame(&dst, &src, &[2]),
+            eth_frame(&dst, &[2, 0, 0, 0, 0, 3], &[99]), eth_frame(&dst, &src, &[3])];
+        vs.process_session_batch("A", src, &mut input);
+        assert!(input.is_empty());
+        assert_eq!(drained_last_byte(&rx), [1, 2, 3]);
+        assert_eq!(vs.spoof_drops.load(Ordering::Relaxed), 1);
+        vs.remove_port("B");
+        let mut input = vec![eth_frame(&dst, &src, &[4])];
+        vs.process_session_batch("A", src, &mut input);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

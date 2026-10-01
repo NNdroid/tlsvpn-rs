@@ -163,6 +163,7 @@ pub fn pad_stream_batch_tail(
 
 pub struct FrameScanner {
     buffer: Vec<u8>,
+    lazy_compact: bool,
     offset: usize,
     // 当前允许的帧负载上限：认证前的握手帧用小上限，认证通过后恢复线路
     // 全量上限（见 set_max_data_len）。默认给全量上限，这样只在握手路径上
@@ -184,6 +185,7 @@ impl FrameScanner {
         // 帧是 45 倍冗余，多连接下白占内存并放大内存扫描开销。
         Self {
             buffer: Vec::with_capacity(HANDSHAKE_DATA_LENGTH),
+            lazy_compact: std::env::var("TLSVPN_RX_COMPACT").as_deref() == Ok("1"),
             offset: 0,
             max_data_len: MAX_DATA_LENGTH,
         }
@@ -251,8 +253,13 @@ impl FrameScanner {
 
     #[inline]
     fn compact_consumed(&mut self) {
-        if self.offset > 0 && (self.offset == self.buffer.len() || self.offset > 16384) {
+        if self.lazy_compact && self.offset != self.buffer.len()
+            && self.buffer.len() < self.buffer.capacity() { return; }
+        if self.offset > 0 && (self.offset == self.buffer.len()
+            || if self.lazy_compact { self.buffer.len() == self.buffer.capacity() } else { self.offset > 16384 }) {
             let remain = self.buffer.len() - self.offset;
+            #[cfg(feature = "alloc-profile")]
+            crate::alloc_profile::COMPACT_BYTES.fetch_add(remain as u64, std::sync::atomic::Ordering::Relaxed);
             self.buffer.copy_within(self.offset.., 0);
             self.buffer.truncate(remain);
             self.offset = 0;
@@ -353,6 +360,8 @@ pub struct VPNFrame {
 pub struct VPNFrameBatch {
     pub frames: Vec<VPNFrame>,
     pub bytes: u64,
+    #[cfg(feature = "alloc-profile")]
+    pub queued_at: std::time::Instant,
 }
 
 impl VPNFrameBatch {
@@ -361,6 +370,8 @@ impl VPNFrameBatch {
         Self {
             frames: Vec::with_capacity(capacity),
             bytes: 0,
+            #[cfg(feature = "alloc-profile")]
+            queued_at: std::time::Instant::now(),
         }
     }
 
@@ -391,6 +402,38 @@ impl VPNFrameBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lazy_compaction_handles_fragmented_padded_jumbo_and_invalid_frames() {
+        struct Fragmented(std::io::Cursor<Vec<u8>>);
+        impl Read for Fragmented {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = out.len().min(997);
+                self.0.read(&mut out[..n])
+            }
+        }
+        let mut stream = Vec::new();
+        for seq in 1..=70u32 {
+            let n = if seq == 35 { 9000 } else { 1500 };
+            append_frame_head(&mut stream, n, 7, seq);
+            stream.extend(std::iter::repeat_n(seq as u8, n as usize));
+            stream.extend_from_slice(&[0xff; 7]);
+        }
+        append_frame_head(&mut stream, MAX_DATA_LENGTH as u32 + 1, 0, 71);
+        for enabled in [false, true] {
+            let mut scanner = FrameScanner::new();
+            scanner.lazy_compact = enabled;
+            let mut reader = Fragmented(std::io::Cursor::new(stream.clone()));
+            for want in 1..=70 {
+                let (frame, seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
+                assert_eq!(seq, want);
+                assert!(frame.iter().all(|b| *b == want as u8));
+                assert_eq!(frame.len(), if want == 35 { 9000 } else { 1500 });
+                release_frame_vec(frame);
+                assert!(scanner.buffer.capacity() <= 32768);
+            }
+            assert_eq!(scanner.read_frame(&mut reader).unwrap_err().kind(), ErrorKind::InvalidData);
+        }
+    }
 
     /// 填充必须按线路长度（明文 + GCM 标签）分桶，而不是明文长度。
     /// 128 号桶边界落在明文 112B 上（112 + 16B 标签 = 128）：

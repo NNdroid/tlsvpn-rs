@@ -248,16 +248,22 @@ pub struct SessionState {
 // descriptors are recycled so the handoff itself does not allocate per frame.
 const TAP_DELIVERY_QUEUE: usize = 256;
 const TAP_DELIVERY_BATCH_CAP: usize = 64;
-// Retain only standard-MTU payloads, with at most 512 KiB in the return queue.
+// Each of the shared/owned return queues retains at most 512 KiB of payloads.
 const TAP_RETURN_POOL: usize = 8;
 const TAP_RETURN_FRAMES: usize = 32;
 const TAP_RETURN_MAX_CAPACITY: usize = 2048;
 type TapDeliveryBatch = Vec<Arc<Vec<u8>>>;
+enum TapWork {
+    Shared(TapDeliveryBatch),
+    Owned(Vec<Vec<u8>>),
+}
 
 struct TapDelivery {
-    tx: Sender<TapDeliveryBatch>,
+    tx: Sender<TapWork>,
     pool_tx: Sender<TapDeliveryBatch>,
     pool_rx: Receiver<TapDeliveryBatch>,
+    owned_pool_tx: Sender<Vec<Vec<u8>>>,
+    owned_pool_rx: Receiver<Vec<Vec<u8>>>,
     dropped: AtomicU64,
 }
 
@@ -268,11 +274,30 @@ impl TapDelivery {
     }
 
     fn new_with_recycling(tap: Arc<dyn TapDevice>, recycle: bool) -> Self {
-        let (tx, rx) = bounded::<TapDeliveryBatch>(TAP_DELIVERY_QUEUE);
+        let (tx, rx) = bounded::<TapWork>(TAP_DELIVERY_QUEUE);
         let (pool_tx, pool_rx) = bounded::<TapDeliveryBatch>(TAP_RETURN_POOL);
         let worker_pool = pool_tx.clone();
+        let (owned_pool_tx, owned_pool_rx) = bounded::<Vec<Vec<u8>>>(TAP_RETURN_POOL);
+        let worker_owned_pool = owned_pool_tx.clone();
         std::thread::spawn(move || {
-            while let Ok(mut batch) = rx.recv() {
+            while let Ok(work) = rx.recv() {
+                let mut batch = match work {
+                    TapWork::Shared(batch) => batch,
+                    TapWork::Owned(mut batch) => {
+                        let mut keep = 0;
+                        for index in 0..batch.len() {
+                            let _ = tap.send(&batch[index]);
+                            if recycle && keep < TAP_RETURN_FRAMES
+                                && batch[index].capacity() == TAP_RETURN_MAX_CAPACITY {
+                                batch.swap(keep, index);
+                                keep += 1;
+                            }
+                        }
+                        for frame in batch.drain(keep..) { release_frame_vec(frame); }
+                        let _ = worker_owned_pool.try_send(batch);
+                        continue;
+                    }
+                };
                 let mut keep = 0;
                 for index in 0..batch.len() {
                     let _ = tap.send(&batch[index]);
@@ -293,6 +318,8 @@ impl TapDelivery {
             tx,
             pool_tx,
             pool_rx,
+            owned_pool_tx,
+            owned_pool_rx,
             dropped: AtomicU64::new(0),
         }
     }
@@ -322,9 +349,10 @@ impl TapDelivery {
             self.recycle(batch);
             return;
         }
-        match self.tx.try_send(batch) {
+        match self.tx.try_send(TapWork::Shared(batch)) {
             Ok(()) => {}
-            Err(TrySendError::Full(mut batch)) | Err(TrySendError::Disconnected(mut batch)) => {
+            Err(TrySendError::Full(TapWork::Shared(mut batch)))
+            | Err(TrySendError::Disconnected(TapWork::Shared(mut batch))) => {
                 self.dropped
                     .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 for frame in batch.drain(..) {
@@ -332,6 +360,29 @@ impl TapDelivery {
                 }
                 self.recycle(batch);
             }
+            _ => unreachable!(),
+        }
+    }
+
+    fn acquire_owned(&self) -> Vec<Vec<u8>> {
+        let mut batch = self.owned_pool_rx.try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(TAP_DELIVERY_BATCH_CAP));
+        for frame in batch.drain(..) { release_frame_vec(frame); }
+        batch
+    }
+
+    fn enqueue_owned(&self, mut batch: Vec<Vec<u8>>) {
+        if batch.is_empty() { let _ = self.owned_pool_tx.try_send(batch); return; }
+        match self.tx.try_send(TapWork::Owned(batch)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(TapWork::Owned(returned)))
+            | Err(TrySendError::Disconnected(TapWork::Owned(returned))) => {
+                batch = returned;
+                self.dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for frame in batch.drain(..) { release_frame_vec(frame); }
+                let _ = self.owned_pool_tx.try_send(batch);
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -905,6 +956,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
         let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
+            let batch_tx = std::env::var("TLSVPN_TX_BATCH").as_deref() == Ok("1");
+            let mut frames = Vec::with_capacity(crate::net::tx_batch_size());
             loop {
                 if EXIT.load(Ordering::Relaxed) {
                     return;
@@ -915,7 +968,22 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                         frame.truncate(n);
                         // TAP 读线程天然持有唯一 pooled Vec：直接把所有权交给
                         // AsyncPort/backend，避免每帧 Arc 控制块 allocation/free。
-                        port.write_owned_frame(frame);
+                        if batch_tx {
+                            frames.push(crate::frame::FramePayload::Owned(frame));
+                            while frames.len() < crate::net::tx_batch_size() {
+                                let mut next = acquire_frame_vec_overwrite(tap_read_size);
+                                match dev.try_recv(&mut next) {
+                                    Ok(n) if n > 0 => {
+                                        next.truncate(n);
+                                        frames.push(crate::frame::FramePayload::Owned(next));
+                                    }
+                                    _ => { release_frame_vec(next); break; }
+                                }
+                            }
+                            port.write_payload_batch(&mut frames);
+                        } else {
+                            port.write_owned_frame(frame);
+                        }
                     }
                     Ok(_) => release_frame_vec(frame),
                     Err(_) => {
@@ -1737,6 +1805,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let rx_batch_cap = crate::rx_actor::rx_batch_size();
     let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
     let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
+    let mut owned_input: Vec<(u32, Vec<u8>)> = Vec::with_capacity(rx_batch_cap);
+    let owned_rx = static_rx && std::env::var("TLSVPN_RX_OWNED").as_deref() == Ok("1");
 
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
@@ -1903,6 +1973,13 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 }
                             }
 
+                            if owned_rx && seq != 0 {
+                                owned_input.push((seq, data));
+                                if owned_input.len() >= rx_batch_cap {
+                                    flush_owned_client_rx_batch(&cl, &mut owned_input);
+                                }
+                                continue;
+                            }
                             let data = Arc::new(data);
                             if let Some(producer) = rx_producer.as_mut() {
                                 if !producer.push(seq, data) {
@@ -1977,6 +2054,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 conn_closed = true;
             }
         } else {
+            flush_owned_client_rx_batch(&cl, &mut owned_input);
             flush_client_rx_batch(
                 &cl,
                 fec_dec.as_ref(),
@@ -2201,6 +2279,27 @@ fn flush_client_rx_batch(
     }
 }
 
+fn flush_owned_client_rx_batch(cl: &Arc<Client>, input: &mut Vec<(u32, Vec<u8>)>) {
+    flush_owned_frames(&cl.reorder_buf, &cl.tap_delivery, input);
+}
+
+fn flush_owned_frames(reorder_buf: &Mutex<ReorderBuffer>, delivery: &TapDelivery, input: &mut Vec<(u32, Vec<u8>)>) {
+    if input.is_empty() { return; }
+    let mut reorder = reorder_buf.lock();
+    if reorder.try_advance_sequences(input.iter().map(|(seq, _)| *seq)) {
+        let mut ready = delivery.acquire_owned();
+        ready.extend(input.drain(..).map(|(_, frame)| frame));
+        delivery.enqueue_owned(ready);
+    } else {
+        // A gap/reconnect/replay converts only the slow batch to shared storage.
+        let mut ready = delivery.acquire();
+        for (seq, frame) in input.drain(..) {
+            reorder.insert_into(seq, Arc::new(frame), &mut ready);
+        }
+        delivery.enqueue(ready);
+    }
+}
+
 fn flush_reorder_to_tap(cl: &Arc<Client>) {
     let mut ready = cl.tap_delivery.acquire();
     let mut reorder = cl.reorder_buf.lock();
@@ -2234,6 +2333,76 @@ fn clamp_poll_for_tx_backlog(base: Duration, tx_backlog: bool, tls_wants_write: 
 #[cfg(test)]
 mod tap_return_tests {
     use super::*;
+    #[test]
+    fn owned_delivery_gap_replay_and_reset_match_shared_reorder() {
+        let (tx, rx) = mpsc::channel();
+        let delivery = TapDelivery::new_with_recycling(Arc::new(RecordingTap(tx)), true);
+        let reorder = Mutex::new(ReorderBuffer::new());
+        for seq in [1, 3, 2, 1] {
+            let mut input = vec![(seq, vec![seq as u8])];
+            flush_owned_frames(&reorder, &delivery, &mut input);
+            assert!(input.is_empty());
+        }
+        for expected in [1, 2, 3] {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), expected);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(reorder.lock().expected_seq_snapshot(), 4);
+        reorder.lock().reset();
+        flush_owned_frames(&reorder, &delivery, &mut vec![(20, vec![20])]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 20);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_owned_tap_delivery() {
+        for owned in [false, true] {
+            let delivery = TapDelivery::new_with_recycling(Arc::new(MemTap), true);
+            let start = Instant::now();
+            #[cfg(feature = "alloc-profile")]
+            let before = crate::alloc_profile::allocation_calls();
+            let mut frames = 0u64;
+            while start.elapsed() < Duration::from_secs(1) {
+                if owned {
+                    let mut batch = delivery.acquire_owned();
+                    for _ in 0..16 { batch.push(acquire_frame_vec_overwrite(1500)); }
+                    delivery.enqueue_owned(batch);
+                    let returned = delivery.owned_pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    delivery.owned_pool_tx.try_send(returned).unwrap();
+                } else {
+                    let mut batch = delivery.acquire();
+                    for _ in 0..16 { batch.push(Arc::new(acquire_frame_vec_overwrite(1500))); }
+                    delivery.enqueue(batch);
+                    let returned = delivery.pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    delivery.pool_tx.try_send(returned).unwrap();
+                }
+                frames += 16;
+            }
+            println!("TAP_OWNED enabled={} pps={:.0} ns/frame={:.1}", u8::from(owned),
+                frames as f64 / start.elapsed().as_secs_f64(), start.elapsed().as_nanos() as f64 / frames as f64);
+            #[cfg(feature = "alloc-profile")]
+            println!("TAP_OWNED allocations/frame={:.4}", (crate::alloc_profile::allocation_calls() - before) as f64 / frames as f64);
+        }
+    }
+    #[test]
+    fn owned_and_shared_tap_work_preserve_fifo_and_owned_storage() {
+        let (tx, rx) = mpsc::channel();
+        let delivery = TapDelivery::new_with_recycling(Arc::new(RecordingTap(tx)), true);
+        let mut buf = acquire_frame_vec_overwrite(1500);
+        buf.fill(7);
+        let ptr = buf.as_ptr();
+        delivery.enqueue_owned(vec![buf]);
+        delivery.enqueue(vec![Arc::new(vec![8])]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 7);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 8);
+        let owned = delivery.owned_pool_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(owned[0].as_ptr(), ptr);
+        delivery.owned_pool_tx.try_send(owned).unwrap();
+        assert!(delivery.acquire_owned().is_empty());
+        let reused = acquire_frame_vec_overwrite(1500);
+        assert_eq!(reused.as_ptr(), ptr);
+        release_frame_vec(reused);
+    }
     use crate::buffer::acquire_frame_vec_overwrite;
     use std::sync::mpsc;
 

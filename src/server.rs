@@ -2005,6 +2005,10 @@ fn flush_server_rx_batch(
             }
         }
     }
+    if c_sess.mac_bin != [0; 6] && switch_batch_enabled() {
+        core.vswitch.process_session_batch(&c_sess.stat.client_id, c_sess.mac_bin, ready);
+        return;
+    }
     for ordered in ready.drain(..) {
         if c_sess.mac_bin != [0u8; 6] {
             core.vswitch
@@ -2013,6 +2017,11 @@ fn flush_server_rx_batch(
             core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
         }
     }
+}
+
+fn switch_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TLSVPN_SWITCH_BATCH").as_deref() == Ok("1"))
 }
 
 /// 从端口通道拉帧成批发送（对齐 Go 下行写协程）
@@ -2628,6 +2637,10 @@ fn handle_handshake(
                 };
                 Some(RxSessionActor::new(
                     Arc::new(move |mut batch| {
+                        if actor_mac != [0; 6] && switch_batch_enabled() {
+                            vswitch.process_session_batch(&actor_client_id, actor_mac, &mut batch);
+                            return batch;
+                        }
                         for ordered in batch.drain(..) {
                             if actor_mac != [0u8; 6] {
                                 vswitch.process_session_frame(&actor_client_id, actor_mac, ordered);

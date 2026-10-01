@@ -15,6 +15,10 @@ pub fn tap_read_buffer_size(mtu: u16) -> usize {
 pub trait TapDevice: Send + Sync {
     fn send(&self, data: &[u8]) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Opportunistic drain by the device's sole reader; never wait for a batch.
+    fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::WouldBlock.into())
+    }
 }
 
 impl TapDevice for SyncDevice {
@@ -22,6 +26,18 @@ impl TapDevice for SyncDevice {
         SyncDevice::send(self, data).map(|_| ())
     }
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        SyncDevice::recv(self, buf)
+    }
+    #[cfg(target_os = "linux")]
+    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd { fd: self.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // Only the TAP read thread consumes this fd. Readability cannot be
+        // stolen by another reader between poll(0) and recv.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        if n < 0 { return Err(io::Error::last_os_error()); }
+        if n == 0 { return Err(io::ErrorKind::WouldBlock.into()); }
+        if fd.revents & libc::POLLIN == 0 { return Err(io::ErrorKind::BrokenPipe.into()); }
         SyncDevice::recv(self, buf)
     }
 }

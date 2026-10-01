@@ -74,3 +74,50 @@ and endpoint sampling overhead. CPU and packet counter resets fail the sample.
 The TAP return microbenchmark includes producer/worker synchronization and memory
 reuse, but does not model the kernel TAP or TLS crypto. Whole-allocator profiles
 and physical ARM device measurements remain outstanding.
+
+## Second optimization pass (experimental controls)
+
+The candidates remain opt-in until real-TAP A/B results justify a default change:
+
+* `TLSVPN_RX_OWNED=1`: static single-connection/no-FEC client RX keeps unique
+  payload Vecs through TAP delivery. A batch with a gap or replay converts to
+  shared storage and uses the existing reorder path. Both delivery variants
+  share one bounded FIFO; each return pool retains at most 512 KiB, or 1 MiB
+  combined when both variants are present. The session batch mutex remains.
+* `TLSVPN_TX_BATCH=1`: the client TAP reader drains already-readable packets
+  without waiting. A single-backend/no-FEC port assigns sequences and queues
+  the batch under one queue lock, with one wake. FEC/multipath keeps the existing
+  scheduler/fence path. Queue headroom and sequence exhaustion still drop safely.
+* `TLSVPN_RX_COMPACT=1`: scanner tail compaction is deferred until storage is
+  full or consumed. It reduces tail copies, not the payload extraction copy;
+  this is not a zero-copy TLS decoder. Padding, length caps and fragmented reads
+  retain their original behavior.
+* `TLSVPN_SWITCH_BATCH=1`: server forwarding groups only consecutive known
+  unicasts with the authenticated source MAC and same destination. It holds the
+  MAC shard guard through enqueue, preserving port removal ordering. Unknown
+  destinations, broadcast and spoofed frames use the scalar path.
+* `TLSVPN_TX_BATCH_SIZE=8|16|32`: selects the maximum frame count for ownership
+  batches and opportunistic TAP drains. The existing 8 KiB byte bound remains;
+  default stays 8. Invalid values use 8. No timer waits for a full batch.
+
+`scripts/dataplane_candidates.sh` tests each candidate separately, TX batch
+limits, then a 10-second off/on/on/off combined sweep of rs/rs, rs/go, go/rs and
+go/go. Logs include process CPU, TAP pps, throughput and `LOAD_LATENCY` ICMP
+p50/p95/p99/loss under load. These are ICMP samples, not application latency.
+Two repeats on a shared VM do not establish statistical significance.
+
+The separate `alloc-profile` feature wraps the existing mimalloc allocator with
+event counters. Set `TLSVPN_ALLOC_PROFILE=1` to log cumulative alloc/realloc calls
+and requested bytes once per second. Requested bytes are allocation traffic,
+not retained/live memory. Diagnostic builds also log TX batch-size buckets
+(1, 2–4, 5–8, >8), batch queue residence buckets (<=10 us, <=100 us, <=1 ms,
+<=10 ms, >10 ms), peak queued frame count, actual/attempted wakes and scanner
+tail bytes moved. Batch residence timestamps start at the first frame, and
+the histogram counts batches, not packets. Instrumentation is compiled out of
+ordinary builds; diagnostic throughput must not be compared to release numbers.
+
+CI rebuilds pre-candidate commit `aa6f6d1` separately and profiles that binary
+plus current candidates off/on. Software CPU-clock sampling with frame pointers
+produces raw perf data, text reports, stacks and SVG flame graphs. A missing perf
+permission/tool creates explicit SKIP evidence rather than fabricated profiles.
+Allocation counters do not identify allocation call sites or peak heap usage.

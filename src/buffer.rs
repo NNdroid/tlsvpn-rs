@@ -262,17 +262,9 @@ impl ReorderBuffer {
         input: &mut Vec<(u32, Arc<Vec<u8>>)>,
         ready: &mut Vec<Arc<Vec<u8>>>,
     ) -> bool {
-        if input.is_empty() || self.gap_since.is_some() {
+        if !self.try_advance_sequences(input.iter().map(|(seq, _)| *seq)) {
             return false;
         }
-        let mut expected = if self.expected_seq == 0 { input[0].0 } else { self.expected_seq };
-        for (seq, _) in input.iter() {
-            if *seq == 0 || *seq != expected {
-                return false;
-            }
-            expected = expected.wrapping_add(1);
-        }
-        self.expected_seq = expected;
         for (_, frame) in input.drain(..) {
             if !frame.is_empty() {
                 ready.push(frame);
@@ -280,6 +272,22 @@ impl ReorderBuffer {
                 release_shared_frame(frame);
             }
         }
+        true
+    }
+
+    /// Validate before changing shared progress; payload ownership is irrelevant.
+    pub fn try_advance_sequences(&mut self, seqs: impl Iterator<Item = u32>) -> bool {
+        if self.gap_since.is_some() { return false; }
+        let mut expected = self.expected_seq;
+        let mut seen = false;
+        for seq in seqs {
+            if !seen && expected == 0 { expected = seq; }
+            if seq == 0 || seq != expected { return false; }
+            seen = true;
+            expected = expected.wrapping_add(1);
+        }
+        if !seen { return false; }
+        self.expected_seq = expected;
         true
     }
 
