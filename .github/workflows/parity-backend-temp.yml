@@ -38,7 +38,6 @@ jobs:
         run: |
           python3 scripts/parity_backend_temp.py
           cp go-impl/config.server.json config.server.json
-          cargo update -p rcgen
           cargo test --verbose
 
       - name: Verify persistent self-signed certificate behavior
@@ -71,6 +70,7 @@ jobs:
 
       - name: Commit product changes and self-clean
         run: |
+          rm -rf go-impl
           rm -f scripts/parity_backend_temp.py .github/workflows/parity-backend-temp.yml
           git add -A
           git -c user.name='github-actions[bot]' \
