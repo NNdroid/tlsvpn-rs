@@ -5,7 +5,13 @@ use tracing::{error, info, warn};
 
 // mimalloc：每帧多次 malloc/free 的场景下比系统分配器快 10-20%
 #[global_allocator]
+#[cfg(not(feature = "alloc-profile"))]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "alloc-profile")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: alloc_profile::CountingAllocator = alloc_profile::CountingAllocator;
+#[cfg(feature = "alloc-profile")]
+mod alloc_profile;
 
 pub mod adaptive_multipath;
 pub mod api;
@@ -652,6 +658,8 @@ fn parse_config_arg() -> Option<String> {
 }
 
 fn main() {
+    #[cfg(feature = "alloc-profile")]
+    alloc_profile::start();
     if std::env::args().any(|a| a == "-version" || a == "--version") {
         println!("{}", crate::api::APP_VERSION);
         return;

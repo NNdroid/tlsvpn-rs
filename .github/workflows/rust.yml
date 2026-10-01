@@ -266,6 +266,21 @@ jobs:
         sudo -E bash scripts/rx_perf_matrix.sh
         sudo -E bash scripts/tap_recycle_perf.sh
 
+    - name: Profile real-TAP CPU and allocation events (diagnostic binary)
+      env:
+        CARGO_TARGET_DIR: target/profile
+        CARGO_PROFILE_RELEASE_STRIP: "false"
+        CARGO_PROFILE_RELEASE_DEBUG: "1"
+        RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
+      run: |
+        cargo build --release --features alloc-profile
+        # Software sampling works without a hardware PMU on many VMs.
+        sudo apt-get install -y linux-tools-common linux-tools-generic || true
+        BIN_SRV="$PWD/target/profile/release/tlsvpn" BIN_CLI="$PWD/target/profile/release/tlsvpn" \
+          FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 \
+          PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile" TLSVPN_ALLOC_PROFILE=1 \
+          sudo -E bash scripts/net_perf_test.sh
+
     - uses: actions/upload-artifact@v4
       if: always()
       with:

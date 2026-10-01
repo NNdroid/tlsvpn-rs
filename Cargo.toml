@@ -3,6 +3,10 @@ name = "tlsvpn"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Diagnostic builds only: release dataplane has no allocator counter overhead.
+alloc-profile = []
+
 [dependencies]
 tun-rs = "2"
 mio = { version = "0.8", features = ["net", "os-poll"] }

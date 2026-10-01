@@ -160,6 +160,10 @@ impl_config() {
 }
 
 cleanup() {
+  if [[ -n "${PERF_PROFILE_DIR:-}" && -d "$SRV_DIR" ]]; then
+    mkdir -p "$PERF_PROFILE_DIR"
+    cp "$SRV_DIR"/*.log "$PERF_PROFILE_DIR/" 2>/dev/null || true
+  fi
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   sleep 0.5
   ip netns del "$NS_SRV" 2>/dev/null || true
@@ -345,6 +349,19 @@ iperf_one_way() {
   local json mbps
   local metrics_file="$SRV_DIR/metrics-$direction.json"
   local metrics_args=("$srv_tunnel_pid" "$cli_tunnel_pid" "$NS_SRV" "$NS_CLI" "$TAP_SRV" "$TAP_CLI")
+  local profiler=""
+  if [[ -n "${PERF_PROFILE_DIR:-}" ]]; then
+    mkdir -p "$PERF_PROFILE_DIR"
+    if command -v perf >/dev/null 2>&1 && perf stat -e cpu-clock -- true >/dev/null 2>&1; then
+      perf record -F 99 -g --call-graph fp -p "$srv_tunnel_pid,$cli_tunnel_pid" \
+        -o "$PERF_PROFILE_DIR/$direction.data" -- sleep "$IPERF_SECONDS" \
+        >"$PERF_PROFILE_DIR/$direction-perf.log" 2>&1 &
+      profiler=$!
+      PIDS+=("$profiler")
+    else
+      echo 'PERF_PROFILE SKIP: perf tool or CPU-clock permission unavailable' | tee "$PERF_PROFILE_DIR/SKIP.txt"
+    fi
+  fi
   python3 "$PERF_METRICS_SCRIPT" start "$metrics_file" "$direction" "${metrics_args[@]}" || {
     fail "could not sample VPN CPU/TAP counters before $direction"; return 1;
   }
@@ -354,6 +371,14 @@ iperf_one_way() {
   python3 "$PERF_METRICS_SCRIPT" finish "$metrics_file" "$direction" "${metrics_args[@]}" || {
     fail "could not sample VPN CPU/TAP counters after $direction"; return 1;
   }
+  if [[ -n "$profiler" ]]; then
+    wait "$profiler" || { fail 'perf record failed'; return 1; }
+    perf report --stdio -i "$PERF_PROFILE_DIR/$direction.data" \
+      > "$PERF_PROFILE_DIR/$direction-report.txt"
+    perf script -i "$PERF_PROFILE_DIR/$direction.data" \
+      > "$PERF_PROFILE_DIR/$direction-stacks.txt"
+    echo "PERF_PROFILE captured direction=$direction"
+  fi
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
   # 最后一个 bits_per_second 就是最终汇总速率。用 grep+awk 解析，避免
   # hosted runner / 极简 rootfs 缺 Python 时把吞吐断言静默降级成“transfer ok”。
