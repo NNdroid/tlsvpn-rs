@@ -10,7 +10,7 @@ use crate::fec::FecDecoder;
 pub const RX_ACTOR_BATCH_CAP: usize = 16;
 const RX_ACTOR_QUEUE_DEPTH: usize = 256;
 
-type RxDelivery = Arc<dyn Fn(Vec<Arc<Vec<u8>>>) + Send + Sync>;
+pub type RxDelivery = Arc<dyn Fn(Vec<Arc<Vec<u8>>>) + Send + Sync>;
 
 pub struct RxFrame {
     pub seq: u32,

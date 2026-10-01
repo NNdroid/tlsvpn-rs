@@ -19,8 +19,11 @@ use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
+use crate::rx_actor::RxSessionActor;
 use crate::socks5::{split_host_port, Socks5Proxy};
-use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameCounters, TxFrameTotals};
+use crate::stats_accounting::{
+    padding_snapshot, record_padding_write, TxFrameCounters, TxFrameTotals,
+};
 use crate::tap::{MemTap, TapDevice};
 use crate::tcp_cork::TlsBatchCork;
 
@@ -340,10 +343,13 @@ pub struct Client {
     pub tap: Arc<dyn TapDevice>,
     pub mac: String,
     pub tx_port: Arc<AsyncPort>,
+    // Legacy/direct receive state is retained for the static single-connection fast path.
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
-    tap_delivery: TapDelivery,
+    tap_delivery: Arc<TapDelivery>,
     pub fec_dec: Mutex<Option<Arc<FecDecoder>>>,
     pub dedup: Arc<DeDuplicator>,
+    // Multi-connection sessions transfer RX ownership to this single actor.
+    pub rx_actor: Option<Arc<RxSessionActor>>,
     pub session: Mutex<SessionState>,
     // 身份状态文件路径；空串 = 不持久化（进程内测试未从文件加载配置）
     pub state_path: String,
@@ -380,6 +386,43 @@ pub struct Client {
     pub network_setup: Mutex<()>,
 }
 
+impl Client {
+    fn rx_runtime_snapshot(&self) -> (u64, u64, ReorderStats, bool) {
+        if let Some(actor) = &self.rx_actor {
+            let snap = actor.snapshot();
+            return (
+                self.fec_recovered_lifetime
+                    .load(Ordering::Relaxed)
+                    .saturating_add(snap.recovered),
+                self.fec_lost_lifetime
+                    .load(Ordering::Relaxed)
+                    .saturating_add(snap.lost),
+                snap.reorder,
+                snap.fec_bypass,
+            );
+        }
+        let (active_rec, active_lost, bypass) = self
+            .fec_dec
+            .lock()
+            .as_ref()
+            .map(|d| {
+                let (r, l) = d.stats();
+                (r, l, d.bypass_snapshot())
+            })
+            .unwrap_or((0, 0, false));
+        (
+            self.fec_recovered_lifetime
+                .load(Ordering::Relaxed)
+                .saturating_add(active_rec),
+            self.fec_lost_lifetime
+                .load(Ordering::Relaxed)
+                .saturating_add(active_lost),
+            self.reorder_buf.lock().stats(),
+            bypass,
+        )
+    }
+}
+
 impl TunnelIpSource for Client {
     fn tunnel_addrs(&self, port: u16) -> Vec<String> {
         let mut out = Vec::new();
@@ -406,14 +449,7 @@ impl TunnelIpSource for Client {
 
 impl WebStatsProvider for Client {
     fn stats_json(&self) -> serde_json::Value {
-        let (active_rec, active_lost) = self
-            .fec_dec
-            .lock()
-            .as_ref()
-            .map(|d| d.stats())
-            .unwrap_or((0, 0));
-        let rec = self.fec_recovered_lifetime.load(Ordering::Relaxed).saturating_add(active_rec);
-        let lost = self.fec_lost_lifetime.load(Ordering::Relaxed).saturating_add(active_lost);
+        let (rec, lost, reorder, rx_bypass) = self.rx_runtime_snapshot();
         let written = self.written.snapshot();
         let (pad_wire, pad_bytes) = padding_snapshot();
         let conns: Vec<serde_json::Value> = self
@@ -434,7 +470,6 @@ impl WebStatsProvider for Client {
         let negotiated_tls = sess.tls.clone();
         let negotiated_peer = sess.peer_info.clone();
         drop(sess);
-        let reorder = self.reorder_buf.lock().stats();
         let local = serde_json::json!({
             "client_id": self.client_id,
             "ipv4": self.assigned_v4.lock().clone(),
@@ -533,7 +568,7 @@ impl WebStatsProvider for Client {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
-            "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.tx_port.fec_tx_armed() { 1 } else { 0 }, "rx_bypass_sessions": if self.fec_dec.lock().as_ref().map(|d| d.bypass_snapshot()).unwrap_or(false) { 1 } else { 0 }, "recovered": rec, "lost": lost},
+            "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.tx_port.fec_tx_armed() { 1 } else { 0 }, "rx_bypass_sessions": if rx_bypass { 1 } else { 0 }, "recovered": rec, "lost": lost},
             "padding": {"wire_bytes": pad_wire, "pad_bytes": pad_bytes, "overhead_pct": if pad_wire > 0 { pad_bytes as f64 * 100.0 / pad_wire as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
@@ -546,15 +581,7 @@ impl WebStatsProvider for Client {
     }
 
     fn metrics_text(&self) -> String {
-        let (active_rec, active_lost) = self
-            .fec_dec
-            .lock()
-            .as_ref()
-            .map(|d| d.stats())
-            .unwrap_or((0, 0));
-        let rec = self.fec_recovered_lifetime.load(Ordering::Relaxed).saturating_add(active_rec);
-        let lost = self.fec_lost_lifetime.load(Ordering::Relaxed).saturating_add(active_lost);
-        let reorder = self.reorder_buf.lock().stats();
+        let (rec, lost, reorder, _rx_bypass) = self.rx_runtime_snapshot();
         let mut m = String::new();
         {
             let mut emit = |name: &str, help: &str, typ: &str, val: String| {
@@ -880,9 +907,18 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     }
 
     let reorder_buf = Arc::new(Mutex::new(ReorderBuffer::new()));
-    let tap_delivery = TapDelivery::new(device.clone());
-    // 重排 timeout 不再单独起 5ms 轮询线程；物理连接的 mio poll deadline
-    // 会合并 session reorder deadline，仅在真实 gap 存在时提前唤醒。
+    let tap_delivery = Arc::new(TapDelivery::new(device.clone()));
+    let rx_actor = if args.conns.max(1) > 1 {
+        let delivery = tap_delivery.clone();
+        Some(RxSessionActor::new(
+            Arc::new(move |batch| delivery.enqueue(batch)),
+            None,
+        ))
+    } else {
+        None
+    };
+    // Multi-connection reorder timeout is actor-owned. The legacy direct path
+    // keeps the connection-loop deadline logic for static single-connection RX.
 
     let config = build_tls_config(args);
 
@@ -949,6 +985,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         tap_delivery,
         fec_dec: Mutex::new(None),
         dedup: Arc::new(DeDuplicator::new()),
+        rx_actor,
         session: Mutex::new(session),
         state_path,
         identity: Mutex::new(identity),
@@ -1432,6 +1469,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
     // 5. 会话级协商（对齐 Go sessionMu 段）
     let mut use_xor_fec = false;
+    let mut is_new_session = false;
+    let mut actor_reconfigure = false;
+    let mut actor_fec_k = 0usize;
     {
         let mut st = cl.session.lock();
         if cl.fec_mode && st.fec_negotiated == 0 {
@@ -1443,8 +1483,6 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     conn_index, resp.fec_group, resp.fec_group
                 );
             } else {
-                // 服务端协商不出可用分组（fec_group < 2）：本次不开 FEC，
-                // fec_negotiated 保持 0，后续连接继续重试
                 *cl.fec_status.lock() = "off".into();
                 warn!(
                     "[Conn {}] FEC requested but server negotiated fec_group={}, FEC disabled",
@@ -1454,42 +1492,59 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
         if cl.fec_mode && st.fec_negotiated > 0 {
             use_xor_fec = true;
-            // FEC 编解码器绑定当前会话加密器与盐：会话/盐变化即重建
-            let rebuild_needed = {
+            let actor_mode = cl.rx_actor.is_some();
+            let rebuild_needed = if actor_mode {
+                st.fec_algo != enc_algo || st.fec_salt_key != resp.enc_salt
+            } else {
                 let dec_guard = cl.fec_dec.lock();
                 dec_guard.is_none() || st.fec_algo != enc_algo || st.fec_salt_key != resp.enc_salt
             };
             if rebuild_needed {
-                if let Some(old) = cl.fec_dec.lock().as_ref() {
-                    let (r, l) = old.stats();
-                    cl.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
-                    cl.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
-                    old.reset();
-                }
                 let negotiated = st.fec_negotiated as usize;
-                let dec = Arc::new(FecDecoder::new(negotiated, fec_rx.clone()));
-                dec.set_static_single_path(cl.conns_count == 1);
-                let reorder = cl.reorder_buf.clone();
-                dec.set_reorder_progress(Arc::new(move || reorder.lock().expected_seq_snapshot()));
-                *cl.fec_dec.lock() = Some(dec);
+                if actor_mode {
+                    // The actor folds its previous decoder counters internally
+                    // during reconfigure; the shared decoder remains unused.
+                    *cl.fec_dec.lock() = None;
+                    actor_reconfigure = true;
+                } else {
+                    if let Some(old) = cl.fec_dec.lock().as_ref() {
+                        let (r, l) = old.stats();
+                        cl.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
+                        cl.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
+                        old.reset();
+                    }
+                    let dec = Arc::new(FecDecoder::new(negotiated, fec_rx.clone()));
+                    dec.set_static_single_path(true);
+                    let reorder = cl.reorder_buf.clone();
+                    dec.set_reorder_progress(Arc::new(move || {
+                        reorder.lock().expected_seq_snapshot()
+                    }));
+                    *cl.fec_dec.lock() = Some(dec);
+                }
                 cl.tx_port.reset_epoch(negotiated, fec_tx.clone());
                 st.fec_algo = enc_algo;
                 st.fec_salt_key = resp.enc_salt.clone();
             }
+            actor_fec_k = st.fec_negotiated as usize;
         }
-        if let Some(dec) = cl.fec_dec.lock().as_ref() {
-            dec.set_static_single_path(cl.conns_count == 1);
+        if cl.rx_actor.is_none() {
+            if let Some(dec) = cl.fec_dec.lock().as_ref() {
+                dec.set_static_single_path(true);
+            }
         }
         if st.enc_algo != enc_algo {
             st.enc_algo = enc_algo;
             st.ic_tx = ic_tx.clone();
             st.ic_rx = ic_rx.clone();
         }
-        let is_new_session =
+        is_new_session =
             st.server_session_id != resp.session_id || st.session_epoch != resp.session_epoch;
         if is_new_session {
             st.server_session_id = resp.session_id.clone();
             st.session_epoch = resp.session_epoch;
+            if cl.rx_actor.is_some() {
+                actor_reconfigure = true;
+            }
         }
         st.gw_v4 = resp.gw_v4.clone();
         st.gw_v6 = resp.gw_v6.clone();
@@ -1497,15 +1552,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             st.brutal_tx = resp.brutal_total_tx;
             st.brutal_rx = resp.brutal_total_rx;
         }
-        // 记下服务端下发的会话令牌，供后续重连回带。服务端未开启
-        // session_token 时该字段为空，行为与旧版一致（对齐 Go）。
         st.session_token = resp.session_token.clone();
-        // 服务端返回的是它实际看到的 ClientHello；旧服务端没有该可选字段时清空，
-        // 避免重连到旧节点后面板继续展示上一个节点的陈旧观测值。
         st.tls = resp.tls.clone();
-        // peer_info is optional for rolling upgrades; clear stale metadata when an old server omits it.
         st.peer_info = resp.peer_info.as_ref().map(normalize_peer_info);
-        // 落盘：进程重启后第一次握手就能回带令牌接回同一会话
         persist_session_state(
             cl,
             &resp.session_id,
@@ -1514,7 +1563,6 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         );
         *cl.assigned_v4.lock() = resp.ipv4.split('/').next().unwrap_or("").to_string();
         *cl.assigned_v6.lock() = resp.ipv6.split('/').next().unwrap_or("").to_string();
-        // 取值：0=明文，2=AES-256-GCM，4=AES-128-GCM。
         cl.enc_algo_display.store(enc_algo, Ordering::Relaxed);
 
         if is_new_session {
@@ -1526,10 +1574,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 "[Conn {}] 🔄 server reset the session; flushing stale local receive buffers...",
                 conn_index
             );
-            drop(st);
-            cl.reorder_buf.lock().reset();
-            cl.dedup.reset();
         }
+    }
+    if let Some(actor) = &cl.rx_actor {
+        if actor_reconfigure {
+            let decoder = if use_xor_fec && actor_fec_k >= fec::FEC_MIN_GROUP {
+                Some(FecDecoder::new(actor_fec_k, fec_rx.clone()))
+            } else {
+                None
+            };
+            actor.reconfigure(decoder);
+        }
+    } else if is_new_session {
+        cl.reorder_buf.lock().reset();
+        cl.dedup.reset();
     }
 
     // 6. 配置接口与策略路由（Linux；对齐 Go setupInterface/setupPolicyRouting）
@@ -1646,6 +1704,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut conn_closed = false;
     let mut close_reason = String::new();
     let mut queued_payload_pending = 0u64;
+    let mut rx_producer = cl.rx_actor.as_ref().map(|actor| actor.producer());
 
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
@@ -1654,6 +1713,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     send_buf.clear();
     send_buf.reserve((TLS_WRITE_BATCH_BYTES + 4096).saturating_sub(send_buf.capacity()));
     while !conn_closed && !EXIT.load(Ordering::Relaxed) {
+        if let Some(producer) = rx_producer.as_ref() {
+            if let Some(error) = producer.take_error() {
+                close_reason = error;
+                break;
+            }
+        }
         if cl.tx_port.is_sequence_exhausted() {
             close_reason = "sequence space exhausted".into();
             if cl
@@ -1679,7 +1744,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         if !proxied {
             poll_timeout = poll_timeout.min(next_rtt_refresh.saturating_duration_since(now));
         }
-        let reorder_wait = cl.reorder_buf.lock().next_timeout();
+        let reorder_wait = if rx_producer.is_none() {
+            cl.reorder_buf.lock().next_timeout()
+        } else {
+            None
+        };
         if let Some(wait) = reorder_wait {
             poll_timeout = poll_timeout.min(wait);
         }
@@ -1726,7 +1795,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // A gap timeout can release a burst. Queue it while still holding the
         // reorder lock so multiple physical connections cannot enqueue ready batches
         // out of sequence; the TAP syscall itself runs on the delivery worker.
-        if reorder_wait.is_some() {
+        if rx_producer.is_none() && reorder_wait.is_some() {
             flush_reorder_to_tap(&cl);
         }
 
@@ -1736,7 +1805,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // 一个仍 readable 但再也没有新 edge 的 socket。
         let mut rx_bytes_batch = 0u64;
         let mut rx_packets_batch = 0u64;
-        let fec_dec = if use_xor_fec {
+        let fec_dec = if rx_producer.is_none() && use_xor_fec {
             cl.fec_dec.lock().clone()
         } else {
             None
@@ -1805,6 +1874,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                             }
 
                             let data = Arc::new(data);
+                            if let Some(producer) = rx_producer.as_mut() {
+                                if !producer.push(seq, data) {
+                                    close_reason = "session RX actor queue closed".into();
+                                    conn_closed = true;
+                                    break 'socket_read;
+                                }
+                                continue;
+                            }
                             if seq == 0 {
                                 let Some(dec) = &fec_dec else {
                                     close_reason = format!(
@@ -1858,12 +1935,23 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
-        flush_client_rx_batch(
-            &cl,
-            fec_dec.as_ref(),
-            &mut fec_data_batch,
-            &mut reorder_input,
-        );
+        if let Some(producer) = rx_producer.as_mut() {
+            if !producer.flush() {
+                close_reason = "session RX actor queue closed".into();
+                conn_closed = true;
+            }
+            if let Some(error) = producer.take_error() {
+                close_reason = error;
+                conn_closed = true;
+            }
+        } else {
+            flush_client_rx_batch(
+                &cl,
+                fec_dec.as_ref(),
+                &mut fec_data_batch,
+                &mut reorder_input,
+            );
+        }
 
         if rx_packets_batch != 0 {
             cl.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
