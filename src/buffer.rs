@@ -254,6 +254,35 @@ impl ReorderBuffer {
         ready
     }
 
+    /// Static single-path RX: transfer a contiguous batch without touching the
+    /// reorder ring/bitmap. Validate the entire burst first so a gap or replay
+    /// leaves both inputs and progress unchanged for the normal path.
+    pub fn try_direct_batch(
+        &mut self,
+        input: &mut Vec<(u32, Arc<Vec<u8>>)>,
+        ready: &mut Vec<Arc<Vec<u8>>>,
+    ) -> bool {
+        if input.is_empty() || self.gap_since.is_some() {
+            return false;
+        }
+        let mut expected = if self.expected_seq == 0 { input[0].0 } else { self.expected_seq };
+        for (seq, _) in input.iter() {
+            if *seq == 0 || *seq != expected {
+                return false;
+            }
+            expected = expected.wrapping_add(1);
+        }
+        self.expected_seq = expected;
+        for (_, frame) in input.drain(..) {
+            if !frame.is_empty() {
+                ready.push(frame);
+            } else {
+                release_shared_frame(frame);
+            }
+        }
+        true
+    }
+
     fn grow_window(&mut self, required_distance: u32) -> bool {
         let old_size = self.ring.len();
         if old_size >= REORDER_MAX_WINDOW as usize {
@@ -388,6 +417,122 @@ impl ReorderBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_batch_preserves_gap_replay_and_resume_semantics() {
+        let traces: &[&[u32]] = &[
+            &[20, 21, 22], &[23, 25], &[24, 25, 26], &[22, 27, 28],
+            &[30, 29, 31], &[32, 33],
+        ];
+        let mut before = ReorderBuffer::new();
+        let mut after = ReorderBuffer::new();
+        let mut direct_hits = 0;
+        for trace in traces {
+            let mut want = Vec::new();
+            for seq in *trace {
+                before.insert_into(*seq, Arc::new(seq.to_be_bytes().to_vec()), &mut want);
+            }
+            let mut input: Vec<_> = trace.iter().map(|seq| (*seq, Arc::new(seq.to_be_bytes().to_vec()))).collect();
+            let mut got = Vec::new();
+            if after.try_direct_batch(&mut input, &mut got) {
+                direct_hits += 1;
+            } else {
+                for (seq, frame) in input.drain(..) {
+                    after.insert_into(seq, frame, &mut got);
+                }
+            }
+            assert_eq!(got, want, "trace {trace:?}");
+            assert_eq!(after.expected_seq_snapshot(), before.expected_seq_snapshot());
+            assert_eq!(after.stats().gap_events, before.stats().gap_events);
+            assert_eq!(after.next_timeout().is_some(), before.next_timeout().is_some());
+        }
+        assert_eq!(direct_hits, 2);
+    }
+
+    #[test]
+    fn direct_batch_rejects_controls_and_gap_without_consuming_input() {
+        let mut reorder = ReorderBuffer::new();
+        let mut ready = Vec::new();
+        let mut input = vec![(1, Arc::new(vec![1])), (0, Arc::new(vec![0]))];
+        assert!(!reorder.try_direct_batch(&mut input, &mut ready));
+        assert_eq!(input.len(), 2);
+        assert_eq!(reorder.expected_seq_snapshot(), 0);
+        assert!(ready.is_empty());
+        reorder.insert_into(1, Arc::new(vec![1]), &mut ready);
+        reorder.insert_into(3, Arc::new(vec![3]), &mut ready);
+        input = vec![(2, Arc::new(vec![2]))];
+        assert!(!reorder.try_direct_batch(&mut input, &mut ready));
+        reorder.insert_into(2, input.pop().unwrap().1, &mut ready);
+        assert_eq!(ready.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![1, 2, 3]);
+        input = vec![(4, Arc::new(vec![4]))];
+        assert!(reorder.try_direct_batch(&mut input, &mut ready));
+    }
+
+    #[test]
+    fn direct_batch_all_sizes_reuse_vectors_and_do_not_clone_frames() {
+        for cap in [16, 32, 64, 128] {
+            let mut reorder = ReorderBuffer::new();
+            let mut input: Vec<_> = (1..=cap).map(|seq| (seq as u32, Arc::new(vec![1]))).collect();
+            let input_ptr = input.as_ptr();
+            let mut ready = Vec::with_capacity(cap);
+            let ready_ptr = ready.as_ptr();
+            assert!(reorder.try_direct_batch(&mut input, &mut ready));
+            assert!(input.is_empty());
+            assert_eq!(input.as_ptr(), input_ptr);
+            assert_eq!(ready.as_ptr(), ready_ptr);
+            assert!(ready.iter().all(|f| Arc::strong_count(f) == 1));
+            assert_eq!(reorder.expected_seq_snapshot(), cap as u32 + 1);
+        }
+    }
+
+    /// Measures only RX dedup/reorder CPU cost, with the same shared lock and
+    /// Arc ownership on both sides. No TLS, TAP, or whole-process CPU claim.
+    #[test]
+    #[ignore]
+    fn bench_rx_direct_batch() {
+        use parking_lot::Mutex;
+        use std::hint::black_box;
+        for cap in [16, 32, 64, 128] {
+            let mut results = [0.0; 2];
+            for (mode, direct) in [false, true].into_iter().enumerate() {
+                let reorder = Mutex::new(ReorderBuffer::new());
+                let dedup = DeDuplicator::new();
+                let frame = Arc::new(vec![0x55; 1500]);
+                let mut input = Vec::with_capacity(cap);
+                let mut ready = Vec::with_capacity(cap);
+                let mut seq = 1u32;
+                let start = Instant::now();
+                let mut count = 0u64;
+                while start.elapsed() < Duration::from_millis(400) {
+                    for _ in 0..cap {
+                        let n = seq;
+                        seq += 1;
+                        if direct || !dedup.is_duplicate(n) {
+                            input.push((n, frame.clone()));
+                        }
+                    }
+                    let mut guard = reorder.lock();
+                    if direct {
+                        assert!(guard.try_direct_batch(&mut input, &mut ready));
+                    } else {
+                        for (n, f) in input.drain(..) {
+                            guard.insert_into(n, f, &mut ready);
+                        }
+                    }
+                    drop(guard);
+                    assert_eq!(ready.len(), cap);
+                    black_box(&ready);
+                    ready.clear();
+                    count += cap as u64;
+                }
+                results[mode] = count as f64 / start.elapsed().as_secs_f64();
+                println!("RX_STAGE batch={cap} mode={} pps={:.0} Mbps={:.0} ns/frame={:.2}",
+                    if direct { "after" } else { "before" }, results[mode],
+                    results[mode] * 1500.0 * 8.0 / 1e6, 1e9 / results[mode]);
+            }
+            println!("RX_STAGE batch={cap} speedup={:.2}x", results[1] / results[0]);
+        }
+    }
 
     #[test]
     fn overwrite_pool_reuses_initialized_storage_without_zero_contract() {

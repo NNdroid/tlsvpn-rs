@@ -1708,6 +1708,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut close_reason = String::new();
     let mut queued_payload_pending = 0u64;
     let mut rx_producer = cl.rx_actor.as_ref().map(|actor| actor.producer());
+    let static_rx = rx_producer.is_none() && cl.conns_count == 1 && !use_xor_fec
+        && crate::rx_actor::rx_bypass_enabled();
+    let rx_batch_cap = crate::rx_actor::rx_batch_size();
+    let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
+    let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
 
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
@@ -1813,8 +1818,6 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         } else {
             None
         };
-        let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
-        let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
 
         if readable {
             'socket_read: loop {
@@ -1912,13 +1915,15 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 fec_data_batch.push((seq, data.clone()));
                             }
 
-                            if !cl.dedup.is_duplicate(seq) {
+                            // Reorder still rejects old/duplicate sequences on a
+                            // bypass miss, so static no-FEC does not need dedup.
+                            if static_rx || !cl.dedup.is_duplicate(seq) {
                                 reorder_input.push((seq, data));
                             } else {
                                 release_shared_frame(data);
                             }
 
-                            if fec_data_batch.len() >= 64 || reorder_input.len() >= 64 {
+                            if fec_data_batch.len() >= rx_batch_cap || reorder_input.len() >= rx_batch_cap {
                                 flush_client_rx_batch(
                                     &cl,
                                     fec_dec.as_ref(),
@@ -2154,8 +2159,13 @@ fn flush_client_rx_batch(
     }
     let mut ready = cl.tap_delivery.acquire();
     let mut reorder = cl.reorder_buf.lock();
-    for (seq, frame) in reorder_input.drain(..) {
-        reorder.insert_into(seq, frame, &mut ready);
+    let direct = cl.conns_count == 1 && fec_dec.is_none()
+        && crate::rx_actor::rx_bypass_enabled()
+        && reorder.try_direct_batch(reorder_input, &mut ready);
+    if !direct {
+        for (seq, frame) in reorder_input.drain(..) {
+            reorder.insert_into(seq, frame, &mut ready);
+        }
     }
     if ready.is_empty() {
         drop(reorder);
