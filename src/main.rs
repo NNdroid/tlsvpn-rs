@@ -20,6 +20,7 @@ pub mod net;
 pub mod peer_info;
 pub mod protocol;
 pub mod server;
+pub mod stats_accounting;
 pub mod socks5;
 pub mod tap;
 pub mod tcp_cork;
@@ -567,9 +568,6 @@ fn validate_args(args: &Args) -> Result<(), String> {
             if cleaned.len() != 64 || !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("client cert_sha256 must be 64 hex chars (sha256)".into());
             }
-        }
-        if args.insecure && !args.cert_sha256.is_empty() {
-            return Err("client.insecure and client.cert_sha256 cannot be enabled together".into());
         }
     }
     // 上限是拒绝服务阀值：负数无意义，超大值等于关掉保护（对齐 Go Validate）

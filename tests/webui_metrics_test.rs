@@ -8,12 +8,12 @@ fn metric_formula_contract() {
     for want in [
         "Math.ceil(v.length * 0.95) - 1",
         "const reorder = data.reorder || {}",
-        "const dataTxPackets = Math.max(0, c.txPackets - parityTx)",
+        "fec.counter_domain === 'written'",
         "const txAttempts = c.txPackets + dropped",
-        "c.rxBytes / c.rxPackets",
-        "parityTx / dataTxPackets * 100",
+        "c.rxBytes/c.rxPackets",
+        "parityWire/dataWire*100",
         "const missing = recovered + lost",
-        "recovered / missing * 100",
+        "recovered/missing*100",
     ] {
         assert!(js.contains(want), "metric formula contract missing {want:?}");
     }
@@ -41,7 +41,7 @@ fn embedded_index_loads_metric_corrections_after_app() {
         "embedded index does not inject metrics.js"
     );
 
-    let html = fs::read_to_string(root.join("webui/index.html")).expect("webui/index.html");
+    let html = fs::read_to_string(root.join("webui/index.html")).expect("index.html");
     let i18n = html.find("<script src=\"i18n.js\"></script>").expect("i18n.js script");
     let app = html.find("<script src=\"app.js\"></script>").expect("app.js script");
     assert!(i18n < app, "i18n.js must load before app.js");

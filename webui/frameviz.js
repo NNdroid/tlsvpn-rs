@@ -16,7 +16,6 @@
       batch_limits:'{batch} · 软上限 12 KiB · TLS 明文最大 16 KiB',frame:'帧 #{n} · padLen=0',final_frame:'最后一帧 · padLen=N',
       flow:'Ethernet → AEAD（+16 B）→ 10 B TLSVPN 头 → 聚合帧 → 可选的 MSS 对齐尾部填充 → TLS 写入',
       control_note:'seq=0 的握手/控制/心跳帧绕过内层 AEAD。独立控制帧仍可根据 pad_mode 使用 bucket/off 填充；聚合数据平面不会对每一帧执行 bucket 填充。',
-      legacy_note:'旧版迁移说明：以前逐帧 bucket 的示例“60 B → 1600 B”已不再代表当前数据平面行为；这里只保留用于识别过时文档。'
     },
     'zh-TW':{
       kpi_header:'協定標頭 (header)',kpi_data_len:'資料長度 (dataLen)',kpi_pad_len:'填充長度 (padLen)',kpi_batch:'聚合批次 (batch)',
@@ -28,7 +27,6 @@
       batch_limits:'{batch} · 軟上限 12 KiB · TLS 明文最大 16 KiB',frame:'訊框 #{n} · padLen=0',final_frame:'最後一幀 · padLen=N',
       flow:'Ethernet → AEAD（+16 B）→ 10 B TLSVPN 標頭 → 聚合訊框 → 可選的 MSS 對齊尾端填充 → TLS 寫入',
       control_note:'seq=0 的握手/控制/心跳訊框會略過內層 AEAD。獨立控制訊框仍可依 pad_mode 使用 bucket/off 填充；聚合資料平面不會對每一幀執行 bucket 填充。',
-      legacy_note:'舊版遷移說明：先前逐幀 bucket 的範例「60 B → 1600 B」已不再代表目前資料平面行為；此處僅保留用來辨識過時文件。'
     },
     en:{
       kpi_header:'Protocol header',kpi_data_len:'Data length (dataLen)',kpi_pad_len:'Padding length (padLen)',kpi_batch:'Aggregate batch',
@@ -40,7 +38,6 @@
       batch_limits:'{batch} · soft limit 12 KiB · maximum TLS plaintext 16 KiB',frame:'Frame #{n} · padLen=0',final_frame:'Final frame · padLen=N',
       flow:'Ethernet → AEAD (+16 B) → 10 B TLSVPN header → aggregate frames → optional MSS-alignment tail padding → TLS Write',
       control_note:'seq=0 handshake/control/heartbeat frames bypass inner AEAD. Standalone control frames may still use bucket/off padding selected by pad_mode; the aggregated data plane does not bucket-pad every frame.',
-      legacy_note:'Legacy migration note: the old per-frame bucket example “60 B → 1600 B” is no longer the data-plane behavior; it is retained here only to identify obsolete documentation.'
     },
     de:{
       kpi_header:'Protokoll-Header',kpi_data_len:'Datenlänge (dataLen)',kpi_pad_len:'Padding-Länge (padLen)',kpi_batch:'Aggregierter Batch',
@@ -52,7 +49,6 @@
       batch_limits:'{batch} · weiches Limit 12 KiB · maximaler TLS-Klartext 16 KiB',frame:'Frame #{n} · padLen=0',final_frame:'Letzter Frame · padLen=N',
       flow:'Ethernet → AEAD (+16 B) → 10-B-TLSVPN-Header → Frames aggregieren → optionales MSS-ausgerichtetes Tail-Padding → TLS Write',
       control_note:'Handshake-, Steuer- und Heartbeat-Frames mit seq=0 umgehen die innere AEAD. Einzelne Steuerframes können weiterhin das über pad_mode gewählte bucket/off-Padding verwenden; die aggregierte Datenebene bucket-paddet nicht jeden Frame.',
-      legacy_note:'Migrationshinweis: Das alte Beispiel für per-Frame-Bucket-Padding „60 B → 1600 B“ entspricht nicht mehr dem Verhalten der Datenebene und bleibt hier nur zur Erkennung veralteter Dokumentation erhalten.'
     },
     fr:{
       kpi_header:'En-tête du protocole',kpi_data_len:'Longueur des données (dataLen)',kpi_pad_len:'Longueur du padding (padLen)',kpi_batch:'Lot agrégé',
@@ -64,7 +60,6 @@
       batch_limits:'{batch} · limite souple 12 Kio · texte clair TLS maximal 16 Kio',frame:'Trame nº {n} · padLen=0',final_frame:'Dernière trame · padLen=N',
       flow:'Ethernet → AEAD (+16 o) → en-tête TLSVPN de 10 o → agrégation des trames → padding final optionnel aligné sur le MSS → écriture TLS',
       control_note:'Les trames de handshake/contrôle/heartbeat avec seq=0 contournent l’AEAD interne. Les trames de contrôle autonomes peuvent toujours utiliser le padding bucket/off choisi par pad_mode ; le plan de données agrégé n’applique pas de bucket-padding à chaque trame.',
-      legacy_note:'Note de migration : l’ancien exemple de bucket-padding par trame « 60 o → 1600 o » ne décrit plus le comportement du plan de données ; il est conservé uniquement pour repérer une documentation obsolète.'
     },
     ja:{
       kpi_header:'プロトコルヘッダー',kpi_data_len:'データ長 (dataLen)',kpi_pad_len:'パディング長 (padLen)',kpi_batch:'集約バッチ',
@@ -76,7 +71,6 @@
       batch_limits:'{batch} · ソフト上限 12 KiB · TLS 平文最大 16 KiB',frame:'フレーム #{n} · padLen=0',final_frame:'最終フレーム · padLen=N',
       flow:'Ethernet → AEAD（+16 B）→ 10 B TLSVPN ヘッダー → フレーム集約 → 任意の MSS 整列末尾パディング → TLS Write',
       control_note:'seq=0 のハンドシェイク/制御/ハートビートフレームは内部 AEAD を迂回します。単独の制御フレームでは pad_mode で選択した bucket/off パディングを引き続き使用できますが、集約データプレーンでは各フレームに bucket パディングを行いません。',
-      legacy_note:'移行メモ：旧来のフレーム単位 bucket 例「60 B → 1600 B」は現在のデータプレーン動作ではありません。古いドキュメントを識別するためだけにここへ残しています。'
     }
   };
 
@@ -105,8 +99,7 @@
     </div>
     <div class="fv-batch"><div class="fv-sub">${s.batch_limits.replace('{batch}',s.batch)}</div><div class="fv-scroll"><div class="fv-batch-row"><span>${s.frame.replace('{n}','42')}</span><span>${s.frame.replace('{n}','43')}</span><span>${s.final_frame}</span></div></div></div>
     <div class="fv-flow">${s.flow}</div>
-    <div class="fv-note">${s.control_note}</div>
-    <div class="fv-note">${s.legacy_note}</div>`;
+    <div class="fv-note">${s.control_note}</div>`;
   const host=root.querySelector('.st-grid')||root.querySelector('.status-grid')||root;
   host.appendChild(card);
 })();

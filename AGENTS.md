@@ -56,9 +56,6 @@ plus a `server` or `client` block.
 - `psk` is required by both. Validation rejects only the empty string and four
   placeholders (`quic_secret`, `change-me`, `change-me-please`,
   `replace-with-a-random-secret`) — there is no length or entropy check.
-- Rust rejects `client.insecure` together with `client.cert_sha256`
-  (`src/main.rs`). Go tolerates the pair. When a config must work for both,
-  pick one.
 - If you add a required field, add it in `impl_config` in
   `scripts/net_perf_test.sh` or in `e2e_lib.sh` — never as a fragment at
   three call sites. That is exactly how `psk` was dropped and this script was

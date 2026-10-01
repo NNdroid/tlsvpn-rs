@@ -26,6 +26,7 @@ use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::tap::{MemTap, TapDevice};
 use crate::tcp_cork::TlsBatchCork;
+use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameTotals};
 use crate::utils::*;
 
 // ======================= IP 地址池（对齐 Go assignIPsLocked 语义） =======================
@@ -396,6 +397,8 @@ pub struct ServerCore {
     pub brutal_down: u64,
     pub vswitch: Arc<VSwitch>,
     pub sessions: RwLock<HashMap<String, Arc<ClientSession>>>,
+    pub fec_recovered_retired: AtomicU64,
+    pub fec_lost_retired: AtomicU64,
     pub pool: Mutex<IpPool>,
     pub banned: BanList,
     pub registry: StatRegistry,
@@ -435,6 +438,18 @@ impl ServerCore {
         if !Arc::ptr_eq(current, session) {
             return;
         }
+        // Fold the final decoder epoch into the same process-lifetime domain
+        // before removing the session. Decoder rebuilds have already been
+        // accumulated into ClientStat, so add current decoder only once here.
+        let mut recovered = session.stat.fec_recovered_lifetime.load(Ordering::Relaxed);
+        let mut lost = session.stat.fec_lost_lifetime.load(Ordering::Relaxed);
+        if let Some(dec) = &session.epoch_state.read().fec_dec {
+            let (r, l) = dec.stats();
+            recovered = recovered.saturating_add(r);
+            lost = lost.saturating_add(l);
+        }
+        self.fec_recovered_retired.fetch_add(recovered, Ordering::Relaxed);
+        self.fec_lost_retired.fetch_add(lost, Ordering::Relaxed);
         sessions.remove(cid);
         drop(sessions);
         self.vswitch.remove_port(cid);
@@ -470,21 +485,42 @@ impl WebStatsProvider for ServerCore {
     fn stats_json(&self) -> serde_json::Value {
         let sessions = self.sessions.read();
         let mut clients = serde_json::Map::new();
-        let mut rec = 0u64;
-        let mut lost = 0u64;
+        let mut rec = self.fec_recovered_retired.load(Ordering::Relaxed);
+        let mut lost = self.fec_lost_retired.load(Ordering::Relaxed);
         let mut parity = 0u64;
+        let mut data_tx = 0u64;
+        let mut control_tx = 0u64;
+        let mut data_wire = 0u64;
+        let mut parity_wire = 0u64;
+        let mut enabled_sessions = 0u64;
+        let mut tx_active_sessions = 0u64;
+        let mut rx_bypass_sessions = 0u64;
         let mut dropped = 0u64;
         let mut reorder_gap = 0u64;
         let mut reorder_flushes = 0u64;
         let mut reorder_skipped = 0u64;
         for (id, s) in sessions.iter() {
+            let w = s.stat.written.snapshot();
+            parity = parity.saturating_add(w.parity_frames);
+            data_tx = data_tx.saturating_add(w.data_frames);
+            control_tx = control_tx.saturating_add(w.control_frames);
+            data_wire = data_wire.saturating_add(w.data_wire_bytes);
+            parity_wire = parity_wire.saturating_add(w.parity_wire_bytes);
+            if s.fec_enc_k > 0 {
+                enabled_sessions += 1;
+                if s.port.fec_tx_armed() {
+                    tx_active_sessions += 1;
+                }
+            }
             let epoch = s.epoch_state.read();
             if let Some(dec) = &epoch.fec_dec {
+                if dec.bypass_snapshot() {
+                    rx_bypass_sessions += 1;
+                }
                 let (r, l) = dec.stats();
                 rec += r;
                 lost += l;
             }
-            parity += s.port.parity_sent();
             dropped += s.port.dropped();
             let reorder = s.reorder_buf.lock().stats();
             reorder_gap += reorder.gap_events;
@@ -629,7 +665,8 @@ impl WebStatsProvider for ServerCore {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": dropped,
-            "fec": {"enabled": true, "parity_tx": parity, "recovered": rec, "lost": lost},
+            "fec": {"enabled": enabled_sessions > 0, "parity_tx": parity, "data_tx": data_tx, "control_tx": control_tx, "data_wire_bytes": data_wire, "parity_wire_bytes": parity_wire, "counter_domain": "written", "enabled_sessions": enabled_sessions, "tx_active_sessions": tx_active_sessions, "rx_bypass_sessions": rx_bypass_sessions, "recovered": rec, "lost": lost},
+            "padding": {"wire_bytes": padding_snapshot().0, "pad_bytes": padding_snapshot().1, "overhead_pct": if padding_snapshot().0 > 0 { padding_snapshot().1 as f64 * 100.0 / padding_snapshot().0 as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder_gap, "timeout_flushes": reorder_flushes, "skipped_frames": reorder_skipped},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
             "ip_pool": {"v4_used": v4_used, "v4_total": v4_total, "v6_used": v6_used},
@@ -854,46 +891,88 @@ impl WebStatsProvider for ServerCore {
 
 // ======================= TLS 材料 =======================
 
+const SELF_SIGNED_CERT_FILE: &str = "tlsvpn-selfsigned-cert.pem";
+const SELF_SIGNED_KEY_FILE: &str = "tlsvpn-selfsigned-key.pem";
+
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    if path.is_empty() {
-        return Err(
-            "server.cert is empty: this build does not auto-generate a self-signed cert \
-             (see README for the openssl one-liner)"
-                .into(),
-        );
-    }
-    let f = std::fs::File::open(path).map_err(|e| format!("server.cert {}: {}", path, e))?;
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open server.cert {path}: {e}"))?;
     let mut r = std::io::BufReader::new(f);
-    rustls_pemfile::certs(&mut r)
+    let certs: Vec<_> = rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("server.cert {}: invalid cert PEM: {}", path, e))
+        .map_err(|e| format!("cannot parse server.cert {path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("server.cert {path} contains no certificates"));
+    }
+    Ok(certs)
 }
 
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
-    if path.is_empty() {
-        return Err(
-            "server.key is empty: this build does not auto-generate a self-signed cert \
-             (see README for the openssl one-liner)"
-                .into(),
-        );
-    }
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("server.key {}: {}", path, e))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("server.key {}: invalid key PEM: {}", path, e))?
-        .ok_or_else(|| format!("server.key {}: no private key found", path))
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open server.key {path}: {e}"))?;
+    let mut r = std::io::BufReader::new(f);
+    rustls_pemfile::private_key(&mut r)
+        .map_err(|e| format!("cannot parse server.key {path}: {e}"))?
+        .ok_or_else(|| format!("server.key {path} contains no supported private key"))
 }
 
-/// 服务端 TLS 配置。历史上这一步的每个失败点都是 panic（unwrap / expect），
-/// 报的是 "Invalid TLS cert/key" 这种看不出哪份文件出问题的话。
-fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
+fn build_server_tls_from_paths(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(load_certs(cert)?, load_key(key)?)
-        .map_err(|e| format!("server.cert and server.key do not match: {}", e))?;
+        .map_err(|e| format!("invalid TLS cert/key pair ({cert}, {key}): {e}"))?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
+}
+
+fn generate_persistent_self_signed(cert_path: &str, key_path: &str) -> Result<(), String> {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(|e| format!("generate self-signed TLS certificate: {e}"))?;
+    let cert_pem = cert.pem();
+    let key_pem = signing_key.serialize_pem();
+
+    // Match Go's persistence contract: key 0600, certificate 0644.
+    std::fs::write(key_path, key_pem.as_bytes())
+        .map_err(|e| format!("persist self-signed key {key_path}: {e}"))?;
+    std::fs::write(cert_path, cert_pem.as_bytes())
+        .map_err(|e| format!("persist self-signed cert {cert_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod self-signed key {key_path}: {e}"))?;
+        std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("chmod self-signed cert {cert_path}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Server TLS behavior follows Go: an explicit pair is loaded verbatim; when
+/// both fields are empty a persistent self-signed pair is reused from the
+/// working directory or generated once under the same filenames Go uses.
+fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
+    if !cert.is_empty() || !key.is_empty() {
+        return build_server_tls_from_paths(cert, key);
+    }
+
+    match build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE) {
+        Ok(cfg) => {
+            info!("Loaded existing self-signed certificate from {}", SELF_SIGNED_CERT_FILE);
+            return Ok(cfg);
+        }
+        Err(e) => {
+            if std::path::Path::new(SELF_SIGNED_CERT_FILE).exists()
+                || std::path::Path::new(SELF_SIGNED_KEY_FILE).exists()
+            {
+                warn!("Failed to load existing self-signed pair ({e}); regenerating");
+            }
+        }
+    }
+
+    generate_persistent_self_signed(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)?;
+    info!("Generated self-signed certificate and persisted it to {} / {}", SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE);
+    build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)
 }
 
 // ======================= 服务端主流程 =======================
@@ -932,6 +1011,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         brutal_down: args.brutal_down,
         vswitch: vswitch.clone(),
         sessions: RwLock::new(HashMap::new()),
+        fec_recovered_retired: AtomicU64::new(0),
+        fec_lost_retired: AtomicU64::new(0),
         pool: Mutex::new(pool),
         banned: BanList::new(),
         registry: Arc::new(RwLock::new(HashMap::new())),
@@ -1883,6 +1964,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     const TLS_WRITE_BATCH_BYTES: usize = STREAM_TLS_BATCH_SOFT_LIMIT;
     let mut pulled = 0u64;
     let mut pulled_payload = 0u64;
+    let mut written_batch = TxFrameTotals::default();
     let mut last_frame_start = None;
     sess.send_buf.clear();
     while let Some(batch) = try_recv_backend_batch(
@@ -1896,12 +1978,14 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         let batch_frames = batch.frames.len() as u64;
         for f in batch.frames {
             let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
+            let before = sess.send_buf.len();
             last_frame_start = Some(append_unpadded_frame(
                 &mut sess.send_buf,
                 f.seq,
                 f.data.as_slice(),
                 ic_ref,
             ));
+            written_batch.add_frame(f.seq, f.data.as_slice(), sess.send_buf.len() - before);
             f.data.release();
         }
         pulled_payload = pulled_payload.saturating_add(batch_bytes);
@@ -1910,25 +1994,29 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
             break;
         }
     }
-    if pulled != 0 {
-        let _ = pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit);
-    }
+    let pad_bytes_batch = if pulled != 0 {
+        pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit)
+    } else {
+        0
+    };
 
     if !sess.send_buf.is_empty() {
         sess.batch_cork
             .before_write(&sess.socket, sess.send_buf.len());
-        if let Some(s) = &sess.client_session {
-            if pulled != 0 {
-                s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
-            }
-            s.stat
-                .tx_bytes
-                .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
-        }
         if let Err(e) = sess.tls.writer().write_all(&sess.send_buf) {
             debug!("closing session: tls plaintext writer failed: {}", e);
             *close = true;
             return;
+        }
+        if let Some(s) = &sess.client_session {
+            if pulled != 0 {
+                s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
+                s.stat.written.record(written_batch);
+                record_padding_write(sess.send_buf.len(), pad_bytes_batch);
+            }
+            s.stat
+                .tx_bytes
+                .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
         }
         sess.queued_payload_pending = sess.queued_payload_pending.saturating_add(pulled_payload);
         sess.send_buf.clear();
@@ -2067,6 +2155,9 @@ fn rotate_session_epoch(
         None
     };
     if let Some(old) = &epoch.fec_dec {
+        let (r, l) = old.stats();
+        session.stat.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
+        session.stat.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
         old.reset();
     }
     session.reorder_buf.lock().reset();

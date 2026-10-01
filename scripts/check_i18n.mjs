@@ -72,7 +72,7 @@ try{
     'Legacy migration note:'
   ];
   for(const text of stale)if(runtime.includes(text))failures.push(`webui/frameviz.js: hard-coded visible text remains: ${text}`);
-  for(const key of ['kpi_header','kpi_data_len','kpi_pad_len','kpi_batch','ethernet_frame','aead_tag','header_desc','inner_aead','aead_desc','tail_desc','detail_desc','batch_limits','frame','final_frame','flow','control_note','legacy_note']){
+  for(const key of ['kpi_header','kpi_data_len','kpi_pad_len','kpi_batch','ethernet_frame','aead_tag','header_desc','inner_aead','aead_desc','tail_desc','detail_desc','batch_limits','frame','final_frame','flow','control_note']){
     if(!runtime.includes(`s.${key}`))failures.push(`webui/frameviz.js: translated key not rendered: ${key}`);
   }
 }catch(err){failures.push(`webui/frameviz.js audit failed: ${err.stack||err}`);}

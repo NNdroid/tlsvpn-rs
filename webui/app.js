@@ -24,7 +24,7 @@ function fmtBytes(b,s=false){
 }
 function badge(f){if(!f||f==='off')return '<span class="badge b-off">'+t('badge.off')+'</span>';
   if(f==='dup')return '<span class="badge b-dup">'+t('badge.dup')+'</span>';return '<span class="badge b-on">'+f+'</span>';}
-function encBadge(a){if(a===2)return '<span class="badge b-on">AES-256-GCM</span>';
+function encBadge(a){if(a===null||a===undefined)return '<span class="badge b-off">-</span>';if(a===2)return '<span class="badge b-on">AES-256-GCM</span>';
   if(a===4)return '<span class="badge b-on">AES-128-GCM</span>';
   if(a===5)return '<span class="badge b-on">ChaCha20-Poly1305</span>';
   if(a===6)return '<span class="badge b-on">XChaCha20-Poly1305</span>';
@@ -78,15 +78,19 @@ function renderLineChart(canvasId,pts,opts){
   if(c.width!==Math.round(W*dpr)||c.height!==Math.round(H*dpr)){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);}
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,W,H);
-  const L=56,R=16,T=16,B=24,pw=W-L-R,ph=H-T-B;
   const max=Math.max(1,opts.max||1);
+  ctx.font='10px sans-serif';
+  const ticks=Array.from({length:5},(_,g)=>fmtBytes(max*(4-g)/4,opts.perSec));
+  // Reserve the measured label width, the axis gap, and an outer gutter.
+  const L=Math.max(56,Math.ceil(Math.max(...ticks.map(s=>ctx.measureText(s).width)))+14);
+  const R=16,T=16,B=24,pw=W-L-R,ph=H-T-B;
   // 网格 + 纵坐标刻度
   ctx.strokeStyle=cssv('--grid');ctx.lineWidth=1;
   ctx.fillStyle=cssv('--sub');ctx.font='10px sans-serif';ctx.textAlign='right';
   for(let g=0;g<=4;g++){
     const y=T+ph*g/4;
     ctx.beginPath();ctx.moveTo(L,y+.5);ctx.lineTo(W-R,y+.5);ctx.stroke();
-    ctx.fillText(fmtBytes(max*(4-g)/4,opts.perSec),L-6,y+3);
+    ctx.fillText(ticks[g],L-6,y+3);
   }
   ctx.textAlign='left';
   if(!pts||pts.length<2){
@@ -128,7 +132,7 @@ function renderLineChart(canvasId,pts,opts){
   pts.forEach((p,i)=>{
     if(i%step!==0&&i!==pts.length-1)return;
     const tw=ctx.measureText(p.label).width;
-    const tx=Math.max(L,Math.min(L+p.x*pw-tw/2,W-R-tw));
+    const tx=Math.max(L+tw/2,Math.min(L+p.x*pw,W-R-tw/2));
     ctx.fillText(p.label,tx,H-8);
   });
   ctx.textAlign='left';
@@ -448,6 +452,7 @@ function tpl(s,o){
 // （服务端每轮轮询回写 log_level）一行都不用改。
 const DL=new WeakMap();
 let dlCur=null;
+let dlSerial=0;
 const DL_ARROW='<svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // 包起来：外壳 + 触发按钮（当前值 + chevron）+ 菜单；原生 select 缩成 1px 藏在里面
@@ -472,6 +477,10 @@ function buildSelect(sel){
   btn.setAttribute('role','combobox');
   btn.setAttribute('aria-haspopup','listbox');
   btn.setAttribute('aria-expanded','false');
+  const listID='dl-list-'+(++dlSerial);
+  btn.setAttribute('aria-controls',listID);
+  const labelText=host&&host.tagName==='LABEL'?host.querySelector('span'):null;
+  if(labelText){if(!labelText.id)labelText.id=listID+'-label';btn.setAttribute('aria-labelledby',labelText.id);}
   btn.tabIndex=0;
   const lab=document.createElement('span');
   lab.className='dl-lab';
@@ -491,6 +500,7 @@ function buildSelect(sel){
   wrap.appendChild(btn);
   const menu=document.createElement('div');
   menu.className='dl-menu';
+  menu.id=listID;
   menu.setAttribute('role','listbox');
   menu.setAttribute('aria-hidden','true');
   wrap.appendChild(menu);
@@ -518,6 +528,8 @@ function buildSelect(sel){
 function syncSelect(sel){
   const st=DL.get(sel);
   if(!st)return;
+  st.btn.setAttribute('aria-disabled',String(sel.disabled));
+  st.btn.tabIndex=sel.disabled?-1:0;
   const ops=sel.options;
   const n=ops.length;
   let cur=sel.selectedIndex;
@@ -531,7 +543,7 @@ function syncSelect(sel){
     if(i===cur)c+=' on';
     if(op.disabled)c+=' disabled';
     const asel=i===cur?'true':'false';
-    html+='<div class="'+c+'" role="option" aria-selected="'+asel+'" data-i="'+i+'"><span class="dl-tx">'+esc(op.textContent||op.value||'')+'</span></div>';
+    html+='<div id="'+st.menu.id+'-opt-'+i+'" class="'+c+'" role="option" aria-selected="'+asel+'" data-i="'+i+'"><span class="dl-tx">'+esc(op.textContent||op.value||'')+'</span></div>';
     st.items.push({v:op.value,off:op.disabled});
   }
   st.menu.innerHTML=html;
@@ -546,12 +558,12 @@ function syncSelect(sel){
   }
   st.sz.textContent=wide;
   st.active=cur;
-  if(dlCur===sel)dlPlace(sel);
+  if(dlCur===sel){dlPlace(sel);dlHot(sel,st.active);}
 }
 
 // 扫一遍所有原生 select：没包的包起来，已经包的按当前选项与值重建
 function syncSelects(){
-  document.querySelectorAll('select.sel').forEach(function(sel){
+  document.querySelectorAll('select').forEach(function(sel){
     if(DL.has(sel))syncSelect(sel);
     else buildSelect(sel);
   });
@@ -562,6 +574,7 @@ function dlPlace(sel){
   const st=DL.get(sel);
   if(!st)return;
   const b=st.btn.getBoundingClientRect();
+  st.menu.style.maxWidth=Math.max(0,window.innerWidth-16)+'px';
   st.menu.style.minWidth=Math.round(b.width)+'px';
   const mw=st.menu.getBoundingClientRect().width;
   const mh=st.menu.getBoundingClientRect().height;
@@ -569,6 +582,7 @@ function dlPlace(sel){
   if(left+mw>window.innerWidth-8)left=Math.max(8,window.innerWidth-8-mw);
   let top=b.bottom+6;
   if(top+mh>window.innerHeight-8&&b.top-6-mh>8)top=Math.max(8,b.top-6-mh);
+  top=Math.max(8,Math.min(top,window.innerHeight-8-mh));
   st.menu.style.left=Math.round(left)+'px';
   st.menu.style.top=Math.round(top)+'px';
 }
@@ -579,6 +593,7 @@ function dlToggle(sel){
 }
 
 function dlOpen(sel){
+  if(sel.disabled)return;
   if(dlCur&&dlCur!==sel)dlClose(dlCur);
   const st=DL.get(sel);
   if(!st)return;
@@ -599,6 +614,7 @@ function dlClose(sel){
     st.btn.classList.remove('on');
     st.menu.classList.remove('on');
     st.btn.setAttribute('aria-expanded','false');
+    st.btn.removeAttribute('aria-activedescendant');
     st.menu.setAttribute('aria-hidden','true');
   }
   if(dlCur===sel)dlCur=null;
@@ -645,9 +661,11 @@ function dlHot(sel,i){
   if(i<0)return;
   const o=ops[i];
   if(!o)return;
+  st.btn.setAttribute('aria-activedescendant',o.id);
   const r=o.getBoundingClientRect();
   const m=st.menu.getBoundingClientRect();
-  if(r.top<m.top||r.bottom>m.bottom)o.scrollIntoView({block:'nearest'});
+  if(r.top<m.top)st.menu.scrollTop-=m.top-r.top;
+  else if(r.bottom>m.bottom)st.menu.scrollTop+=r.bottom-m.bottom;
 }
 
 // 触发器上的键盘：上下/Home/End 移动，Enter/Space 展开或选中，Esc 收起，Tab 收起
@@ -695,12 +713,12 @@ function dlOutside(ev){
   dlClose(sel);
 }
 
-// 页面滚动时 fixed 弹层不会跟着动，收起比留一个错位菜单强；菜单自己滚动不算
+// 页面滚动时重新定位菜单；菜单内部滚动无需重新定位。
 function dlScroll(ev){
   if(!dlCur)return;
   const st=DL.get(dlCur);
   if(st&&ev&&ev.target===st.menu)return;
-  dlClose(dlCur);
+  dlPlace(dlCur);
 }
 
 // Esc 收起（触发器没聚焦时也要有效）；Tab 让焦点正常走
@@ -829,7 +847,9 @@ function applyStats(data){
     lastStatsT=Date.now();
     const upd=document.getElementById('updated-at');
     if(upd)upd.textContent=t('updated').replace('{n}',new Date().toLocaleTimeString());
-    const now=performance.now();const dt=lastT?(now-lastT)/1000:2;lastT=now;
+    resetDashboardPeriod(data);
+    const now=data.sample_time_ms===undefined?performance.now():Number(data.sample_time_ms);
+    const dt=lastT&&now>lastT?(now-lastT)/1000:0;lastT=now;
 
     document.getElementById('mode').innerText=data.mode.toUpperCase();
     const chip=document.getElementById('mode-chip');
@@ -847,7 +867,7 @@ function applyStats(data){
     const proc=(id,c)=>{
       tTx+=c.tx_bytes;tRx+=c.rx_bytes;tConns+=c.active_conns||0;
       let sx=0,sr=0;
-      if(prev[id]){sx=Math.max(0,(c.tx_bytes-prev[id].tx_bytes)/dt);sr=Math.max(0,(c.rx_bytes-prev[id].rx_bytes)/dt);}
+      if(prev[id]&&dt>0){sx=Math.max(0,(c.tx_bytes-prev[id].tx_bytes)/dt);sr=Math.max(0,(c.rx_bytes-prev[id].rx_bytes)/dt);}
       cur[id]={tx_bytes:c.tx_bytes,rx_bytes:c.rx_bytes};
       speeds[id]={sx:sx,sr:sr};
       tTxS+=sx;tRxS+=sr;
@@ -855,7 +875,15 @@ function applyStats(data){
     if(data.mode==='server'){for(const [id,c] of Object.entries(data.clients||{}))proc(id,c);}
     else if(data.clients&&data.clients.local)proc('local',data.clients.local);
     prev=cur;lastSpeeds=speeds;
-    txHist.push(tTxS);rxHist.push(tRxS);txTimes.push(Date.now());
+    if(data.global_tx_bytes!==undefined && data.global_rx_bytes!==undefined){
+      tTx=Number(data.global_tx_bytes)||0;tRx=Number(data.global_rx_bytes)||0;
+      tTxS=globalPrev&&dt>0?Math.max(0,(tTx-globalPrev.tx)/dt):0;
+      tRxS=globalPrev&&dt>0?Math.max(0,(tRx-globalPrev.rx)/dt):0;
+      globalPrev={tx:tTx,rx:tRx};
+    }
+    const isServer=data.mode==='server';
+    const upSpeed=isServer?tRxS:tTxS,downSpeed=isServer?tTxS:tRxS;
+    txHist.push(upSpeed);rxHist.push(downSpeed);txTimes.push(Date.now());
     if(txHist.length>MAXPTS){txHist.shift();rxHist.shift();txTimes.shift();}
     if(chartRange==='2m'&&!trendData)drawChart(); // 冷启动兜底；拿到服务端 2 分钟缓存后由 drawTrendChart 接管
 
@@ -865,8 +893,8 @@ function applyStats(data){
     document.getElementById('total-rx').innerText=fmtBytes(tRx);
     document.getElementById('total-tx-speed').innerText=fmtBytes(tTxS,true);
     document.getElementById('total-rx-speed').innerText=fmtBytes(tRxS,true);
-    document.getElementById('live-up').innerText=fmtBytes(tTxS,true);
-    document.getElementById('live-down').innerText=fmtBytes(tRxS,true);
+    document.getElementById('live-up').innerText=fmtBytes(upSpeed,true);
+    document.getElementById('live-down').innerText=fmtBytes(downSpeed,true);
     renderClientsTable(data);
     if(drawerOn())renderDrawer();
 
@@ -881,19 +909,22 @@ function applyStats(data){
     }else if(data.clients&&data.clients.local){
       txPk=data.clients.local.tx_packets||0;rxPk=data.clients.local.rx_packets||0;
     }
-    // FEC 开销 ≈ 校验帧 / 已发帧总数（含校验帧），无流量时不显示
-    document.getElementById('fec-overhead').innerText=txPk>0?((f.parity_tx||0)/txPk*100).toFixed(1)+'%':'-';
+    if(data.global_tx_packets!==undefined)txPk=Number(data.global_tx_packets)||0;
+    if(data.global_rx_packets!==undefined)rxPk=Number(data.global_rx_packets)||0;
+    const quality=dashboardQualityStats(data);
+    // Parity/DATA application-frame wire bytes, excluding cover padding.
+    document.getElementById('fec-overhead').innerText=quality.fecOverheadPct===null?'-':quality.fecOverheadPct.toFixed(1)+'%';
     document.getElementById('k-dropped').innerText=data.dropped_frames||0;
 	const ro=data.reorder||{};
 	document.getElementById('reorder-skipped').innerText=ro.skipped_frames||0;
     document.getElementById('tap-errors').innerText=data.tap_write_errors||0;
     // 包速率 PPS：与字节速率同口径的差分
-    const ppsTx=prevPps.ok?Math.max(0,(txPk-prevPps.tx)/dt):0;
-    const ppsRx=prevPps.ok?Math.max(0,(rxPk-prevPps.rx)/dt):0;
+    const ppsTx=prevPps.ok&&dt>0?Math.max(0,(txPk-prevPps.tx)/dt):0;
+    const ppsRx=prevPps.ok&&dt>0?Math.max(0,(rxPk-prevPps.rx)/dt):0;
     prevPps={tx:txPk,rx:rxPk,ok:true};
     document.getElementById('k-pps').innerText=Math.round(ppsTx+ppsRx).toLocaleString();
-    document.getElementById('pps-up').innerText=Math.round(ppsTx).toLocaleString();
-    document.getElementById('pps-down').innerText=Math.round(ppsRx).toLocaleString();
+    document.getElementById('pps-up').innerText=Math.round(isServer?ppsRx:ppsTx).toLocaleString();
+    document.getElementById('pps-down').innerText=Math.round(isServer?ppsTx:ppsRx).toLocaleString();
     const m=data.mem||{};
     document.getElementById('mem').innerHTML=(m.heap_alloc_mb||0).toFixed(1)+'<small> MB</small>';
     document.getElementById('goroutines').innerText=m.num_goroutine||0;
@@ -1009,7 +1040,7 @@ function renderStatus(data){
     [t('stt.neg.proto'),neg.protocol_version?('v'+neg.protocol_version):ntxt()],
     [t('stt.neg.enc'),neg.enc_algo?encName(neg.enc_algo):ntxt()],
     [t('stt.neg.fec'),yn(!!neg.fec)],
-    [t('stt.neg.grp'),neg.fec_group?String(neg.fec_group):ntxt()],
+    [t('stt.neg.grp'),neg.fec_group?String(neg.fec_group):(neg.fec?t('stats.fec_mixed'):ntxt())],
     [t('stt.neg.pad'),neg.pad_mode?mtxt(neg.pad_mode):ntxt()],
     [t('stt.neg.minenc'),neg.min_enc?mtxt(neg.min_enc):ntxt()],
     [t('stt.neg.stoken'),yn(!!neg.session_token)],
@@ -1047,7 +1078,7 @@ function renderStatus(data){
     [t('stt.brut.perconn'),'<span class="mono">'+rateRange(b.min_up_mbps,b.max_up_mbps)+' / '+rateRange(b.min_down_mbps,b.max_down_mbps)+'</span>'],
     [t('stt.brut.errs'),brutErrCell(b)],
   ]:[[t('ov.no_data'),ntxt()]]);
-  kv(document.getElementById('st-cfg'),Object.keys(cfg).map(function(k){
+  kv(document.getElementById('st-cfg'),Object.keys(cfg).filter(k=>data.mode!=='server'||(k!=='fec'&&k!=='fec_group')).map(function(k){
     const v=cfg[k];let cell;
     if(typeof v==='boolean')cell=yn(v);
     else if(Array.isArray(v))cell=v.length?mtxt(v.map(function(x){
@@ -1216,9 +1247,10 @@ function dgRun(data){
   if(f.enabled===false)add('fec','fecloss','skip',miss);
   else add('fec','fecloss',dgLevel('nonzero',f.lost),
       N(f.recovered)+(f.lost?'<span class="dim"> · '+N(f.lost)+'</span>':''));
-  if(f.enabled===false||!txPk)add('fec','fecovh','skip',miss);
-  else add('fec','fecovh',dgLevel('ge',f.parity_tx/txPk*100,15,25),
-      (f.parity_tx/txPk*100).toFixed(1)+'<span class="dim">%</span>');
+  const fecQuality=dashboardQualityStats(data);
+  if(fecQuality.fecOverheadPct===null)add('fec','fecovh','skip',miss);
+  else add('fec','fecovh','ok',fecQuality.fecOverheadPct.toFixed(1)+'<span class="dim">%</span>');
+  // A configured redundancy ratio is an observation, not a fixed-threshold fault.
   const base=data.fec_mode||cfg.fec_mode;
   const modes=[];
   cr.forEach(function(x){if(x.fec&&modes.indexOf(x.fec)<0)modes.push(x.fec);});
@@ -1617,16 +1649,16 @@ function renderConnsTable(data,fresh){
   if(data.mode==='server'){
     (data.server_conns||[]).forEach(c=>rows.push({key:(c.conn_id||c.client_id+'|'+c.remote),owner:shortId(c.client_id,10),fullId:c.client_id,connid:c.conn_id||'',target:'',remote:c.remote,state:'up',rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,age:c.age_sec,epoch:c.session_epoch||0,err:'',enc:c.enc_algo,fec:c.fec||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_cli_tx_mbps||0,down:c.brutal_srv_tx_mbps||0}));
   }else{
-    (data.conns||[]).forEach((c,i)=>rows.push({key:(c.conn_id||i+'|'+(c.target||'')+'|'+(c.remote||'')),owner:'local',fullId:null,connid:c.conn_id||'',target:c.target,remote:c.remote,state:c.state,rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:data.session_epoch||0,err:c.last_error||'',enc:data.enc_algo,fec:data.fec_mode||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0}));
+    (data.conns||[]).forEach((c,i)=>rows.push({key:(c.conn_id||i+'|'+(c.target||'')+'|'+(c.remote||'')),owner:'local',fullId:null,connid:c.conn_id||'',target:c.target,remote:c.remote,state:c.state,rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:c.session_epoch!==undefined?c.session_epoch:(data.session_epoch||0),err:c.last_error||'',enc:c.negotiated===false?null:(c.enc_algo!==undefined?c.enc_algo:data.enc_algo),fec:c.fec!==undefined?c.fec:(data.fec_mode||''),sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0}));
   }
   // 速率差分：fresh=true 仅在拿到新快照时（fetchStats），过滤重渲染沿用缓存
-  const now=Date.now();
-  const dt=(fresh&&lastConnsT)?(now-lastConnsT)/1000:2;
+  const now=data.sample_time_ms===undefined?Date.now():Number(data.sample_time_ms);
+  const dt=(fresh&&lastConnsT&&now>lastConnsT)?(now-lastConnsT)/1000:0;
   rows.forEach(function(r){
     if(fresh){
       const p=prevConns[r.key];
-      r.sx=p?Math.max(0,(r.tx-p.tx)/dt):0;
-      r.sr=p?Math.max(0,(r.rx-p.rx)/dt):0;
+      r.sx=p&&dt>0?Math.max(0,(r.tx-p.tx)/dt):0;
+      r.sr=p&&dt>0?Math.max(0,(r.rx-p.rx)/dt):0;
       prevConns[r.key]={tx:r.tx,rx:r.rx};
     }else{
       const s=lastConnSpeeds[r.key]||{sx:0,sr:0};
@@ -1634,6 +1666,8 @@ function renderConnsTable(data,fresh){
     }
   });
   if(fresh){
+    const present=new Set(rows.map(r=>r.key));
+    Object.keys(prevConns).forEach(k=>{if(!present.has(k))delete prevConns[k];});
     lastConnsT=now;
     lastConnSpeeds={};
     rows.forEach(function(r){lastConnSpeeds[r.key]={sx:r.sx,sr:r.sr};});
@@ -1674,7 +1708,7 @@ function renderConnsTable(data,fresh){
     // 唯独这里是个看得见的洞。
     const cerr=r.err||r.brutErr;
     const errCell=cerr?'<span style="color:var(--err)" title="'+esc(cerr)+'">'+esc(String(cerr).slice(0,40))+'</span>':'<span style="color:var(--sub)">-</span>';
-    return '<tr><td class="num dim">'+hi(esc(r.owner),f)+'</td><td class="hide-sm num dim" title="'+esc(r.connid||'')+'">'+(r.connid?hi(esc(shortId(r.connid,12)),f):'-')+'</td><td class="num hide-srv">'+hi(esc(r.target||'-'),f)+'</td><td class="num">'+hi(esc(r.remote||'-'),f)+'</td><td title="'+esc(brutTip)+'">'+st+'</td>'+
+    return '<tr data-conn-id="'+esc(r.connid||'')+'"><td class="num dim">'+hi(esc(r.owner),f)+'</td><td class="hide-sm num dim" title="'+esc(r.connid||'')+'">'+(r.connid?hi(esc(shortId(r.connid,12)),f):'-')+'</td><td class="num hide-srv">'+hi(esc(r.target||'-'),f)+'</td><td class="num">'+hi(esc(r.remote||'-'),f)+'</td><td title="'+esc(brutTip)+'">'+st+'</td>'+
       '<td class="num">'+rtt+'</td><td class="hide-sm">'+schedulerCell(r.sched)+'</td><td class="num">'+fmtBytes(r.tx)+'</td><td class="num">'+fmtBytes(r.rx)+'</td>'+
       '<td class="hide-sm num speed">'+fmtBytes(r.sx,true)+'</td><td class="hide-sm num speed dn">'+fmtBytes(r.sr,true)+'</td>'+
       '<td class="hide-sm dim" title="'+esc(sniMeta)+'">'+(r.sni?hi(esc(r.sni),f):'<span style="color:var(--sub)">-</span>')+'</td>'+
@@ -1792,12 +1826,13 @@ function renderDrawer(){
     cells.push([t('dc.d7'),fmtBytes(sumDays(7))]);
     cells.push([t('dc.d30'),fmtBytes(sumDays(30))]);
   }
-  cells.push([t('dc.sess_up'),fmtBytes(c.tx_bytes||0)]);
-  cells.push([t('dc.sess_down'),fmtBytes(c.rx_bytes||0)]);
-  cells.push([t('dc.pkt_up'),fmtNum(c.tx_packets||0)]);
-  cells.push([t('dc.pkt_dn'),fmtNum(c.rx_packets||0)]);
-  cells.push([t('dc.rate_up'),fmtBytes(sp.sx,true)]);
-  cells.push([t('dc.rate_dn'),fmtBytes(sp.sr,true)]);
+  const srvDirection=data.mode==='server';
+  cells.push([t('dc.sess_up'),fmtBytes((srvDirection?c.rx_bytes:c.tx_bytes)||0)]);
+  cells.push([t('dc.sess_down'),fmtBytes((srvDirection?c.tx_bytes:c.rx_bytes)||0)]);
+  cells.push([t('dc.pkt_up'),fmtNum((srvDirection?c.rx_packets:c.tx_packets)||0)]);
+  cells.push([t('dc.pkt_dn'),fmtNum((srvDirection?c.tx_packets:c.rx_packets)||0)]);
+  cells.push([t('dc.rate_up'),fmtBytes(srvDirection?sp.sr:sp.sx,true)]);
+  cells.push([t('dc.rate_dn'),fmtBytes(srvDirection?sp.sx:sp.sr,true)]);
 
   // 每日明细：最近 10 天，条长按该窗口内最大值归一
   let daysHtml='';
@@ -1819,7 +1854,7 @@ function renderDrawer(){
   if(conns.length){
     connHtml=conns.map(function(x){
       const rtt=x.rtt_ms||0;
-      const xEnc=x.enc_algo!==undefined?x.enc_algo:data.enc_algo;
+      const xEnc=x.negotiated===false?null:(x.enc_algo!==undefined?x.enc_algo:data.enc_algo);
       const up=x.brutal_cli_tx_mbps||x.brutal_tx_mbps||0;
       const dn=x.brutal_srv_tx_mbps||x.brutal_rx_mbps||0;
       let brut;
@@ -1833,12 +1868,12 @@ function renderDrawer(){
         '<div class="dc-conn-top">'+
           '<span class="mono" title="'+esc(x.remote||'')+'">'+esc(x.remote||'-')+'</span>'+
           '<span class="dc-conn-rtt">'+(rtt>0&&rtt<100000?(rtt+' ms'):'-')+'</span>'+
-          '<span class="dc-conn-rate"><span class="arr-up">↑</span> '+fmtBytes(x.tx_bytes||0)+
-            '<span class="arr-down">↓</span> '+fmtBytes(x.rx_bytes||0)+'</span>'+
+          '<span class="dc-conn-rate"><span class="arr-up">↑</span> '+fmtBytes((srvDirection?x.rx_bytes:x.tx_bytes)||0)+
+            '<span class="arr-down">↓</span> '+fmtBytes((srvDirection?x.tx_bytes:x.rx_bytes)||0)+'</span>'+
         '</div>'+
         '<div class="dc-conn-meta">'+
           '<span class="dc-conn-k">'+esc(t('th.age'))+' '+(x.age_sec?fmtDur(x.age_sec):'-')+'</span>'+
-          '<span class="dc-conn-k">'+esc(t('th.epoch'))+' '+(x.session_epoch||data.session_epoch||0)+'</span>'+
+          '<span class="dc-conn-k">'+esc(t('th.epoch'))+' '+(x.session_epoch!==undefined?x.session_epoch:(data.session_epoch||0))+'</span>'+
           encBadge(xEnc)+badge(x.fec||fec)+brut+pkts+
         '</div>'+
         (x.sni?'<div class="dc-conn-sni">'+esc(t('dc.sec_sni'))+': '+esc(x.sni)+'</div>':'')+
@@ -2263,7 +2298,7 @@ function scRun(data){
   if(cfg.session_encrypt===true)add('enc','e_session','ok',t('stt.yes'));
   else if(cfg.session_encrypt===false)add('enc','e_session','warn',t('stt.no'));
   else add('enc','e_session','skip',miss);
-  if(np.fec===true)add('enc','e_fec','ok','K='+np.fec_group+(np.pad_mode?' · '+esc(np.pad_mode):''));
+  if(np.fec===true)add('enc','e_fec','ok',(np.fec_group?'K='+np.fec_group:t('stats.fec_mixed'))+(np.pad_mode?' · '+esc(np.pad_mode):''));
   else if(np.fec===false)add('enc','e_fec','warn',t('badge.off'));
   else add('enc','e_fec','skip',miss);
   if(np.pad_mode&&np.pad_mode!=='off')add('enc','e_pad','ok',esc(np.pad_mode));
@@ -2872,4 +2907,20 @@ function platformSummary(os,version,arch){
   if(version)parts.push('<span class="mono dim">'+esc(version)+'</span>');
   if(arch)parts.push(platformBadge('arch',arch,arch));
   return parts.length?'<span class="platform-summary">'+parts.join('')+'</span>':'<span class="mono">-</span>';
+}
+
+// An SSE reconnect may attach to a new process. Reset every lifetime baseline
+// before applying its first snapshot, including log/event cursors.
+let dashboardInstance=null, dashboardUptime=null, globalPrev=null;
+function resetDashboardPeriod(data){
+  const changed=(data.instance_id && dashboardInstance!==null && data.instance_id!==dashboardInstance) ||
+    (dashboardUptime!==null && data.uptime_sec!==undefined && data.uptime_sec<dashboardUptime);
+  if(changed){
+    prev={};lastT=0;globalPrev=null;prevPps={ok:false};lastSpeeds={};prevConns={};lastConnsT=0;lastConnSpeeds={};
+    txHist.length=0;rxHist.length=0;txTimes.length=0;trendData=null;
+    logSeq=0;evSeq=0;evItems=[];
+    const box=document.getElementById('logbox');if(box)box.innerHTML='';
+  }
+  if(data.instance_id)dashboardInstance=data.instance_id;
+  if(data.uptime_sec!==undefined)dashboardUptime=data.uptime_sec;
 }

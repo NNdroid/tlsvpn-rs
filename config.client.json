@@ -6,20 +6,18 @@
   "up": "",
   "down": "",
   "encrypt": true,
-  "min_enc": "gcm",
+  "enc_algo": "gcm256",
   "pad_mode": "bucket",
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
-  "traffic_days": 30,
-  "traffic_file": "",
   "socks5": "",
   "tap": "tap0",
   "mac": "",
   "web": {
     "addr": ":8080",
-    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "bind": "tunnel",
+    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "cert": "",
     "key": ""
   },
@@ -33,6 +31,9 @@
     "cert_sha256": "",
     "req_v4": "",
     "req_v6": "",
-    "fwmark": 0
+    "fwmark": 0,
+    "fwmark_priority": 0,
+    "extra_routes": [],
+    "source_rules": []
   }
 }

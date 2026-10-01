@@ -20,6 +20,7 @@ use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::socks5::{split_host_port, Socks5Proxy};
+use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameCounters, TxFrameTotals};
 use crate::tap::{MemTap, TapDevice};
 use crate::tcp_cork::TlsBatchCork;
 
@@ -356,6 +357,9 @@ pub struct Client {
     pub rx_bytes: AtomicU64,
     pub tx_packets: AtomicU64,
     pub rx_packets: AtomicU64,
+    pub written: TxFrameCounters,
+    pub fec_recovered_lifetime: AtomicU64,
+    pub fec_lost_lifetime: AtomicU64,
     pub live_conns: AtomicI32,
     pub reconnects: AtomicU64,
     pub assigned_v4: Mutex<String>,
@@ -402,12 +406,16 @@ impl TunnelIpSource for Client {
 
 impl WebStatsProvider for Client {
     fn stats_json(&self) -> serde_json::Value {
-        let (rec, lost) = self
+        let (active_rec, active_lost) = self
             .fec_dec
             .lock()
             .as_ref()
             .map(|d| d.stats())
             .unwrap_or((0, 0));
+        let rec = self.fec_recovered_lifetime.load(Ordering::Relaxed).saturating_add(active_rec);
+        let lost = self.fec_lost_lifetime.load(Ordering::Relaxed).saturating_add(active_lost);
+        let written = self.written.snapshot();
+        let (pad_wire, pad_bytes) = padding_snapshot();
         let conns: Vec<serde_json::Value> = self
             .conn_infos
             .iter()
@@ -525,7 +533,8 @@ impl WebStatsProvider for Client {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
-            "fec": {"enabled": self.fec_mode, "parity_tx": self.tx_port.parity_sent(), "recovered": rec, "lost": lost},
+            "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.tx_port.fec_tx_armed() { 1 } else { 0 }, "rx_bypass_sessions": if self.fec_dec.lock().as_ref().map(|d| d.bypass_snapshot()).unwrap_or(false) { 1 } else { 0 }, "recovered": rec, "lost": lost},
+            "padding": {"wire_bytes": pad_wire, "pad_bytes": pad_bytes, "overhead_pct": if pad_wire > 0 { pad_bytes as f64 * 100.0 / pad_wire as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
             "conns": conns,
@@ -537,12 +546,14 @@ impl WebStatsProvider for Client {
     }
 
     fn metrics_text(&self) -> String {
-        let (rec, lost) = self
+        let (active_rec, active_lost) = self
             .fec_dec
             .lock()
             .as_ref()
             .map(|d| d.stats())
             .unwrap_or((0, 0));
+        let rec = self.fec_recovered_lifetime.load(Ordering::Relaxed).saturating_add(active_rec);
+        let lost = self.fec_lost_lifetime.load(Ordering::Relaxed).saturating_add(active_lost);
         let reorder = self.reorder_buf.lock().stats();
         let mut m = String::new();
         {
@@ -948,6 +959,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         rx_bytes: AtomicU64::new(0),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
+        written: TxFrameCounters::default(),
+        fec_recovered_lifetime: AtomicU64::new(0),
+        fec_lost_lifetime: AtomicU64::new(0),
         live_conns: AtomicI32::new(0),
         reconnects: AtomicU64::new(0),
         assigned_v4: Mutex::new(String::new()),
@@ -1447,6 +1461,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             };
             if rebuild_needed {
                 if let Some(old) = cl.fec_dec.lock().as_ref() {
+                    let (r, l) = old.stats();
+                    cl.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
+                    cl.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
                     old.reset();
                 }
                 let negotiated = st.fec_negotiated as usize;
@@ -1858,6 +1875,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         let ic_tx_ref = ic_tx.as_deref();
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
+        let mut written_batch = TxFrameTotals::default();
+        let mut pad_bytes_batch = 0usize;
         let mut last_frame_start = None;
         if !tls.wants_write() && (woken || !backend_tx_is_empty(Some(backend.as_ref()), &rx)) {
             if let Some(n) = &backend.notify {
@@ -1877,12 +1896,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 let batch_frames = batch.frames.len() as u64;
                 for f in batch.frames {
                     let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
+                    let before = send_buf.len();
                     last_frame_start = Some(append_unpadded_frame(
                         &mut send_buf,
                         f.seq,
                         f.data.as_slice(),
                         ic_ref,
                     ));
+                    written_batch.add_frame(f.seq, f.data.as_slice(), send_buf.len() - before);
                     f.data.release();
                 }
                 queued_payload_pending = queued_payload_pending.saturating_add(batch_bytes);
@@ -1891,9 +1912,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     break;
                 }
             }
-            if tx_packets_batch != 0 {
-                let _ = pad_stream_batch_tail(&mut send_buf, last_frame_start, pad_record_limit);
-            }
+            pad_bytes_batch = if tx_packets_batch != 0 {
+                pad_stream_batch_tail(&mut send_buf, last_frame_start, pad_record_limit)
+            } else {
+                0
+            };
         }
 
         if send_buf.is_empty()
@@ -1913,6 +1936,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             if tx_packets_batch != 0 {
                 cl.tx_packets.fetch_add(tx_packets_batch, Ordering::Relaxed);
+                cl.written.record(written_batch);
+                record_padding_write(send_buf.len(), pad_bytes_batch);
             }
             cl.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
             ci.tx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);

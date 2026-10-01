@@ -5,7 +5,7 @@
   'use strict';
 
   let source=null,controller=null,retryTimer=null,retryMs=1000,generation=0;
-  const TYPES=['stats','trend','logs','events'];
+  const TYPES=['stats','trend','logs','events','diagnostics'];
 
   function streamPath(){
     const q=new URLSearchParams();
@@ -13,6 +13,7 @@
     q.set('range',String(chartRange||'2m'));
     q.set('log_after',String(typeof logSeq==='number'?logSeq:0));
     q.set('event_after',String(typeof evSeq==='number'?evSeq:0));
+    if(typeof dashboardInstance==='string')q.set('instance_id',dashboardInstance);
     return '/api/stream?'+q.toString();
   }
 
@@ -24,6 +25,7 @@
       else if(type==='trend')applyTrend(payload);
       else if(type==='logs')applyLogs(payload);
       else if(type==='events')applyEvents(payload);
+      else if(type==='diagnostics'&&window.applyDiagnostics)window.applyDiagnostics(payload);
     }catch(err){
       console.error('dashboard SSE '+type+' decode failed',err);
     }
@@ -62,8 +64,8 @@
       retryMs=1000;
       setLive('sse');
     };
-    // Native EventSource owns reconnect/backoff. There is deliberately no HTTP polling fallback.
-    es.onerror=function(){if(myGen===generation)setLive('reconn');};
+    // Rebuild the URL with current cursors on reconnect.
+    es.onerror=function(){if(myGen===generation){es.close();if(source===es)source=null;scheduleReconnect(myGen);}};
   }
 
   function parseBlock(block){

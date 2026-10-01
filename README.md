@@ -25,9 +25,8 @@ The Rust and Go binaries are **wire-compatible**: any current Rust/Go client-ser
 git clone https://github.com/NNdroid/tlsvpn-rs.git && cd tlsvpn-rs
 cargo build --release
 
-# generate a TLS pair once, then pin it on clients via cert_sha256
-openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
-            -days 3650 -nodes -subj "/CN=tlsvpn"
+# explicit TLS pairs are supported; when server.cert/key are empty, tlsvpn-rs
+# generates tlsvpn-selfsigned-cert.pem / tlsvpn-selfsigned-key.pem once and reuses them
 
 sudo ./target/release/tlsvpn -c server.json
 ```
@@ -106,7 +105,7 @@ Fuller ready-made examples are checked in at the repo root — `config.server.js
 
 </details>
 
-The wire-facing defaults are kept aligned with Go, but the full config surfaces differ. Rust-only `workers` and `mtu` belong only in Rust-specific files; `traffic_days` and `traffic_file` are shared with Go and drive the same persistent daily-traffic dashboard view. `client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode also requires explicit `server.cert`/`server.key`, whereas Go can generate and persist a self-signed pair.
+The wire-facing defaults are kept aligned with Go, but the full config surfaces differ. Rust-only `workers` and `mtu` belong only in Rust-specific files; `traffic_days` and `traffic_file` are shared with Go and drive the same persistent daily-traffic dashboard view. `client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode now matches Go when `server.cert`/`server.key` are empty: it generates and persists a reusable self-signed pair.
 
 Session resume tokens are a mandatory protocol-v3 property and are always enabled. There is no `server.session_token` switch. Legacy configs containing that key are still accepted during upgrade, but its value is ignored.
 
@@ -136,7 +135,7 @@ Session resume tokens are a mandatory protocol-v3 property and are always enable
 | `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
-| `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |
+| `server.cert` / `server.key` | (empty) | server | TLS certificate pair (PEM). When both are empty, generate and persist `tlsvpn-selfsigned-cert.pem` / `tlsvpn-selfsigned-key.pem` like Go; when either is set, both must be set and valid |
 | `server.max_sessions` | `1024` | server | Maximum concurrent sessions |
 | `server.fec_group_min` | `2` | server | Lower bound on a peer's FEC group size K; an FEC handshake below it is refused |
 | `server.fec_group_max` | `64` | server | Upper bound on a peer's FEC group size K; an FEC handshake above it is refused. Neither end is clamped, and defaults are the protocol limits so nothing is limited unless configured. One parity copy is rotated across healthy backends, so the redundancy ratio is ≈1/K: a `min` floor bounds bandwidth, while a `max` ceiling bounds pending-frame buffering and recovery latency |
