@@ -12,6 +12,9 @@ fn real_tap_exercises_adaptive_multipath_and_enforces_utilization() {
         "path monopoly",
         "max(shares) > 0.80",
     ] {
-        assert!(script.contains(marker), "net-perf adaptive gate missing {marker:?}");
+        assert!(
+            script.contains(marker),
+            "net-perf adaptive gate missing {marker:?}"
+        );
     }
 }

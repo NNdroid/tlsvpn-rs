@@ -124,10 +124,12 @@ impl EventHub {
         while inner.ring.len() > EVENT_CAP {
             inner.ring.pop_front();
         }
-        inner.subscribers.retain(|tx| match tx.try_send(event.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
-        });
+        inner
+            .subscribers
+            .retain(|tx| match tx.try_send(event.clone()) {
+                Ok(()) | Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            });
     }
 
     pub fn snapshot(&self, after: u64) -> Vec<DashboardEvent> {
@@ -619,8 +621,7 @@ impl WebParityState {
             .unwrap_or_default();
         let mut previous = self.last_clients.lock();
         for id in current.difference(&previous) {
-            self.events
-                .emit("connect", "info", id, "Client connected");
+            self.events.emit("connect", "info", id, "Client connected");
         }
         for id in previous.difference(&current) {
             self.events

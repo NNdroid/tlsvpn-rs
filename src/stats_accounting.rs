@@ -42,11 +42,16 @@ pub struct TxFrameCounters {
 impl TxFrameCounters {
     #[inline]
     pub fn record(&self, totals: TxFrameTotals) {
-        self.data_frames.fetch_add(totals.data_frames, Ordering::Relaxed);
-        self.parity_frames.fetch_add(totals.parity_frames, Ordering::Relaxed);
-        self.control_frames.fetch_add(totals.control_frames, Ordering::Relaxed);
-        self.data_wire_bytes.fetch_add(totals.data_wire_bytes, Ordering::Relaxed);
-        self.parity_wire_bytes.fetch_add(totals.parity_wire_bytes, Ordering::Relaxed);
+        self.data_frames
+            .fetch_add(totals.data_frames, Ordering::Relaxed);
+        self.parity_frames
+            .fetch_add(totals.parity_frames, Ordering::Relaxed);
+        self.control_frames
+            .fetch_add(totals.control_frames, Ordering::Relaxed);
+        self.data_wire_bytes
+            .fetch_add(totals.data_wire_bytes, Ordering::Relaxed);
+        self.parity_wire_bytes
+            .fetch_add(totals.parity_wire_bytes, Ordering::Relaxed);
     }
 
     #[inline]

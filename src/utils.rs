@@ -242,7 +242,11 @@ pub fn apply_ip_cmds(cmds: &[Vec<&str>]) -> Result<(), String> {
             }
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// 面板监听地址算不算「对外」：非回环地址就算。对齐 Go main.go 的 web.auth 提示判断。

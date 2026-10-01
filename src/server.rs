@@ -24,9 +24,10 @@ use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
+use crate::rx_actor::{RxProducer, RxSessionActor};
+use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameTotals};
 use crate::tap::{MemTap, TapDevice};
 use crate::tcp_cork::TlsBatchCork;
-use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameTotals};
 use crate::utils::*;
 
 // ======================= IP 地址池（对齐 Go assignIPsLocked 语义） =======================
@@ -196,8 +197,11 @@ pub struct ClientSession {
     pub session_id: String,
     pub stat: Arc<ClientStat>,
     pub port: Arc<AsyncPort>,
+    // Legacy/direct receive state for static single-connection sessions.
     pub reorder_buf: Arc<Mutex<ReorderBuffer>>,
     pub dedup: Arc<DeDuplicator>,
+    // Multi-connection FEC/reorder/gap-timeout ownership lives here.
+    pub rx_actor: Option<Arc<RxSessionActor>>,
     pub fec_enc_k: i64,
     pub mac: String,
     pub peer_info: RwLock<Option<PeerInfo>>,
@@ -216,6 +220,47 @@ pub struct ClientSession {
     // 物理连接级计数；不能让后建立的一条失败连接覆盖此前成功连接的状态。
     pub brutal_applied_conns: AtomicU64,
     pub brutal_error: Mutex<String>,
+}
+
+impl ClientSession {
+    fn rx_runtime_snapshot(&self) -> (u64, u64, ReorderStats, bool) {
+        if let Some(actor) = &self.rx_actor {
+            let snap = actor.snapshot();
+            return (
+                self.stat
+                    .fec_recovered_lifetime
+                    .load(Ordering::Relaxed)
+                    .saturating_add(snap.recovered),
+                self.stat
+                    .fec_lost_lifetime
+                    .load(Ordering::Relaxed)
+                    .saturating_add(snap.lost),
+                snap.reorder,
+                snap.fec_bypass,
+            );
+        }
+        let epoch = self.epoch_state.read();
+        let (active_recovered, active_lost, bypass) = epoch
+            .fec_dec
+            .as_ref()
+            .map(|dec| {
+                let (r, l) = dec.stats();
+                (r, l, dec.bypass_snapshot())
+            })
+            .unwrap_or((0, 0, false));
+        (
+            self.stat
+                .fec_recovered_lifetime
+                .load(Ordering::Relaxed)
+                .saturating_add(active_recovered),
+            self.stat
+                .fec_lost_lifetime
+                .load(Ordering::Relaxed)
+                .saturating_add(active_lost),
+            self.reorder_buf.lock().stats(),
+            bypass,
+        )
+    }
 }
 
 pub struct SessionEpochState {
@@ -252,6 +297,7 @@ struct MioSession {
     batch_cork: TlsBatchCork,
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
+    rx_producer: Option<RxProducer>,
     write_stalled: Option<Instant>,
     queued_payload_pending: u64,
     brutal_applied: bool,
@@ -441,14 +487,9 @@ impl ServerCore {
         // Fold the final decoder epoch into the same process-lifetime domain
         // before removing the session. Decoder rebuilds have already been
         // accumulated into ClientStat, so add current decoder only once here.
-        let mut recovered = session.stat.fec_recovered_lifetime.load(Ordering::Relaxed);
-        let mut lost = session.stat.fec_lost_lifetime.load(Ordering::Relaxed);
-        if let Some(dec) = &session.epoch_state.read().fec_dec {
-            let (r, l) = dec.stats();
-            recovered = recovered.saturating_add(r);
-            lost = lost.saturating_add(l);
-        }
-        self.fec_recovered_retired.fetch_add(recovered, Ordering::Relaxed);
+        let (recovered, lost, _reorder, _bypass) = session.rx_runtime_snapshot();
+        self.fec_recovered_retired
+            .fetch_add(recovered, Ordering::Relaxed);
         self.fec_lost_retired.fetch_add(lost, Ordering::Relaxed);
         sessions.remove(cid);
         drop(sessions);
@@ -512,17 +553,14 @@ impl WebStatsProvider for ServerCore {
                     tx_active_sessions += 1;
                 }
             }
-            let epoch = s.epoch_state.read();
-            if let Some(dec) = &epoch.fec_dec {
-                if dec.bypass_snapshot() {
-                    rx_bypass_sessions += 1;
-                }
-                let (r, l) = dec.stats();
-                rec += r;
-                lost += l;
+            let (session_rec, session_lost, reorder, rx_bypass) = s.rx_runtime_snapshot();
+            rec = rec.saturating_add(session_rec);
+            lost = lost.saturating_add(session_lost);
+            if rx_bypass {
+                rx_bypass_sessions += 1;
             }
+            let epoch = s.epoch_state.read();
             dropped += s.port.dropped();
-            let reorder = s.reorder_buf.lock().stats();
             reorder_gap += reorder.gap_events;
             reorder_flushes += reorder.timeout_flushes;
             reorder_skipped += reorder.skipped_frames;
@@ -688,14 +726,10 @@ impl WebStatsProvider for ServerCore {
             rx += s.stat.rx_bytes.load(Ordering::Relaxed);
             pk += s.stat.tx_packets.load(Ordering::Relaxed)
                 + s.stat.rx_packets.load(Ordering::Relaxed);
-            let epoch = s.epoch_state.read();
-            if let Some(dec) = &epoch.fec_dec {
-                let (r, l) = dec.stats();
-                rec += r;
-                lost += l;
-            }
+            let (session_rec, session_lost, reorder, _rx_bypass) = s.rx_runtime_snapshot();
+            rec = rec.saturating_add(session_rec);
+            lost = lost.saturating_add(session_lost);
             dropped += s.port.dropped();
-            let reorder = s.reorder_buf.lock().stats();
             reorder_gap += reorder.gap_events;
             reorder_flushes += reorder.timeout_flushes;
             reorder_skipped += reorder.skipped_frames;
@@ -895,8 +929,8 @@ const SELF_SIGNED_CERT_FILE: &str = "tlsvpn-selfsigned-cert.pem";
 const SELF_SIGNED_KEY_FILE: &str = "tlsvpn-selfsigned-key.pem";
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("cannot open server.cert {path}: {e}"))?;
+    let f =
+        std::fs::File::open(path).map_err(|e| format!("cannot open server.cert {path}: {e}"))?;
     let mut r = std::io::BufReader::new(f);
     let certs: Vec<_> = rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
@@ -908,8 +942,7 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
 }
 
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("cannot open server.key {path}: {e}"))?;
+    let f = std::fs::File::open(path).map_err(|e| format!("cannot open server.key {path}: {e}"))?;
     let mut r = std::io::BufReader::new(f);
     rustls_pemfile::private_key(&mut r)
         .map_err(|e| format!("cannot parse server.key {path}: {e}"))?
@@ -958,7 +991,10 @@ fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> 
 
     match build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE) {
         Ok(cfg) => {
-            info!("Loaded existing self-signed certificate from {}", SELF_SIGNED_CERT_FILE);
+            info!(
+                "Loaded existing self-signed certificate from {}",
+                SELF_SIGNED_CERT_FILE
+            );
             return Ok(cfg);
         }
         Err(e) => {
@@ -971,7 +1007,10 @@ fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> 
     }
 
     generate_persistent_self_signed(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)?;
-    info!("Generated self-signed certificate and persisted it to {} / {}", SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE);
+    info!(
+        "Generated self-signed certificate and persisted it to {} / {}",
+        SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE
+    );
     build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)
 }
 
@@ -1316,8 +1355,10 @@ fn worker_loop(
         let poll_now = Instant::now();
         for sess in mio_sessions.values() {
             if let Some(c_sess) = &sess.client_session {
-                if let Some(wait) = c_sess.reorder_buf.lock().next_timeout() {
-                    poll_timeout = poll_timeout.min(wait);
+                if c_sess.rx_actor.is_none() {
+                    if let Some(wait) = c_sess.reorder_buf.lock().next_timeout() {
+                        poll_timeout = poll_timeout.min(wait);
+                    }
                 }
             }
             if let Some(wait) = sess.batch_cork.next_timeout(poll_now) {
@@ -1400,6 +1441,7 @@ fn worker_loop(
                     batch_cork: TlsBatchCork::disabled(),
                     ic_rx: None,
                     session_epoch: 0,
+                    rx_producer: None,
                     write_stalled: None,
                     queued_payload_pending: 0,
                     brutal_applied: false,
@@ -1670,6 +1712,7 @@ fn worker_loop(
         let reorder_sessions: Vec<_> = mio_sessions
             .values()
             .filter_map(|sess| sess.client_session.clone())
+            .filter(|session| session.rx_actor.is_none())
             .filter(|session| seen_reorder.insert(Arc::as_ptr(session) as usize))
             .collect();
         for session in reorder_sessions {
@@ -1719,6 +1762,13 @@ fn process_plain_frames(
     tarpit: &mut bool,
     reorder_ready: &mut Vec<Arc<Vec<u8>>>,
 ) {
+    if let Some(producer) = sess.rx_producer.as_ref() {
+        if let Some(error) = producer.take_error() {
+            debug!("closing session plaintext path: {}", error);
+            *close = true;
+            return;
+        }
+    }
     // 共享统计按一次 TLS plaintext drain 聚合，降低多 worker 写同一 cache line 的频率。
     let mut rx_bytes_batch = 0u64;
     let mut rx_packets_batch = 0u64;
@@ -1798,6 +1848,17 @@ fn process_plain_frames(
                         *close = true;
                         break;
                     }
+                    if sess.rx_producer.is_some() {
+                        drop(epoch);
+                        let data = Arc::new(data);
+                        let producer = sess.rx_producer.as_mut().unwrap();
+                        if !producer.push(seq, data) {
+                            debug!("closing session plaintext path: RX actor queue closed");
+                            *close = true;
+                            break;
+                        }
+                        continue;
+                    }
                     let fec_dec = epoch.fec_dec.clone();
                     drop(epoch);
                     if batch_session.is_none() {
@@ -1869,7 +1930,16 @@ fn process_plain_frames(
         }
     }
 
-    if let Some(c_sess) = batch_session.as_ref() {
+    if let Some(producer) = sess.rx_producer.as_mut() {
+        if !producer.flush() {
+            debug!("closing session plaintext path: RX actor queue closed");
+            *close = true;
+        }
+        if let Some(error) = producer.take_error() {
+            debug!("closing session plaintext path: {}", error);
+            *close = true;
+        }
+    } else if let Some(c_sess) = batch_session.as_ref() {
         flush_server_rx_batch(
             c_sess,
             core,
@@ -2146,7 +2216,13 @@ fn rotate_session_epoch(
     } else {
         (None, None, None, None)
     };
-    let fec_dec = if session.fec_enc_k > 0 {
+
+    let actor_fec = if session.rx_actor.is_some() && session.fec_enc_k > 0 {
+        Some(FecDecoder::new(session.fec_enc_k as usize, fec_rx.clone()))
+    } else {
+        None
+    };
+    let legacy_fec = if session.rx_actor.is_none() && session.fec_enc_k > 0 {
         Some(Arc::new(FecDecoder::new(
             session.fec_enc_k as usize,
             fec_rx,
@@ -2154,14 +2230,28 @@ fn rotate_session_epoch(
     } else {
         None
     };
-    if let Some(old) = &epoch.fec_dec {
-        let (r, l) = old.stats();
-        session.stat.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
-        session.stat.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
-        old.reset();
+
+    if let Some(actor) = &session.rx_actor {
+        // Reconfigure is an epoch barrier: old producers are stale after the
+        // worker acknowledges it, so queued data cannot cross into new FEC keys.
+        actor.reconfigure(actor_fec);
+    } else {
+        if let Some(old) = &epoch.fec_dec {
+            let (r, l) = old.stats();
+            session
+                .stat
+                .fec_recovered_lifetime
+                .fetch_add(r, Ordering::Relaxed);
+            session
+                .stat
+                .fec_lost_lifetime
+                .fetch_add(l, Ordering::Relaxed);
+            old.reset();
+        }
+        session.reorder_buf.lock().reset();
+        session.dedup.reset();
     }
-    session.reorder_buf.lock().reset();
-    session.dedup.reset();
+
     if session.fec_enc_k > 0 {
         session.port.reset_epoch(session.fec_enc_k as usize, fec_tx);
     } else {
@@ -2173,7 +2263,7 @@ fn rotate_session_epoch(
     epoch.salt_b = salt_b;
     epoch.ic_tx = ic_tx;
     epoch.ic_rx = ic_rx;
-    epoch.fec_dec = fec_dec;
+    epoch.fec_dec = legacy_fec;
     session.stat.active_conns.store(0, Ordering::Release);
     Ok(())
 }
@@ -2486,8 +2576,12 @@ fn handle_handshake(
             if fec_enc_k > 0 {
                 port.attach_encoder(fec_enc_k as usize, fec_tx);
             }
-            let fec_dec = if fec_enc_k > 0 {
-                Some(Arc::new(FecDecoder::new(fec_enc_k as usize, fec_rx)))
+            let multi_rx = req.brutal_conns > 1;
+            let fec_dec = if !multi_rx && fec_enc_k > 0 {
+                Some(Arc::new(FecDecoder::new(
+                    fec_enc_k as usize,
+                    fec_rx.clone(),
+                )))
             } else {
                 None
             };
@@ -2506,6 +2600,31 @@ fn handle_handshake(
             };
 
             let mac_bin = parse_mac_key(&mac).unwrap_or_default();
+            let rx_actor = if multi_rx {
+                let vswitch = core.vswitch.clone();
+                let actor_client_id = client_id.clone();
+                let actor_mac = mac_bin;
+                let initial_fec = if fec_enc_k > 0 {
+                    Some(FecDecoder::new(fec_enc_k as usize, fec_rx))
+                } else {
+                    None
+                };
+                Some(RxSessionActor::new(
+                    Arc::new(move |mut batch| {
+                        for ordered in batch.drain(..) {
+                            if actor_mac != [0u8; 6] {
+                                vswitch.process_session_frame(&actor_client_id, actor_mac, ordered);
+                            } else {
+                                vswitch.process_frame(&actor_client_id, ordered);
+                            }
+                        }
+                        batch
+                    }),
+                    initial_fec,
+                ))
+            } else {
+                None
+            };
             core.vswitch.add_port(client_id.clone(), port.clone());
             core.vswitch.add_static_mac(client_id.clone(), mac_bin);
             if !mac.is_empty() {
@@ -2530,6 +2649,7 @@ fn handle_handshake(
                 port,
                 reorder_buf: Arc::new(Mutex::new(ReorderBuffer::new())),
                 dedup: Arc::new(DeDuplicator::new()),
+                rx_actor,
                 fec_enc_k,
                 mac,
                 peer_info: RwLock::new(req.peer_info.as_ref().map(normalize_peer_info)),
@@ -2566,10 +2686,10 @@ fn handle_handshake(
     // from the previous connection instead of showing a stale host identity.
     *c_sess.peer_info.write() = req.peer_info.as_ref().map(normalize_peer_info);
 
-    {
+    if c_sess.rx_actor.is_none() {
         let epoch = c_sess.epoch_state.read();
         if let Some(dec) = &epoch.fec_dec {
-            dec.set_static_single_path(req.brutal_conns == 1);
+            dec.set_static_single_path(true);
             let reorder = c_sess.reorder_buf.clone();
             dec.set_reorder_progress(Arc::new(move || reorder.lock().expected_seq_snapshot()));
         }
@@ -2593,6 +2713,7 @@ fn handle_handshake(
     c_sess
         .port
         .register_backend(sess.tx_backend.as_ref().unwrap().clone());
+    sess.rx_producer = c_sess.rx_actor.as_ref().map(|actor| actor.producer());
     sess.client_session = Some(c_sess.clone());
 
     // Brutal 速率协商（对齐 Go）。两个方向的预算不能混：server_tx_rate 是

@@ -903,7 +903,10 @@ fn load_web_ssl(cert: &str, key: &str) -> Result<tiny_http::SslConfig, String> {
 /// （true=成功），供 web.bind=tunnel 的重绑管理器逐个采纳。单监听模式
 /// 传 None：失败直接记 error，因为没有下一轮会重试。
 
-fn dashboard_stats_json(provider: &Arc<dyn WebStatsProvider>, ctx: &Arc<RuntimeCtx>) -> serde_json::Value {
+fn dashboard_stats_json(
+    provider: &Arc<dyn WebStatsProvider>,
+    ctx: &Arc<RuntimeCtx>,
+) -> serde_json::Value {
     let mut stats = provider.stats_json();
     if let Some(obj) = stats.as_object_mut() {
         obj.insert("cfg".to_string(), ctx.cfg.read().clone());
@@ -940,22 +943,56 @@ struct DashboardStream {
 }
 
 impl DashboardStream {
-    fn new(provider: Arc<dyn WebStatsProvider>, ctx: Arc<RuntimeCtx>, interval: Duration, range: String, log_after: u64, event_after: u64) -> Self {
-        Self { provider, ctx, interval, range, log_after, event_after, pending: Vec::new(), first: true }
+    fn new(
+        provider: Arc<dyn WebStatsProvider>,
+        ctx: Arc<RuntimeCtx>,
+        interval: Duration,
+        range: String,
+        log_after: u64,
+        event_after: u64,
+    ) -> Self {
+        Self {
+            provider,
+            ctx,
+            interval,
+            range,
+            log_after,
+            event_after,
+            pending: Vec::new(),
+            first: true,
+        }
     }
 
     fn refill(&mut self) {
-        if !self.first { std::thread::sleep(self.interval); }
+        if !self.first {
+            std::thread::sleep(self.interval);
+        }
         self.first = false;
         let mut out = Vec::with_capacity(32 * 1024);
-        sse_json(&mut out, "stats", &dashboard_stats_json(&self.provider, &self.ctx));
+        sse_json(
+            &mut out,
+            "stats",
+            &dashboard_stats_json(&self.provider, &self.ctx),
+        );
         sse_json(&mut out, "trend", &self.ctx.web.trend_json(&self.range));
         let logs = log_ring_snapshot(self.log_after);
-        if let Some(seq) = logs.last().and_then(|v| v.get("seq")).and_then(|v| v.as_u64()) { self.log_after = seq; }
-        if !logs.is_empty() { sse_json(&mut out, "logs", &logs); }
+        if let Some(seq) = logs
+            .last()
+            .and_then(|v| v.get("seq"))
+            .and_then(|v| v.as_u64())
+        {
+            self.log_after = seq;
+        }
+        if !logs.is_empty() {
+            sse_json(&mut out, "logs", &logs);
+        }
         let events = self.ctx.web.events.snapshot(self.event_after);
-        if let Some(last) = events.last() { self.event_after = last.seq; }
-        if !events.is_empty() { sse_json(&mut out, "events", &events); }
+        if let Some(last) = events.last() {
+            self.event_after = last.seq;
+        }
+        if !events.is_empty() {
+            sse_json(&mut out, "events", &events);
+        }
         out.extend_from_slice(b": ping\n\n");
         self.pending = out;
     }
@@ -963,8 +1000,12 @@ impl DashboardStream {
 
 impl Read for DashboardStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() { return Ok(0); }
-        if self.pending.is_empty() { self.refill(); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pending.is_empty() {
+            self.refill();
+        }
         let n = buf.len().min(self.pending.len());
         buf[..n].copy_from_slice(&self.pending[..n]);
         self.pending.drain(..n);
@@ -1160,17 +1201,28 @@ fn serve_listener(
 
         match (request.method(), url.as_str()) {
             (&Method::Get, "/api/stats") => {
-                respond_json(request, dashboard_stats_json(&provider, &ctx).to_string(), 200);
+                respond_json(
+                    request,
+                    dashboard_stats_json(&provider, &ctx).to_string(),
+                    200,
+                );
             }
             (&Method::Get, "/api/stream") => {
                 let interval_ms = query_u64(request.url(), "interval_ms").clamp(250, 10_000);
-                let range = request.url().split_once('?')
+                let range = request
+                    .url()
+                    .split_once('?')
                     .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("range=")))
                     .filter(|v| matches!(*v, "2m" | "1h" | "24h"))
-                    .unwrap_or("2m").to_string();
+                    .unwrap_or("2m")
+                    .to_string();
                 let stream = DashboardStream::new(
-                    provider.clone(), ctx.clone(), Duration::from_millis(interval_ms), range,
-                    query_u64(request.url(), "log_after"), query_u64(request.url(), "event_after"),
+                    provider.clone(),
+                    ctx.clone(),
+                    Duration::from_millis(interval_ms),
+                    range,
+                    query_u64(request.url(), "log_after"),
+                    query_u64(request.url(), "event_after"),
                 );
                 let headers = vec![
                     http_header("Content-Type", "text/event-stream"),
@@ -1431,10 +1483,7 @@ pub fn web_port(addr: &str) -> u16 {
 /// Start the process-level dashboard/traffic sampler exactly once. It runs even
 /// when the HTTP dashboard is disabled so traffic_days/traffic_file keep the same
 /// process-level semantics as the Go implementation.
-pub fn start_dashboard_sampler(
-    provider: Arc<dyn WebStatsProvider>,
-    ctx: Arc<RuntimeCtx>,
-) {
+pub fn start_dashboard_sampler(provider: Arc<dyn WebStatsProvider>, ctx: Arc<RuntimeCtx>) {
     if !ctx.web.try_start_sampler() {
         return;
     }
