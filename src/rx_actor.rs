@@ -1,294 +1,4 @@
-#!/usr/bin/env python3
-from pathlib import Path
-
-
-def replace_once(path, old, new):
-    p = Path(path)
-    s = p.read_text()
-    if old not in s:
-        raise SystemExit(f"marker not found in {path}: {old[:120]!r}")
-    p.write_text(s.replace(old, new, 1))
-
-# Module registration.
-replace_once("src/main.rs", "pub mod protocol;\n", "pub mod protocol;\npub mod rx_actor;\n")
-
-# Actor-only FEC fence methods: same state machine, no parking_lot mutex lock when
-# the session worker owns the object exclusively.
-p = Path("src/protocol.rs")
-s = p.read_text()
-marker = "    pub fn generation(&self) -> u64 {\n        *self.generation.lock()\n    }\n"
-insert = '''    pub fn reset_actor(&mut self) {
-        *self.generation.get_mut() = 0;
-        self.window.store(0, Ordering::Release);
-    }
-
-    pub fn apply_actor(&mut self, control: FecModeControl) -> bool {
-        if control.generation == 0
-            || control.boundary == 0
-            || (control.op != FEC_MODE_SUSPEND && control.op != FEC_MODE_RESUME)
-        {
-            return false;
-        }
-        let generation = self.generation.get_mut();
-        if control.generation <= *generation {
-            return false;
-        }
-        let (from, _) = self.window();
-        *generation = control.generation;
-        match control.op {
-            FEC_MODE_SUSPEND => self
-                .window
-                .store(pack_window(control.boundary, 0), Ordering::Release),
-            FEC_MODE_RESUME => {
-                if from == 0 || control.boundary <= from {
-                    self.window.store(0, Ordering::Release);
-                } else {
-                    self.window.store(
-                        pack_window(from, control.boundary),
-                        Ordering::Release,
-                    );
-                }
-            }
-            _ => unreachable!(),
-        }
-        true
-    }
-
-'''
-if marker not in s:
-    raise SystemExit("protocol actor insertion marker not found")
-p.write_text(s.replace(marker, insert + marker, 1))
-
-# Actor-owned FEC API. Existing shared API remains untouched for the static
-# single-connection fast path and direct tests.
-p = Path("src/fec.rs")
-s = p.read_text()
-marker = "    fn group_start_of(&self, seq: u32) -> u32 {\n"
-actor = r'''    pub fn stats_actor(&mut self) -> (u64, u64) {
-        let inner = self.inner.get_mut();
-        (inner.recovered, inner.lost)
-    }
-
-    pub fn reset_actor(&mut self) {
-        let inner = self.inner.get_mut();
-        for (_, mut g) in inner.groups.drain() {
-            if let Some(parity) = g.parity.take() {
-                release_frame_vec(parity);
-            }
-        }
-        inner.done.fill(0);
-        self.cleanup_before.store(0, Ordering::Release);
-        self.retired_before.store(0, Ordering::Release);
-        self.fence.reset_actor();
-    }
-
-    fn maybe_retire_old_groups_actor(&mut self, expected: u32) {
-        let boundary = self.cleanup_before.load(Ordering::Acquire);
-        if boundary == 0 || self.retired_before.load(Ordering::Acquire) >= boundary {
-            return;
-        }
-        if expected == 0 || expected < boundary {
-            return;
-        }
-        self.retired_before.store(boundary, Ordering::Release);
-        let inner = self.inner.get_mut();
-        let doomed: Vec<u32> = inner
-            .groups
-            .keys()
-            .copied()
-            .filter(|start| *start < boundary)
-            .collect();
-        for start in doomed {
-            if let Some(mut g) = inner.groups.remove(&start) {
-                if let Some(parity) = g.parity.take() {
-                    release_frame_vec(parity);
-                }
-            }
-        }
-    }
-
-    fn handle_mode_control_actor(&mut self, control: FecModeControl, expected: u32) {
-        if !self.fence.apply_actor(control) {
-            return;
-        }
-        let (from, until) = self.fence.window();
-        if from == 0 {
-            return;
-        }
-        Self::atomic_max(&self.cleanup_before, from);
-        {
-            let inner = self.inner.get_mut();
-            Self::drop_groups_in_range(inner, from, until);
-        }
-        self.maybe_retire_old_groups_actor(expected);
-    }
-
-    /// Session-actor data path. The decoder is owned by one RX worker, so this
-    /// mutates `inner` through Mutex::get_mut() and does not acquire the shared
-    /// decoder mutex used by the legacy/direct path.
-    pub fn on_data_actor(
-        &mut self,
-        seq: u32,
-        frame: &Arc<Vec<u8>>,
-        reorder_expected: u32,
-    ) -> Option<(u32, Arc<Vec<u8>>)> {
-        if frame.is_empty() || seq == 0 || self.static_single.load(Ordering::Acquire) {
-            return None;
-        }
-        if self.fence.bypass_data(seq) {
-            if seq & 0xff == 0 {
-                self.maybe_retire_old_groups_actor(reorder_expected);
-            }
-            return None;
-        }
-        let retired = self.retired_before.load(Ordering::Acquire);
-        if retired != 0 && seq < retired {
-            return None;
-        }
-        let k = self.k;
-        let full_mask = self.full_mask;
-        let start = seq - ((seq - 1) % k as u32);
-        let inner = self.inner.get_mut();
-        if is_done(&inner.done, start, k) {
-            return None;
-        }
-        let complete;
-        {
-            let g = entry(&mut inner.groups, start);
-            let bit = seq - start;
-            let mask = 1u64 << bit;
-            if g.got_mask & mask != 0 {
-                return None;
-            }
-            g.got_mask |= mask;
-            complete = g.got_mask == full_mask;
-            if !complete {
-                if frame.len() > g.acc.len() {
-                    g.acc.resize(frame.len(), 0);
-                }
-                xor_into(&mut g.acc, frame);
-            }
-        }
-        if complete {
-            if let Some(mut g) = inner.groups.remove(&start) {
-                if let Some(parity) = g.parity.take() {
-                    release_frame_vec(parity);
-                }
-            }
-            mark_done(&mut inner.done, start, k);
-            return None;
-        }
-        let mut recovered = None;
-        try_recover(inner, start, k, &mut |s, f| recovered = Some((s, f)));
-        recovered
-    }
-
-    pub fn on_control_actor(
-        &mut self,
-        payload: &[u8],
-        reorder_expected: u32,
-    ) -> Result<Option<(u32, Arc<Vec<u8>>)>, String> {
-        match control_kind(payload)? {
-            CONTROL_KIND_FEC_PARITY => self.on_parity_actor(payload, reorder_expected),
-            CONTROL_KIND_FEC_MODE => {
-                let control = FecModeControl::parse(payload)?;
-                self.handle_mode_control_actor(control, reorder_expected);
-                Ok(None)
-            }
-            kind => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
-        }
-    }
-
-    fn on_parity_actor(
-        &mut self,
-        payload: &[u8],
-        reorder_expected: u32,
-    ) -> Result<Option<(u32, Arc<Vec<u8>>)>, String> {
-        if self.static_single.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if payload.len() < 7 || payload[0] != CONTROL_KIND_FEC_PARITY {
-            return Err("malformed FEC_PARITY header".into());
-        }
-        let start = BigEndian::read_u32(&payload[1..5]);
-        let k = payload[5] as usize;
-        if start == 0 || k != self.k || (start - 1) % self.k as u32 != 0 {
-            return Err(format!("invalid FEC_PARITY start={start} k={k}"));
-        }
-        self.maybe_retire_old_groups_actor(reorder_expected);
-        let retired = self.retired_before.load(Ordering::Acquire);
-        if retired != 0 && start < retired {
-            return Ok(None);
-        }
-        let desc_len = 6 + 4 * k;
-        let tag_len = self.ic.as_ref().map(|c| c.tag_len()).unwrap_or(0);
-        if payload.len() < desc_len + tag_len {
-            return Err("truncated FEC_PARITY descriptor/body".into());
-        }
-        let mut lens = Vec::with_capacity(k);
-        let mut max_len = 0usize;
-        for i in 0..k {
-            let l = BigEndian::read_u32(&payload[6 + 4 * i..10 + 4 * i]) as usize;
-            if l + tag_len > payload.len() - desc_len {
-                return Err("invalid FEC_PARITY member length".into());
-            }
-            lens.push(l);
-            max_len = max_len.max(l);
-        }
-        let mut pb = acquire_frame_vec(max_len);
-        if let Some(ic) = &self.ic {
-            let mut aad = [0u8; 8];
-            aad[0..4].copy_from_slice(&((max_len + tag_len) as u32).to_be_bytes());
-            aad[4..8].copy_from_slice(&start.to_be_bytes());
-            match ic.open_to(
-                &mut pb,
-                &payload[desc_len..desc_len + max_len + tag_len],
-                start,
-                &aad,
-            ) {
-                Ok(plain) => {
-                    let n = plain.len();
-                    pb.truncate(n);
-                }
-                Err(_) => {
-                    release_frame_vec(pb);
-                    return Err("FEC_PARITY AEAD failure".into());
-                }
-            }
-        } else {
-            pb.copy_from_slice(&payload[desc_len..desc_len + max_len]);
-        }
-        let k_self = self.k;
-        let inner = self.inner.get_mut();
-        let retired = self.retired_before.load(Ordering::Acquire);
-        if (retired != 0 && start < retired) || is_done(&inner.done, start, k_self) {
-            release_frame_vec(pb);
-            return Ok(None);
-        }
-        {
-            let g = entry(&mut inner.groups, start);
-            if g.parity.is_some() {
-                release_frame_vec(pb);
-                return Ok(None);
-            }
-            g.k = k;
-            g.lens = lens;
-            g.parity = Some(pb);
-        }
-        let mut recovered = None;
-        try_recover(inner, start, k_self, &mut |s, f| recovered = Some((s, f)));
-        // `inner` borrow ends before the next actor cleanup call.
-        let _ = inner;
-        self.maybe_retire_old_groups_actor(reorder_expected);
-        Ok(recovered)
-    }
-
-'''
-if marker not in s:
-    raise SystemExit("fec actor insertion marker not found")
-p.write_text(s.replace(marker, actor + marker, 1))
-
-rx_actor = r'''use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -535,7 +245,11 @@ fn publish_stats(
 ) {
     let (recovered, lost, bypass) = if let Some(dec) = fec.as_mut() {
         let (r, l) = dec.stats_actor();
-        (recovered_base.saturating_add(r), lost_base.saturating_add(l), dec.bypass_snapshot())
+        (
+            recovered_base.saturating_add(r),
+            lost_base.saturating_add(l),
+            dec.bypass_snapshot(),
+        )
     } else {
         (recovered_base, lost_base, false)
     };
@@ -545,8 +259,12 @@ fn publish_stats(
     stats.lost.store(lost, Ordering::Relaxed);
     stats.fec_bypass.store(bypass, Ordering::Relaxed);
     stats.gap_events.store(rs.gap_events, Ordering::Relaxed);
-    stats.timeout_flushes.store(rs.timeout_flushes, Ordering::Relaxed);
-    stats.skipped_frames.store(rs.skipped_frames, Ordering::Relaxed);
+    stats
+        .timeout_flushes
+        .store(rs.timeout_flushes, Ordering::Relaxed);
+    stats
+        .skipped_frames
+        .store(rs.skipped_frames, Ordering::Relaxed);
 }
 
 fn deliver_ready(delivery: &RxDelivery, ready: &mut Vec<Arc<Vec<u8>>>) {
@@ -667,9 +385,9 @@ fn run_actor(
                         continue;
                     }
 
-                    let recovered = fec
-                        .as_mut()
-                        .and_then(|dec| dec.on_data_actor(seq, &data, reorder.expected_seq_snapshot()));
+                    let recovered = fec.as_mut().and_then(|dec| {
+                        dec.on_data_actor(seq, &data, reorder.expected_seq_snapshot())
+                    });
                     if !dedup.is_duplicate(seq) {
                         insert_pair(&mut reorder, &mut ready, seq, data, recovered);
                     } else {
@@ -790,7 +508,10 @@ mod tests {
     fn typed_control_without_fec_reports_to_originating_producer() {
         let (actor, _rx) = actor_with_output();
         let mut p = actor.producer();
-        assert!(p.push(0, Arc::new(vec![crate::protocol::CONTROL_KIND_FEC_MODE; 16])));
+        assert!(p.push(
+            0,
+            Arc::new(vec![crate::protocol::CONTROL_KIND_FEC_MODE; 16])
+        ));
         for _ in 0..50 {
             if let Some(err) = p.take_error() {
                 assert!(err.contains("without negotiated FEC"));
@@ -801,5 +522,3 @@ mod tests {
         panic!("actor did not report protocol error");
     }
 }
-'''
-Path("src/rx_actor.rs").write_text(rx_actor)

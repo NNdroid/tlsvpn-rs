@@ -130,6 +130,41 @@ impl FecRxFenceState {
         self.window.store(0, Ordering::Release);
     }
 
+    pub fn reset_actor(&mut self) {
+        *self.generation.get_mut() = 0;
+        self.window.store(0, Ordering::Release);
+    }
+
+    pub fn apply_actor(&mut self, control: FecModeControl) -> bool {
+        if control.generation == 0
+            || control.boundary == 0
+            || (control.op != FEC_MODE_SUSPEND && control.op != FEC_MODE_RESUME)
+        {
+            return false;
+        }
+        let (from, _) = self.window();
+        let generation = self.generation.get_mut();
+        if control.generation <= *generation {
+            return false;
+        }
+        *generation = control.generation;
+        match control.op {
+            FEC_MODE_SUSPEND => self
+                .window
+                .store(pack_window(control.boundary, 0), Ordering::Release),
+            FEC_MODE_RESUME => {
+                if from == 0 || control.boundary <= from {
+                    self.window.store(0, Ordering::Release);
+                } else {
+                    self.window
+                        .store(pack_window(from, control.boundary), Ordering::Release);
+                }
+            }
+            _ => unreachable!(),
+        }
+        true
+    }
+
     pub fn generation(&self) -> u64 {
         *self.generation.lock()
     }
@@ -163,10 +198,8 @@ impl FecRxFenceState {
                 if from == 0 || control.boundary <= from {
                     self.window.store(0, Ordering::Release);
                 } else {
-                    self.window.store(
-                        pack_window(from, control.boundary),
-                        Ordering::Release,
-                    );
+                    self.window
+                        .store(pack_window(from, control.boundary), Ordering::Release);
                 }
             }
             _ => unreachable!(),
@@ -270,10 +303,7 @@ mod tests {
             boundary: 9,
         };
         let wire = c.encode();
-        assert_eq!(
-            hex::encode(wire),
-            "02010000010203040506070800000009"
-        );
+        assert_eq!(hex::encode(wire), "02010000010203040506070800000009");
         assert_eq!(FecModeControl::parse(&wire).unwrap(), c);
 
         let mut malformed = wire;
