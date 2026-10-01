@@ -24,25 +24,27 @@
 
   function qualityStats(data) {
     const c = aggregateClientCounters(data || {});
+    if(data && data.global_tx_packets!==undefined) c.txPackets=num(data.global_tx_packets);
+    if(data && data.global_rx_packets!==undefined) c.rxPackets=num(data.global_rx_packets);
+    if(data && data.global_rx_bytes!==undefined) c.rxBytes=num(data.global_rx_bytes);
     const dropped = num(data && data.dropped_frames);
     const fec = data && data.fec ? data.fec : {};
+    const written = fec.counter_domain === 'written';
     const parityTx = num(fec.parity_tx);
-    const dataTxPackets = Math.max(0, c.txPackets - parityTx);
+    const dataTxPackets = written ? num(fec.data_tx) : null;
     const txAttempts = c.txPackets + dropped;
-    const recovered = num(fec.recovered);
-    const lost = num(fec.lost);
+    const recovered = num(fec.recovered), lost = num(fec.lost);
     const missing = recovered + lost;
+    const dataWire = num(fec.data_wire_bytes), parityWire = num(fec.parity_wire_bytes);
     return {
-      txPackets: c.txPackets,
-      rxPackets: c.rxPackets,
-      dataTxPackets: dataTxPackets,
-      parityTx: parityTx,
-      avgPacketBytes: c.rxPackets > 0 ? c.rxBytes / c.rxPackets : null,
-      txDropPct: txAttempts > 0 ? dropped / txAttempts * 100 : null,
-      fecOverheadPct: dataTxPackets > 0 ? parityTx / dataTxPackets * 100 : null,
-      fecRecoveryPct: missing > 0 ? recovered / missing * 100 : null
+      txPackets:c.txPackets, rxPackets:c.rxPackets, dataTxPackets:dataTxPackets, parityTx:parityTx,
+      avgPacketBytes:c.rxPackets>0?c.rxBytes/c.rxPackets:null,
+      txDropPct:txAttempts>0?dropped/txAttempts*100:null,
+      fecOverheadPct:written && dataWire>0?parityWire/dataWire*100:null,
+      fecRecoveryPct:missing>0?recovered/missing*100:null
     };
   }
+  globalThis.dashboardQualityStats = qualityStats;
 
   rttStats = function (rows) {
     const v = rows.map(function (r) { return r.rtt; })
@@ -93,9 +95,14 @@
     if (fecOverhead) fecOverhead.innerText = q.fecOverheadPct === null ? '-' : q.fecOverheadPct.toFixed(1) + '%';
     const el = document.getElementById('conn-quality');
     if (el) el.innerHTML = out.join('');
+    const state=document.getElementById('fec-state');
+    if(state) state.innerText=fec.counter_domain==='written'?
+      t('stats.fec_state').replace('{enabled}',num(fec.enabled_sessions)).replace('{tx}',num(fec.tx_active_sessions)).replace('{bypass}',num(fec.rx_bypass_sessions)):'-';
   };
 
   // Data scheduler counters and FEC parity counters are lifetime monotonic.
+  // Keep lifetime assigned counters only as cumulative diagnostics/tooltips; the
+  // live scheduler cells below must use interval deltas, never lifetime totals.
   // Convert both into deltas over the actual snapshot interval. assigned_* keeps
   // its original data-only meaning for scheduler tests; the WebUI displays the
   // actual transport assignment (DATA + FEC), so standby parity paths no longer
@@ -103,6 +110,7 @@
   const schedPrev = {};
   const schedView = {};
   let schedLastAt = 0;
+  let schedInstance = null;
 
   function schedulerKey(mode, c, i) {
     if (c.conn_id) return c.conn_id;
@@ -114,14 +122,21 @@
   function annotateSchedulers(data, fresh) {
     const mode = data && data.mode;
     const list = mode === 'server' ? (data.server_conns || []) : (data.conns || []);
-    const now = performance.now();
+    const now = data.sample_time_ms === undefined ? performance.now() : Number(data.sample_time_ms);
+    if(data.instance_id && schedInstance!==data.instance_id) {
+      Object.keys(schedPrev).forEach(k=>delete schedPrev[k]);Object.keys(schedView).forEach(k=>delete schedView[k]);
+      schedLastAt=0;schedInstance=data.instance_id;
+    }
     const dt = fresh && schedLastAt ? Math.max(0.001, (now - schedLastAt) / 1000) : 0;
     const samples = [];
-    let totalDelta = 0;
+    const groupTotals = {};
+    const present = new Set();
 
     list.forEach(function (c, i) {
       const s = c.scheduler || (c.scheduler = {});
       const key = schedulerKey(mode, c, i);
+      present.add(key);
+      const group = mode==='server'?String(c.client_id||''):'local';
       if (fresh) {
         const assigned = num(s.assigned_bytes);
         const batches = num(s.assigned_batches);
@@ -150,8 +165,8 @@
           share: 0
         };
         schedView[key] = view;
-        samples.push({s: s, view: view});
-        totalDelta += dBytes;
+        samples.push({s: s, view: view, group:group});
+        groupTotals[group]=(groupTotals[group]||0)+dBytes;
       } else {
         samples.push({s: s, view: schedView[key] || {
           sampled: false, assignBps: 0, batchPs: 0, dataBps: 0, dataBatchPs: 0,
@@ -161,7 +176,8 @@
     });
 
     if (fresh) {
-      samples.forEach(function (x) { x.view.share = totalDelta > 0 ? x.view.deltaBytes / totalDelta * 100 : 0; });
+      samples.forEach(function (x) {const total=groupTotals[x.group]||0;x.view.share=total>0?x.view.deltaBytes/total*100:0;});
+      Object.keys(schedPrev).forEach(k=>{if(!present.has(k)){delete schedPrev[k];delete schedView[k];}});
       schedLastAt = now;
     }
 
@@ -176,6 +192,9 @@
       s._fec_assign_bps = v.fecBps;
       s._fec_batch_ps = v.fecBatchPs;
       s._share_pct = v.share;
+      // backend eta_us is the last scheduling-decision estimate and can remain
+      // stale after a drain. Show queue-drain ETA from current queue + rate EWMA.
+      // Before the first rate sample, mirror the scheduler's 200 Mbps fallback.
       const rateBytes = num(s.rate_mbps) > 0 ? num(s.rate_mbps) * 1000000 / 8 : 25000000;
       s._queue_eta_us = rateBytes > 0 ? num(s.queued_bytes) * 1000000 / rateBytes : 0;
       totalAssignBps += v.assignBps;

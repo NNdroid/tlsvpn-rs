@@ -13,6 +13,7 @@
     q.set('range',String(chartRange||'2m'));
     q.set('log_after',String(typeof logSeq==='number'?logSeq:0));
     q.set('event_after',String(typeof evSeq==='number'?evSeq:0));
+    if(typeof dashboardInstance==='string')q.set('instance_id',dashboardInstance);
     return '/api/stream?'+q.toString();
   }
 
@@ -62,8 +63,8 @@
       retryMs=1000;
       setLive('sse');
     };
-    // Native EventSource owns reconnect/backoff. There is deliberately no HTTP polling fallback.
-    es.onerror=function(){if(myGen===generation)setLive('reconn');};
+    // Rebuild the URL with current cursors on reconnect.
+    es.onerror=function(){if(myGen===generation){es.close();if(source===es)source=null;scheduleReconnect(myGen);}};
   }
 
   function parseBlock(block){

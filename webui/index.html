@@ -27,8 +27,7 @@
     </button>
     <div class="topctl" id="topctl">
       <div class="seg" id="lang-seg">
-        <button data-v="zh-CN" onclick="setLang('zh-CN')">简中</button>
-        <button data-v="zh-TW" onclick="setLang('zh-TW')">繁中</button>
+        <button data-v="zh-CN" onclick="setLang('zh-CN')">中文</button>
         <button data-v="en" onclick="setLang('en')">EN</button>
         <button data-v="de" onclick="setLang('de')">DE</button>
         <button data-v="fr" onclick="setLang('fr')">FR</button>
@@ -86,7 +85,7 @@
     <div class="card kpi-card">
       <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="kpi-label" data-i18n="kpi.fec">-</span></div>
       <div class="kpi-val" id="fec-kpi">-</div>
-      <div class="kpi-sub"><span data-i18n="kpi.parity">-</span> <span class="num" id="parity">-</span> · <span data-i18n="kpi.overhead">-</span> <span class="num" id="fec-overhead">-</span></div>
+      <div class="kpi-sub"><span data-i18n="kpi.parity">-</span> <span class="num" id="parity">-</span> · <span data-i18n="kpi.overhead">-</span> <span class="num" id="fec-overhead">-</span><div id="fec-state" class="dim"></div></div>
     </div>
     <div class="card kpi-card">
       <div class="kpi-top"><span class="kpi-ico violet"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="kpi-label" data-i18n="kpi.pps">-</span></div>
@@ -427,6 +426,5 @@
 <footer><span id="footer-text"></span><span class="sep">·</span><span id="updated-at"></span><span class="sep">·</span><span id="tls-flag"></span></footer>
 <script src="i18n.js"></script>
 <script src="app.js"></script>
-<script src="frameviz.js"></script>
 </body>
 </html>
