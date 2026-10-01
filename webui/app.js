@@ -452,6 +452,7 @@ function tpl(s,o){
 // （服务端每轮轮询回写 log_level）一行都不用改。
 const DL=new WeakMap();
 let dlCur=null;
+let dlSerial=0;
 const DL_ARROW='<svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // 包起来：外壳 + 触发按钮（当前值 + chevron）+ 菜单；原生 select 缩成 1px 藏在里面
@@ -476,6 +477,10 @@ function buildSelect(sel){
   btn.setAttribute('role','combobox');
   btn.setAttribute('aria-haspopup','listbox');
   btn.setAttribute('aria-expanded','false');
+  const listID='dl-list-'+(++dlSerial);
+  btn.setAttribute('aria-controls',listID);
+  const labelText=host&&host.tagName==='LABEL'?host.querySelector('span'):null;
+  if(labelText){if(!labelText.id)labelText.id=listID+'-label';btn.setAttribute('aria-labelledby',labelText.id);}
   btn.tabIndex=0;
   const lab=document.createElement('span');
   lab.className='dl-lab';
@@ -495,6 +500,7 @@ function buildSelect(sel){
   wrap.appendChild(btn);
   const menu=document.createElement('div');
   menu.className='dl-menu';
+  menu.id=listID;
   menu.setAttribute('role','listbox');
   menu.setAttribute('aria-hidden','true');
   wrap.appendChild(menu);
@@ -522,6 +528,8 @@ function buildSelect(sel){
 function syncSelect(sel){
   const st=DL.get(sel);
   if(!st)return;
+  st.btn.setAttribute('aria-disabled',String(sel.disabled));
+  st.btn.tabIndex=sel.disabled?-1:0;
   const ops=sel.options;
   const n=ops.length;
   let cur=sel.selectedIndex;
@@ -535,7 +543,7 @@ function syncSelect(sel){
     if(i===cur)c+=' on';
     if(op.disabled)c+=' disabled';
     const asel=i===cur?'true':'false';
-    html+='<div class="'+c+'" role="option" aria-selected="'+asel+'" data-i="'+i+'"><span class="dl-tx">'+esc(op.textContent||op.value||'')+'</span></div>';
+    html+='<div id="'+st.menu.id+'-opt-'+i+'" class="'+c+'" role="option" aria-selected="'+asel+'" data-i="'+i+'"><span class="dl-tx">'+esc(op.textContent||op.value||'')+'</span></div>';
     st.items.push({v:op.value,off:op.disabled});
   }
   st.menu.innerHTML=html;
@@ -550,12 +558,12 @@ function syncSelect(sel){
   }
   st.sz.textContent=wide;
   st.active=cur;
-  if(dlCur===sel)dlPlace(sel);
+  if(dlCur===sel){dlPlace(sel);dlHot(sel,st.active);}
 }
 
 // 扫一遍所有原生 select：没包的包起来，已经包的按当前选项与值重建
 function syncSelects(){
-  document.querySelectorAll('select.sel').forEach(function(sel){
+  document.querySelectorAll('select').forEach(function(sel){
     if(DL.has(sel))syncSelect(sel);
     else buildSelect(sel);
   });
@@ -566,6 +574,7 @@ function dlPlace(sel){
   const st=DL.get(sel);
   if(!st)return;
   const b=st.btn.getBoundingClientRect();
+  st.menu.style.maxWidth=Math.max(0,window.innerWidth-16)+'px';
   st.menu.style.minWidth=Math.round(b.width)+'px';
   const mw=st.menu.getBoundingClientRect().width;
   const mh=st.menu.getBoundingClientRect().height;
@@ -573,6 +582,7 @@ function dlPlace(sel){
   if(left+mw>window.innerWidth-8)left=Math.max(8,window.innerWidth-8-mw);
   let top=b.bottom+6;
   if(top+mh>window.innerHeight-8&&b.top-6-mh>8)top=Math.max(8,b.top-6-mh);
+  top=Math.max(8,Math.min(top,window.innerHeight-8-mh));
   st.menu.style.left=Math.round(left)+'px';
   st.menu.style.top=Math.round(top)+'px';
 }
@@ -583,6 +593,7 @@ function dlToggle(sel){
 }
 
 function dlOpen(sel){
+  if(sel.disabled)return;
   if(dlCur&&dlCur!==sel)dlClose(dlCur);
   const st=DL.get(sel);
   if(!st)return;
@@ -603,6 +614,7 @@ function dlClose(sel){
     st.btn.classList.remove('on');
     st.menu.classList.remove('on');
     st.btn.setAttribute('aria-expanded','false');
+    st.btn.removeAttribute('aria-activedescendant');
     st.menu.setAttribute('aria-hidden','true');
   }
   if(dlCur===sel)dlCur=null;
@@ -649,9 +661,11 @@ function dlHot(sel,i){
   if(i<0)return;
   const o=ops[i];
   if(!o)return;
+  st.btn.setAttribute('aria-activedescendant',o.id);
   const r=o.getBoundingClientRect();
   const m=st.menu.getBoundingClientRect();
-  if(r.top<m.top||r.bottom>m.bottom)o.scrollIntoView({block:'nearest'});
+  if(r.top<m.top)st.menu.scrollTop-=m.top-r.top;
+  else if(r.bottom>m.bottom)st.menu.scrollTop+=r.bottom-m.bottom;
 }
 
 // 触发器上的键盘：上下/Home/End 移动，Enter/Space 展开或选中，Esc 收起，Tab 收起
@@ -699,15 +713,12 @@ function dlOutside(ev){
   dlClose(sel);
 }
 
-// 页面滚动时重新计算 fixed 弹层位置；菜单自身滚动保持展开。
-// 浏览器/辅助技术可能在展开后为目标选项自动滚动页面，若此处直接关闭会形成
-// "已打开 -> 自动滚动 -> 点击前关闭" 的竞态，真实键盘/窄屏交互同样可能触发。
+// 页面滚动时重新定位菜单；菜单内部滚动无需重新定位。
 function dlScroll(ev){
   if(!dlCur)return;
-  const sel=dlCur,st=DL.get(sel);
-  if(!st)return;
-  if(ev&&(ev.target===st.menu||st.menu.contains(ev.target)))return;
-  requestAnimationFrame(function(){if(dlCur===sel)dlPlace(sel);});
+  const st=DL.get(dlCur);
+  if(st&&ev&&ev.target===st.menu)return;
+  dlPlace(dlCur);
 }
 
 // Esc 收起（触发器没聚焦时也要有效）；Tab 让焦点正常走
