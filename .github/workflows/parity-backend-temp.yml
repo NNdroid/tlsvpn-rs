@@ -1,4 +1,4 @@
-# retry: corrected dependency resolution and cleanup
+# retry: current Go metric contract aligned
 name: One-shot backend parity
 
 on:
