@@ -386,6 +386,8 @@ iperf_one_way() {
   }
   if [[ -n "$profiler" ]]; then
     wait "$profiler" || { fail 'perf record failed'; return 1; }
+    # perf creates root-owned mode-0600 data; the CI artifact uploader is not root.
+    chmod a+r "$PERF_PROFILE_DIR/$direction.data"
     "$perf_tool" report --stdio -i "$PERF_PROFILE_DIR/$direction.data" \
       > "$PERF_PROFILE_DIR/$direction-report.txt"
     "$perf_tool" script -i "$PERF_PROFILE_DIR/$direction.data" \
