@@ -29,7 +29,7 @@ const SELF_SIGNED_KEY_FILE: &str = "tlsvpn-selfsigned-key.pem";
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
     let f = std::fs::File::open(path)
         .map_err(|e| format!("cannot open server.cert {path}: {e}"))?;
-    let mut r = BufReader::new(f);
+    let mut r = std::io::BufReader::new(f);
     let certs: Vec<_> = rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cannot parse server.cert {path}: {e}"))?;
@@ -42,7 +42,7 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
     let f = std::fs::File::open(path)
         .map_err(|e| format!("cannot open server.key {path}: {e}"))?;
-    let mut r = BufReader::new(f);
+    let mut r = std::io::BufReader::new(f);
     rustls_pemfile::private_key(&mut r)
         .map_err(|e| format!("cannot parse server.key {path}: {e}"))?
         .ok_or_else(|| format!("server.key {path} contains no supported private key"))
