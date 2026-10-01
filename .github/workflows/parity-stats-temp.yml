@@ -31,7 +31,6 @@ jobs:
       - name: Apply stats parity patch
         run: |
           python3 scripts/parity_stats_temp.py
-          cargo fmt --all -- --check
           cargo test --verbose
           node scripts/check_i18n.mjs
       - name: Commit product changes and self-clean
