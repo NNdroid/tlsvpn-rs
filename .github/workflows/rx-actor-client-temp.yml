@@ -1,0 +1,41 @@
+name: One-shot RX actor client
+
+on:
+  push:
+    branches:
+      - perf/rx-session-actor
+    paths:
+      - .github/workflows/rx-actor-client-temp.yml
+      - scripts/rx_actor_client_temp.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout actor branch
+        uses: actions/checkout@v4
+        with:
+          ref: perf/rx-session-actor
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Apply client actor integration
+        run: |
+          python3 scripts/rx_actor_client_temp.py
+          rustfmt --edition 2021 --config skip_children=true src/client.rs src/rx_actor.rs
+          cargo test rx_actor --verbose
+          cargo test client --verbose
+          cargo test --verbose
+      - name: Commit validated client integration and self-clean
+        run: |
+          rm -f scripts/rx_actor_client_temp.py .github/workflows/rx-actor-client-temp.yml
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'perf: route multi-connection client RX through session actor'
+          git push origin HEAD:perf/rx-session-actor
