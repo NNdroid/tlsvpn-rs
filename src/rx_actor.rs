@@ -1,14 +1,13 @@
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::buffer::{release_shared_frame, DeDuplicator, ReorderBuffer, ReorderStats};
 use crate::fec::FecDecoder;
 
 pub const RX_ACTOR_BATCH_CAP: usize = 16;
-const RX_ACTOR_QUEUE_DEPTH: usize = 256;
+const RX_ACTOR_IDLE_POLL: Duration = Duration::from_millis(250);
 
 pub type RxDelivery = Arc<dyn Fn(Vec<Arc<Vec<u8>>>) + Send + Sync>;
 
@@ -29,31 +28,18 @@ impl ProducerError {
             message: Mutex::new(None),
         }
     }
+
     fn fail(&self, message: String) {
         *self.message.lock() = Some(message);
         self.failed.store(true, Ordering::Release);
     }
+
     fn take(&self) -> Option<String> {
         if !self.failed.swap(false, Ordering::AcqRel) {
             return None;
         }
         self.message.lock().take()
     }
-}
-
-struct BatchWork {
-    generation: u64,
-    frames: Vec<RxFrame>,
-    error: Arc<ProducerError>,
-}
-
-enum Work {
-    Batch(BatchWork),
-    Reconfigure {
-        generation: u64,
-        fec: Option<FecDecoder>,
-        done: Sender<()>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -65,130 +51,276 @@ pub struct RxActorSnapshot {
     pub reorder: ReorderStats,
 }
 
-struct ActorStats {
-    generation: AtomicU64,
-    recovered: AtomicU64,
-    lost: AtomicU64,
-    fec_bypass: AtomicBool,
-    gap_events: AtomicU64,
-    timeout_flushes: AtomicU64,
-    skipped_frames: AtomicU64,
+/// Session receive state guarded by one outer ownership lock.
+///
+/// FEC and reorder use their actor-only lock-free entry points while this lock
+/// is held. Compared with the first dedicated-worker design this keeps the
+/// single-owner invariant but removes the reader -> channel -> worker context
+/// switch from every RX batch. A reader that owns this lock performs the work
+/// immediately in its current CPU context.
+struct RxActorState {
+    generation: u64,
+    fec: Option<FecDecoder>,
+    reorder: ReorderBuffer,
+    dedup: DeDuplicator,
+    ready: Vec<Arc<Vec<u8>>>,
+    recovered_base: u64,
+    lost_base: u64,
 }
 
-impl ActorStats {
-    fn new() -> Self {
+impl RxActorState {
+    fn new(fec: Option<FecDecoder>) -> Self {
         Self {
-            generation: AtomicU64::new(1),
-            recovered: AtomicU64::new(0),
-            lost: AtomicU64::new(0),
-            fec_bypass: AtomicBool::new(false),
-            gap_events: AtomicU64::new(0),
-            timeout_flushes: AtomicU64::new(0),
-            skipped_frames: AtomicU64::new(0),
-        }
-    }
-    fn snapshot(&self) -> RxActorSnapshot {
-        RxActorSnapshot {
-            generation: self.generation.load(Ordering::Acquire),
-            recovered: self.recovered.load(Ordering::Relaxed),
-            lost: self.lost.load(Ordering::Relaxed),
-            fec_bypass: self.fec_bypass.load(Ordering::Relaxed),
-            reorder: ReorderStats {
-                gap_events: self.gap_events.load(Ordering::Relaxed),
-                timeout_flushes: self.timeout_flushes.load(Ordering::Relaxed),
-                skipped_frames: self.skipped_frames.load(Ordering::Relaxed),
-            },
+            generation: 1,
+            fec,
+            reorder: ReorderBuffer::new(),
+            dedup: DeDuplicator::new(),
+            ready: Vec::with_capacity(64),
+            recovered_base: 0,
+            lost_base: 0,
         }
     }
 }
 
 pub struct RxSessionActor {
-    tx: Sender<Work>,
     generation: AtomicU64,
     control: Mutex<()>,
-    pool_rx: Receiver<Vec<RxFrame>>,
-    stats: Arc<ActorStats>,
+    state: Mutex<RxActorState>,
+    delivery: RxDelivery,
+    timeout_thread: Mutex<Option<std::thread::Thread>>,
 }
 
 impl RxSessionActor {
     pub fn new(delivery: RxDelivery, initial_fec: Option<FecDecoder>) -> Arc<Self> {
-        let (tx, rx) = bounded::<Work>(RX_ACTOR_QUEUE_DEPTH);
-        let (pool_tx, pool_rx) = bounded::<Vec<RxFrame>>(RX_ACTOR_QUEUE_DEPTH);
-        let stats = Arc::new(ActorStats::new());
-        let worker_stats = stats.clone();
-        std::thread::spawn(move || run_actor(rx, pool_tx, delivery, initial_fec, worker_stats));
-        Arc::new(Self {
-            tx,
+        let actor = Arc::new(Self {
             generation: AtomicU64::new(1),
             control: Mutex::new(()),
-            pool_rx,
-            stats,
-        })
+            state: Mutex::new(RxActorState::new(initial_fec)),
+            delivery,
+            timeout_thread: Mutex::new(None),
+        });
+
+        // The timer thread is cold-path only: it never receives normal data.
+        // It wakes for an actual reorder gap (or a coarse idle poll) and takes
+        // the same outer owner lock used by readers. This preserves gap timeout
+        // semantics without paying an inter-thread handoff per data batch.
+        let weak = Arc::downgrade(&actor);
+        let handle = std::thread::spawn(move || timeout_loop(weak));
+        *actor.timeout_thread.lock() = Some(handle.thread().clone());
+        drop(handle); // detached; Weak lets it exit once the session is gone.
+        actor
     }
 
     pub fn producer(self: &Arc<Self>) -> RxProducer {
         let _guard = self.control.lock();
         RxProducer {
-            tx: self.tx.clone(),
-            pool_rx: self.pool_rx.clone(),
+            actor: self.clone(),
             generation: self.generation.load(Ordering::Acquire),
-            batch: None,
+            batch: Vec::with_capacity(RX_ACTOR_BATCH_CAP),
             error: Arc::new(ProducerError::new()),
         }
     }
 
-    /// Fence the old receive generation, then replace FEC/reorder/dedup state on
-    /// the worker. Producers created before this call are stale by construction;
-    /// their late batches are discarded after the barrier.
-    pub fn reconfigure(&self, fec: Option<FecDecoder>) {
+    /// Fence the old receive generation and replace FEC/reorder/dedup state.
+    ///
+    /// `state` is the execution barrier: an old batch already holding ownership
+    /// finishes before reset; old producers arriving after reset observe a stale
+    /// generation and are discarded. New producers cannot be created while the
+    /// control lock is held.
+    pub fn reconfigure(&self, mut fec: Option<FecDecoder>) {
         let _guard = self.control.lock();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let (done_tx, done_rx) = bounded(1);
-        if self
-            .tx
-            .send(Work::Reconfigure {
-                generation,
-                fec,
-                done: done_tx,
-            })
-            .is_ok()
         {
-            let _ = done_rx.recv();
+            let mut state = self.state.lock();
+            if let Some(old) = state.fec.as_mut() {
+                let (r, l) = old.stats_actor();
+                state.recovered_base = state.recovered_base.saturating_add(r);
+                state.lost_base = state.lost_base.saturating_add(l);
+                old.reset_actor();
+            }
+            if let Some(new) = fec.as_mut() {
+                new.reset_actor();
+            }
+            state.fec = fec;
+            state.generation = generation;
+            state.reorder.reset();
+            state.dedup.reset();
+            state.ready.clear();
         }
+        self.wake_timeout_thread();
     }
 
     pub fn snapshot(&self) -> RxActorSnapshot {
-        self.stats.snapshot()
+        // Dashboard/stat sampling is cold-path; reading the authoritative state
+        // directly avoids several atomic stores on every hot RX batch.
+        let mut state = self.state.lock();
+        let recovered_base = state.recovered_base;
+        let lost_base = state.lost_base;
+        let (recovered, lost, fec_bypass) = if let Some(dec) = state.fec.as_mut() {
+            let (r, l) = dec.stats_actor();
+            (
+                recovered_base.saturating_add(r),
+                lost_base.saturating_add(l),
+                dec.bypass_snapshot(),
+            )
+        } else {
+            (recovered_base, lost_base, false)
+        };
+        RxActorSnapshot {
+            generation: state.generation,
+            recovered,
+            lost,
+            fec_bypass,
+            reorder: state.reorder.stats(),
+        }
+    }
+
+    fn process_batch(
+        &self,
+        generation: u64,
+        frames: &mut Vec<RxFrame>,
+        error: &ProducerError,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let mut deliver = None;
+        let mut protocol_error = None;
+        let mut wake_timeout = false;
+        {
+            let mut state = self.state.lock();
+            if generation != state.generation {
+                for frame in frames.drain(..) {
+                    release_shared_frame(frame.data);
+                }
+                return;
+            }
+
+            for item in frames.drain(..) {
+                let seq = item.seq;
+                let data = item.data;
+
+                if seq == 0 {
+                    let expected = state.reorder.expected_seq_snapshot();
+                    let Some(dec) = state.fec.as_mut() else {
+                        release_shared_frame(data);
+                        protocol_error = Some(format!(
+                            "protocol v{} typed control without negotiated FEC",
+                            crate::protocol::PROTOCOL_VERSION
+                        ));
+                        break;
+                    };
+                    match dec.on_control_actor(&data, expected) {
+                        Ok(Some((rseq, recovered))) => {
+                            state.reorder.insert_into(rseq, recovered, &mut state.ready);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            release_shared_frame(data);
+                            protocol_error = Some(format!("protocol v3 control error: {e}"));
+                            break;
+                        }
+                    }
+                    release_shared_frame(data);
+                    continue;
+                }
+
+                let expected = state.reorder.expected_seq_snapshot();
+                let recovered = state
+                    .fec
+                    .as_mut()
+                    .and_then(|dec| dec.on_data_actor(seq, &data, expected));
+                if !state.dedup.is_duplicate(seq) {
+                    insert_pair(
+                        &mut state.reorder,
+                        &mut state.ready,
+                        seq,
+                        data,
+                        recovered,
+                    );
+                } else {
+                    release_shared_frame(data);
+                    if let Some((rseq, frame)) = recovered {
+                        state.reorder.insert_into(rseq, frame, &mut state.ready);
+                    }
+                }
+            }
+
+            // Frames after a protocol error were never consumed.
+            for item in frames.drain(..) {
+                release_shared_frame(item.data);
+            }
+
+            if !state.ready.is_empty() {
+                let cap = state.ready.capacity().max(64);
+                deliver = Some(std::mem::replace(
+                    &mut state.ready,
+                    Vec::with_capacity(cap),
+                ));
+            }
+            wake_timeout = state.reorder.next_timeout().is_some();
+        }
+
+        if let Some(batch) = deliver {
+            (self.delivery)(batch);
+        }
+        if let Some(message) = protocol_error {
+            error.fail(message);
+        }
+        if wake_timeout {
+            self.wake_timeout_thread();
+        }
+    }
+
+    fn flush_timeout(&self) {
+        let mut deliver = None;
+        {
+            let mut state = self.state.lock();
+            state.reorder.flush_timeout_into(&mut state.ready);
+            if !state.ready.is_empty() {
+                let cap = state.ready.capacity().max(64);
+                deliver = Some(std::mem::replace(
+                    &mut state.ready,
+                    Vec::with_capacity(cap),
+                ));
+            }
+        }
+        if let Some(batch) = deliver {
+            (self.delivery)(batch);
+        }
+    }
+
+    fn next_timeout(&self) -> Duration {
+        self.state
+            .lock()
+            .reorder
+            .next_timeout()
+            .unwrap_or(RX_ACTOR_IDLE_POLL)
+    }
+
+    fn wake_timeout_thread(&self) {
+        if let Some(thread) = self.timeout_thread.lock().as_ref() {
+            thread.unpark();
+        }
     }
 }
 
 pub struct RxProducer {
-    tx: Sender<Work>,
-    pool_rx: Receiver<Vec<RxFrame>>,
+    actor: Arc<RxSessionActor>,
     generation: u64,
-    batch: Option<Vec<RxFrame>>,
+    batch: Vec<RxFrame>,
     error: Arc<ProducerError>,
 }
 
 impl RxProducer {
-    fn acquire(&self) -> Vec<RxFrame> {
-        self.pool_rx
-            .try_recv()
-            .unwrap_or_else(|_| Vec::with_capacity(RX_ACTOR_BATCH_CAP))
-    }
-
     pub fn push(&mut self, seq: u32, data: Arc<Vec<u8>>) -> bool {
         if self.error.failed.load(Ordering::Acquire) {
             release_shared_frame(data);
             return false;
         }
-        if self.batch.is_none() {
-            self.batch = Some(self.acquire());
-        }
-        let batch = self.batch.as_mut().unwrap();
-        batch.push(RxFrame { seq, data });
-        let flush = batch.len() >= RX_ACTOR_BATCH_CAP || seq == 0;
-        if flush {
+        self.batch.push(RxFrame { seq, data });
+        if self.batch.len() >= RX_ACTOR_BATCH_CAP || seq == 0 {
             self.flush()
         } else {
             true
@@ -196,28 +328,12 @@ impl RxProducer {
     }
 
     pub fn flush(&mut self) -> bool {
-        let Some(frames) = self.batch.take() else {
+        if self.batch.is_empty() {
             return !self.error.failed.load(Ordering::Acquire);
-        };
-        if frames.is_empty() {
-            self.batch = Some(frames);
-            return true;
         }
-        match self.tx.send(Work::Batch(BatchWork {
-            generation: self.generation,
-            frames,
-            error: self.error.clone(),
-        })) {
-            Ok(()) => true,
-            Err(err) => {
-                if let Work::Batch(mut b) = err.0 {
-                    for frame in b.frames.drain(..) {
-                        release_shared_frame(frame.data);
-                    }
-                }
-                false
-            }
-        }
+        self.actor
+            .process_batch(self.generation, &mut self.batch, &self.error);
+        true
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -227,53 +343,25 @@ impl RxProducer {
 
 impl Drop for RxProducer {
     fn drop(&mut self) {
-        if let Some(mut frames) = self.batch.take() {
-            for frame in frames.drain(..) {
-                release_shared_frame(frame.data);
-            }
+        for frame in self.batch.drain(..) {
+            release_shared_frame(frame.data);
         }
     }
 }
 
-fn publish_stats(
-    stats: &ActorStats,
-    generation: u64,
-    recovered_base: u64,
-    lost_base: u64,
-    fec: &mut Option<FecDecoder>,
-    reorder: &ReorderBuffer,
-) {
-    let (recovered, lost, bypass) = if let Some(dec) = fec.as_mut() {
-        let (r, l) = dec.stats_actor();
-        (
-            recovered_base.saturating_add(r),
-            lost_base.saturating_add(l),
-            dec.bypass_snapshot(),
-        )
-    } else {
-        (recovered_base, lost_base, false)
-    };
-    let rs = reorder.stats();
-    stats.generation.store(generation, Ordering::Release);
-    stats.recovered.store(recovered, Ordering::Relaxed);
-    stats.lost.store(lost, Ordering::Relaxed);
-    stats.fec_bypass.store(bypass, Ordering::Relaxed);
-    stats.gap_events.store(rs.gap_events, Ordering::Relaxed);
-    stats
-        .timeout_flushes
-        .store(rs.timeout_flushes, Ordering::Relaxed);
-    stats
-        .skipped_frames
-        .store(rs.skipped_frames, Ordering::Relaxed);
-}
-
-fn deliver_ready(delivery: &RxDelivery, ready: &mut Vec<Arc<Vec<u8>>>) {
-    if ready.is_empty() {
-        return;
+fn timeout_loop(actor: Weak<RxSessionActor>) {
+    loop {
+        let Some(strong) = actor.upgrade() else {
+            break;
+        };
+        let wait = strong.next_timeout();
+        drop(strong);
+        std::thread::park_timeout(wait);
+        let Some(strong) = actor.upgrade() else {
+            break;
+        };
+        strong.flush_timeout();
     }
-    let mut out = Vec::with_capacity(ready.capacity().max(RX_ACTOR_BATCH_CAP));
-    std::mem::swap(&mut out, ready);
-    delivery(out);
 }
 
 fn insert_pair(
@@ -300,145 +388,11 @@ fn insert_pair(
     }
 }
 
-fn release_batch(mut frames: Vec<RxFrame>, pool_tx: &Sender<Vec<RxFrame>>) {
-    for frame in frames.drain(..) {
-        release_shared_frame(frame.data);
-    }
-    let _ = pool_tx.try_send(frames);
-}
-
-fn run_actor(
-    rx: Receiver<Work>,
-    pool_tx: Sender<Vec<RxFrame>>,
-    delivery: RxDelivery,
-    mut fec: Option<FecDecoder>,
-    stats: Arc<ActorStats>,
-) {
-    let mut generation = 1u64;
-    let mut reorder = ReorderBuffer::new();
-    let dedup = DeDuplicator::new();
-    let mut ready = Vec::with_capacity(64);
-    let mut recovered_base = 0u64;
-    let mut lost_base = 0u64;
-
-    loop {
-        let timeout = reorder.next_timeout().unwrap_or(Duration::from_millis(250));
-        match rx.recv_timeout(timeout) {
-            Ok(Work::Reconfigure {
-                generation: new_generation,
-                fec: mut new_fec,
-                done,
-            }) => {
-                if let Some(old) = fec.as_mut() {
-                    let (r, l) = old.stats_actor();
-                    recovered_base = recovered_base.saturating_add(r);
-                    lost_base = lost_base.saturating_add(l);
-                    old.reset_actor();
-                }
-                if let Some(new) = new_fec.as_mut() {
-                    new.reset_actor();
-                }
-                fec = new_fec;
-                generation = new_generation;
-                reorder.reset();
-                dedup.reset();
-                publish_stats(
-                    &stats,
-                    generation,
-                    recovered_base,
-                    lost_base,
-                    &mut fec,
-                    &reorder,
-                );
-                let _ = done.send(());
-            }
-            Ok(Work::Batch(mut batch)) => {
-                if batch.generation != generation {
-                    release_batch(batch.frames, &pool_tx);
-                    continue;
-                }
-                let mut failed = None;
-                for item in batch.frames.drain(..) {
-                    let seq = item.seq;
-                    let data = item.data;
-                    if seq == 0 {
-                        let Some(dec) = fec.as_mut() else {
-                            release_shared_frame(data);
-                            failed = Some(format!(
-                                "protocol v{} typed control without negotiated FEC",
-                                crate::protocol::PROTOCOL_VERSION
-                            ));
-                            break;
-                        };
-                        match dec.on_control_actor(&data, reorder.expected_seq_snapshot()) {
-                            Ok(Some((rseq, recovered))) => {
-                                reorder.insert_into(rseq, recovered, &mut ready);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                release_shared_frame(data);
-                                failed = Some(format!("protocol v3 control error: {e}"));
-                                break;
-                            }
-                        }
-                        release_shared_frame(data);
-                        continue;
-                    }
-
-                    let recovered = fec.as_mut().and_then(|dec| {
-                        dec.on_data_actor(seq, &data, reorder.expected_seq_snapshot())
-                    });
-                    if !dedup.is_duplicate(seq) {
-                        insert_pair(&mut reorder, &mut ready, seq, data, recovered);
-                    } else {
-                        release_shared_frame(data);
-                        if let Some((_seq, frame)) = recovered {
-                            reorder.insert_into(_seq, frame, &mut ready);
-                        }
-                    }
-                }
-                // Any frames left after a protocol failure were never consumed.
-                for item in batch.frames.drain(..) {
-                    release_shared_frame(item.data);
-                }
-                batch.frames.clear();
-                let _ = pool_tx.try_send(batch.frames);
-                deliver_ready(&delivery, &mut ready);
-                if let Some(error) = failed {
-                    batch.error.fail(error);
-                }
-                publish_stats(
-                    &stats,
-                    generation,
-                    recovered_base,
-                    lost_base,
-                    &mut fec,
-                    &reorder,
-                );
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                reorder.flush_timeout_into(&mut ready);
-                deliver_ready(&delivery, &mut ready);
-                publish_stats(
-                    &stats,
-                    generation,
-                    recovered_base,
-                    lost_base,
-                    &mut fec,
-                    &reorder,
-                );
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fec::FecEncoder;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     fn actor_with_output() -> (Arc<RxSessionActor>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel();
@@ -512,13 +466,19 @@ mod tests {
             0,
             Arc::new(vec![crate::protocol::CONTROL_KIND_FEC_MODE; 16])
         ));
-        for _ in 0..50 {
-            if let Some(err) = p.take_error() {
-                assert!(err.contains("without negotiated FEC"));
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        let err = p.take_error().expect("actor must report protocol error");
+        assert!(err.contains("without negotiated FEC"));
+    }
+
+    #[test]
+    fn producer_reuses_the_same_batch_allocation() {
+        let (actor, _rx) = actor_with_output();
+        let mut p = actor.producer();
+        let ptr = p.batch.as_ptr();
+        for seq in 1..=64 {
+            assert!(p.push(seq, Arc::new(vec![seq as u8])));
         }
-        panic!("actor did not report protocol error");
+        assert!(p.flush());
+        assert_eq!(p.batch.as_ptr(), ptr);
     }
 }
