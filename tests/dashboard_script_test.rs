@@ -20,7 +20,7 @@ fn webui_matches_shared_static_asset_contract() {
     assert!(!index.contains("zh-tw.js") && !index.contains("frameviz-zh-tw.js"));
     assert!(!app.contains("const I18N={"));
     assert!(
-        app.contains("requestAnimationFrame(function(){if(dlCur===sel)dlPlace(sel);});"),
+        app.contains("function dlScroll(ev)") && app.contains("dlPlace(dlCur);"),
         "custom dropdown must stay open and follow its trigger during page scroll"
     );
     for marker in ["const I18N={", "const FRAMEVIZ_I18N=", "'zh-CN'", "'zh-TW'", "'de'", "'fr'", "'ja'", "Frame format example", "FEC recovery rate"] {
