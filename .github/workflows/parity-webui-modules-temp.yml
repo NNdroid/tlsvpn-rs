@@ -1,0 +1,43 @@
+name: One-shot WebUI module parity
+
+on:
+  push:
+    branches:
+      - parity/go-main-20261001
+    paths:
+      - .github/workflows/parity-webui-modules-temp.yml
+      - scripts/parity_webui_modules_temp.sh
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Rust parity branch
+        uses: actions/checkout@v4
+        with:
+          ref: parity/go-main-20261001
+          fetch-depth: 0
+
+      - name: Checkout authoritative Go main
+        uses: actions/checkout@v4
+        with:
+          repository: NNdroid/tlsvpn
+          ref: main
+          path: go-impl
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Sync, verify and commit
+        run: bash scripts/parity_webui_modules_temp.sh go-impl
