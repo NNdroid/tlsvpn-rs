@@ -18,6 +18,7 @@ pub mod frame;
 pub mod hooks;
 pub mod net;
 pub mod peer_info;
+pub mod protocol;
 pub mod server;
 pub mod socks5;
 pub mod tap;
@@ -193,19 +194,9 @@ fn load_config_file(path: &str) -> Result<Args, String> {
     // 是唯一还能看到原始 JSON 的地方。未写 encrypt 按开启处理——模板一直输出
     // true，省略字段若仍按零值 false 处理，整条链路会静默跑明文，与模板读起来
     // 完全相反。要显式关闭必须写 "encrypt": false。
-    let mut raw_value: serde_json::Value =
+    let raw_value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse config {}: {}", path, e))?;
     let encrypt_present = raw_value.get("encrypt").and_then(|e| e.as_bool()).is_some();
-
-    // server.session_token 已从配置契约删除：resume token 是 protocol v2 的强制属性。
-    // 升级时仍接受旧配置中的该键，但无论 true/false 都忽略；其余未知字段继续由
-    // deny_unknown_fields 严格拒绝，避免拼写错误静默失效。
-    if let Some(server) = raw_value
-        .get_mut("server")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        server.remove("session_token");
-    }
 
     let mut cfg: ConfigFile =
         serde_json::from_value(raw_value).map_err(|e| format!("parse config {}: {}", path, e))?;
@@ -1167,22 +1158,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_token_is_accepted_but_ignored() {
-        for legacy in [false, true] {
-            let mut v: serde_json::Value = serde_json::from_str(GO_SERVER_CONFIG).unwrap();
-            v["server"]["session_token"] = serde_json::json!(legacy);
-            let dir = std::env::temp_dir();
-            let path = dir.join(format!(
-                "tlsvpn-legacy-session-token-{}-{}.json",
-                std::process::id(),
-                legacy
-            ));
-            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
-            let args = load_config_file(path.to_str().unwrap())
-                .unwrap_or_else(|e| panic!("legacy session_token={} rejected: {}", legacy, e));
-            let _ = std::fs::remove_file(&path);
-            assert_eq!(args.mode, "server");
-        }
+    fn removed_session_token_config_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(GO_SERVER_CONFIG).unwrap();
+        v["server"]["session_token"] = serde_json::json!(false);
+        let path = std::env::temp_dir().join(format!(
+            "tlsvpn-removed-session-token-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let err = load_config_file(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("unknown field"),
+            "removed server.session_token must be rejected: {err}"
+        );
     }
 
     #[test]

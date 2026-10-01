@@ -1,10 +1,10 @@
-use crossbeam_channel::{Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use dashmap::{mapref::entry::Entry, DashMap};
 use mio;
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,10 +15,11 @@ use tracing::{debug, info, warn};
 use crate::adaptive_multipath::{
     AdaptiveBackend, AdaptivePortState, SchedulerBackendState, SchedulerSnapshot,
 };
-use crate::buffer::{release_frame_vec, release_shared_frame};
+use crate::buffer::release_frame_vec;
 use crate::crypto::*;
 use crate::fec::FecEncoder;
-use crate::frame::{FramePayload, VPNFrame};
+use crate::frame::{FramePayload, VPNFrame, VPNFrameBatch};
+use crate::protocol::{FecModeControl, FecTxModeState};
 use crate::utils::*;
 
 const H2_403_RESPONSE: &[u8] = &[
@@ -1184,8 +1185,125 @@ impl BackendNotify {
     }
 }
 
+const OWNED_BATCH_MAX_FRAMES: usize = 8;
+const OWNED_BATCH_MAX_BYTES: u64 = 8 * 1024;
+// Conservative framing allowance: 10-byte TLSVPN header + up to a 16-byte
+// inner AEAD tag, rounded up so a batch accepted under the budget cannot push
+// the rustls plaintext buffer past its hard record limit.
+const OWNED_BATCH_WIRE_OVERHEAD_PER_FRAME: usize = 32;
+
+struct OwnedBatchQueueInner {
+    batches: VecDeque<VPNFrameBatch>,
+    frames: usize,
+}
+
+/// Bounded ownership queue used by real TLS backends. Producers append a frame
+/// to the current tail batch when possible; the TLS writer atomically takes a
+/// complete batch. Capacity is still expressed in frames to preserve the old
+/// channel backpressure semantics seen by the adaptive scheduler.
+pub struct OwnedBatchQueue {
+    inner: Mutex<OwnedBatchQueueInner>,
+    capacity_frames: usize,
+}
+
+impl OwnedBatchQueue {
+    pub fn new(capacity_frames: usize) -> Self {
+        Self {
+            inner: Mutex::new(OwnedBatchQueueInner {
+                batches: VecDeque::new(),
+                frames: 0,
+            }),
+            capacity_frames: capacity_frames.max(1),
+        }
+    }
+
+    #[inline]
+    pub fn try_push(&self, frame: VPNFrame, bytes: u64) -> Result<(), VPNFrame> {
+        let mut inner = self.inner.lock();
+        if inner.frames >= self.capacity_frames {
+            return Err(frame);
+        }
+        let can_append = inner
+            .batches
+            .back()
+            .map(|batch| {
+                batch.frames.len() < OWNED_BATCH_MAX_FRAMES
+                    && batch.bytes.saturating_add(bytes) <= OWNED_BATCH_MAX_BYTES
+            })
+            .unwrap_or(false);
+        if can_append {
+            inner.batches.back_mut().unwrap().push(frame, bytes);
+        } else {
+            inner
+                .batches
+                .push_back(VPNFrameBatch::from_frame(frame, bytes));
+        }
+        inner.frames += 1;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_pop_fitting(&self, wire_budget: usize) -> Option<VPNFrameBatch> {
+        let mut inner = self.inner.lock();
+        let front = inner.batches.front()?;
+        let estimated_wire = (front.bytes as usize).saturating_add(
+            front
+                .frames
+                .len()
+                .saturating_mul(OWNED_BATCH_WIRE_OVERHEAD_PER_FRAME),
+        );
+        if estimated_wire > wire_budget {
+            return None;
+        }
+        let batch = inner.batches.pop_front()?;
+        inner.frames = inner.frames.saturating_sub(batch.frames.len());
+        Some(batch)
+    }
+
+    #[inline]
+    pub fn len_frames(&self) -> usize {
+        self.inner.lock().frames
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().frames == 0
+    }
+
+    #[inline]
+    pub fn capacity_frames(&self) -> usize {
+        self.capacity_frames
+    }
+}
+
+/// Receive one ownership batch from a real backend; legacy/test backends are
+/// wrapped as a one-frame batch so cold-path tests keep their existing channel.
+#[inline]
+pub fn try_recv_backend_batch(
+    backend: Option<&Backend>,
+    legacy_rx: &Receiver<VPNFrame>,
+    wire_budget: usize,
+) -> Option<VPNFrameBatch> {
+    if let Some(queue) = backend.and_then(|b| b.owned_batches.as_deref()) {
+        return queue.try_pop_fitting(wire_budget);
+    }
+    let frame = legacy_rx.try_recv().ok()?;
+    let bytes = frame.data.as_slice().len() as u64;
+    Some(VPNFrameBatch::from_frame(frame, bytes))
+}
+
+#[inline]
+pub fn backend_tx_is_empty(backend: Option<&Backend>, legacy_rx: &Receiver<VPNFrame>) -> bool {
+    if let Some(queue) = backend.and_then(|b| b.owned_batches.as_deref()) {
+        return queue.is_empty();
+    }
+    legacy_rx.is_empty()
+}
+
 pub struct Backend {
+    pub fec_fence_gen: AtomicU64,
     pub ch: Sender<VPNFrame>,
+    pub owned_batches: Option<Arc<OwnedBatchQueue>>,
     pub conn_id: Arc<Mutex<String>>,
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
@@ -1203,11 +1321,17 @@ impl AdaptiveBackend for Backend {
     }
     #[inline]
     fn scheduler_queue_len(&self) -> usize {
-        self.ch.len()
+        self.owned_batches
+            .as_deref()
+            .map(OwnedBatchQueue::len_frames)
+            .unwrap_or_else(|| self.ch.len())
     }
     #[inline]
     fn scheduler_queue_capacity(&self) -> usize {
-        self.ch.capacity().unwrap_or(4096)
+        self.owned_batches
+            .as_deref()
+            .map(OwnedBatchQueue::capacity_frames)
+            .unwrap_or_else(|| self.ch.capacity().unwrap_or(4096))
     }
 }
 
@@ -1224,6 +1348,7 @@ pub struct AsyncPort {
     adaptive: AdaptivePortState,
     parity_cursor: AtomicUsize,
     encoder: Mutex<Option<FecEncoder>>,
+    fec_mode: Mutex<FecTxModeState>,
     encoder_enabled: AtomicBool,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
@@ -1240,6 +1365,7 @@ impl AsyncPort {
             adaptive: AdaptivePortState::default(),
             parity_cursor: AtomicUsize::new(0),
             encoder: Mutex::new(None),
+            fec_mode: Mutex::new(FecTxModeState::default()),
             encoder_enabled: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
@@ -1257,6 +1383,10 @@ impl AsyncPort {
         self.tx_seq.store(0, Ordering::Release);
         self.sequence_exhausted.store(false, Ordering::Release);
         self.parity_cursor.store(0, Ordering::Release);
+        self.fec_mode.lock().reset();
+        for backend in self.backends.read().iter() {
+            backend.fec_fence_gen.store(0, Ordering::Release);
+        }
         let enabled = k >= crate::fec::FEC_MIN_GROUP;
         if !enabled {
             self.encoder_enabled.store(false, Ordering::Release);
@@ -1334,6 +1464,20 @@ impl AsyncPort {
     ) -> Result<(), FramePayload> {
         let bytes = data.as_slice().len() as u64;
         b.scheduler.add_queued(bytes);
+        if let Some(queue) = &b.owned_batches {
+            return match queue.try_push(VPNFrame { seq, data }, bytes) {
+                Ok(()) => {
+                    if let Some(n) = &b.notify {
+                        n.wake();
+                    }
+                    Ok(())
+                }
+                Err(frame) => {
+                    b.scheduler.complete_queued(bytes);
+                    Err(frame.data)
+                }
+            };
+        }
         match b.ch.try_send(VPNFrame { seq, data }) {
             Ok(()) => {
                 if let Some(n) = &b.notify {
@@ -1346,6 +1490,29 @@ impl AsyncPort {
                 Err(frame.data)
             }
         }
+    }
+
+    fn try_send_payload_to_fenced(
+        &self,
+        b: &Backend,
+        seq: u32,
+        data: FramePayload,
+        control: Option<FecModeControl>,
+    ) -> Result<(), FramePayload> {
+        if let Some(control) = control {
+            if b.fec_fence_gen.load(Ordering::Acquire) < control.generation {
+                let control_payload = FramePayload::Owned(control.encode().to_vec());
+                if let Err(returned) = self.try_send_payload_to(b, 0, control_payload) {
+                    returned.release();
+                    return Err(data);
+                }
+                // Channel enqueue completed before publication. Any thread that
+                // observes this generation can only enqueue governed data after
+                // the control record already exists in this backend FIFO.
+                b.fec_fence_gen.store(control.generation, Ordering::Release);
+            }
+        }
+        self.try_send_payload_to(b, seq, data)
     }
 
     fn send_payload_to(&self, b: &Backend, seq: u32, data: FramePayload) -> u64 {
@@ -1367,13 +1534,14 @@ impl AsyncPort {
         preferred_idx: Option<usize>,
         seq: u32,
         data: FramePayload,
+        control: Option<FecModeControl>,
     ) -> Option<usize> {
         let bytes = data.as_slice().len() as u64;
         let mut data = data;
 
         if let Some(idx) = preferred_idx {
             if idx < backends.len() {
-                match self.try_send_payload_to(&backends[idx], seq, data) {
+                match self.try_send_payload_to_fenced(&backends[idx], seq, data, control) {
                     Ok(()) => {
                         backends[idx].scheduler.note_assigned(bytes);
                         return Some(idx);
@@ -1387,7 +1555,7 @@ impl AsyncPort {
             if Some(idx) == preferred_idx || Self::backend_score(b).is_none() {
                 continue;
             }
-            match self.try_send_payload_to(b, seq, data) {
+            match self.try_send_payload_to_fenced(b, seq, data, control) {
                 Ok(()) => {
                     b.scheduler.note_assigned(bytes);
                     return Some(idx);
@@ -1535,18 +1703,27 @@ impl AsyncPort {
             return;
         };
 
-        // FEC 只借用 payload bytes；Owned/Shared 的所有权都继续向 backend 移动。
-        let parity = if self.encoder_enabled.load(Ordering::Relaxed) {
-            self.encoder
-                .lock()
-                .as_mut()
-                .and_then(|enc| enc.add(seq, frame.as_slice()))
+        // FEC-enabled dispatch serializes topology observation, encoder state and
+        // fence publication. The control itself is sent only on the backend that
+        // actually accepts governed data after scheduler fallback.
+        let (parity, current_control) = if self.encoder_enabled.load(Ordering::Relaxed) {
+            let mut mode = self.fec_mode.lock();
+            let mut encoder = self.encoder.lock();
+            if let Some(enc) = encoder.as_mut() {
+                enc.set_physical_path_count(backends.len());
+                let _ = mode.observe(backends.len(), seq, enc.group_size());
+                let control = mode.current();
+                (enc.add(seq, frame.as_slice()), control)
+            } else {
+                (None, None)
+            }
         } else {
-            None
+            (None, None)
         };
 
         let selected_idx = self.selected_data_backend_index(&backends, incoming_bytes);
-        let data_idx = self.send_data_payload_to_any(&backends, selected_idx, seq, frame);
+        let data_idx =
+            self.send_data_payload_to_any(&backends, selected_idx, seq, frame, current_control);
 
         if let Some(par) = parity {
             if backends.len() < 2 {
@@ -1931,6 +2108,61 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    fn owned_test_frame(seq: u32, bytes: usize) -> VPNFrame {
+        VPNFrame {
+            seq,
+            data: FramePayload::Owned(vec![seq as u8; bytes]),
+        }
+    }
+
+    #[test]
+    fn owned_batch_queue_coalesces_and_preserves_accounting() {
+        let queue = OwnedBatchQueue::new(16);
+        assert!(queue.try_push(owned_test_frame(1, 1200), 1200).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 1300), 1300).is_ok());
+        assert_eq!(queue.len_frames(), 2);
+
+        let batch = queue.try_pop_fitting(4096).expect("batch must fit");
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.bytes, 2500);
+        assert_eq!(batch.frames[0].seq, 1);
+        assert_eq!(batch.frames[1].seq, 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn owned_batch_queue_keeps_front_when_wire_budget_is_too_small() {
+        let queue = OwnedBatchQueue::new(16);
+        assert!(queue.try_push(owned_test_frame(7, 1400), 1400).is_ok());
+        assert!(queue.try_push(owned_test_frame(8, 1400), 1400).is_ok());
+
+        assert!(queue.try_pop_fitting(2800).is_none());
+        assert_eq!(
+            queue.len_frames(),
+            2,
+            "failed fit must not consume ownership"
+        );
+
+        let batch = queue
+            .try_pop_fitting(4096)
+            .expect("larger budget must drain");
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.bytes, 2800);
+    }
+
+    #[test]
+    fn owned_batch_queue_capacity_remains_frame_based() {
+        let queue = OwnedBatchQueue::new(2);
+        assert!(queue.try_push(owned_test_frame(1, 64), 64).is_ok());
+        assert!(queue.try_push(owned_test_frame(2, 64), 64).is_ok());
+        let rejected = queue
+            .try_push(owned_test_frame(3, 64), 64)
+            .expect_err("third frame must hit frame capacity");
+        assert_eq!(rejected.seq, 3);
+        rejected.data.release();
+        assert_eq!(queue.len_frames(), 2);
+    }
+
     /// 端口后端 + 它的收帧端：测试需要从这一侧把交换机投来的帧取走
     type TestBackend = (Arc<Backend>, crossbeam_channel::Receiver<VPNFrame>);
 
@@ -1938,8 +2170,10 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(256);
         (
             Arc::new(Backend {
+                fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                owned_batches: None,
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
@@ -1966,8 +2200,10 @@ mod tests {
         let port = AsyncPort::new("pre-seq-backpressure".into());
         let (tx, rx) = crossbeam_channel::bounded(4);
         let backend = Arc::new(Backend {
+            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx.clone(),
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
@@ -2012,16 +2248,20 @@ mod tests {
 
         let (tx0, rx0) = crossbeam_channel::bounded(4);
         let b0 = Arc::new(Backend {
+            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx0.clone(),
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
         });
         let (tx1, rx1) = crossbeam_channel::bounded(8);
         let b1 = Arc::new(Backend {
+            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx1,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
@@ -2071,15 +2311,19 @@ mod tests {
         let (tx_a, _rx_a) = crossbeam_channel::bounded(32);
         let (tx_b, _rx_b) = crossbeam_channel::bounded(32);
         let a = Arc::new(Backend {
+            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_a,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(250_000)),
             notify: None,
         });
         let b = Arc::new(Backend {
+            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
             scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
             ch: tx_b,
+            owned_batches: None,
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(240_000)),
             notify: None,
@@ -2240,6 +2484,169 @@ mod tests {
         }
         assert_eq!(parity, 1);
         assert_eq!(port.parity_sent(), 1);
+    }
+
+    #[test]
+    fn dynamic_fec_fence_follows_actual_fallback_backend() {
+        let port = AsyncPort::new("dynamic-fence-fallback".into());
+        port.reset_epoch(4, None);
+        let (preferred, preferred_rx) = make_backend();
+        let (fallback, fallback_rx) = make_backend();
+
+        preferred.fec_fence_gen.store(0, Ordering::Release);
+        fallback.fec_fence_gen.store(0, Ordering::Release);
+
+        // Publish a sender-authoritative SUSPEND without relying on scheduler
+        // topology transitions; this isolates the actual-backend fencing rule.
+        let control = FecModeControl {
+            generation: 1,
+            op: crate::protocol::FEC_MODE_SUSPEND,
+            boundary: 5,
+        };
+
+        while preferred.ch.len() < preferred.ch.capacity().unwrap() {
+            preferred
+                .ch
+                .try_send(VPNFrame {
+                    seq: 99,
+                    data: FramePayload::Owned(vec![0]),
+                })
+                .unwrap();
+        }
+
+        let backends = vec![preferred.clone(), fallback.clone()];
+        assert_eq!(
+            port.send_data_payload_to_any(
+                &backends,
+                Some(0),
+                5,
+                FramePayload::Owned(vec![0x5a]),
+                Some(control),
+            ),
+            Some(1)
+        );
+        assert_eq!(preferred.fec_fence_gen.load(Ordering::Acquire), 0);
+        assert_eq!(fallback.fec_fence_gen.load(Ordering::Acquire), 1);
+
+        let fence = fallback_rx.try_recv().expect("fallback fence");
+        assert_eq!(fence.seq, 0);
+        assert_eq!(fence.data.as_slice(), control.encode());
+        fence.data.release();
+        let data = fallback_rx.try_recv().expect("governed fallback data");
+        assert_eq!(data.seq, 5);
+        data.data.release();
+
+        for frame in preferred_rx.try_iter() {
+            frame.data.release();
+        }
+    }
+
+    #[test]
+    fn dynamic_fec_fence_is_sent_once_per_backend_generation() {
+        let port = AsyncPort::new("dynamic-fence-once".into());
+        let (backend, rx) = make_backend();
+        let backends = vec![backend.clone()];
+        let control = FecModeControl {
+            generation: 7,
+            op: crate::protocol::FEC_MODE_RESUME,
+            boundary: 9,
+        };
+
+        for seq in [9, 10] {
+            assert_eq!(
+                port.send_data_payload_to_any(
+                    &backends,
+                    Some(0),
+                    seq,
+                    FramePayload::Owned(vec![seq as u8]),
+                    Some(control),
+                ),
+                Some(0)
+            );
+        }
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            frames.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+            vec![0, 9, 10]
+        );
+        assert_eq!(backend.fec_fence_gen.load(Ordering::Acquire), 7);
+        for frame in frames {
+            frame.data.release();
+        }
+    }
+
+    #[test]
+    fn dynamic_fec_epoch_reset_clears_backend_fence_generation() {
+        let port = AsyncPort::new("dynamic-fence-reset".into());
+        let (backend, _rx) = make_backend();
+        backend.fec_fence_gen.store(9, Ordering::Release);
+        port.register_backend(backend.clone());
+        port.reset_epoch(4, None);
+        assert_eq!(backend.fec_fence_gen.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dynamic_fec_topology_emits_suspend_then_resume_boundaries() {
+        let port = AsyncPort::new("dynamic-topology".into());
+        let (backend0, rx0) = make_backend();
+        let (backend1, rx1) = make_backend();
+        backend0.rtt_cache.store(1_000, Ordering::Relaxed);
+        backend1.rtt_cache.store(2_000, Ordering::Relaxed);
+        port.register_backend(backend0.clone());
+        port.register_backend(backend1.clone());
+        port.reset_epoch(4, None);
+
+        // Complete group 1..4 and leave group 5..8 partial under multipath.
+        for seq in 1..=6u8 {
+            port.write_frame(Arc::new(vec![seq]));
+        }
+        for rx in [&rx0, &rx1] {
+            for frame in rx.try_iter() {
+                frame.data.release();
+            }
+        }
+
+        port.unregister_backend(&backend1.ch);
+        port.write_frame(Arc::new(vec![7]));
+        let phase1: Vec<_> = rx0.try_iter().collect();
+        let suspend = phase1
+            .iter()
+            .find(|frame| {
+                frame.seq == 0
+                    && frame.data.as_slice().first()
+                        == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
+            })
+            .map(|frame| FecModeControl::parse(frame.data.as_slice()).unwrap())
+            .expect("2->1 must emit FEC_MODE SUSPEND");
+        assert_eq!(suspend.generation, 1);
+        assert_eq!(suspend.op, crate::protocol::FEC_MODE_SUSPEND);
+        assert_eq!(suspend.boundary, 5);
+        for frame in phase1 {
+            frame.data.release();
+        }
+
+        let (backend2, rx2) = make_backend();
+        backend2.rtt_cache.store(1_500, Ordering::Relaxed);
+        port.register_backend(backend2);
+        port.write_frame(Arc::new(vec![8]));
+        let mut phase2: Vec<_> = rx0.try_iter().collect();
+        phase2.extend(rx2.try_iter());
+        let resume = phase2
+            .iter()
+            .find(|frame| {
+                frame.seq == 0
+                    && frame.data.as_slice().first()
+                        == Some(&crate::protocol::CONTROL_KIND_FEC_MODE)
+            })
+            .map(|frame| FecModeControl::parse(frame.data.as_slice()).unwrap())
+            .expect("1->2 must emit FEC_MODE RESUME");
+        assert_eq!(resume.generation, 2);
+        assert_eq!(resume.op, crate::protocol::FEC_MODE_RESUME);
+        assert_eq!(resume.boundary, 9);
+        for frame in phase2 {
+            frame.data.release();
+        }
     }
 
     #[test]

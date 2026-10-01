@@ -341,6 +341,13 @@ impl ReorderBuffer {
         self.stats
     }
 
+    /// Cold-path ordered-delivery progress snapshot used by dynamic FEC cleanup.
+    /// Callers already serialize ReorderBuffer through its session mutex; this
+    /// accessor deliberately adds no per-packet atomic store to the reorder path.
+    pub fn expected_seq_snapshot(&self) -> u32 {
+        self.expected_seq
+    }
+
     /// 距离当前缺口 deadline 的剩余时间。无缺口时返回 None，调用方可以让
     /// poller 使用自己的常规定时周期而不为空闲会话轮询。
     pub fn next_timeout(&self) -> Option<Duration> {

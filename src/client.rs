@@ -483,7 +483,7 @@ impl WebStatsProvider for Client {
         let pr_applied = *self.pr_ok.lock();
         let pr_error = self.pr_err.lock().clone();
         let negotiate = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
             "fec": self.fec_mode,
             "fec_group": self.fec_group_req,
             "enc_algo": enc,
@@ -1278,7 +1278,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let conn_id = uuid::Uuid::new_v4().to_string();
     *ci.conn_id.lock() = conn_id.clone();
     let req = HandshakeReq {
-        protocol_version: 2,
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         client_instance: instance_id,
         conn_id: conn_id.clone(),
         client_id: cl.client_id.clone(),
@@ -1326,7 +1326,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         Some(r) => r,
         None => return Duration::ZERO,
     };
-    if resp.protocol_version != 2 {
+    if resp.protocol_version != crate::protocol::PROTOCOL_VERSION {
         *ci.last_error.lock() = format!(
             "unsupported server protocol version {}",
             resp.protocol_version
@@ -1450,11 +1450,18 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     old.reset();
                 }
                 let negotiated = st.fec_negotiated as usize;
-                *cl.fec_dec.lock() = Some(Arc::new(FecDecoder::new(negotiated, fec_rx.clone())));
+                let dec = Arc::new(FecDecoder::new(negotiated, fec_rx.clone()));
+                dec.set_static_single_path(cl.conns_count == 1);
+                let reorder = cl.reorder_buf.clone();
+                dec.set_reorder_progress(Arc::new(move || reorder.lock().expected_seq_snapshot()));
+                *cl.fec_dec.lock() = Some(dec);
                 cl.tx_port.reset_epoch(negotiated, fec_tx.clone());
                 st.fec_algo = enc_algo;
                 st.fec_salt_key = resp.enc_salt.clone();
             }
+        }
+        if let Some(dec) = cl.fec_dec.lock().as_ref() {
+            dec.set_static_single_path(cl.conns_count == 1);
         }
         if st.enc_algo != enc_algo {
             st.enc_algo = enc_algo;
@@ -1583,8 +1590,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let rtt_cache = Arc::new(AtomicU32::new(50000));
     let (tx, rx) = bounded(1024);
     let backend = Arc::new(Backend {
+        fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tx.clone(),
+        owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
         conn_id: Arc::new(Mutex::new(conn_id.clone())),
         rtt_cache: rtt_cache.clone(),
         notify: Some(Arc::new(BackendNotify::new(
@@ -1665,7 +1674,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // queued after the previous 32 KiB drain and rustls is not blocked
         // on socket writes, poll nonblocking so we service that backlog
         // immediately while still observing socket readability.
-        poll_timeout = clamp_poll_for_tx_backlog(poll_timeout, !rx.is_empty(), tls.wants_write());
+        poll_timeout = clamp_poll_for_tx_backlog(
+            poll_timeout,
+            !backend_tx_is_empty(Some(backend.as_ref()), &rx),
+            tls.wants_write(),
+        );
         if let Err(e) = poll.poll(&mut events, Some(poll_timeout)) {
             close_reason = format!("mio poll failed: {e}");
             break;
@@ -1776,16 +1789,26 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
                             let data = Arc::new(data);
                             if seq == 0 {
-                                if let Some(dec) = &fec_dec {
-                                    if fec::is_parity_frame(&data) {
-                                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                            reorder_input.push((s, f));
-                                        };
-                                        dec.on_parity(&data, &mut sink);
-                                        release_shared_frame(data);
-                                        continue;
-                                    }
+                                let Some(dec) = &fec_dec else {
+                                    close_reason = format!(
+                                        "protocol v{} typed control without negotiated FEC",
+                                        crate::protocol::PROTOCOL_VERSION
+                                    );
+                                    release_shared_frame(data);
+                                    conn_closed = true;
+                                    break 'socket_read;
+                                };
+                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                                    reorder_input.push((s, f));
+                                };
+                                if let Err(e) = dec.on_control(&data, &mut sink) {
+                                    close_reason = format!("protocol v3 control error: {e}");
+                                    release_shared_frame(data);
+                                    conn_closed = true;
+                                    break 'socket_read;
                                 }
+                                release_shared_frame(data);
+                                continue;
                             }
 
                             if fec_dec.is_some() {
@@ -1836,25 +1859,34 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         send_buf.clear();
         let mut tx_packets_batch = 0u64;
         let mut last_frame_start = None;
-        if !tls.wants_write() && (woken || !rx.is_empty()) {
+        if !tls.wants_write() && (woken || !backend_tx_is_empty(Some(backend.as_ref()), &rx)) {
             if let Some(n) = &backend.notify {
                 // Only clear pending when we are actually going to drain the
                 // backend queue. If TLS is socket-backpressured, leave pending
                 // set and retry from the periodic poll loop once ciphertext drains.
                 n.consume_wake();
             }
-            while let Ok(f) = rx.try_recv() {
-                let payload_len = f.data.as_slice().len() as u64;
-                let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
-                last_frame_start = Some(append_unpadded_frame(
-                    &mut send_buf,
-                    f.seq,
-                    f.data.as_slice(),
-                    ic_ref,
-                ));
-                f.data.release();
-                queued_payload_pending = queued_payload_pending.saturating_add(payload_len);
-                tx_packets_batch += 1;
+            while let Some(batch) = try_recv_backend_batch(
+                Some(backend.as_ref()),
+                &rx,
+                MAX_TLS_PLAINTEXT_RECORD
+                    .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
+                    .saturating_sub(send_buf.len()),
+            ) {
+                let batch_bytes = batch.bytes;
+                let batch_frames = batch.frames.len() as u64;
+                for f in batch.frames {
+                    let ic_ref = if f.seq != 0 { ic_tx_ref } else { None };
+                    last_frame_start = Some(append_unpadded_frame(
+                        &mut send_buf,
+                        f.seq,
+                        f.data.as_slice(),
+                        ic_ref,
+                    ));
+                    f.data.release();
+                }
+                queued_payload_pending = queued_payload_pending.saturating_add(batch_bytes);
+                tx_packets_batch += batch_frames;
                 if send_buf.len() >= TLS_WRITE_BATCH_BYTES {
                     break;
                 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e_tok.sh — protocol v2 e2e：两台同 MAC 客户端，验证跨实例接管被拒。
+# e2e_tok.sh — protocol v3 e2e：两台同 MAC 客户端，验证跨实例接管被拒。
 #
 # 威胁模型：client_id 完全由 (MAC, PSK) 推导，持密者只要知道目标 MAC 就能算出
 # 对方 client_id，走"会话复活"分支接管既有隧道。v2 随机令牌只在原会话的
@@ -56,7 +56,7 @@ trap cleanup EXIT
 
 # --- 服务端 ---
 if [ "$SRV" = rs ]; then
-  # Rust 服务端：session token 是 protocol v2 固定能力，不再有配置开关。
+  # Rust 服务端：session token 是 protocol v3 固定能力，不再有配置开关。
   e2e_config "$TMP/srv.json" server "127.0.0.1:$PORT" \
     "\"psk\": \"$PSK\"" \
     '"encrypt": true' \

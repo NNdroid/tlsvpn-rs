@@ -17,6 +17,7 @@
 #   互通（真实 server+client，断言会话建立且配置真的生效）
 #     cidr       自定义网段 + req_v4/req_v6 → 分配必须落在池内
 #     multi      client.conns=2 → 面板 /api/stats 里该客户端 active_conns 必须是 2
+#     multifec   client.conns=2 + XOR FEC → 两条连接和 FEC 协商必须同时生效
 #     webauth    web.auth → 无凭证 401、带凭证 200
 #     webtls     web.cert + web.key → 面板真走 HTTPS（明文拿不到 200，
 #                openssl s_client 拿到 200），而不是被解析后丢掉继续明文
@@ -46,12 +47,16 @@ LABEL="${LABEL:-}"
 SRV_BIN="$E2E_RS_BIN"; [ "$SRV" = go ] && SRV_BIN="$E2E_GO_BIN"
 CLI_BIN="$E2E_RS_BIN"; [ "$CLI" = go ] && CLI_BIN="$E2E_GO_BIN"
 
-[ -n "$CASE" ] || { echo "e2e_cfg: CASE 必填 (cidr|multi|webauth|webtls|webtunnel|logquiet|bad*)"; exit 2; }
+[ -n "$CASE" ] || { echo "e2e_cfg: CASE 必填 (cidr|multi|multifec|webauth|webtls|webtunnel|logquiet|bad*)"; exit 2; }
 e2e_require RS_BIN "$SRV_BIN" "先构建：scripts/build.sh native" || exit 2
 e2e_ensure_cert || { echo "e2e_cfg: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
 KEY="$E2E_KEY"
 
+# The client has no listening socket in this suite, so port-only cleanup cannot
+# reap it. A leaked reconnect supervisor can attach to a later case that reuses
+# the port and make session-token/active_conns assertions nondeterministic.
+e2e_reap_all
 e2e_kill_port "$PORT"
 [ "$WEB_BASE" != 0 ] && e2e_kill_port "$WEB_BASE"
 
@@ -59,9 +64,14 @@ TMP="$(mktemp -d)"
 SRV_LOG="$(e2e_winpath "$TMP/srv.log")"
 CLI_LOG="$(e2e_winpath "$TMP/cli.log")"
 cleanup() {
+  e2e_reap_all
   e2e_kill_port "$PORT"
   [ "$WEB_BASE" != 0 ] && e2e_kill_port "$WEB_BASE"
-  rm -rf "$TMP"
+  if [ -n "${KEEP_TMP:-}" ]; then
+    echo "保留 e2e_cfg 日志目录: $TMP"
+  else
+    rm -rf "$TMP"
+  fi
   return 0
 }
 trap cleanup EXIT
@@ -194,6 +204,13 @@ case "$CASE" in
     # 断言可以跨语言。conns 是那种「配了但没人读」就会静默退化成单连接的字段。
     CLI_FX='"client": {"insecure": true, "conns": 2}'
     ;;
+  multifec)
+    # 协议 v3 动态 FEC 的跨实现基线：先证明两条物理连接与 XOR FEC
+    # 同时协商成功；2→1→2 的 fence/failover 由 Rust 单元故障测试覆盖。
+    CLI_FX='"client": {"insecure": true, "conns": 2, "fec": true, "fec_group": 4}'
+    SRV_LOGFRAG='"log_level": "debug"'
+    CLI_LOGFRAG='"log_level": "debug"'
+    ;;
   webauth)
     WEB_FX='"auth": "admin:s3cret"'
     ;;
@@ -270,11 +287,16 @@ case "$CASE" in
     e2e_wait_log "$V4PREFIX" "$SRV_LOG" 10 || { echo "v4 分配不来自 $V4CIDR"; PASS=0; }
     e2e_wait_log "fd99" "$SRV_LOG" 10 || { echo "v6 分配不来自 $V6CIDR"; PASS=0; }
     ;;
-  multi)
+  multi|multifec)
     sleep 3
     BODY="$(http_get 127.0.0.1 "$WEB_BASE" /api/stats "$AUTH_HDR")" || { echo "面板请求失败"; PASS=0; }
-    if ! echo "$BODY" | grep -qE '"active_conns"[[:space:]]*:[[:space:]]*2'; then
+    if ! grep -qE '"active_conns"[[:space:]]*:[[:space:]]*2' <<<"$BODY"; then
       echo "面板里没有 active_conns=2，client.conns 没生效"
+      echo "$BODY" | tail -c 400
+      PASS=0
+    fi
+    if [ "$CASE" = multifec ] && ! grep -qE '"fec"[[:space:]]*:[[:space:]]*"xor K=4"' <<<"$BODY"; then
+      echo "面板会话里没有 fec=\"xor K=4\"，多连接 XOR FEC 协商未生效"
       echo "$BODY" | tail -c 400
       PASS=0
     fi

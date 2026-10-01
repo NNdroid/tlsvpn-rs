@@ -9,18 +9,10 @@
 # artifact:
 #   E2E_RS_BIN / E2E_GO_BIN         server+client binaries
 #   E2E_RS_PROBE / E2E_GO_PROBE     protocol-level probes (in-memory TAP)
-#   E2E_RS_OLD_BIN / E2E_RS_OLD_PROBE / E2E_GO_OLD_BIN   pre-feature builds
 #   E2E_GO_DIR                      Go implementation checkout (../tlsvpn)
 #   E2E_CERT / E2E_KEY              TLS cert pair (repo root)
 #   E2E_PSK                         shared secret
 #
-# The "old" builds exist only to exercise the mixed-version phases. A fresh
-# runner never builds them, so every suite gates those cases on their presence
-# and reports how many it skipped rather than failing.
-#
-# This file deliberately sets neither -e nor -u: the suites own their strictness
-# and the helpers below return 1 from guards instead of dying.
-
 export MSYS_NO_PATHCONV=1   # keep bash from rewriting drive paths to POSIX form
 
 E2E_OS=linux
@@ -62,9 +54,6 @@ E2E_GO_BIN="${E2E_GO_BIN:-$E2E_GO_DIR/bin/tlsvpn$E2E_EXE}"
 E2E_RS_PROBE="${E2E_RS_PROBE:-$E2E_REPO/target/debug/examples/interop_client$E2E_EXE}"
 E2E_GO_PROBE="${E2E_GO_PROBE:-$E2E_GO_DIR/interop/probe$E2E_EXE}"
 
-E2E_RS_OLD_BIN="${E2E_RS_OLD_BIN:-}"
-E2E_RS_OLD_PROBE="${E2E_RS_OLD_PROBE:-}"
-E2E_GO_OLD_BIN="${E2E_GO_OLD_BIN:-}"
 
 # e2e_cert.pem / e2e_key.pem are gitignored, so a clean checkout has neither —
 # the cert is generated on demand below and treated as a derived artifact.
@@ -76,12 +65,6 @@ E2E_KEY="$(e2e_drvpath "${E2E_KEY:-$E2E_REPO/e2e_key.pem}")"
 E2E_PSK="${E2E_PSK:-e2e_secret}"
 
 
-# True when the env var named by $1 is set and the file it points to exists.
-# Lets a suite opt out of a phase instead of failing on a missing old build.
-e2e_have() {
-  local v="${!1:-}"
-  [ -n "$v" ] && [ -e "$v" ]
-}
 
 # Fail fast on a prerequisite that is genuinely required, with a build hint.
 e2e_require() {

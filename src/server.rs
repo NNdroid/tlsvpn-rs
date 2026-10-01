@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::api::*;
 use crate::buffer::*;
 use crate::crypto::*;
-use crate::fec::{self, FecDecoder};
+use crate::fec::FecDecoder;
 use crate::frame::*;
 use crate::hooks::{HookEnv, LifecycleHooks};
 use crate::net::*;
@@ -559,7 +559,9 @@ impl WebStatsProvider for ServerCore {
             .sum();
         let mut server_conns = Vec::new();
         for s in sessions.values() {
-            for (idx, (conn_id, rtt, scheduler)) in s.port.diagnostic_paths().into_iter().enumerate() {
+            for (idx, (conn_id, rtt, scheduler)) in
+                s.port.diagnostic_paths().into_iter().enumerate()
+            {
                 server_conns.push(serde_json::json!({
                     "client_id": s.stat.client_id,
                     "conn_id": conn_id,
@@ -591,7 +593,7 @@ impl WebStatsProvider for ServerCore {
             min_down = 0;
         }
         let negotiate = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
             "fec": true,
             "fec_group": 4,
             "enc_algo": if self.encrypt { self.enc_algo } else { ENC_ALGO_NONE },
@@ -1003,8 +1005,10 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
     tap_port.register_backend(Arc::new(Backend {
+        fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
         ch: tap_tx,
+        owned_batches: None,
         conn_id: Arc::new(Mutex::new(String::new())),
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
@@ -1270,8 +1274,10 @@ fn worker_loop(
             let pad_record_limit = mss_padding_record_limit(get_tcp_mss(&socket));
             let (tx, rx) = bounded(1024);
             let backend = Arc::new(Backend {
+                fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
                 scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
                 ch: tx,
+                owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: Some(Arc::new(BackendNotify::new(
@@ -1722,16 +1728,23 @@ fn process_plain_frames(
                     let data = Arc::new(data);
 
                     if seq == 0 {
-                        if let Some(dec) = &fec_dec {
-                            if fec::is_parity_frame(&data) {
-                                let mut sink = |s: u32, f: Arc<Vec<u8>>| {
-                                    reorder_input.push((s, f));
-                                };
-                                dec.on_parity(&data, &mut sink);
-                                release_shared_frame(data);
-                                continue;
-                            }
+                        let Some(dec) = &fec_dec else {
+                            debug!("protocol v3 typed control without negotiated FEC");
+                            release_shared_frame(data);
+                            *close = true;
+                            break;
+                        };
+                        let mut sink = |s: u32, f: Arc<Vec<u8>>| {
+                            reorder_input.push((s, f));
+                        };
+                        if let Err(e) = dec.on_control(&data, &mut sink) {
+                            debug!("protocol v3 control error: {}", e);
+                            release_shared_frame(data);
+                            *close = true;
+                            break;
                         }
+                        release_shared_frame(data);
+                        continue;
                     }
 
                     if fec_dec.is_some() {
@@ -1872,18 +1885,27 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     let mut pulled_payload = 0u64;
     let mut last_frame_start = None;
     sess.send_buf.clear();
-    while let Ok(f) = sess.rx.try_recv() {
-        let payload_len = f.data.as_slice().len() as u64;
-        let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
-        last_frame_start = Some(append_unpadded_frame(
-            &mut sess.send_buf,
-            f.seq,
-            f.data.as_slice(),
-            ic_ref,
-        ));
-        f.data.release();
-        pulled_payload = pulled_payload.saturating_add(payload_len);
-        pulled += 1;
+    while let Some(batch) = try_recv_backend_batch(
+        sess.tx_backend.as_deref(),
+        &sess.rx,
+        MAX_TLS_PLAINTEXT_RECORD
+            .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
+            .saturating_sub(sess.send_buf.len()),
+    ) {
+        let batch_bytes = batch.bytes;
+        let batch_frames = batch.frames.len() as u64;
+        for f in batch.frames {
+            let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
+            last_frame_start = Some(append_unpadded_frame(
+                &mut sess.send_buf,
+                f.seq,
+                f.data.as_slice(),
+                ic_ref,
+            ));
+            f.data.release();
+        }
+        pulled_payload = pulled_payload.saturating_add(batch_bytes);
+        pulled = pulled.saturating_add(batch_frames);
         if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
             break;
         }
@@ -2156,7 +2178,7 @@ fn handle_handshake(
         );
         return HandshakeOutcome::Close;
     }
-    if req.protocol_version != 2 {
+    if req.protocol_version != crate::protocol::PROTOCOL_VERSION {
         warn!(
             "[{}] connection refused: unsupported protocol_version={}",
             client_id, req.protocol_version
@@ -2453,6 +2475,15 @@ fn handle_handshake(
     // from the previous connection instead of showing a stale host identity.
     *c_sess.peer_info.write() = req.peer_info.as_ref().map(normalize_peer_info);
 
+    {
+        let epoch = c_sess.epoch_state.read();
+        if let Some(dec) = &epoch.fec_dec {
+            dec.set_static_single_path(req.brutal_conns == 1);
+            let reorder = c_sess.reorder_buf.clone();
+            dec.set_reorder_progress(Arc::new(move || reorder.lock().expected_seq_snapshot()));
+        }
+    }
+
     let epoch_snapshot = c_sess.epoch_state.read();
     sess.ic_rx = epoch_snapshot.ic_rx.clone();
     sess.session_epoch = epoch_snapshot.epoch;
@@ -2513,7 +2544,7 @@ fn handle_handshake(
     c_sess.brutal_rx.store(client_tx_rate, Ordering::Relaxed);
 
     let resp = HandshakeResp {
-        protocol_version: req.protocol_version,
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         session_epoch: response_epoch,
         success: true,
         message: "OK".into(),

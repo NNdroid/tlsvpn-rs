@@ -1,0 +1,247 @@
+{
+  "version": 3,
+  "psk_hashes": [
+    {
+      "psk": "",
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "psk": "test_psk",
+      "hash": "f5d533019f1f68ca8f48956c2e00e7208a2c4a17dac07204570dc1ef166c1ecf"
+    },
+    {
+      "psk": "my_super_secret_test_key",
+      "hash": "977b4aa0442ab5b43884857609ac975da3d719b841793d616d943c0e19e9aa3f"
+    },
+    {
+      "psk": "中文密钥🔑",
+      "hash": "c32433580ee4a49069094fffe6cdf1dec1737a5feae33d0cfb7ed6bf547cc0fd"
+    },
+    {
+      "psk": "a",
+      "hash": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+    }
+  ],
+  "gcm_domain_vectors": [
+    {
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "data",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b"
+    },
+    {
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "fec",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56"
+    }
+  ],
+  "aead_domain_vectors": [
+    {
+      "algo": 2,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "data",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b"
+    },
+    {
+      "algo": 2,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "fec",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56"
+    },
+    {
+      "algo": 4,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "data",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "aca23415a7f2daba74e4b585171732e8970a3346125a0ce7ff4a3681c5dc098b"
+    },
+    {
+      "algo": 4,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "fec",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "46276ec436392e1ea49e5f00726d9079703524f0b623df8e1ccf582216a12375"
+    },
+    {
+      "algo": 5,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "data",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "720c46b7bdec71fd38fbde65073f9bab7b0f40fa6bed33a973127531ce7f14d5"
+    },
+    {
+      "algo": 5,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "fec",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "ba223e31950d27fe521b6629df45160df251cc361c649e3e7654bf6be23bd7b0"
+    },
+    {
+      "algo": 6,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "data",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "dab95dcd60c7526fea52c69928fcce4fe639b2d03e02e543dc5158522649d397"
+    },
+    {
+      "algo": 6,
+      "psk": "cross-language-domain-vector",
+      "salt_hex": "0011223344556677",
+      "domain": "fec",
+      "seq": 16909060,
+      "plaintext_hex": "65746865726e65742d7061796c6f6164",
+      "ciphertext_hex": "47fa22c20f87f0b4e46db710bace56dfab35bccf7ed17ca820ad3b4f35dad9d8"
+    }
+  ],
+  "frame_headers": [
+    {
+      "data_len": 0,
+      "pad_len": 0,
+      "seq": 0,
+      "header_hex": "00000000000000000000"
+    },
+    {
+      "data_len": 1,
+      "pad_len": 2,
+      "seq": 3,
+      "header_hex": "00000001000200000003"
+    },
+    {
+      "data_len": 1400,
+      "pad_len": 100,
+      "seq": 65536,
+      "header_hex": "00000578006400010000"
+    },
+    {
+      "data_len": 65535,
+      "pad_len": 65535,
+      "seq": 4294967295,
+      "header_hex": "0000ffffffffffffffff"
+    }
+  ],
+  "control_frames": [
+    {
+      "name": "fec_mode_suspend",
+      "payload_hex": "02010000010203040506070800000009"
+    },
+    {
+      "name": "fec_parity_k2",
+      "payload_hex": "01000000010200000002000000020206"
+    }
+  ],
+  "tls_fingerprint_vectors": [
+    {
+      "cipher_suites": [
+        2570,
+        4865,
+        4866,
+        49199
+      ],
+      "signature_schemes": [
+        2052,
+        1027
+      ],
+      "groups": [
+        6682,
+        29,
+        23
+      ],
+      "alpn": [
+        "h2",
+        "http/1.1"
+      ],
+      "fingerprint_sha256": "34dbfe52fd7fd02415290a74053a9f194eae601e8e0c536566ca06fa27d58a2f"
+    },
+    {
+      "cipher_suites": [
+        4867
+      ],
+      "signature_schemes": [],
+      "groups": [],
+      "alpn": [],
+      "fingerprint_sha256": "3776d01dc44e9c2ed7f43f839c0273569b8cec4570cc18437797cd1258760c61"
+    }
+  ],
+  "handshake_req_keys": [
+    "brutal_conn_index",
+    "brutal_conns",
+    "brutal_groups",
+    "brutal_total_rx",
+    "brutal_total_tx",
+    "client_id",
+    "client_instance",
+    "conn_id",
+    "enc_algo",
+    "encrypt",
+    "fec",
+    "fec_group",
+    "ipv4",
+    "ipv6",
+    "mac",
+    "padding",
+    "peer_info",
+    "protocol_version",
+    "psk",
+    "session_token"
+  ],
+  "handshake_resp_keys": [
+    "brutal_groups",
+    "brutal_total_rx",
+    "brutal_total_tx",
+    "client_id",
+    "enc_algo",
+    "enc_salt",
+    "enc_salt2",
+    "encrypt",
+    "fec",
+    "fec_group",
+    "gw_v4",
+    "gw_v6",
+    "ipv4",
+    "ipv6",
+    "message",
+    "padding",
+    "peer_info",
+    "protocol_version",
+    "session_epoch",
+    "session_id",
+    "session_token",
+    "success",
+    "tls"
+  ],
+  "tls_info_keys": [
+    "alpn",
+    "cipher_suite",
+    "cipher_suite_id",
+    "fingerprint_kind",
+    "fingerprint_sha256",
+    "offered_alpn",
+    "offered_cipher_suites",
+    "offered_groups",
+    "offered_signature_schemes",
+    "sni",
+    "version",
+    "version_id"
+  ]
+}
