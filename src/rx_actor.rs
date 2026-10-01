@@ -9,7 +9,11 @@ use crate::fec::FecDecoder;
 pub const RX_ACTOR_BATCH_CAP: usize = 16;
 const RX_ACTOR_IDLE_POLL: Duration = Duration::from_millis(250);
 
-pub type RxDelivery = Arc<dyn Fn(Vec<Arc<Vec<u8>>>) + Send + Sync>;
+/// Delivery consumes a ready vector and returns an empty vector for reuse.
+/// Client mode can exchange it with TapDelivery's existing pool; server mode
+/// drains and returns the same allocation.
+pub type RxDelivery =
+    Arc<dyn Fn(Vec<Arc<Vec<u8>>>) -> Vec<Arc<Vec<u8>>> + Send + Sync>;
 
 pub struct RxFrame {
     pub seq: u32,
@@ -54,16 +58,13 @@ pub struct RxActorSnapshot {
 /// Session receive state guarded by one outer ownership lock.
 ///
 /// FEC and reorder use their actor-only lock-free entry points while this lock
-/// is held. Compared with the first dedicated-worker design this keeps the
-/// single-owner invariant but removes the reader -> channel -> worker context
-/// switch from every RX batch. A reader that owns this lock performs the work
-/// immediately in its current CPU context.
+/// is held. This keeps one logical owner without a reader -> channel -> worker
+/// context switch for every batch.
 struct RxActorState {
     generation: u64,
     fec: Option<FecDecoder>,
     reorder: ReorderBuffer,
     dedup: DeDuplicator,
-    ready: Vec<Arc<Vec<u8>>>,
     recovered_base: u64,
     lost_base: u64,
 }
@@ -75,7 +76,6 @@ impl RxActorState {
             fec,
             reorder: ReorderBuffer::new(),
             dedup: DeDuplicator::new(),
-            ready: Vec::with_capacity(64),
             recovered_base: 0,
             lost_base: 0,
         }
@@ -100,14 +100,13 @@ impl RxSessionActor {
             timeout_thread: Mutex::new(None),
         });
 
-        // The timer thread is cold-path only: it never receives normal data.
-        // It wakes for an actual reorder gap (or a coarse idle poll) and takes
-        // the same outer owner lock used by readers. This preserves gap timeout
-        // semantics without paying an inter-thread handoff per data batch.
+        // Cold path only: normal frames are processed by the reader that owns
+        // state. The timer exists solely to release a real reorder gap when no
+        // more packets arrive.
         let weak = Arc::downgrade(&actor);
         let handle = std::thread::spawn(move || timeout_loop(weak));
         *actor.timeout_thread.lock() = Some(handle.thread().clone());
-        drop(handle); // detached; Weak lets it exit once the session is gone.
+        drop(handle);
         actor
     }
 
@@ -117,16 +116,12 @@ impl RxSessionActor {
             actor: self.clone(),
             generation: self.generation.load(Ordering::Acquire),
             batch: Vec::with_capacity(RX_ACTOR_BATCH_CAP),
+            ready: Vec::with_capacity(64),
             error: Arc::new(ProducerError::new()),
         }
     }
 
     /// Fence the old receive generation and replace FEC/reorder/dedup state.
-    ///
-    /// `state` is the execution barrier: an old batch already holding ownership
-    /// finishes before reset; old producers arriving after reset observe a stale
-    /// generation and are discarded. New producers cannot be created while the
-    /// control lock is held.
     pub fn reconfigure(&self, mut fec: Option<FecDecoder>) {
         let _guard = self.control.lock();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -134,9 +129,9 @@ impl RxSessionActor {
             let mut state = self.state.lock();
             if let Some(old) = state.fec.as_mut() {
                 let (r, l) = old.stats_actor();
+                old.reset_actor();
                 state.recovered_base = state.recovered_base.saturating_add(r);
                 state.lost_base = state.lost_base.saturating_add(l);
-                old.reset_actor();
             }
             if let Some(new) = fec.as_mut() {
                 new.reset_actor();
@@ -145,14 +140,13 @@ impl RxSessionActor {
             state.generation = generation;
             state.reorder.reset();
             state.dedup.reset();
-            state.ready.clear();
         }
         self.wake_timeout_thread();
     }
 
     pub fn snapshot(&self) -> RxActorSnapshot {
-        // Dashboard/stat sampling is cold-path; reading the authoritative state
-        // directly avoids several atomic stores on every hot RX batch.
+        // Dashboard sampling is cold path. Read the authoritative state instead
+        // of publishing multiple atomics on every RX batch.
         let mut state = self.state.lock();
         let recovered_base = state.recovered_base;
         let lost_base = state.lost_base;
@@ -179,18 +173,18 @@ impl RxSessionActor {
         &self,
         generation: u64,
         frames: &mut Vec<RxFrame>,
+        ready: &mut Vec<Arc<Vec<u8>>>,
         error: &ProducerError,
     ) {
         if frames.is_empty() {
             return;
         }
 
-        let mut deliver = None;
         let mut protocol_error = None;
-        let mut wake_timeout = false;
+        let wake_timeout;
         {
-            let mut state = self.state.lock();
-            if generation != state.generation {
+            let mut guard = self.state.lock();
+            if generation != guard.generation {
                 for frame in frames.drain(..) {
                     release_shared_frame(frame.data);
                 }
@@ -198,73 +192,18 @@ impl RxSessionActor {
             }
 
             for item in frames.drain(..) {
-                let seq = item.seq;
-                let data = item.data;
-
-                if seq == 0 {
-                    let expected = state.reorder.expected_seq_snapshot();
-                    let Some(dec) = state.fec.as_mut() else {
-                        release_shared_frame(data);
-                        protocol_error = Some(format!(
-                            "protocol v{} typed control without negotiated FEC",
-                            crate::protocol::PROTOCOL_VERSION
-                        ));
-                        break;
-                    };
-                    match dec.on_control_actor(&data, expected) {
-                        Ok(Some((rseq, recovered))) => {
-                            state.reorder.insert_into(rseq, recovered, &mut state.ready);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            release_shared_frame(data);
-                            protocol_error = Some(format!("protocol v3 control error: {e}"));
-                            break;
-                        }
-                    }
-                    release_shared_frame(data);
-                    continue;
-                }
-
-                let expected = state.reorder.expected_seq_snapshot();
-                let recovered = state
-                    .fec
-                    .as_mut()
-                    .and_then(|dec| dec.on_data_actor(seq, &data, expected));
-                if !state.dedup.is_duplicate(seq) {
-                    insert_pair(
-                        &mut state.reorder,
-                        &mut state.ready,
-                        seq,
-                        data,
-                        recovered,
-                    );
-                } else {
-                    release_shared_frame(data);
-                    if let Some((rseq, frame)) = recovered {
-                        state.reorder.insert_into(rseq, frame, &mut state.ready);
-                    }
+                if let Err(e) = process_item(&mut guard, ready, item) {
+                    protocol_error = Some(e);
+                    break;
                 }
             }
-
-            // Frames after a protocol error were never consumed.
             for item in frames.drain(..) {
                 release_shared_frame(item.data);
             }
-
-            if !state.ready.is_empty() {
-                let cap = state.ready.capacity().max(64);
-                deliver = Some(std::mem::replace(
-                    &mut state.ready,
-                    Vec::with_capacity(cap),
-                ));
-            }
-            wake_timeout = state.reorder.next_timeout().is_some();
+            wake_timeout = guard.reorder.next_timeout().is_some();
         }
 
-        if let Some(batch) = deliver {
-            (self.delivery)(batch);
-        }
+        self.deliver_reusing(ready);
         if let Some(message) = protocol_error {
             error.fail(message);
         }
@@ -273,22 +212,31 @@ impl RxSessionActor {
         }
     }
 
-    fn flush_timeout(&self) {
-        let mut deliver = None;
-        {
-            let mut state = self.state.lock();
-            state.reorder.flush_timeout_into(&mut state.ready);
-            if !state.ready.is_empty() {
-                let cap = state.ready.capacity().max(64);
-                deliver = Some(std::mem::replace(
-                    &mut state.ready,
-                    Vec::with_capacity(cap),
-                ));
+    fn deliver_reusing(&self, ready: &mut Vec<Arc<Vec<u8>>>) {
+        if ready.is_empty() {
+            return;
+        }
+        let out = std::mem::take(ready);
+        let mut returned = (self.delivery)(out);
+        // Delivery contract requires an empty vector. Be defensive so a buggy
+        // callback cannot leak frame ownership into the next reorder batch.
+        if !returned.is_empty() {
+            for frame in returned.drain(..) {
+                release_shared_frame(frame);
             }
         }
-        if let Some(batch) = deliver {
-            (self.delivery)(batch);
+        *ready = returned;
+        if ready.capacity() < RX_ACTOR_BATCH_CAP {
+            ready.reserve(RX_ACTOR_BATCH_CAP - ready.capacity());
         }
+    }
+
+    fn flush_timeout_into(&self, ready: &mut Vec<Arc<Vec<u8>>>) {
+        {
+            let mut state = self.state.lock();
+            state.reorder.flush_timeout_into(ready);
+        }
+        self.deliver_reusing(ready);
     }
 
     fn next_timeout(&self) -> Duration {
@@ -310,6 +258,7 @@ pub struct RxProducer {
     actor: Arc<RxSessionActor>,
     generation: u64,
     batch: Vec<RxFrame>,
+    ready: Vec<Arc<Vec<u8>>>,
     error: Arc<ProducerError>,
 }
 
@@ -331,8 +280,12 @@ impl RxProducer {
         if self.batch.is_empty() {
             return !self.error.failed.load(Ordering::Acquire);
         }
-        self.actor
-            .process_batch(self.generation, &mut self.batch, &self.error);
+        self.actor.process_batch(
+            self.generation,
+            &mut self.batch,
+            &mut self.ready,
+            &self.error,
+        );
         true
     }
 
@@ -346,10 +299,14 @@ impl Drop for RxProducer {
         for frame in self.batch.drain(..) {
             release_shared_frame(frame.data);
         }
+        for frame in self.ready.drain(..) {
+            release_shared_frame(frame);
+        }
     }
 }
 
 fn timeout_loop(actor: Weak<RxSessionActor>) {
+    let mut ready = Vec::with_capacity(64);
     loop {
         let Some(strong) = actor.upgrade() else {
             break;
@@ -360,8 +317,55 @@ fn timeout_loop(actor: Weak<RxSessionActor>) {
         let Some(strong) = actor.upgrade() else {
             break;
         };
-        strong.flush_timeout();
+        strong.flush_timeout_into(&mut ready);
     }
+}
+
+fn process_item(
+    state: &mut RxActorState,
+    ready: &mut Vec<Arc<Vec<u8>>>,
+    item: RxFrame,
+) -> Result<(), String> {
+    let seq = item.seq;
+    let data = item.data;
+
+    if seq == 0 {
+        let expected = state.reorder.expected_seq_snapshot();
+        let Some(dec) = state.fec.as_mut() else {
+            release_shared_frame(data);
+            return Err(format!(
+                "protocol v{} typed control without negotiated FEC",
+                crate::protocol::PROTOCOL_VERSION
+            ));
+        };
+        match dec.on_control_actor(&data, expected) {
+            Ok(Some((rseq, recovered))) => {
+                state.reorder.insert_into(rseq, recovered, ready);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                release_shared_frame(data);
+                return Err(format!("protocol v3 control error: {e}"));
+            }
+        }
+        release_shared_frame(data);
+        return Ok(());
+    }
+
+    let expected = state.reorder.expected_seq_snapshot();
+    let recovered = state
+        .fec
+        .as_mut()
+        .and_then(|dec| dec.on_data_actor(seq, &data, expected));
+    if !state.dedup.is_duplicate(seq) {
+        insert_pair(&mut state.reorder, ready, seq, data, recovered);
+    } else {
+        release_shared_frame(data);
+        if let Some((rseq, frame)) = recovered {
+            state.reorder.insert_into(rseq, frame, ready);
+        }
+    }
+    Ok(())
 }
 
 fn insert_pair(
@@ -396,11 +400,12 @@ mod tests {
 
     fn actor_with_output() -> (Arc<RxSessionActor>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel();
-        let delivery: RxDelivery = Arc::new(move |batch| {
-            for frame in batch {
+        let delivery: RxDelivery = Arc::new(move |mut batch| {
+            for frame in batch.drain(..) {
                 tx.send((*frame).clone()).unwrap();
                 release_shared_frame(frame);
             }
+            batch
         });
         (RxSessionActor::new(delivery, None), rx)
     }
@@ -471,14 +476,16 @@ mod tests {
     }
 
     #[test]
-    fn producer_reuses_the_same_batch_allocation() {
+    fn producer_reuses_input_and_output_batch_allocations() {
         let (actor, _rx) = actor_with_output();
         let mut p = actor.producer();
-        let ptr = p.batch.as_ptr();
+        let input_ptr = p.batch.as_ptr();
+        let output_cap = p.ready.capacity();
         for seq in 1..=64 {
             assert!(p.push(seq, Arc::new(vec![seq as u8])));
         }
         assert!(p.flush());
-        assert_eq!(p.batch.as_ptr(), ptr);
+        assert_eq!(p.batch.as_ptr(), input_ptr);
+        assert!(p.ready.capacity() >= output_cap);
     }
 }
