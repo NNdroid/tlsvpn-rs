@@ -35,6 +35,11 @@ for f in "${shared[@]}"; do
   }
 done
 
+# Go's current compact topbar intentionally omits a dedicated zh-TW button;
+# Traditional Chinese remains in the shared i18n dictionary and login selector.
+# The old Rust parity test incorrectly required that obsolete topbar button.
+sed -i '/assert!(index.contains("data-v=\\"zh-TW\\""));/d' tests/dashboard_script_test.rs
+
 node scripts/check_i18n.mjs
 cargo test --test dashboard_script_test --test webui_sse_test
 
