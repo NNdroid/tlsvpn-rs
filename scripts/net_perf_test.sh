@@ -357,7 +357,7 @@ iperf_one_way() {
     pinger=$!
     PIDS+=("$pinger")
   fi
-  if [[ -n "${PERF_PROFILE_DIR:-}" ]]; then
+  if [[ -n "${PERF_PROFILE_DIR:-}" && "${PERF_PROFILE_CPU:-1}" == 1 ]]; then
     mkdir -p "$PERF_PROFILE_DIR"
     local perf_tool="${PERF_TOOL:-perf}"
     if ! "$perf_tool" stat -e cpu-clock -- true >/dev/null 2>&1; then

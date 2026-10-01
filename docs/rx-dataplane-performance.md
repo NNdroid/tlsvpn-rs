@@ -117,7 +117,9 @@ the histogram counts batches, not packets. Instrumentation is compiled out of
 ordinary builds; diagnostic throughput must not be compared to release numbers.
 
 CI rebuilds pre-candidate commit `aa6f6d1` separately and profiles that binary
-plus current candidates off/on. Software CPU-clock sampling with frame pointers
+plus current candidates off/on for allocation events. A separate build without
+allocator instrumentation captures CPU stacks with candidates off/on. Software
+CPU-clock sampling with frame pointers
 produces raw perf data, text reports, stacks and SVG flame graphs. A missing perf
 permission/tool creates explicit SKIP evidence rather than fabricated profiles.
 Allocation counters do not identify allocation call sites or peak heap usage.

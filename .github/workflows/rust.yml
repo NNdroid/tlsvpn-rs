@@ -294,15 +294,26 @@ jobs:
         cp target/profile/release/tlsvpn .zcode/tlsvpn-profile-baseline
         BIN_SRV="$PWD/.zcode/tlsvpn-profile-baseline" BIN_CLI="$PWD/.zcode/tlsvpn-profile-baseline" \
           FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 PERF_LATENCY=1 \
-          PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-baseline" TLSVPN_ALLOC_PROFILE=1 \
+          PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-baseline" PERF_PROFILE_CPU=0 TLSVPN_ALLOC_PROFILE=1 \
           sudo -E bash scripts/net_perf_test.sh
+        # CPU stacks come from an uninstrumented binary: allocation counters
+        # introduce cache-line traffic and must not become apparent hotspots.
+        cargo build --release
+        for enabled in 0 1; do
+          BIN_SRV="$PWD/target/profile/release/tlsvpn" BIN_CLI="$PWD/target/profile/release/tlsvpn" \
+            FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 PERF_LATENCY=1 \
+            TLSVPN_RX_OWNED="$enabled" TLSVPN_TX_BATCH="$enabled" \
+            TLSVPN_RX_COMPACT="$enabled" TLSVPN_SWITCH_BATCH="$enabled" \
+            PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/cpu-$enabled" \
+            sudo -E bash scripts/net_perf_test.sh
+        done
         cargo build --release --features alloc-profile
         for enabled in 0 1; do
           BIN_SRV="$PWD/target/profile/release/tlsvpn" BIN_CLI="$PWD/target/profile/release/tlsvpn" \
             FLAVOR_SRV=rs FLAVOR_CLI=rs PERF_CONNS=1 IPERF_SECONDS=10 PERF_LATENCY=1 \
             TLSVPN_RX_OWNED="$enabled" TLSVPN_TX_BATCH="$enabled" \
             TLSVPN_RX_COMPACT="$enabled" TLSVPN_SWITCH_BATCH="$enabled" \
-            PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-$enabled" TLSVPN_ALLOC_PROFILE=1 \
+            PERF_PROFILE_DIR="$PWD/perf-results/rx-real-tap/profile-$enabled" PERF_PROFILE_CPU=0 TLSVPN_ALLOC_PROFILE=1 \
             sudo -E bash scripts/net_perf_test.sh
         done
 
