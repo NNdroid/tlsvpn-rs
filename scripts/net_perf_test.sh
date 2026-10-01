@@ -39,6 +39,10 @@ CLI_V4="10.77.0.2"
 GW_V6="fd77::1"
 CLI_V6="fd77::2"
 IPERF_MIN_MBPS="${IPERF_MIN_MBPS:-100}"
+IPERF_SECONDS="${IPERF_SECONDS:-3}"
+[[ "$IPERF_SECONDS" =~ ^[0-9]+$ ]] && (( IPERF_SECONDS >= 1 && IPERF_SECONDS <= 120 )) || {
+  echo '[netperf] invalid IPERF_SECONDS (expected 1..120)'; exit 2;
+}
 PERF_CONNS="${PERF_CONNS:-4}"
 FLAVOR_SRV="${FLAVOR_SRV:-rs}"
 FLAVOR_CLI="${FLAVOR_CLI:-rs}"
@@ -344,7 +348,7 @@ iperf_one_way() {
   python3 "$PERF_METRICS_SCRIPT" start "$metrics_file" "$direction" "${metrics_args[@]}" || {
     fail "could not sample VPN CPU/TAP counters before $direction"; return 1;
   }
-  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
+  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t "$IPERF_SECONDS" -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
   }
   python3 "$PERF_METRICS_SCRIPT" finish "$metrics_file" "$direction" "${metrics_args[@]}" || {

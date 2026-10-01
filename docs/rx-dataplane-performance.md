@@ -61,7 +61,8 @@ path. Shared FEC frames are reused only after unique ownership is available.
 `TLSVPN_RX_RECYCLE=0` restores worker-side release as a negative control.
 
 `scripts/tap_recycle_perf.sh` runs recycle off/on/on/off at batch 16 for rs/rs,
-go/rs, and the unaffected go/go control. The receive buffer return change is in
+go/rs, and the unaffected go/go control. Each transfer lasts 10 seconds by default
+(`IPERF_SECONDS=1..120` overrides it). The receive buffer return change is in
 the Rust client, so rs/go is covered by the RX matrix but is not a recycling
 target. The same CI artifact contains these logs.
 

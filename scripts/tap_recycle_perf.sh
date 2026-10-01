@@ -15,8 +15,8 @@ for recycle in 0 1 1 0; do
     [[ "$srv" == go ]] && srv_bin="$GO_BIN"
     [[ "$cli" == go ]] && cli_bin="$GO_BIN"
     log="$out/${pair}-trial${trial}-recycle${recycle}.txt"
-    printf 'TAP_RECYCLE pair=%s trial=%s recycle=%s batch=16 bypass=1\n' "$pair" "$trial" "$recycle" | tee "$log"
-    TLSVPN_RX_RECYCLE="$recycle" TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
+    printf 'TAP_RECYCLE pair=%s trial=%s recycle=%s batch=16 bypass=1 seconds=%s\n' "$pair" "$trial" "$recycle" "${IPERF_SECONDS:-10}" | tee "$log"
+    IPERF_SECONDS="${IPERF_SECONDS:-10}" TLSVPN_RX_RECYCLE="$recycle" TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
       BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" \
       bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
     if grep -Fq '[netperf] SKIP:' "$log"; then
