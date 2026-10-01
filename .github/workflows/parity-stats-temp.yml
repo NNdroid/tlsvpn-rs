@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/parity-stats-temp.yml
       - scripts/parity_stats_temp.py
+      - scripts/parity_stats_scope_fix.py
   workflow_dispatch:
 
 permissions:
@@ -31,11 +32,12 @@ jobs:
       - name: Apply stats parity patch
         run: |
           python3 scripts/parity_stats_temp.py
+          python3 scripts/parity_stats_scope_fix.py
           cargo test --verbose
           node scripts/check_i18n.mjs
       - name: Commit product changes and self-clean
         run: |
-          rm -f scripts/parity_stats_temp.py .github/workflows/parity-stats-temp.yml
+          rm -f scripts/parity_stats_temp.py scripts/parity_stats_scope_fix.py .github/workflows/parity-stats-temp.yml
           git add -A
           git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
