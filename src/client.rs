@@ -2288,7 +2288,10 @@ fn flush_owned_frames(reorder_buf: &Mutex<ReorderBuffer>, delivery: &TapDelivery
     let mut reorder = reorder_buf.lock();
     if reorder.try_advance_sequences(input.iter().map(|(seq, _)| *seq)) {
         let mut ready = delivery.acquire_owned();
-        ready.extend(input.drain(..).map(|(_, frame)| frame));
+        for (_, frame) in input.drain(..) {
+            if frame.is_empty() { release_frame_vec(frame); }
+            else { ready.push(frame); }
+        }
         delivery.enqueue_owned(ready);
     } else {
         // A gap/reconnect/replay converts only the slow batch to shared storage.
@@ -2351,6 +2354,17 @@ mod tap_return_tests {
         reorder.lock().reset();
         flush_owned_frames(&reorder, &delivery, &mut vec![(20, vec![20])]);
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 20);
+    }
+
+    #[test]
+    fn owned_empty_payload_advances_sequence_without_tap_write() {
+        let (tx, rx) = mpsc::channel();
+        let delivery = TapDelivery::new_with_recycling(Arc::new(RecordingTap(tx)), true);
+        let reorder = Mutex::new(ReorderBuffer::new());
+        flush_owned_frames(&reorder, &delivery, &mut vec![(1, Vec::new()), (2, vec![2])]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        assert_eq!(reorder.lock().expected_seq_snapshot(), 3);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
