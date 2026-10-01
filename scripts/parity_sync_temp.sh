@@ -12,6 +12,7 @@ shared=(
   webui/frameviz.js
   webui/style.css
   webui/login.html
+  scripts/check_i18n.mjs
 )
 
 for f in "${shared[@]}"; do
@@ -29,7 +30,7 @@ done < <(find "$GO_DIR/webui/icons" -type f -print0 | sort -z)
 cp "$GO_DIR/config.client.json" config.client.json
 
 for f in "${shared[@]}"; do
-  test "$(git hash-object "$f")" = "$(git -C "$GO_DIR" hash-object "${f#webui/}" 2>/dev/null || git hash-object "$GO_DIR/$f")" || {
+  test "$(git hash-object "$f")" = "$(git hash-object "$GO_DIR/$f")" || {
     echo "blob mismatch after sync: $f" >&2
     exit 1
   }
