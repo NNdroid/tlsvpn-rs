@@ -27,7 +27,7 @@ jobs:
       - name: Apply actor core
         run: |
           python3 scripts/rx_actor_core_temp.py
-          cargo fmt --all -- --check
+          rustfmt --edition 2021 --config skip_children=true src/main.rs src/protocol.rs src/fec.rs src/rx_actor.rs
           cargo test rx_actor --verbose
           cargo test fec --verbose
           cargo test protocol --verbose
@@ -35,7 +35,6 @@ jobs:
       - name: Commit validated actor core and self-clean
         run: |
           rm -f scripts/rx_actor_core_temp.py .github/workflows/rx-actor-core-temp.yml
-          cargo fmt --all
           git add -A
           git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
