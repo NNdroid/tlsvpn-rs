@@ -46,7 +46,7 @@ function statsFixture() {
     clients: {}, conns: [], server_conns: [], mac_table: [], bans: [],
     tx_bytes: 0, rx_bytes: 0, tx_packets: 0, rx_packets: 0,
     dropped_frames: 0, tap_write_errors: 0,
-    fec: { enabled: false, parity_tx: 0, recovered: 0, lost: 0 },
+    fec: { enabled: false, parity_tx: 0, data_tx: 0, control_tx: 0, data_wire_bytes: 0, parity_wire_bytes: 0, counter_domain: 'written', enabled_sessions: 0, tx_active_sessions: 0, rx_bypass_sessions: 0, recovered: 0, lost: 0 },
     reorder: { dropped_frames: 0, skipped_frames: 0, gap_events: 0 },
     drop_breakdown: {}, padding: {}, sessions: {}, runtime: {},
     traffic: { daily: [] }, alerts: [], routes: [], rules: []

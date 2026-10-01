@@ -26,6 +26,7 @@ use crate::net::*;
 use crate::peer_info::{local_peer_info, normalize_peer_info, PeerInfo};
 use crate::tap::{MemTap, TapDevice};
 use crate::tcp_cork::TlsBatchCork;
+use crate::stats_accounting::{padding_snapshot, record_padding_write, TxFrameTotals};
 use crate::utils::*;
 
 // ======================= IP 地址池（对齐 Go assignIPsLocked 语义） =======================
@@ -473,18 +474,36 @@ impl WebStatsProvider for ServerCore {
         let mut rec = 0u64;
         let mut lost = 0u64;
         let mut parity = 0u64;
+        let mut data_tx = 0u64;
+        let mut control_tx = 0u64;
+        let mut data_wire = 0u64;
+        let mut parity_wire = 0u64;
+        let mut enabled_sessions = 0u64;
+        let mut tx_active_sessions = 0u64;
+        let mut rx_bypass_sessions = 0u64;
         let mut dropped = 0u64;
         let mut reorder_gap = 0u64;
         let mut reorder_flushes = 0u64;
         let mut reorder_skipped = 0u64;
         for (id, s) in sessions.iter() {
+            let w = s.stat.written.snapshot();
+            parity = parity.saturating_add(w.parity_frames);
+            data_tx = data_tx.saturating_add(w.data_frames);
+            control_tx = control_tx.saturating_add(w.control_frames);
+            data_wire = data_wire.saturating_add(w.data_wire_bytes);
+            parity_wire = parity_wire.saturating_add(w.parity_wire_bytes);
+            let conns = s.stat.active_conns.load(Ordering::Relaxed) as u64;
+            if s.fec_enc_k > 0 {
+                enabled_sessions += 1;
+                if conns >= 2 { tx_active_sessions += 1; }
+                if conns <= 1 { rx_bypass_sessions += 1; }
+            }
             let epoch = s.epoch_state.read();
             if let Some(dec) = &epoch.fec_dec {
                 let (r, l) = dec.stats();
                 rec += r;
                 lost += l;
             }
-            parity += s.port.parity_sent();
             dropped += s.port.dropped();
             let reorder = s.reorder_buf.lock().stats();
             reorder_gap += reorder.gap_events;
@@ -629,7 +648,8 @@ impl WebStatsProvider for ServerCore {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": dropped,
-            "fec": {"enabled": true, "parity_tx": parity, "recovered": rec, "lost": lost},
+            "fec": {"enabled": enabled_sessions > 0, "parity_tx": parity, "data_tx": data_tx, "control_tx": control_tx, "data_wire_bytes": data_wire, "parity_wire_bytes": parity_wire, "counter_domain": "written", "enabled_sessions": enabled_sessions, "tx_active_sessions": tx_active_sessions, "rx_bypass_sessions": rx_bypass_sessions, "recovered": rec, "lost": lost},
+            "padding": {"wire_bytes": padding_snapshot().0, "pad_bytes": padding_snapshot().1, "overhead_pct": if padding_snapshot().0 > 0 { padding_snapshot().1 as f64 * 100.0 / padding_snapshot().0 as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder_gap, "timeout_flushes": reorder_flushes, "skipped_frames": reorder_skipped},
             "mem": {"heap_alloc_mb": rss_mb(), "sys_mb": rss_mb(), "num_goroutine": thread_count()},
             "ip_pool": {"v4_used": v4_used, "v4_total": v4_total, "v6_used": v6_used},
@@ -1925,6 +1945,7 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     const TLS_WRITE_BATCH_BYTES: usize = STREAM_TLS_BATCH_SOFT_LIMIT;
     let mut pulled = 0u64;
     let mut pulled_payload = 0u64;
+    let mut written_batch = TxFrameTotals::default();
     let mut last_frame_start = None;
     sess.send_buf.clear();
     while let Some(batch) = try_recv_backend_batch(
@@ -1938,12 +1959,14 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         let batch_frames = batch.frames.len() as u64;
         for f in batch.frames {
             let ic_ref = if f.seq != 0 { ic_tx.as_deref() } else { None };
+            let before = sess.send_buf.len();
             last_frame_start = Some(append_unpadded_frame(
                 &mut sess.send_buf,
                 f.seq,
                 f.data.as_slice(),
                 ic_ref,
             ));
+            written_batch.add_frame(f.seq, f.data.as_slice(), sess.send_buf.len() - before);
             f.data.release();
         }
         pulled_payload = pulled_payload.saturating_add(batch_bytes);
@@ -1952,25 +1975,29 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
             break;
         }
     }
-    if pulled != 0 {
-        let _ = pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit);
-    }
+    let pad_bytes_batch = if pulled != 0 {
+        pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit)
+    } else {
+        0
+    };
 
     if !sess.send_buf.is_empty() {
         sess.batch_cork
             .before_write(&sess.socket, sess.send_buf.len());
-        if let Some(s) = &sess.client_session {
-            if pulled != 0 {
-                s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
-            }
-            s.stat
-                .tx_bytes
-                .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
-        }
         if let Err(e) = sess.tls.writer().write_all(&sess.send_buf) {
             debug!("closing session: tls plaintext writer failed: {}", e);
             *close = true;
             return;
+        }
+        if let Some(s) = &sess.client_session {
+            if pulled != 0 {
+                s.stat.tx_packets.fetch_add(pulled, Ordering::Relaxed);
+                s.stat.written.record(written_batch);
+                record_padding_write(sess.send_buf.len(), pad_bytes_batch);
+            }
+            s.stat
+                .tx_bytes
+                .fetch_add(sess.send_buf.len() as u64, Ordering::Relaxed);
         }
         sess.queued_payload_pending = sess.queued_payload_pending.saturating_add(pulled_payload);
         sess.send_buf.clear();
@@ -2109,6 +2136,9 @@ fn rotate_session_epoch(
         None
     };
     if let Some(old) = &epoch.fec_dec {
+        let (r, l) = old.stats();
+        session.stat.fec_recovered_lifetime.fetch_add(r, Ordering::Relaxed);
+        session.stat.fec_lost_lifetime.fetch_add(l, Ordering::Relaxed);
         old.reset();
     }
     session.reorder_buf.lock().reset();

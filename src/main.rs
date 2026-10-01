@@ -20,6 +20,7 @@ pub mod net;
 pub mod peer_info;
 pub mod protocol;
 pub mod server;
+pub mod stats_accounting;
 pub mod socks5;
 pub mod tap;
 pub mod tcp_cork;
