@@ -1,0 +1,43 @@
+name: One-shot RX actor core
+
+on:
+  push:
+    branches:
+      - perf/rx-session-actor
+    paths:
+      - .github/workflows/rx-actor-core-temp.yml
+      - scripts/rx_actor_core_temp.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout actor branch
+        uses: actions/checkout@v4
+        with:
+          ref: perf/rx-session-actor
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Apply actor core
+        run: |
+          python3 scripts/rx_actor_core_temp.py
+          cargo fmt --all -- --check
+          cargo test rx_actor --verbose
+          cargo test fec --verbose
+          cargo test protocol --verbose
+          cargo test --verbose
+      - name: Commit validated actor core and self-clean
+        run: |
+          rm -f scripts/rx_actor_core_temp.py .github/workflows/rx-actor-core-temp.yml
+          cargo fmt --all
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'perf: add session-owned RX actor core'
+          git push origin HEAD:perf/rx-session-actor
