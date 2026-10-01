@@ -2610,14 +2610,15 @@ fn handle_handshake(
                     None
                 };
                 Some(RxSessionActor::new(
-                    Arc::new(move |batch| {
-                        for ordered in batch {
+                    Arc::new(move |mut batch| {
+                        for ordered in batch.drain(..) {
                             if actor_mac != [0u8; 6] {
                                 vswitch.process_session_frame(&actor_client_id, actor_mac, ordered);
                             } else {
                                 vswitch.process_frame(&actor_client_id, ordered);
                             }
                         }
+                        batch
                     }),
                     initial_fec,
                 ))

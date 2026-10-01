@@ -12,8 +12,7 @@ const RX_ACTOR_IDLE_POLL: Duration = Duration::from_millis(250);
 /// Delivery consumes a ready vector and returns an empty vector for reuse.
 /// Client mode can exchange it with TapDelivery's existing pool; server mode
 /// drains and returns the same allocation.
-pub type RxDelivery =
-    Arc<dyn Fn(Vec<Arc<Vec<u8>>>) -> Vec<Arc<Vec<u8>>> + Send + Sync>;
+pub type RxDelivery = Arc<dyn Fn(Vec<Arc<Vec<u8>>>) -> Vec<Arc<Vec<u8>>> + Send + Sync>;
 
 pub struct RxFrame {
     pub seq: u32,

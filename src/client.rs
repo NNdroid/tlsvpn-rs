@@ -911,7 +911,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let rx_actor = if args.conns.max(1) > 1 {
         let delivery = tap_delivery.clone();
         Some(RxSessionActor::new(
-            Arc::new(move |batch| delivery.enqueue(batch)),
+            Arc::new(move |batch| {
+                delivery.enqueue(batch);
+                delivery.acquire()
+            }),
             None,
         ))
     } else {
