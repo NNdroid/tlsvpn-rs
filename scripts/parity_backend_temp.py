@@ -64,10 +64,7 @@ fn generate_persistent_self_signed(cert_path: &str, key_path: &str) -> Result<()
     let cert_pem = cert.pem();
     let key_pem = signing_key.serialize_pem();
 
-    // Match Go's persistence contract: key 0600, certificate 0644. A write
-    // failure is surfaced in Rust instead of silently rotating the pin on the
-    // next restart; a stable cert_sha256 identity is more important than
-    // limping forward with an ephemeral certificate.
+    // Match Go's persistence contract: key 0600, certificate 0644.
     std::fs::write(key_path, key_pem.as_bytes())
         .map_err(|e| format!("persist self-signed key {key_path}: {e}"))?;
     std::fs::write(cert_path, cert_pem.as_bytes())
@@ -127,7 +124,7 @@ if old not in ms:
 main.write_text(ms.replace(old, "", 1))
 
 # Update local maintainer notes/documentation that described the old deliberate
-# differences. Keep Rust-only workers/mtu caveat intact.
+# differences. Keep Rust-only workers/mtu and netifd caveats intact.
 ag = Path("AGENTS.md")
 a = ag.read_text()
 a = a.replace('''- Rust rejects `client.insecure` together with `client.cert_sha256`
@@ -145,4 +142,5 @@ openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \\
 # generates tlsvpn-selfsigned-cert.pem / tlsvpn-selfsigned-key.pem once and reuses them
 ''')
 r = r.replace('''`client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode also requires explicit `server.cert`/`server.key`, whereas Go can generate and persist a self-signed pair.''', '''`client.interface_manager=netifd` is a Go/OpenWrt integration and is currently rejected by Rust (use `self`). Rust server mode now matches Go when `server.cert`/`server.key` are empty: it generates and persists a reusable self-signed pair.''')
+r = r.replace('''| `server.cert` / `server.key` | (required) | server | TLS certificate pair (PEM). A missing file or a cert/key that don't match is reported as `Invalid configuration: server.cert …` and exits 1 — it must not be a panic |''', '''| `server.cert` / `server.key` | (empty) | server | TLS certificate pair (PEM). When both are empty, generate and persist `tlsvpn-selfsigned-cert.pem` / `tlsvpn-selfsigned-key.pem` like Go; when either is set, both must be set and valid |''')
 rd.write_text(r)
