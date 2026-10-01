@@ -1,0 +1,64 @@
+name: One-shot RX actor semantic diff cleanup
+
+on:
+  push:
+    branches:
+      - perf/rx-session-actor
+    paths:
+      - .github/workflows/rx-actor-semantic-clean-temp.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/rx-session-actor
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rebuild diff from semantic changes only
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          semantic=(src/client.rs src/server.rs src/fec.rs src/protocol.rs src/main.rs src/rx_actor.rs)
+          git diff -w origin/main...HEAD -- "${semantic[@]}" > /tmp/rx-semantic.patch
+          test -s /tmp/rx-semantic.patch
+
+          # Restore every file that rustfmt touched but RX ownership does not need.
+          git checkout origin/main -- \
+            src/api.rs src/hooks.rs src/stats_accounting.rs src/utils.rs src/web_parity.rs \
+            tests/dashboard_script_test.rs tests/gen_golden.rs tests/netperf_adaptive_contract.rs \
+            tests/protocol_conformance.rs tests/version_readme_contract.rs \
+            tests/webui_metrics_test.rs tests/webui_sse_test.rs
+
+          # Restore original repository formatting for semantic files too, then
+          # replay only the whitespace-insensitive RX actor changes.
+          git checkout origin/main -- src/client.rs src/server.rs src/fec.rs src/protocol.rs src/main.rs
+          rm -f src/rx_actor.rs
+          git apply /tmp/rx-semantic.patch
+
+          echo 'Changed files after semantic cleanup:'
+          git diff --name-only origin/main...HEAD
+          echo 'Whitespace-insensitive product diff:'
+          git diff -w --stat origin/main...HEAD
+
+      - name: Validate without rustfmt
+        run: |
+          cargo test rx_actor -- --nocapture
+          cargo test --test webui_sse_test --test dashboard_script_test
+          cargo test --no-run
+
+      - name: Commit semantic-only product diff
+        run: |
+          rm -f .github/workflows/rx-actor-semantic-clean-temp.yml
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'chore: remove rustfmt noise from RX actor change'
+          git push origin HEAD:perf/rx-session-actor
