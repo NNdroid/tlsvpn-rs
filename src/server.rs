@@ -854,46 +854,88 @@ impl WebStatsProvider for ServerCore {
 
 // ======================= TLS 材料 =======================
 
+const SELF_SIGNED_CERT_FILE: &str = "tlsvpn-selfsigned-cert.pem";
+const SELF_SIGNED_KEY_FILE: &str = "tlsvpn-selfsigned-key.pem";
+
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    if path.is_empty() {
-        return Err(
-            "server.cert is empty: this build does not auto-generate a self-signed cert \
-             (see README for the openssl one-liner)"
-                .into(),
-        );
-    }
-    let f = std::fs::File::open(path).map_err(|e| format!("server.cert {}: {}", path, e))?;
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open server.cert {path}: {e}"))?;
     let mut r = std::io::BufReader::new(f);
-    rustls_pemfile::certs(&mut r)
+    let certs: Vec<_> = rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("server.cert {}: invalid cert PEM: {}", path, e))
+        .map_err(|e| format!("cannot parse server.cert {path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("server.cert {path} contains no certificates"));
+    }
+    Ok(certs)
 }
 
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
-    if path.is_empty() {
-        return Err(
-            "server.key is empty: this build does not auto-generate a self-signed cert \
-             (see README for the openssl one-liner)"
-                .into(),
-        );
-    }
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("server.key {}: {}", path, e))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("server.key {}: invalid key PEM: {}", path, e))?
-        .ok_or_else(|| format!("server.key {}: no private key found", path))
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open server.key {path}: {e}"))?;
+    let mut r = std::io::BufReader::new(f);
+    rustls_pemfile::private_key(&mut r)
+        .map_err(|e| format!("cannot parse server.key {path}: {e}"))?
+        .ok_or_else(|| format!("server.key {path} contains no supported private key"))
 }
 
-/// 服务端 TLS 配置。历史上这一步的每个失败点都是 panic（unwrap / expect），
-/// 报的是 "Invalid TLS cert/key" 这种看不出哪份文件出问题的话。
-fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
+fn build_server_tls_from_paths(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(load_certs(cert)?, load_key(key)?)
-        .map_err(|e| format!("server.cert and server.key do not match: {}", e))?;
+        .map_err(|e| format!("invalid TLS cert/key pair ({cert}, {key}): {e}"))?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
+}
+
+fn generate_persistent_self_signed(cert_path: &str, key_path: &str) -> Result<(), String> {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(|e| format!("generate self-signed TLS certificate: {e}"))?;
+    let cert_pem = cert.pem();
+    let key_pem = signing_key.serialize_pem();
+
+    // Match Go's persistence contract: key 0600, certificate 0644.
+    std::fs::write(key_path, key_pem.as_bytes())
+        .map_err(|e| format!("persist self-signed key {key_path}: {e}"))?;
+    std::fs::write(cert_path, cert_pem.as_bytes())
+        .map_err(|e| format!("persist self-signed cert {cert_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod self-signed key {key_path}: {e}"))?;
+        std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("chmod self-signed cert {cert_path}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Server TLS behavior follows Go: an explicit pair is loaded verbatim; when
+/// both fields are empty a persistent self-signed pair is reused from the
+/// working directory or generated once under the same filenames Go uses.
+fn build_server_tls(cert: &str, key: &str) -> Result<Arc<ServerConfig>, String> {
+    if !cert.is_empty() || !key.is_empty() {
+        return build_server_tls_from_paths(cert, key);
+    }
+
+    match build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE) {
+        Ok(cfg) => {
+            info!("Loaded existing self-signed certificate from {}", SELF_SIGNED_CERT_FILE);
+            return Ok(cfg);
+        }
+        Err(e) => {
+            if std::path::Path::new(SELF_SIGNED_CERT_FILE).exists()
+                || std::path::Path::new(SELF_SIGNED_KEY_FILE).exists()
+            {
+                warn!("Failed to load existing self-signed pair ({e}); regenerating");
+            }
+        }
+    }
+
+    generate_persistent_self_signed(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)?;
+    info!("Generated self-signed certificate and persisted it to {} / {}", SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE);
+    build_server_tls_from_paths(SELF_SIGNED_CERT_FILE, SELF_SIGNED_KEY_FILE)
 }
 
 // ======================= 服务端主流程 =======================

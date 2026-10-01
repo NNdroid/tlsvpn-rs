@@ -8,6 +8,7 @@ tun-rs = "2"
 mio = { version = "0.8", features = ["net", "os-poll"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+rcgen = "0.14.10"
 webpki-roots = "0.26"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"

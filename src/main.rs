@@ -568,9 +568,6 @@ fn validate_args(args: &Args) -> Result<(), String> {
                 return Err("client cert_sha256 must be 64 hex chars (sha256)".into());
             }
         }
-        if args.insecure && !args.cert_sha256.is_empty() {
-            return Err("client.insecure and client.cert_sha256 cannot be enabled together".into());
-        }
     }
     // 上限是拒绝服务阀值：负数无意义，超大值等于关掉保护（对齐 Go Validate）
     if args.mode == "server" && !(0..=1 << 20).contains(&args.max_sessions) {

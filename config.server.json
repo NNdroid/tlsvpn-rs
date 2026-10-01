@@ -7,27 +7,24 @@
   "down": "",
   "encrypt": true,
   "enc_algo": "gcm256",
-  "min_enc": "gcm",
   "pad_mode": "bucket",
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
-  "traffic_days": 30,
-  "traffic_file": "",
   "tap": "tap0",
   "mac": "",
   "web": {
     "addr": ":8080",
-    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "bind": "tunnel",
+    "auth": "admin:REPLACE-WITH-A-RANDOM-PASSWORD",
     "cert": "",
     "key": ""
   },
   "server": {
     "v4_cidr": "10.0.0.0/24",
     "v6_cidr": "fd00::/64",
-    "cert": "server.crt",
-    "key": "server.key",
+    "cert": "",
+    "key": "",
     "max_sessions": 1024
   }
 }
