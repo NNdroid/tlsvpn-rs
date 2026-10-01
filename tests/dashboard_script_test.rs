@@ -19,6 +19,10 @@ fn webui_matches_shared_static_asset_contract() {
     assert!(i18n_pos < app_pos, "i18n.js must load before app.js");
     assert!(!index.contains("zh-tw.js") && !index.contains("frameviz-zh-tw.js"));
     assert!(!app.contains("const I18N={"));
+    assert!(
+        app.contains("requestAnimationFrame(function(){if(dlCur===sel)dlPlace(sel);});"),
+        "custom dropdown must stay open and follow its trigger during page scroll"
+    );
     for marker in ["const I18N={", "const FRAMEVIZ_I18N=", "'zh-CN'", "'zh-TW'", "'de'", "'fr'", "'ja'", "Frame format example", "FEC recovery rate"] {
         assert!(i18n.contains(marker), "i18n.js missing {marker:?}");
     }
