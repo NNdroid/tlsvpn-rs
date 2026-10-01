@@ -1,0 +1,44 @@
+name: One-shot stats parity
+
+on:
+  push:
+    branches:
+      - parity/go-main-20261001
+    paths:
+      - .github/workflows/parity-stats-temp.yml
+      - scripts/parity_stats_temp.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout parity branch
+        uses: actions/checkout@v4
+        with:
+          ref: parity/go-main-20261001
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply stats parity patch
+        run: |
+          python3 scripts/parity_stats_temp.py
+          cargo fmt --all -- --check
+          cargo test --verbose
+          node scripts/check_i18n.mjs
+      - name: Commit product changes and self-clean
+        run: |
+          rm -f scripts/parity_stats_temp.py .github/workflows/parity-stats-temp.yml
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'stats: align written FEC and padding counters with Go'
+          git push origin HEAD:parity/go-main-20261001
