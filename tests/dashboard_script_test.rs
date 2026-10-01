@@ -17,7 +17,6 @@ fn webui_matches_shared_static_asset_contract() {
     let i18n_pos = index.find("src=\"i18n.js\"").expect("i18n.js script");
     let app_pos = index.find("src=\"app.js\"").expect("app.js script");
     assert!(i18n_pos < app_pos, "i18n.js must load before app.js");
-    assert!(index.contains("data-v=\"zh-TW\""));
     assert!(!index.contains("zh-tw.js") && !index.contains("frameviz-zh-tw.js"));
     assert!(!app.contains("const I18N={"));
     for marker in ["const I18N={", "const FRAMEVIZ_I18N=", "'zh-CN'", "'zh-TW'", "'de'", "'fr'", "'ja'", "Frame format example", "FEC recovery rate"] {

@@ -280,6 +280,16 @@ const FRAMEVIZ_I18N={
     ja:{title:'フレーム形式の例',sub:'現在のデータプレーン · 集約 Write · ライブキャプチャではありません',example:'内部 AEAD を使用する 1514 B Ethernet データフレーム',header:'ヘッダー',cipher:'暗号文',tag:'認証タグ',tail:'batch 末尾のみ任意 Padding',batch:'TLS plaintext batch',detail:'プロトコル詳細'}
   };
 
+const STATS_LABELS={
+ 'zh-CN':['校验字节 / DATA 字节','已协商 {enabled} · TX 工作 {tx} · RX 旁路 {bypass}','DATA 活跃','DATA 待命','负载写入 EWMA','分配负载（会话内占比）','进程累计发送','进程累计接收'],
+ 'zh-TW':['校驗位元組 / DATA 位元組','已協商 {enabled} · TX 工作 {tx} · RX 旁路 {bypass}','DATA 活躍','DATA 待命','負載寫入 EWMA','分配負載（工作階段內占比）','程序累計傳送','程序累計接收'],
+ en:['Parity bytes / DATA bytes','Negotiated {enabled} · TX active {tx} · RX bypass {bypass}','DATA active','DATA standby','Payload write EWMA','Assigned payload (session share)','Process TX total','Process RX total'],
+ de:['Paritätsbytes / DATA-Bytes','Ausgehandelt {enabled} · TX aktiv {tx} · RX Bypass {bypass}','DATA aktiv','DATA Standby','Nutzlast-Write-EWMA','Zugewiesene Nutzlast (Sitzungsanteil)','Prozess TX gesamt','Prozess RX gesamt'],
+ fr:['Octets de parité / octets DATA','Négocié {enabled} · TX actif {tx} · RX bypass {bypass}','DATA actif','DATA en attente','EWMA écriture utile','Charge attribuée (part de session)','Total TX du processus','Total RX du processus'],
+ ja:['パリティバイト / DATA バイト','協商済 {enabled} · TX 稼働 {tx} · RX バイパス {bypass}','DATA 稼働','DATA 待機','ペイロード書込 EWMA','割当ペイロード（セッション内割合）','プロセス累計 TX','プロセス累計 RX']
+};
+Object.keys(STATS_LABELS).forEach(function(lang){const x=STATS_LABELS[lang],d=I18N[lang];d.kpi.overhead=x[0];d.dg.fecovh=x[0];d.stats={fec_state:x[1],fec_mixed:{'zh-CN':'多个分组（按会话）','zh-TW':'多個分組（依工作階段）',en:'Mixed groups (per session)',de:'Gemischte Gruppen (pro Sitzung)',fr:'Groupes mixtes (par session)',ja:'混在グループ（セッション別）'}[lang]};d.sched.active=x[2];d.sched.standby=x[3];d.sched.capacity=x[4];d.sched.assign=x[5];d.kpi.tx=x[6];d.kpi.rx=x[7];});
+
 // 浏览器语言 → 面板语言：前缀匹配，zh 系一律落到 zh-CN（简体）
 function detectLang(){
   const l=(navigator.language||'en').toLowerCase();

@@ -5,7 +5,7 @@
   'use strict';
 
   let source=null,controller=null,retryTimer=null,retryMs=1000,generation=0;
-  const TYPES=['stats','trend','logs','events'];
+  const TYPES=['stats','trend','logs','events','diagnostics'];
 
   function streamPath(){
     const q=new URLSearchParams();
@@ -25,6 +25,7 @@
       else if(type==='trend')applyTrend(payload);
       else if(type==='logs')applyLogs(payload);
       else if(type==='events')applyEvents(payload);
+      else if(type==='diagnostics'&&window.applyDiagnostics)window.applyDiagnostics(payload);
     }catch(err){
       console.error('dashboard SSE '+type+' decode failed',err);
     }
