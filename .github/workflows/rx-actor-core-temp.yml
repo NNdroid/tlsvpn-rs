@@ -27,6 +27,42 @@ jobs:
       - name: Apply actor core
         run: |
           python3 scripts/rx_actor_core_temp.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/protocol.rs')
+          s = p.read_text()
+          old = '''        let generation = self.generation.get_mut();
+                  if control.generation <= *generation {
+                      return false;
+                  }
+                  let (from, _) = self.window();
+                  *generation = control.generation;
+          '''
+          new = '''        let (from, _) = self.window();
+                  let generation = self.generation.get_mut();
+                  if control.generation <= *generation {
+                      return false;
+                  }
+                  *generation = control.generation;
+          '''
+          if old not in s:
+              raise SystemExit('protocol apply_actor borrow marker not found')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('src/fec.rs')
+          s = p.read_text()
+          old = '''        let k_self = self.k;
+                  let inner = self.inner.get_mut();
+                  let retired = self.retired_before.load(Ordering::Acquire);
+          '''
+          new = '''        let k_self = self.k;
+                  let retired = self.retired_before.load(Ordering::Acquire);
+                  let inner = self.inner.get_mut();
+          '''
+          if old not in s:
+              raise SystemExit('fec actor parity borrow marker not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
           rustfmt --edition 2021 --config skip_children=true src/main.rs src/protocol.rs src/fec.rs src/rx_actor.rs
           cargo test rx_actor --verbose
           cargo test fec --verbose
