@@ -699,12 +699,15 @@ function dlOutside(ev){
   dlClose(sel);
 }
 
-// 页面滚动时 fixed 弹层不会跟着动，收起比留一个错位菜单强；菜单自己滚动不算
+// 页面滚动时重新计算 fixed 弹层位置；菜单自身滚动保持展开。
+// 浏览器/辅助技术可能在展开后为目标选项自动滚动页面，若此处直接关闭会形成
+// "已打开 -> 自动滚动 -> 点击前关闭" 的竞态，真实键盘/窄屏交互同样可能触发。
 function dlScroll(ev){
   if(!dlCur)return;
-  const st=DL.get(dlCur);
-  if(st&&ev&&ev.target===st.menu)return;
-  dlClose(dlCur);
+  const sel=dlCur,st=DL.get(sel);
+  if(!st)return;
+  if(ev&&(ev.target===st.menu||st.menu.contains(ev.target)))return;
+  requestAnimationFrame(function(){if(dlCur===sel)dlPlace(sel);});
 }
 
 // Esc 收起（触发器没聚焦时也要有效）；Tab 让焦点正常走
