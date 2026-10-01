@@ -1,0 +1,37 @@
+name: One-shot current Go WebUI parity
+
+on:
+  push:
+    branches:
+      - parity/go-main-20261001
+    paths:
+      - .github/workflows/parity-resync-go-webui-temp.yml
+      - scripts/parity_resync_go_webui_temp.sh
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Rust parity branch
+        uses: actions/checkout@v4
+        with:
+          ref: parity/go-main-20261001
+          fetch-depth: 0
+      - name: Checkout authoritative Go main
+        uses: actions/checkout@v4
+        with:
+          repository: NNdroid/tlsvpn
+          ref: main
+          path: go-impl
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Sync current shared assets and verify in Chromium
+        run: bash scripts/parity_resync_go_webui_temp.sh go-impl
