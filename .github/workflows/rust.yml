@@ -56,9 +56,9 @@ jobs:
       env:
         TLSVPN_GOLDEN: "testdata/protocol_golden.json"
       run: |
-        # This branch tracks the merged Go protocol-v3 line.
+        # Go main is the protocol-v3 source paired with Rust main.
         curl -fsSL -o testdata/protocol_golden.json \
-          "https://raw.githubusercontent.com/NNdroid/tlsvpn/perf/single-path-fec-bypass/testdata/protocol_golden.json" \
+          "https://raw.githubusercontent.com/NNdroid/tlsvpn/main/testdata/protocol_golden.json" \
           || echo "golden vector fetch failed — running without cross-check"
         cargo test --verbose --test protocol_conformance
 
@@ -92,13 +92,12 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: NNdroid/tlsvpn
-        ref: perf/single-path-fec-bypass
+        ref: main
         path: go-impl
 
     - name: Record the Go commit this run builds
       run: |
-        # This Rust branch is the counterpart of the Go protocol-v3 branch.
-        # Build that exact line so CI tests the contract being synchronized.
+        # Rust main always validates against the current Go main protocol line.
         git -C go-impl log -1 --format='go-impl @ %h (%s)'
         cat <<'EOF'
         If the Go build below fails on tlsvpn source, the break is in NNdroid/tlsvpn,
@@ -163,13 +162,12 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: NNdroid/tlsvpn
-        ref: perf/single-path-fec-bypass
+        ref: main
         path: go-impl
 
     - name: Record the Go commit this run builds
       run: |
-        # This Rust branch is the counterpart of the Go protocol-v3 branch.
-        # Build that exact line so CI tests the contract being synchronized.
+        # Rust main always validates against the current Go main protocol line.
         git -C go-impl log -1 --format='go-impl @ %h (%s)'
         cat <<'EOF'
         If the Go build below fails on tlsvpn source, the break is in NNdroid/tlsvpn,
