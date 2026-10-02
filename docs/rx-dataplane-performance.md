@@ -77,9 +77,11 @@ and physical ARM device measurements remain outstanding.
 
 ## Second optimization pass (experimental controls)
 
-The candidates remain opt-in until real-TAP A/B results justify a default change:
+Static single-path owned RX is enabled by default; the other candidates remain
+opt-in until real-TAP A/B results justify a default change:
 
-* `TLSVPN_RX_OWNED=1`: static single-connection/no-FEC client RX keeps unique
+* `TLSVPN_RX_OWNED=0` disables the default static single-connection/no-FEC client
+  RX ownership path. It keeps unique
   payload Vecs through TAP delivery. A batch with a gap or replay converts to
   shared storage and uses the existing reorder path. Both delivery variants
   share one bounded FIFO; each return pool retains at most 512 KiB, or 1 MiB

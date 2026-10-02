@@ -1810,7 +1810,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
     let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(rx_batch_cap);
     let mut owned_input: Vec<(u32, Vec<u8>)> = Vec::with_capacity(rx_batch_cap);
-    let owned_rx = static_rx && std::env::var("TLSVPN_RX_OWNED").as_deref() == Ok("1");
+    let owned_rx = static_rx && std::env::var("TLSVPN_RX_OWNED").as_deref() != Ok("0");
 
     // Keep one plaintext batch below rustls' bounded outgoing plaintext
     // buffer. Oversized write_all() can hit WriteZero ("failed to write whole
