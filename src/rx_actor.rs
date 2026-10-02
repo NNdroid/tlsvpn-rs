@@ -7,6 +7,20 @@ use crate::buffer::{release_shared_frame, DeDuplicator, ReorderBuffer, ReorderSt
 use crate::fec::FecDecoder;
 
 pub const RX_ACTOR_BATCH_CAP: usize = 16;
+/// Process-local controls for reproducible dataplane comparisons. These do not
+/// alter the wire/config contract and are sampled only once, outside frame loops.
+pub fn rx_batch_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| match std::env::var("TLSVPN_RX_BATCH_SIZE").ok().and_then(|s| s.parse().ok()) {
+        Some(n @ (16 | 32 | 64 | 128)) => n,
+        _ => RX_ACTOR_BATCH_CAP,
+    })
+}
+
+pub fn rx_bypass_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TLSVPN_RX_BYPASS").as_deref() != Ok("0"))
+}
 const RX_ACTOR_IDLE_POLL: Duration = Duration::from_millis(250);
 
 /// Delivery consumes a ready vector and returns an empty vector for reuse.
@@ -114,7 +128,8 @@ impl RxSessionActor {
         RxProducer {
             actor: self.clone(),
             generation: self.generation.load(Ordering::Acquire),
-            batch: Vec::with_capacity(RX_ACTOR_BATCH_CAP),
+            batch: Vec::with_capacity(rx_batch_size()),
+            batch_cap: rx_batch_size(),
             ready: Vec::with_capacity(64),
             error: Arc::new(ProducerError::new()),
         }
@@ -257,6 +272,7 @@ pub struct RxProducer {
     actor: Arc<RxSessionActor>,
     generation: u64,
     batch: Vec<RxFrame>,
+    batch_cap: usize,
     ready: Vec<Arc<Vec<u8>>>,
     error: Arc<ProducerError>,
 }
@@ -268,7 +284,7 @@ impl RxProducer {
             return false;
         }
         self.batch.push(RxFrame { seq, data });
-        if self.batch.len() >= RX_ACTOR_BATCH_CAP || seq == 0 {
+        if self.batch.len() >= self.batch_cap || seq == 0 {
             self.flush()
         } else {
             true

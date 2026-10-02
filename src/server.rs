@@ -298,6 +298,8 @@ struct MioSession {
     ic_rx: Option<Arc<InnerCipher>>,
     session_epoch: u64,
     rx_producer: Option<RxProducer>,
+    fec_data_batch: Vec<(u32, Arc<Vec<u8>>)>,
+    reorder_input: Vec<(u32, Arc<Vec<u8>>)>,
     write_stalled: Option<Instant>,
     queued_payload_pending: u64,
     brutal_applied: bool,
@@ -1442,6 +1444,8 @@ fn worker_loop(
                     ic_rx: None,
                     session_epoch: 0,
                     rx_producer: None,
+                    fec_data_batch: Vec::with_capacity(crate::rx_actor::rx_batch_size()),
+                    reorder_input: Vec::with_capacity(crate::rx_actor::rx_batch_size()),
                     write_stalled: None,
                     queued_payload_pending: 0,
                     brutal_applied: false,
@@ -1774,8 +1778,10 @@ fn process_plain_frames(
     let mut rx_packets_batch = 0u64;
     let mut batch_session: Option<Arc<ClientSession>> = None;
     let mut batch_fec_dec: Option<Arc<FecDecoder>> = None;
-    let mut fec_data_batch: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
-    let mut reorder_input: Vec<(u32, Arc<Vec<u8>>)> = Vec::with_capacity(64);
+    let rx_batch_cap = crate::rx_actor::rx_batch_size();
+    let rx_bypass_enabled = crate::rx_actor::rx_bypass_enabled();
+    let mut fec_data_batch = std::mem::take(&mut sess.fec_data_batch);
+    let mut reorder_input = std::mem::take(&mut sess.reorder_input);
 
     loop {
         match sess.scanner.read_frame(&mut sess.tls.reader()) {
@@ -1893,13 +1899,16 @@ fn process_plain_frames(
                         fec_data_batch.push((seq, data.clone()));
                     }
 
-                    if !c_sess.dedup.is_duplicate(seq) {
+                    let static_rx = c_sess.rx_actor.is_none() && fec_dec.is_none()
+                        && c_sess.stat.active_conns.load(Ordering::Acquire) == 1
+                        && rx_bypass_enabled;
+                    if static_rx || !c_sess.dedup.is_duplicate(seq) {
                         reorder_input.push((seq, data));
                     } else {
                         release_shared_frame(data);
                     }
 
-                    if fec_data_batch.len() >= 64 || reorder_input.len() >= 64 {
+                    if fec_data_batch.len() >= rx_batch_cap || reorder_input.len() >= rx_batch_cap {
                         flush_server_rx_batch(
                             &c_sess,
                             core,
@@ -1950,6 +1959,8 @@ fn process_plain_frames(
         );
     }
 
+    sess.fec_data_batch = fec_data_batch;
+    sess.reorder_input = reorder_input;
     if rx_packets_batch != 0 {
         if let Some(s) = &sess.client_session {
             s.stat.rx_bytes.fetch_add(rx_bytes_batch, Ordering::Relaxed);
@@ -1984,9 +1995,19 @@ fn flush_server_rx_batch(
     ready.clear();
     {
         let mut reorder = c_sess.reorder_buf.lock();
-        for (seq, frame) in reorder_input.drain(..) {
-            reorder.insert_into(seq, frame, ready);
+        let direct = c_sess.rx_actor.is_none() && fec_dec.is_none()
+            && c_sess.stat.active_conns.load(Ordering::Acquire) == 1
+            && crate::rx_actor::rx_bypass_enabled()
+            && reorder.try_direct_batch(reorder_input, ready);
+        if !direct {
+            for (seq, frame) in reorder_input.drain(..) {
+                reorder.insert_into(seq, frame, ready);
+            }
         }
+    }
+    if c_sess.mac_bin != [0; 6] && switch_batch_enabled() {
+        core.vswitch.process_session_batch(&c_sess.stat.client_id, c_sess.mac_bin, ready);
+        return;
     }
     for ordered in ready.drain(..) {
         if c_sess.mac_bin != [0u8; 6] {
@@ -1996,6 +2017,11 @@ fn flush_server_rx_batch(
             core.vswitch.process_frame(&c_sess.stat.client_id, ordered);
         }
     }
+}
+
+fn switch_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TLSVPN_SWITCH_BATCH").as_deref() == Ok("1"))
 }
 
 /// 从端口通道拉帧成批发送（对齐 Go 下行写协程）
@@ -2611,6 +2637,10 @@ fn handle_handshake(
                 };
                 Some(RxSessionActor::new(
                     Arc::new(move |mut batch| {
+                        if actor_mac != [0; 6] && switch_batch_enabled() {
+                            vswitch.process_session_batch(&actor_client_id, actor_mac, &mut batch);
+                            return batch;
+                        }
                         for ordered in batch.drain(..) {
                             if actor_mac != [0u8; 6] {
                                 vswitch.process_session_frame(&actor_client_id, actor_mac, ordered);

@@ -15,14 +15,52 @@ pub fn tap_read_buffer_size(mtu: u16) -> usize {
 pub trait TapDevice: Send + Sync {
     fn send(&self, data: &[u8]) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Opportunistic drain by the device's sole reader; never wait for a batch.
+    fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::WouldBlock.into())
+    }
 }
 
 impl TapDevice for SyncDevice {
     fn send(&self, data: &[u8]) -> io::Result<()> {
-        SyncDevice::send(self, data).map(|_| ())
+        loop {
+            match SyncDevice::send(self, data) {
+                #[cfg(target_os = "linux")]
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_device(self, libc::POLLOUT)?,
+                result => return result.map(|_| ()),
+            }
+        }
     }
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match SyncDevice::recv(self, buf) {
+                #[cfg(target_os = "linux")]
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_device(self, libc::POLLIN)?,
+                result => return result,
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Only used by the sole reader after opting into nonblocking TAP mode.
+        // No per-packet readiness syscall: EAGAIN ends the opportunistic batch.
         SyncDevice::recv(self, buf)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_device(dev: &SyncDevice, events: i16) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd { fd: dev.as_raw_fd(), events, revents: 0 };
+    loop {
+        let n = unsafe { libc::poll(&mut fd, 1, -1) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(e);
+        }
+        if fd.revents & events != 0 { return Ok(()); }
+        return Err(io::ErrorKind::BrokenPipe.into());
     }
 }
 

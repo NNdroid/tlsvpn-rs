@@ -29,3 +29,7 @@ dist/
 # 编译产物（误放仓库根目录的探针二进制；Go 探针源码在 ../tlsvpn/interop/）
 go_webtls
 rs_webtls
+
+# Generated performance reports and Python helper bytecode.
+perf-results/
+__pycache__/

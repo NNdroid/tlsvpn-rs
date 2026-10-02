@@ -30,6 +30,7 @@
 # Fixed addressing (defaults): v4 10.77.0.0/24 (gw .1 = server, client .2),
 # v6 fd77::/64 (gw fd77::1, client fd77::2).
 set -uo pipefail
+PERF_METRICS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/perf_metrics.py"
 
 PORT="${PORT:-18600}"
 SUBNET_V4="${SUBNET_V4:-10.77.0.0/24}"
@@ -38,6 +39,10 @@ CLI_V4="10.77.0.2"
 GW_V6="fd77::1"
 CLI_V6="fd77::2"
 IPERF_MIN_MBPS="${IPERF_MIN_MBPS:-100}"
+IPERF_SECONDS="${IPERF_SECONDS:-3}"
+[[ "$IPERF_SECONDS" =~ ^[0-9]+$ ]] && (( IPERF_SECONDS >= 1 && IPERF_SECONDS <= 120 )) || {
+  echo '[netperf] invalid IPERF_SECONDS (expected 1..120)'; exit 2;
+}
 PERF_CONNS="${PERF_CONNS:-4}"
 FLAVOR_SRV="${FLAVOR_SRV:-rs}"
 FLAVOR_CLI="${FLAVOR_CLI:-rs}"
@@ -155,6 +160,10 @@ impl_config() {
 }
 
 cleanup() {
+  if [[ -n "${PERF_PROFILE_DIR:-}" && -d "$SRV_DIR" ]]; then
+    mkdir -p "$PERF_PROFILE_DIR"
+    cp "$SRV_DIR"/*.log "$PERF_PROFILE_DIR/" 2>/dev/null || true
+  fi
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   sleep 0.5
   ip netns del "$NS_SRV" 2>/dev/null || true
@@ -338,9 +347,60 @@ PY
 iperf_one_way() {
   local label="$1" extra="${2:-}" direction="${3:-upload}"
   local json mbps
-  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t 3 -J $extra 2>/dev/null) || {
+  local metrics_file="$SRV_DIR/metrics-$direction.json"
+  local metrics_args=("$srv_tunnel_pid" "$cli_tunnel_pid" "$NS_SRV" "$NS_CLI" "$TAP_SRV" "$TAP_CLI")
+  local profiler=""
+  local pinger=""
+  if [[ "${PERF_LATENCY:-0}" == 1 ]]; then
+    ip netns exec "$NS_CLI" ping -n -i 0.05 -c "$((IPERF_SECONDS * 20))" -w "$((IPERF_SECONDS + 2))" "$GW_V4" \
+      > "$SRV_DIR/ping-load-$direction.log" 2>&1 &
+    pinger=$!
+    PIDS+=("$pinger")
+  fi
+  if [[ -n "${PERF_PROFILE_DIR:-}" && "${PERF_PROFILE_CPU:-1}" == 1 ]]; then
+    mkdir -p "$PERF_PROFILE_DIR"
+    local perf_tool="${PERF_TOOL:-perf}"
+    if ! "$perf_tool" stat -e cpu-clock -- true >/dev/null 2>&1; then
+      for tool in /usr/lib/linux-tools/*/perf; do
+        if [[ -x "$tool" ]] && "$tool" stat -e cpu-clock -- true >/dev/null 2>&1; then perf_tool="$tool"; break; fi
+      done
+    fi
+    if "$perf_tool" stat -e cpu-clock -- true >/dev/null 2>&1; then
+      "$perf_tool" record -e cpu-clock -F 99 -g --call-graph fp -p "$srv_tunnel_pid,$cli_tunnel_pid" \
+        -o "$PERF_PROFILE_DIR/$direction.data" -- sleep "$IPERF_SECONDS" \
+        >"$PERF_PROFILE_DIR/$direction-perf.log" 2>&1 &
+      profiler=$!
+      PIDS+=("$profiler")
+    else
+      echo 'PERF_PROFILE SKIP: perf tool or CPU-clock permission unavailable' | tee "$PERF_PROFILE_DIR/SKIP.txt"
+    fi
+  fi
+  python3 "$PERF_METRICS_SCRIPT" start "$metrics_file" "$direction" "${metrics_args[@]}" || {
+    fail "could not sample VPN CPU/TAP counters before $direction"; return 1;
+  }
+  json=$(ip netns exec "$NS_CLI" iperf3 -c "$GW_V4" -p "$((PORT + 1))" -t "$IPERF_SECONDS" -J $extra 2>/dev/null) || {
     fail "iperf3 $label: transfer failed"; return 1;
   }
+  python3 "$PERF_METRICS_SCRIPT" finish "$metrics_file" "$direction" "${metrics_args[@]}" || {
+    fail "could not sample VPN CPU/TAP counters after $direction"; return 1;
+  }
+  if [[ -n "$profiler" ]]; then
+    wait "$profiler" || { fail 'perf record failed'; return 1; }
+    # perf creates root-owned mode-0600 data; the CI artifact uploader is not root.
+    chmod a+r "$PERF_PROFILE_DIR/$direction.data"
+    "$perf_tool" report --stdio -i "$PERF_PROFILE_DIR/$direction.data" \
+      > "$PERF_PROFILE_DIR/$direction-report.txt"
+    "$perf_tool" script -i "$PERF_PROFILE_DIR/$direction.data" \
+      > "$PERF_PROFILE_DIR/$direction-stacks.txt"
+    python3 "$(dirname "$PERF_METRICS_SCRIPT")/perf_flame.py" \
+      "$PERF_PROFILE_DIR/$direction-stacks.txt" "$PERF_PROFILE_DIR/$direction-flame.svg"
+    echo "PERF_PROFILE captured direction=$direction"
+  fi
+  if [[ -n "$pinger" ]]; then
+    wait "$pinger" || true
+    python3 "$(dirname "$PERF_METRICS_SCRIPT")/latency_metrics.py" \
+      "$SRV_DIR/ping-load-$direction.log" "$direction" || { fail 'load latency sample invalid'; return 1; }
+  fi
   # iperf3 -J 的 end.sum_received / end.sum_sent 位于 JSON 尾部；
   # 最后一个 bits_per_second 就是最终汇总速率。用 grep+awk 解析，避免
   # hosted runner / 极简 rootfs 缺 Python 时把吞吐断言静默降级成“transfer ok”。
@@ -454,6 +514,7 @@ run_group() {
 
   ip netns exec "$NS_SRV" "$BIN_SRV" -c "$scfg" > "$SRV_DIR/srv.log" 2>&1 &
   local srv_pid=$!
+  local srv_tunnel_pid=$srv_pid
   PIDS+=($srv_pid)
   if ! wait_for_port "$NS_CLI" "$UNDERLAY_SRV" "$PORT" 20; then
     fail "server did not start ($UNDERLAY_SRV:$PORT never opened/reached within 20s)"
@@ -489,6 +550,7 @@ run_group() {
       "\"client\": {\"cert_sha256\": \"$fp\", \"conns\": $PERF_CONNS}"
   fi
   ip netns exec "$NS_CLI" "$BIN_CLI" -c "$ccfg" > "$SRV_DIR/cli.log" 2>&1 &
+  local cli_tunnel_pid=$!
   PIDS+=($!)
 
   if ! wait_for_client_ip; then
