@@ -85,7 +85,9 @@ The candidates remain opt-in until real-TAP A/B results justify a default change
   share one bounded FIFO; each return pool retains at most 512 KiB, or 1 MiB
   combined when both variants are present. The session batch mutex remains.
 * `TLSVPN_TX_BATCH=1`: the client TAP reader drains already-readable packets
-  without waiting. A single-backend/no-FEC port assigns sequences and queues
+  without waiting. On Linux its fd is nonblocking and EAGAIN ends the batch;
+  normal recv/send wait for readiness only on EAGAIN, preserving their blocking
+  behavior without a per-packet poll syscall. A single-backend/no-FEC port assigns sequences and queues
   the batch under one queue lock, with one wake. FEC/multipath keeps the existing
   scheduler/fence path. Queue headroom and sequence exhaustion still drop safely.
 * `TLSVPN_RX_COMPACT=1`: scanner tail compaction is deferred until storage is

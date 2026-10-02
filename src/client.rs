@@ -865,6 +865,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             builder
         };
         let dev = builder.build_sync().unwrap();
+        #[cfg(target_os = "linux")]
+        if std::env::var("TLSVPN_TX_BATCH").as_deref() == Ok("1") {
+            dev.set_nonblocking(true).expect("TAP nonblocking mode for batched reads");
+        }
         Arc::new(dev)
     };
 
