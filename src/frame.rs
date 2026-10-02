@@ -247,14 +247,14 @@ impl FrameScanner {
             (data, seq)
         };
 
-        self.compact_consumed();
+        self.compact_consumed(false);
         Ok(Some(out))
     }
 
     #[inline]
-    fn compact_consumed(&mut self) {
+    fn compact_consumed(&mut self, before_read: bool) {
         if self.lazy_compact && self.offset != self.buffer.len()
-            && self.buffer.len() < self.buffer.capacity() { return; }
+            && (!before_read || self.buffer.len() < self.buffer.capacity()) { return; }
         if self.offset > 0 && (self.offset == self.buffer.len()
             || if self.lazy_compact { self.buffer.len() == self.buffer.capacity() } else { self.offset > 16384 }) {
             let remain = self.buffer.len() - self.offset;
@@ -278,7 +278,7 @@ impl FrameScanner {
             }
 
             // 有已消费前缀时先整理，给后续 socket read 尽量大的连续尾部。
-            self.compact_consumed();
+            self.compact_consumed(true);
 
             if self.buffer.len() == self.buffer.capacity() {
                 self.buffer.reserve(16384);
@@ -402,6 +402,31 @@ impl VPNFrameBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lazy_compaction_does_not_move_tail_after_each_full_buffer_frame() {
+        let mut stream = Vec::new();
+        for seq in 1..=11 {
+            append_frame_head(&mut stream, 1500, 0, seq);
+            stream.extend_from_slice(&[seq as u8; 1500]);
+        }
+        let mut scanner = FrameScanner::new();
+        scanner.lazy_compact = true;
+        scanner.buffer.extend_from_slice(&stream[..HANDSHAKE_DATA_LENGTH]);
+        assert_eq!(scanner.buffer.len(), scanner.buffer.capacity());
+        for want in 1..=10 {
+            let (frame, seq) = scanner.take_buffered_frame().unwrap().unwrap();
+            assert_eq!(seq, want);
+            assert_eq!(scanner.buffer.len(), HANDSHAKE_DATA_LENGTH, "do not copy the tail while complete frames remain");
+            release_frame_vec(frame);
+        }
+        assert_eq!(scanner.offset, 15100);
+        let mut reader = std::io::Cursor::new(stream[HANDSHAKE_DATA_LENGTH..].to_vec());
+        let (frame, seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(seq, 11);
+        assert_eq!(frame, vec![11; 1500]);
+        assert_eq!(scanner.buffer.capacity(), HANDSHAKE_DATA_LENGTH);
+        assert!(scanner.buffer.is_empty());
+    }
     #[test]
     fn lazy_compaction_handles_fragmented_padded_jumbo_and_invalid_frames() {
         struct Fragmented(std::io::Cursor<Vec<u8>>);
