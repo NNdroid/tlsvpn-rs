@@ -78,11 +78,9 @@ run_case() {
   grep -Fq 'iperf3 upload' "$log"
   grep -Fq 'iperf3 download' "$log"
 
-  # net_perf_test sends SIGTERM during cleanup and historically waited only
-  # 0.5 s. LLVM writes .profraw during normal process teardown, so do not start
-  # the next namespace/case until every Rust endpoint from this case has had a
-  # chance to flush its profile. This is candidate-only and does not lengthen
-  # ordinary Real-TAP runs.
+  # net_perf cleanup sends SIGTERM. tlsvpn's ctrlc handler is built with the
+  # `termination` feature in this branch, so SIGTERM now reaches the cooperative
+  # EXIT path and LLVM gets a normal process teardown in which to flush .profraw.
   wait_for_profile_flush "$pair" "$conns" "$expected" "$log"
 }
 
