@@ -12,10 +12,12 @@ run_case() {
   [[ "$cli" == go ]] && cli_bin="$GO_BIN"
   local log="$out/$name-$pair.txt"
   echo "DATAPLANE_CASE name=$name pair=$pair seconds=$seconds flags=$*" | tee "$log"
-  env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
-    TLSVPN_TX_BATCH_SIZE=8 TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
-    PERF_LATENCY=1 IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
-    FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
+  env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_TX_ADAPTIVE_BATCH=0 \
+    TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 TLSVPN_TX_BATCH_SIZE=8 \
+    TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 PERF_LATENCY=1 \
+    IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
+    FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" \
+    bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
   if grep -Fq '[netperf] SKIP:' "$log"; then
     echo 'DATAPLANE_CASE SKIP; no performance evidence' | tee "$out/SKIP.txt"
     exit 0
@@ -29,6 +31,28 @@ done
 for size in 8 16 32; do
   run_case "tx-size-$size" rs-rs 5 TLSVPN_TX_BATCH=1 "TLSVPN_TX_BATCH_SIZE=$size"
 done
+
+# Adaptive TX batching candidate: keep the existing nonblocking TAP drain enabled
+# and change only the backend ownership-batch ceiling. No timer/wait is added.
+for enabled in 0 1; do
+  run_case "tx-adaptive-$enabled" rs-rs 5 TLSVPN_TX_BATCH=1 \
+    "TLSVPN_TX_ADAPTIVE_BATCH=$enabled"
+done
+
+adaptive_trial=0
+for enabled in 0 1 1 0; do
+  adaptive_trial=$((adaptive_trial + 1))
+  for pair in rs-rs rs-go go-rs go-go; do
+    run_case "tx-adaptive-$enabled-trial$adaptive_trial" "$pair" 8 \
+      TLSVPN_RX_OWNED=1 TLSVPN_TX_BATCH=1 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
+      "TLSVPN_TX_ADAPTIVE_BATCH=$enabled"
+  done
+  # Multi-connection pressure control. Keep this rs/rs only to bound CI time.
+  run_case "tx-adaptive-c4-$enabled-trial$adaptive_trial" rs-rs 8 \
+    TLSVPN_RX_OWNED=1 TLSVPN_TX_BATCH=1 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
+    PERF_CONNS=4 "TLSVPN_TX_ADAPTIVE_BATCH=$enabled"
+done
+
 trial=0
 for enabled in 0 1 1 0; do
   trial=$((trial + 1))
