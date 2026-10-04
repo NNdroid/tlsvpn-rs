@@ -1203,6 +1203,29 @@ const OWNED_BATCH_MAX_BYTES: u64 = 8 * 1024;
 // the rustls plaintext buffer past its hard record limit.
 const OWNED_BATCH_WIRE_OVERHEAD_PER_FRAME: usize = 32;
 
+/// Zero-wait TX batching policy. At low queue pressure, smaller ownership
+/// batches let the TLS writer consume work sooner; when a burst/backlog is
+/// already present, grow geometrically back to the existing 8-frame ceiling.
+/// The byte cap remains authoritative, so this never enlarges a TLS write.
+#[inline]
+fn adaptive_tx_batch_limit(queued_frames: usize, incoming_frames: usize, configured_max: usize) -> usize {
+    let pressure = queued_frames.saturating_add(incoming_frames).max(1);
+    let target = pressure.min(8).next_power_of_two().min(8);
+    target.min(configured_max.max(1))
+}
+
+#[cfg(test)]
+#[test]
+fn adaptive_tx_batch_limit_scales_without_exceeding_static_cap() {
+    assert_eq!(adaptive_tx_batch_limit(0, 1, 8), 1);
+    assert_eq!(adaptive_tx_batch_limit(0, 2, 8), 2);
+    assert_eq!(adaptive_tx_batch_limit(0, 3, 8), 4);
+    assert_eq!(adaptive_tx_batch_limit(1, 3, 8), 4);
+    assert_eq!(adaptive_tx_batch_limit(4, 1, 8), 8);
+    assert_eq!(adaptive_tx_batch_limit(32, 1, 8), 8);
+    assert_eq!(adaptive_tx_batch_limit(32, 1, 4), 4);
+}
+
 struct OwnedBatchQueueInner {
     batches: VecDeque<VPNFrameBatch>,
     frames: usize,
@@ -1216,6 +1239,7 @@ pub struct OwnedBatchQueue {
     inner: Mutex<OwnedBatchQueueInner>,
     capacity_frames: usize,
     max_batch_frames: usize,
+    adaptive_batch: bool,
 }
 
 impl OwnedBatchQueue {
@@ -1227,6 +1251,16 @@ impl OwnedBatchQueue {
             }),
             capacity_frames: capacity_frames.max(1),
             max_batch_frames: tx_batch_size(),
+            adaptive_batch: std::env::var("TLSVPN_TX_ADAPTIVE_BATCH").as_deref() == Ok("1"),
+        }
+    }
+
+    #[inline]
+    fn batch_limit(&self, queued_frames: usize, incoming_frames: usize) -> usize {
+        if self.adaptive_batch {
+            adaptive_tx_batch_limit(queued_frames, incoming_frames, self.max_batch_frames)
+        } else {
+            self.max_batch_frames
         }
     }
 
@@ -1236,7 +1270,8 @@ impl OwnedBatchQueue {
         if inner.frames >= self.capacity_frames {
             return Err(frame);
         }
-        Self::push_locked(&mut inner, frame, bytes, self.max_batch_frames);
+        let max_batch_frames = self.batch_limit(inner.frames, 1);
+        Self::push_locked(&mut inner, frame, bytes, max_batch_frames);
         Ok(())
     }
 
@@ -1265,11 +1300,12 @@ impl OwnedBatchQueue {
     pub fn try_push_batch(&self, input: &mut Vec<VPNFrame>) -> (usize, u64) {
         let mut inner = self.inner.lock();
         let count = input.len().min(self.capacity_frames.saturating_sub(inner.frames));
+        let max_batch_frames = self.batch_limit(inner.frames, count);
         let mut bytes = 0;
         for frame in input.drain(..count) {
             let n = frame.data.len() as u64;
             bytes += n;
-            Self::push_locked(&mut inner, frame, n, self.max_batch_frames);
+            Self::push_locked(&mut inner, frame, n, max_batch_frames);
         }
         (count, bytes)
     }
@@ -1734,6 +1770,7 @@ impl AsyncPort {
         };
         let b = &backends[0];
         let mut inner = queue.inner.lock();
+        let batch_limit = queue.batch_limit(inner.frames, frames.len());
         let mut accepted = 0;
         let mut accepted_bytes = 0;
         for data in frames.drain(..) {
@@ -1746,7 +1783,7 @@ impl AsyncPort {
             };
             let bytes = data.len() as u64;
             b.scheduler.add_queued(bytes);
-            OwnedBatchQueue::push_locked(&mut inner, VPNFrame { seq, data }, bytes, queue.max_batch_frames);
+            OwnedBatchQueue::push_locked(&mut inner, VPNFrame { seq, data }, bytes, batch_limit);
             accepted += 1;
             accepted_bytes += bytes;
         }
