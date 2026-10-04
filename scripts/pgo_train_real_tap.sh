@@ -9,9 +9,46 @@ PGO_ROOT="${PGO_ROOT:-$PWD/target/pgo}"
 PGO_RAW_DIR="${PGO_RAW_DIR:-$PGO_ROOT/raw}"
 PGO_TRAIN_SECONDS="${PGO_TRAIN_SECONDS:-6}"
 PGO_TRAIN_OUTPUT="${PGO_TRAIN_OUTPUT:-$PWD/perf-results/pgo/train}"
+PGO_FLUSH_TIMEOUT_TENTHS="${PGO_FLUSH_TIMEOUT_TENTHS:-150}"
 GO_BIN="${GO_BIN:-}"
 
 mkdir -p "$PGO_RAW_DIR" "$PGO_TRAIN_OUTPUT"
+RS_REAL="$(readlink -f "$RS_BIN")"
+
+profile_count_for_case() {
+  local pair="$1" conns="$2"
+  find "$PGO_RAW_DIR" -type f \
+    -name "${pair}-c${conns}-*.profraw" -size +0c 2>/dev/null | wc -l
+}
+
+dump_instrumented_processes() {
+  local proc exe
+  echo 'PGO profile flush timeout; instrumented process state:' >&2
+  for proc in /proc/[0-9]*; do
+    [[ -e "$proc/exe" ]] || continue
+    exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
+    [[ "$exe" == "$RS_REAL" ]] || continue
+    printf '  pid=%s state=' "${proc##*/}" >&2
+    awk '{print $3}' "$proc/stat" 2>/dev/null || echo '?' >&2
+  done
+}
+
+wait_for_profile_flush() {
+  local pair="$1" conns="$2" expected="$3" log="$4"
+  local i count
+  for ((i=0; i<PGO_FLUSH_TIMEOUT_TENTHS; i++)); do
+    count="$(profile_count_for_case "$pair" "$conns")"
+    if (( count >= expected )); then
+      echo "PGO_PROFILE_FLUSH pair=$pair conns=$conns profiles=$count expected=$expected" | tee -a "$log"
+      return 0
+    fi
+    sleep 0.1
+  done
+  count="$(profile_count_for_case "$pair" "$conns")"
+  echo "PGO_PROFILE_FLUSH_FAILED pair=$pair conns=$conns profiles=$count expected=$expected" | tee -a "$log" >&2
+  dump_instrumented_processes | tee -a "$log" >&2 || true
+  return 1
+}
 
 run_case() {
   local pair="$1" conns="$2"
@@ -21,6 +58,9 @@ run_case() {
   [[ "$cli" == go ]] && cli_bin="$GO_BIN"
   local log="$PGO_TRAIN_OUTPUT/train-${pair}-c${conns}.txt"
   local profile_pattern="$PGO_RAW_DIR/${pair}-c${conns}-%p-%m.profraw"
+  local expected=0
+  [[ "$srv" == rs ]] && expected=$((expected + 1))
+  [[ "$cli" == rs ]] && expected=$((expected + 1))
 
   echo "PGO_TRAIN pair=$pair conns=$conns seconds=$PGO_TRAIN_SECONDS" | tee "$log"
   env \
@@ -37,6 +77,13 @@ run_case() {
   fi
   grep -Fq 'iperf3 upload' "$log"
   grep -Fq 'iperf3 download' "$log"
+
+  # net_perf_test sends SIGTERM during cleanup and historically waited only
+  # 0.5 s. LLVM writes .profraw during normal process teardown, so do not start
+  # the next namespace/case until every Rust endpoint from this case has had a
+  # chance to flush its profile. This is candidate-only and does not lengthen
+  # ordinary Real-TAP runs.
+  wait_for_profile_flush "$pair" "$conns" "$expected" "$log"
 }
 
 # rs/rs trains both Rust endpoints. rs/go and go/rs make the same Rust binary
@@ -49,7 +96,7 @@ for conns in 1 4; do
   fi
 done
 
-count=$(find "$PGO_RAW_DIR" -type f -name '*.profraw' | wc -l)
+count=$(find "$PGO_RAW_DIR" -type f -name '*.profraw' -size +0c | wc -l)
 if (( count == 0 )); then
   echo "training finished without producing .profraw files" >&2
   exit 1
