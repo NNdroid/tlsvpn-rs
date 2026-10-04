@@ -31,6 +31,13 @@ jobs:
           repository: NNdroid/tlsvpn
           path: go-impl
 
+      - name: Validate PGO harness syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/pgo_build.sh scripts/pgo_train_real_tap.sh scripts/pgo_abba.sh
+          python3 -m py_compile scripts/pgo_gate.py
+
       - name: Install benchmark dependencies
         shell: bash
         run: |
@@ -42,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd go-impl && bash scripts/build.sh)
+          (cd go-impl && bash scripts/build.sh host)
           test -x go-impl/bin/tlsvpn_linux_amd64
 
       - name: Build baseline and PGO instrumented Rust binaries
