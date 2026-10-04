@@ -4,6 +4,11 @@ from pathlib import Path
 path = Path("src/net.rs")
 text = path.read_text()
 
+# A second push is expected after the workflow commits the real source change.
+# Make that pass a no-op instead of trying to apply the same textual patch twice.
+if 'TLSVPN_TX_ADAPTIVE_BATCH' in text:
+    raise SystemExit(0)
+
 
 def replace_once(old: str, new: str) -> None:
     global text
