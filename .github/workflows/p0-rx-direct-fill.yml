@@ -20,7 +20,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Apply direct-fill FrameScanner patch
-        run: python3 scripts/p0_rx_direct_patch.py
+        run: |
+          python3 scripts/p0_rx_direct_patch.py
+          python3 scripts/p0_rx_direct_fix.py
 
       - name: Validate patch whitespace
         run: git diff --check
@@ -37,9 +39,9 @@ jobs:
       - name: Commit tested implementation
         shell: bash
         run: |
-          rm -f .github/workflows/p0-rx-direct-fill.yml scripts/p0_rx_direct_patch.py
+          rm -f .github/workflows/p0-rx-direct-fill.yml scripts/p0_rx_direct_patch.py scripts/p0_rx_direct_fix.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/frame.rs scripts/dataplane_candidates.sh docs/rx-dataplane-performance.md .github/workflows/p0-rx-direct-fill.yml scripts/p0_rx_direct_patch.py
+          git add src/frame.rs scripts/dataplane_candidates.sh docs/rx-dataplane-performance.md .github/workflows/p0-rx-direct-fill.yml scripts/p0_rx_direct_patch.py scripts/p0_rx_direct_fix.py
           git commit -m 'perf: direct-fill RX frames from rustls plaintext'
           git push origin HEAD:perf/rx-zero-copy-slab
