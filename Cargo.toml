@@ -36,9 +36,9 @@ mimalloc = { version = "0.1", default-features = false }
 # tiny_http 内部用 rustls 0.20，与本项目的 0.23 各编一份，互不影响。
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 base64ct = { version = "1.6", features = ["alloc"] }
-# The process-level shutdown handler is also used by systemd/containers and
-# benchmark cleanup, both of which send SIGTERM on Unix. Without `termination`
-# ctrlc only catches SIGINT, so SIGTERM bypasses graceful cleanup entirely.
+# systemd, containers and benchmark cleanup stop the daemon with SIGTERM.
+# `termination` routes SIGTERM/SIGHUP through the existing cooperative EXIT
+# handler instead of bypassing shutdown cleanup with the Unix default action.
 ctrlc = { version = "3", features = ["termination"] }
 dashmap = "5.5"
 
