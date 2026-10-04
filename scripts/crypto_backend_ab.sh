@@ -2,7 +2,8 @@
 # Build the same source tree twice with rustls backed by ring and aws-lc-rs,
 # then compare both binaries on the same privileged Real-TAP runner.
 # The inner TLSVPN AEAD remains ring::aead in both builds; only rustls' outer
-# TLS provider changes. Cargo.toml/Cargo.lock are restored before exit.
+# TLS provider changes. Cargo.toml/Cargo.lock and temporary source edits are
+# restored before benchmarking and again on exit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,20 +15,27 @@ mkdir -p "$out" "$work"
 
 cargo_toml_backup="$work/Cargo.toml.original"
 cargo_lock_backup="$work/Cargo.lock.original"
+main_backup="$work/main.rs.original"
+client_backup="$work/client.rs.original"
 cp Cargo.toml "$cargo_toml_backup"
 cp Cargo.lock "$cargo_lock_backup"
-restore_manifest() {
+cp src/main.rs "$main_backup"
+cp src/client.rs "$client_backup"
+restore_workspace() {
   cp "$cargo_toml_backup" Cargo.toml
   cp "$cargo_lock_backup" Cargo.lock
+  cp "$main_backup" src/main.rs
+  cp "$client_backup" src/client.rs
 }
-trap restore_manifest EXIT
+trap restore_workspace EXIT
 
 build_provider() {
   local provider="$1" target_dir="$work/target-$provider" bin="$work/tlsvpn-$provider"
-  restore_manifest
+  restore_workspace
   if [[ "$provider" == "aws-lc" ]]; then
     python3 - <<'PY'
 from pathlib import Path
+
 p = Path("Cargo.toml")
 s = p.read_text()
 old = 'rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }'
@@ -35,6 +43,14 @@ new = 'rustls = { version = "0.23", default-features = false, features = ["aws_l
 if old not in s:
     raise SystemExit("expected rustls ring dependency line not found")
 p.write_text(s.replace(old, new, 1))
+
+for path in (Path("src/main.rs"), Path("src/client.rs")):
+    text = path.read_text()
+    old_provider = "rustls::crypto::ring::default_provider()"
+    count = text.count(old_provider)
+    if count == 0:
+        raise SystemExit(f"expected explicit ring provider hook not found in {path}")
+    path.write_text(text.replace(old_provider, "rustls::crypto::aws_lc_rs::default_provider()"))
 PY
   fi
   echo "[crypto-ab] building provider=$provider"
@@ -46,7 +62,7 @@ PY
 
 build_provider ring
 build_provider aws-lc
-restore_manifest
+restore_workspace
 
 RING_BIN="$work/tlsvpn-ring"
 AWS_BIN="$work/tlsvpn-aws-lc"
