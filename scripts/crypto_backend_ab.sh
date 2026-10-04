@@ -17,15 +17,18 @@ cargo_toml_backup="$work/Cargo.toml.original"
 cargo_lock_backup="$work/Cargo.lock.original"
 main_backup="$work/main.rs.original"
 client_backup="$work/client.rs.original"
+probe_backup="$work/interop_client.rs.original"
 cp Cargo.toml "$cargo_toml_backup"
 cp Cargo.lock "$cargo_lock_backup"
 cp src/main.rs "$main_backup"
 cp src/client.rs "$client_backup"
+cp examples/interop_client.rs "$probe_backup"
 restore_workspace() {
   cp "$cargo_toml_backup" Cargo.toml
   cp "$cargo_lock_backup" Cargo.lock
   cp "$main_backup" src/main.rs
   cp "$client_backup" src/client.rs
+  cp "$probe_backup" examples/interop_client.rs
 }
 trap restore_workspace EXIT
 
@@ -42,13 +45,22 @@ from pathlib import Path
 
 p = Path("Cargo.toml")
 s = p.read_text()
-old = 'rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }'
-new = 'rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }'
-if old not in s:
-    raise SystemExit("expected rustls ring dependency line not found")
-p.write_text(s.replace(old, new, 1))
+# Anchor on the rustls dependency line itself instead of its full literal
+# text: feature-list edits stay tolerated, anything else fails loudly
+# instead of benchmarking ring against itself.
+rustls_lines = [ln for ln in s.splitlines() if ln.startswith("rustls = {")]
+if len(rustls_lines) != 1:
+    raise SystemExit(f"expected exactly one rustls dependency line, found {len(rustls_lines)}")
+line = rustls_lines[0]
+if "default-features = false" not in line:
+    raise SystemExit("rustls dependency must disable default features for the provider swap")
+if '"ring"' not in line:
+    raise SystemExit("rustls dependency does not select ring; cannot swap to aws_lc_rs")
+p.write_text(s.replace(line, line.replace('"ring"', '"aws_lc_rs"', 1), 1))
 
-for path in (Path("src/main.rs"), Path("src/client.rs")):
+# The interop probe is patched alongside the daemon sources so every binary
+# built from the aws-lc tree picks the same outer provider, not just tlsvpn.
+for path in (Path("src/main.rs"), Path("src/client.rs"), Path("examples/interop_client.rs")):
     text = path.read_text()
     old_provider = "rustls::crypto::ring::default_provider()"
     count = text.count(old_provider)
