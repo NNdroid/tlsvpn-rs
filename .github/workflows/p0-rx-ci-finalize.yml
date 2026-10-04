@@ -19,7 +19,7 @@ jobs:
       - name: Keep direct-fill in CI control domains
         shell: bash
         run: |
-          python3 -c 'from pathlib import Path; p=Path(".github/workflows/rust.yml"); s=p.read_text(); s=s.replace("        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", "        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_RX_DIRECT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", 1); s=s.replace("            TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\" \\\\\n", "            TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_RX_DIRECT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\" \\\\\n"); p.write_text(s)'
+          python3 -c 'from pathlib import Path; p=Path(".github/workflows/rust.yml"); s=p.read_text(); s=s.replace("        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", "        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_RX_DIRECT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", 1); s=s.replace("TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\"", "TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_RX_DIRECT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\""); p.write_text(s)'
           grep -Fq 'TLSVPN_RX_DIRECT: "1"' .github/workflows/rust.yml
           test "$(grep -c 'TLSVPN_RX_DIRECT="$enabled"' .github/workflows/rust.yml)" -eq 2
           git diff --check
