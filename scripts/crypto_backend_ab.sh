@@ -108,11 +108,11 @@ run_case() {
   (( conns > 1 )) && max_attempts="${CRYPTO_AB_C4_ATTEMPTS:-3}"
   local attempt rc
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
-    set +e
-    run_case_once "$provider" "$trial" "$pair" "$conns" "$seconds" "$attempt"
-    rc=$?
-    set -e
-    [[ $rc -eq 0 ]] && return 0
+    if run_case_once "$provider" "$trial" "$pair" "$conns" "$seconds" "$attempt"; then
+      return 0
+    else
+      rc=$?
+    fi
     if [[ $rc -eq 75 && $attempt -lt $max_attempts ]]; then
       echo "[crypto-ab] retrying invalid scheduler sample provider=$provider trial=$trial attempt=$attempt"
       continue
