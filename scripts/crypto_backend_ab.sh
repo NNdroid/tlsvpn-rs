@@ -79,6 +79,10 @@ if [[ "$cargo_bin" == *"/.cargo/bin/cargo" ]]; then
     cargo_env+=("RUSTUP_HOME=$cargo_home_root/.rustup")
   fi
 fi
+# cargo spawns `rustc` (and rustdoc) by name through PATH, and sudo's
+# secure_path has no rustup shims either. Prepend the shim dir so the cargo
+# process resolves the same toolchain rustc that RUSTUP_HOME points at.
+cargo_env+=("PATH=${cargo_bin%/*}:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}")
 
 build_provider() {
   # One `local` statement per assignment dependency: bash expands every word
