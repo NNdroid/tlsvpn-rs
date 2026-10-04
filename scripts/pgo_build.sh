@@ -13,6 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODE="${1:-}"
+HOST_TRIPLE="$(rustc -vV | awk -F': ' '/^host:/{print $2}')"
 PGO_ROOT="${PGO_ROOT:-$PWD/target/pgo}"
 PGO_RAW_DIR="${PGO_RAW_DIR:-$PGO_ROOT/raw}"
 PGO_PROFDATA="${PGO_PROFDATA:-$PGO_ROOT/merged.profdata}"
@@ -47,11 +48,15 @@ append_flags() {
   fi
 }
 
+artifact_path() {
+  local target_dir="$1"
+  printf '%s/%s/release/tlsvpn\n' "$target_dir" "$HOST_TRIPLE"
+}
+
 find_llvm_profdata() {
-  local host sysroot tool
-  host="$(rustc -vV | awk -F': ' '/^host:/{print $2}')"
+  local sysroot tool
   sysroot="$(rustc --print sysroot)"
-  tool="$sysroot/lib/rustlib/$host/bin/llvm-profdata"
+  tool="$sysroot/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
   if [[ -x "$tool" ]]; then
     printf '%s\n' "$tool"
     return 0
@@ -63,20 +68,24 @@ find_llvm_profdata() {
 }
 
 build_baseline() {
-  echo '[pgo] building baseline release binary'
+  echo "[pgo] building baseline release binary ($HOST_TRIPLE)"
   rm -rf "$PGO_BASE_TARGET_DIR"
-  CARGO_TARGET_DIR="$PGO_BASE_TARGET_DIR" cargo build --release
-  cp "$PGO_BASE_TARGET_DIR/release/tlsvpn" "$PGO_OUT_DIR/tlsvpn-baseline"
+  CARGO_TARGET_DIR="$PGO_BASE_TARGET_DIR" \
+    cargo build --release --target "$HOST_TRIPLE"
+  cp "$(artifact_path "$PGO_BASE_TARGET_DIR")" "$PGO_OUT_DIR/tlsvpn-baseline"
 }
 
 build_instrumented() {
-  echo '[pgo] building profile-generate binary'
+  echo "[pgo] building profile-generate binary ($HOST_TRIPLE)"
   rm -rf "$PGO_GEN_TARGET_DIR" "$PGO_RAW_DIR"
   mkdir -p "$PGO_RAW_DIR"
   local flags
   flags="$(append_flags "-Cprofile-generate=$PGO_RAW_DIR -Ccodegen-units=1")"
-  CARGO_TARGET_DIR="$PGO_GEN_TARGET_DIR" RUSTFLAGS="$flags" cargo build --release
-  cp "$PGO_GEN_TARGET_DIR/release/tlsvpn" "$PGO_OUT_DIR/tlsvpn-instrumented"
+  # --target keeps these RUSTFLAGS off host build scripts/proc-macros, matching
+  # rustc's documented Cargo PGO workflow and avoiding irrelevant profiles.
+  CARGO_TARGET_DIR="$PGO_GEN_TARGET_DIR" RUSTFLAGS="$flags" \
+    cargo build --release --target "$HOST_TRIPLE"
+  cp "$(artifact_path "$PGO_GEN_TARGET_DIR")" "$PGO_OUT_DIR/tlsvpn-instrumented"
   echo "[pgo] instrumented binary: $PGO_OUT_DIR/tlsvpn-instrumented"
   echo "[pgo] raw profile dir:     $PGO_RAW_DIR"
 }
@@ -101,14 +110,15 @@ build_optimized() {
     echo "missing merged profile: $PGO_PROFDATA" >&2
     exit 1
   }
-  echo '[pgo] building profile-use release binary'
+  echo "[pgo] building profile-use release binary ($HOST_TRIPLE)"
   rm -rf "$PGO_USE_TARGET_DIR"
   local flags
   # Missing-function warnings are useful during the candidate phase: they make
   # profile drift visible without turning expected cold-code misses into errors.
   flags="$(append_flags "-Cprofile-use=$PGO_PROFDATA -Cllvm-args=-pgo-warn-missing-function -Ccodegen-units=1")"
-  CARGO_TARGET_DIR="$PGO_USE_TARGET_DIR" RUSTFLAGS="$flags" cargo build --release
-  cp "$PGO_USE_TARGET_DIR/release/tlsvpn" "$PGO_OUT_DIR/tlsvpn-pgo"
+  CARGO_TARGET_DIR="$PGO_USE_TARGET_DIR" RUSTFLAGS="$flags" \
+    cargo build --release --target "$HOST_TRIPLE"
+  cp "$(artifact_path "$PGO_USE_TARGET_DIR")" "$PGO_OUT_DIR/tlsvpn-pgo"
   echo "[pgo] optimized binary: $PGO_OUT_DIR/tlsvpn-pgo"
 }
 
