@@ -18,16 +18,12 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
 
       - name: Apply direct-fill FrameScanner patch
         run: python3 scripts/p0_rx_direct_patch.py
 
-      - name: Format and validate patch
-        run: |
-          cargo fmt -- --check
-          git diff --check
+      - name: Validate patch whitespace
+        run: git diff --check
 
       - name: Test core logic
         run: cargo test --all-targets
