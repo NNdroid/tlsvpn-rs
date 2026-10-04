@@ -32,6 +32,23 @@ restore_workspace() {
 }
 trap restore_workspace EXIT
 
+# The two cold provider builds are the expensive part of this harness; pay
+# for them only on runners that can produce evidence. net_perf_test.sh runs
+# its RTNL/TAP capability gate before any case, so this go/go probe either
+# SKIPs within seconds on an incapable runner or confirms the runner is
+# usable before any build starts.
+probe_log="$out/probe.txt"
+echo "[crypto-ab] probing runner capability with go/go"
+set +e
+env BIN_SRV="$GO_BIN" BIN_CLI="$GO_BIN" FLAVOR_SRV=go FLAVOR_CLI=go \
+  PERF_CONNS=1 PERF_LATENCY=0 IPERF_SECONDS=1 \
+  bash scripts/net_perf_test.sh 2>&1 | tee "$probe_log"
+set -e
+if grep -Fq '[netperf] SKIP:' "$probe_log"; then
+  echo 'CRYPTO_AB SKIP; runner cannot produce performance evidence' | tee "$out/SKIP.txt"
+  exit 0
+fi
+
 build_provider() {
   # One `local` statement per assignment dependency: bash expands every word
   # of a single `local` before any of them lands, so referencing $provider in
