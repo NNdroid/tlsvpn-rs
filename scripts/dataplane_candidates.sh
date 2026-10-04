@@ -12,7 +12,7 @@ run_case() {
   [[ "$cli" == go ]] && cli_bin="$GO_BIN"
   local log="$out/$name-$pair.txt"
   echo "DATAPLANE_CASE name=$name pair=$pair seconds=$seconds flags=$*" | tee "$log"
-  env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
+  env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_RX_DIRECT=0 TLSVPN_SWITCH_BATCH=0 \
     TLSVPN_TX_BATCH_SIZE=8 TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
     PERF_LATENCY=1 IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
     FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
@@ -23,7 +23,7 @@ run_case() {
   grep -Fq VPN_METRICS "$log" || exit 1
   grep -Fq LOAD_LATENCY "$log" || exit 1
 }
-for flag in TLSVPN_RX_OWNED TLSVPN_TX_BATCH TLSVPN_RX_COMPACT TLSVPN_SWITCH_BATCH; do
+for flag in TLSVPN_RX_OWNED TLSVPN_TX_BATCH TLSVPN_RX_COMPACT TLSVPN_RX_DIRECT TLSVPN_SWITCH_BATCH; do
   for enabled in 0 1; do run_case "$flag-$enabled" rs-rs 5 "$flag=$enabled"; done
 done
 for size in 8 16 32; do
@@ -35,6 +35,6 @@ for enabled in 0 1 1 0; do
   for pair in rs-rs rs-go go-rs go-go; do
     run_case "all-$enabled-trial$trial" "$pair" 10 \
       "TLSVPN_RX_OWNED=$enabled" "TLSVPN_TX_BATCH=$enabled" \
-      "TLSVPN_RX_COMPACT=$enabled" "TLSVPN_SWITCH_BATCH=$enabled"
+      "TLSVPN_RX_COMPACT=$enabled" "TLSVPN_RX_DIRECT=$enabled" "TLSVPN_SWITCH_BATCH=$enabled"
   done
 done

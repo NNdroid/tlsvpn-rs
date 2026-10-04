@@ -165,6 +165,17 @@ pub struct FrameScanner {
     buffer: Vec<u8>,
     lazy_compact: bool,
     offset: usize,
+    // Default-on direct-fill parser: after the 10-byte frame header is known,
+    // rustls plaintext is read straight into the final pooled payload Vec.
+    // TLSVPN_RX_DIRECT=0 keeps the old buffered extractor as an A/B control.
+    direct_fill: bool,
+    direct_header: [u8; HEADER_SIZE],
+    direct_header_read: usize,
+    direct_data: Option<Vec<u8>>,
+    direct_data_read: usize,
+    direct_pad_remaining: usize,
+    direct_seq: u32,
+    direct_pad_scratch: [u8; 2048],
     // 当前允许的帧负载上限：认证前的握手帧用小上限，认证通过后恢复线路
     // 全量上限（见 set_max_data_len）。默认给全量上限，这样只在握手路径上
     // 需要显式收紧。
@@ -187,6 +198,14 @@ impl FrameScanner {
             buffer: Vec::with_capacity(HANDSHAKE_DATA_LENGTH),
             lazy_compact: std::env::var("TLSVPN_RX_COMPACT").as_deref() == Ok("1"),
             offset: 0,
+            direct_fill: std::env::var("TLSVPN_RX_DIRECT").as_deref() != Ok("0"),
+            direct_header: [0; HEADER_SIZE],
+            direct_header_read: 0,
+            direct_data: None,
+            direct_data_read: 0,
+            direct_pad_remaining: 0,
+            direct_seq: 0,
+            direct_pad_scratch: [0; 2048],
             max_data_len: MAX_DATA_LENGTH,
         }
     }
@@ -199,6 +218,9 @@ impl FrameScanner {
 
     /// 供服务端"内层首字节嗅探"使用：返回缓冲区下一个待解析字节
     pub fn peek_first_byte(&self) -> Option<u8> {
+        if self.direct_fill && self.direct_header_read > 0 {
+            return Some(self.direct_header[0]);
+        }
         if self.buffer.len() > self.offset {
             Some(self.buffer[self.offset])
         } else {
@@ -266,12 +288,93 @@ impl FrameScanner {
         }
     }
 
+    #[inline]
+    fn reset_direct_state(&mut self) {
+        self.direct_header_read = 0;
+        self.direct_data = None;
+        self.direct_data_read = 0;
+        self.direct_pad_remaining = 0;
+        self.direct_seq = 0;
+    }
+
+    /// Direct-fill RX parser. The old scanner first read TLS plaintext into a
+    /// scanner Vec and then copied every payload into a pooled frame Vec. This
+    /// state machine reads only the fixed header into local storage; payload
+    /// bytes go directly from rustls::Reader into the final pooled Vec. Padding
+    /// is drained through a fixed scratch buffer. Partial TLS plaintext and
+    /// WouldBlock preserve parser state across calls.
+    fn read_frame_direct<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<Option<(Vec<u8>, u32)>> {
+        loop {
+            while self.direct_header_read < HEADER_SIZE {
+                match reader.read(&mut self.direct_header[self.direct_header_read..]) {
+                    Ok(0) => return Ok(None),
+                    Ok(n) => self.direct_header_read += n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if self.direct_data.is_none() {
+                let data_len = BigEndian::read_u32(&self.direct_header[..4]) as usize;
+                let pad_len = BigEndian::read_u16(&self.direct_header[4..6]) as usize;
+                let seq = BigEndian::read_u32(&self.direct_header[6..10]);
+                if data_len > self.max_data_len {
+                    self.reset_direct_state();
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid frame data length",
+                    ));
+                }
+                self.direct_data = Some(acquire_frame_vec_overwrite(data_len));
+                self.direct_data_read = 0;
+                self.direct_pad_remaining = pad_len;
+                self.direct_seq = seq;
+            }
+
+            if let Some(data) = self.direct_data.as_mut() {
+                while self.direct_data_read < data.len() {
+                    match reader.read(&mut data[self.direct_data_read..]) {
+                        Ok(0) => return Ok(None),
+                        Ok(n) => self.direct_data_read += n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            while self.direct_pad_remaining > 0 {
+                let want = self
+                    .direct_pad_remaining
+                    .min(self.direct_pad_scratch.len());
+                match reader.read(&mut self.direct_pad_scratch[..want]) {
+                    Ok(0) => return Ok(None),
+                    Ok(n) => self.direct_pad_remaining -= n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let data = self.direct_data.take().unwrap_or_default();
+            let seq = self.direct_seq;
+            self.direct_header_read = 0;
+            self.direct_data_read = 0;
+            self.direct_seq = 0;
+            return Ok(Some((data, seq)));
+        }
+    }
+
     /// 读取一帧。与 Go 行为一致：
     /// - 优先消费扫描缓冲中已经完整的帧，避免每帧额外 read/WOULDBLOCK；
     /// - dataLen > max_data_len → InvalidData 错误并清空缓冲；
     /// - dataLen == 0 的空帧返回空 Vec，供调用方刷新空闲计时；
     /// - 无完整帧且底层暂不可读时返回 Ok(None)。
     pub fn read_frame<R: Read>(&mut self, reader: &mut R) -> io::Result<Option<(Vec<u8>, u32)>> {
+        if self.direct_fill {
+            return self.read_frame_direct(reader);
+        }
         loop {
             if let Some(frame) = self.take_buffered_frame()? {
                 return Ok(Some(frame));
@@ -410,6 +513,7 @@ mod tests {
             stream.extend_from_slice(&[seq as u8; 1500]);
         }
         let mut scanner = FrameScanner::new();
+        scanner.direct_fill = false;
         scanner.lazy_compact = true;
         scanner.buffer.extend_from_slice(&stream[..HANDSHAKE_DATA_LENGTH]);
         assert_eq!(scanner.buffer.len(), scanner.buffer.capacity());
@@ -446,6 +550,7 @@ mod tests {
         append_frame_head(&mut stream, MAX_DATA_LENGTH as u32 + 1, 0, 71);
         for enabled in [false, true] {
             let mut scanner = FrameScanner::new();
+            scanner.direct_fill = false;
             scanner.lazy_compact = enabled;
             let mut reader = Fragmented(std::io::Cursor::new(stream.clone()));
             for want in 1..=70 {
@@ -458,6 +563,68 @@ mod tests {
             }
             assert_eq!(scanner.read_frame(&mut reader).unwrap_err().kind(), ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn direct_fill_handles_fragmented_payload_padding_and_would_block() {
+        struct Fragmented {
+            inner: std::io::Cursor<Vec<u8>>,
+            block_next: bool,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                let want = out.len().min(137);
+                let n = self.inner.read(&mut out[..want])?;
+                self.block_next = n != 0;
+                Ok(n)
+            }
+        }
+
+        let mut stream = Vec::new();
+        append_frame_head(&mut stream, 1500, 23, 41);
+        stream.extend_from_slice(&vec![0x5a; 1500]);
+        stream.extend_from_slice(&vec![0xa5; 23]);
+        append_frame_head(&mut stream, 9000, 7, 42);
+        stream.extend_from_slice(&vec![0x6b; 9000]);
+        stream.extend_from_slice(&vec![0xb6; 7]);
+
+        let mut scanner = FrameScanner::new();
+        scanner.direct_fill = true;
+        let mut reader = Fragmented {
+            inner: std::io::Cursor::new(stream),
+            block_next: false,
+        };
+
+        for (want_seq, want_len, want_byte) in [(41, 1500, 0x5a), (42, 9000, 0x6b)] {
+            let frame = loop {
+                match scanner.read_frame(&mut reader).unwrap() {
+                    Some(frame) => break frame,
+                    None => continue,
+                }
+            };
+            assert_eq!(frame.1, want_seq);
+            assert_eq!(frame.0.len(), want_len);
+            assert!(frame.0.iter().all(|b| *b == want_byte));
+            release_frame_vec(frame.0);
+        }
+    }
+
+    #[test]
+    fn direct_fill_rejects_oversized_frame_before_allocating_payload() {
+        let mut stream = Vec::new();
+        append_frame_head(&mut stream, MAX_DATA_LENGTH as u32 + 1, 0, 9);
+        let mut scanner = FrameScanner::new();
+        scanner.direct_fill = true;
+        let err = scanner
+            .read_frame(&mut std::io::Cursor::new(stream))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(scanner.direct_data.is_none());
+        assert_eq!(scanner.direct_header_read, 0);
     }
 
     /// 填充必须按线路长度（明文 + GCM 标签）分桶，而不是明文长度。
@@ -616,6 +783,10 @@ mod tests {
             reads: 0,
         };
         let mut scanner = FrameScanner::new();
+        // This regression specifically locks the legacy scanner's buffered-burst
+        // behavior. Direct-fill intentionally reads header/payload separately and
+        // has its own fragmented/WouldBlock regression coverage below.
+        scanner.direct_fill = false;
 
         let (first, first_seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
         assert_eq!(first_seq, 11);

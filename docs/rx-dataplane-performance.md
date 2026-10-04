@@ -92,10 +92,13 @@ opt-in until real-TAP A/B results justify a default change:
   behavior without a per-packet poll syscall. A single-backend/no-FEC port assigns sequences and queues
   the batch under one queue lock, with one wake. FEC/multipath keeps the existing
   scheduler/fence path. Queue headroom and sequence exhaustion still drop safely.
-* `TLSVPN_RX_COMPACT=1`: scanner tail compaction is deferred until storage is
-  full or consumed. It reduces tail copies, not the payload extraction copy;
-  this is not a zero-copy TLS decoder. Padding, length caps and fragmented reads
-  retain their original behavior.
+* `TLSVPN_RX_DIRECT=1` (default): after the fixed 10-byte TLSVPN header is
+  parsed, rustls plaintext is read directly into the final pooled frame buffer.
+  This removes the old scanner-buffer -> frame-buffer payload memcpy. Padding is
+  drained through a fixed scratch buffer and fragmented/WouldBlock reads preserve
+  parser state. Set `TLSVPN_RX_DIRECT=0` for the old buffered extractor.
+* `TLSVPN_RX_COMPACT=1`: controls tail compaction only when the legacy buffered
+  extractor is selected with `TLSVPN_RX_DIRECT=0`.
 * `TLSVPN_SWITCH_BATCH=1`: server forwarding groups only consecutive known
   unicasts with the authenticated source MAC and same destination. It holds the
   MAC shard guard through enqueue, preserving port removal ordering. Unknown
