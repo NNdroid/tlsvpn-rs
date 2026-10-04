@@ -1,0 +1,33 @@
+name: Finalize RX direct profiling controls
+
+on:
+  push:
+    branches:
+      - perf/rx-zero-copy-slab
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/rx-zero-copy-slab
+          fetch-depth: 0
+      - name: Keep direct-fill in CI control domains
+        shell: bash
+        run: |
+          python3 -c 'from pathlib import Path; p=Path(".github/workflows/rust.yml"); s=p.read_text(); s=s.replace("        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", "        TLSVPN_RX_COMPACT: \"1\"\n        TLSVPN_RX_DIRECT: \"1\"\n        TLSVPN_SWITCH_BATCH: \"1\"", 1); s=s.replace("            TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\" \\\\\n", "            TLSVPN_RX_COMPACT=\"$enabled\" TLSVPN_RX_DIRECT=\"$enabled\" TLSVPN_SWITCH_BATCH=\"$enabled\" \\\\\n"); p.write_text(s)'
+          grep -Fq 'TLSVPN_RX_DIRECT: "1"' .github/workflows/rust.yml
+          test "$(grep -c 'TLSVPN_RX_DIRECT="$enabled"' .github/workflows/rust.yml)" -eq 2
+          git diff --check
+      - name: Commit final CI controls
+        run: |
+          rm -f .github/workflows/p0-rx-ci-finalize.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/rust.yml .github/workflows/p0-rx-ci-finalize.yml
+          git commit -m 'ci: include RX direct-fill in performance controls'
+          git push origin HEAD:perf/rx-zero-copy-slab
