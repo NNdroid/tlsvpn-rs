@@ -77,8 +77,9 @@ and physical ARM device measurements remain outstanding.
 
 ## Second optimization pass (experimental controls)
 
-Static single-path owned RX is enabled by default; the other candidates remain
-opt-in until real-TAP A/B results justify a default change:
+Static single-path owned RX and client TX batching are enabled by default; the
+remaining candidates stay opt-in until real-TAP A/B results justify a default
+change:
 
 * `TLSVPN_RX_OWNED=0` disables the default static single-connection/no-FEC client
   RX ownership path. It keeps unique
@@ -86,12 +87,16 @@ opt-in until real-TAP A/B results justify a default change:
   shared storage and uses the existing reorder path. Both delivery variants
   share one bounded FIFO; each return pool retains at most 512 KiB, or 1 MiB
   combined when both variants are present. The session batch mutex remains.
-* `TLSVPN_TX_BATCH=1`: the client TAP reader drains already-readable packets
+* `TLSVPN_TX_BATCH=0`: disables the default client TX batching. The TAP reader
+  drains already-readable packets
   without waiting. On Linux its fd is nonblocking and EAGAIN ends the batch;
   normal recv/send wait for readiness only on EAGAIN, preserving their blocking
   behavior without a per-packet poll syscall. A single-backend/no-FEC port assigns sequences and queues
   the batch under one queue lock, with one wake. FEC/multipath keeps the existing
   scheduler/fence path. Queue headroom and sequence exhaustion still drop safely.
+  The default flip follows the hosted-runner real-TAP A/B (rs-rs, single flag,
+  5 s iperf): upload +9.9%, download +5.4%; the combined sweep diluted it with
+  the negative `TLSVPN_SWITCH_BATCH`/`TLSVPN_RX_COMPACT` candidates.
 * `TLSVPN_RX_COMPACT=1`: scanner tail compaction is deferred until storage is
   full or consumed. It reduces tail copies, not the payload extraction copy;
   this is not a zero-copy TLS decoder. Padding, length caps and fragmented reads

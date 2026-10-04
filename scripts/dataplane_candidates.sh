@@ -30,6 +30,16 @@ for size in 8 16 32; do
   run_case "tx-size-$size" rs-rs 5 TLSVPN_TX_BATCH=1 "TLSVPN_TX_BATCH_SIZE=$size"
 done
 
+# The netperf matrix shows the Rust server falling behind the go/go control at
+# conns=4 (rs-rs down 1226 vs 2874 Mbps on 2026-10-04) while go_srv <- rs_cli
+# keeps pace, so the server TX path is the suspect. These c4 controls give the
+# server-side candidates evidence at that width; the c1 sweeps cannot.
+for flag in TLSVPN_TX_BATCH TLSVPN_SWITCH_BATCH; do
+  for enabled in 0 1; do
+    run_case "$flag-c4-$enabled" rs-rs 5 "PERF_CONNS=4" "$flag=$enabled"
+  done
+done
+
 # Compare rustls' outer TLS crypto provider without changing the production
 # manifest: the helper builds ring/aws-lc variants from this exact source tree,
 # restores Cargo.toml/Cargo.lock, then runs same-runner B/A/A/B Real-TAP cases.
