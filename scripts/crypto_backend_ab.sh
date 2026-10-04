@@ -30,7 +30,11 @@ restore_workspace() {
 trap restore_workspace EXIT
 
 build_provider() {
-  local provider="$1" target_dir="$work/target-$provider" bin="$work/tlsvpn-$provider"
+  # One `local` statement per assignment dependency: bash expands every word
+  # of a single `local` before any of them lands, so referencing $provider in
+  # the same statement dies with "unbound variable" under set -u.
+  local provider="$1"
+  local target_dir="$work/target-$provider" bin="$work/tlsvpn-$provider"
   restore_workspace
   if [[ "$provider" == "aws-lc" ]]; then
     python3 - <<'PY'
