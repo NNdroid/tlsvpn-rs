@@ -41,7 +41,7 @@ PY
   CARGO_TARGET_DIR="$target_dir" cargo build --release --bin tlsvpn
   cp "$target_dir/release/tlsvpn" "$bin"
   chmod +x "$bin"
-  "$bin" --help >/dev/null 2>&1 || true
+  test -x "$bin"
 }
 
 build_provider ring
@@ -79,7 +79,11 @@ run_case_once() {
   if grep -Fq 'adaptive scheduler utilization gate failed' "$log"; then
     return 75
   fi
-  return "${rc:-1}"
+  if [[ $rc -eq 0 ]]; then
+    echo "[crypto-ab] missing required VPN_METRICS/LOAD_LATENCY markers" | tee -a "$log"
+    return 1
+  fi
+  return "$rc"
 }
 
 run_case() {
