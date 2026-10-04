@@ -127,7 +127,10 @@ over it.
 
 ## Standing decision that is the user's, not yours
 
-The `net-perf` job's `runs-on` is `ubuntu-latest`, where it SKIPs (RTNL is
-refused even though TUNSETIFF is allowed) and exits 0. Running it for real
-needs a privileged self-hosted runner. That is an infrastructure choice the
-user makes; do not change `runs-on` on your own initiative.
+The `net-perf` job's `runs-on` is `ubuntu-latest`. An earlier version of this
+note claimed the job SKIPs on hosted runners (RTNL refused); that no longer
+holds — as of 2026-10 the hosted runner executes the whole RTNL/TAP path for
+real, and both the netperf matrix and the crypto AB harness produce genuine
+throughput numbers there. Whether to keep it hosted or move it to a
+privileged self-hosted runner is an infrastructure choice the user makes; do
+not change `runs-on` on your own initiative.
