@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - 'Cargo.toml'
       - 'scripts/pgo_build.sh'
       - 'scripts/pgo_train_real_tap.sh'
       - 'scripts/pgo_abba.sh'
@@ -59,6 +60,19 @@ jobs:
           bash scripts/pgo_build.sh baseline
           bash scripts/pgo_build.sh instrument
           file dist/pgo/tlsvpn-baseline dist/pgo/tlsvpn-instrumented
+
+      - name: Verify LLVM profile runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/tlsvpn-pgo-smoke"
+          rm -rf "$smoke"
+          mkdir -p "$smoke"
+          LLVM_PROFILE_FILE="$smoke/smoke-%p-%m.profraw" \
+            dist/pgo/tlsvpn-instrumented --version
+          find "$smoke" -type f -name '*.profraw' -size +0c -printf '%p %s bytes\n'
+          test "$(find "$smoke" -type f -name '*.profraw' -size +0c | wc -l)" -ge 1
+          rm -rf "$smoke"
 
       - name: Train LLVM profile on representative Real-TAP traffic
         shell: bash
