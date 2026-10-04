@@ -1,0 +1,36 @@
+name: Stage adaptive TX batching
+
+on:
+  push:
+    branches:
+      - perf/adaptive-tx-batching
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    if: ${{ !contains(github.event.head_commit.message, 'perf: add zero-wait adaptive TX batching') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply candidate patch
+        run: python3 scripts/apply_adaptive_tx_patch.py
+      - name: Validate diff
+        run: |
+          git diff --check
+          git diff -- src/net.rs
+      - name: Targeted policy test
+        run: cargo test --release adaptive_tx_batch_limit_scales_without_exceeding_static_cap -- --nocapture
+      - name: Full Rust tests
+        run: cargo test --release
+      - name: Commit candidate
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/net.rs
+          git commit -m 'perf: add zero-wait adaptive TX batching'
+          git push origin HEAD:perf/adaptive-tx-batching
