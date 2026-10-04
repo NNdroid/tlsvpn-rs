@@ -1,0 +1,38 @@
+name: Stage crypto backend A/B
+
+on:
+  push:
+    branches:
+      - perf/crypto-backend-ab
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/crypto-backend-ab
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply backend abstraction
+        run: python3 scripts/stage_crypto_backend_ab.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Test default ring backend
+        run: cargo test --release
+      - name: Test aws-lc backend
+        run: cargo test --release --no-default-features --features crypto-aws-lc
+      - name: Build aws-lc release
+        run: cargo build --release --no-default-features --features crypto-aws-lc
+      - name: Commit staged candidate
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock src/crypto.rs
+          git diff --cached --check
+          git commit -m 'perf: add compile-time ring/aws-lc crypto backend A/B'
+          git push origin HEAD:perf/crypto-backend-ab
