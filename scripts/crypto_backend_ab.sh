@@ -49,6 +49,37 @@ if grep -Fq '[netperf] SKIP:' "$probe_log"; then
   exit 0
 fi
 
+# The caller runs this harness under `sudo -E`, and sudo's secure_path drops
+# ~/.cargo/bin while HOME may point at /root — every pre-existing sudo step
+# either runs prebuilt binaries or builds outside sudo. Resolve the toolchain
+# by absolute path, pin the rustup home so the shim resolves the same
+# toolchain regardless of HOME, and keep every cargo write inside our work
+# dir so the runner user's ~/.cargo cache is never touched as root.
+cargo_env=()
+if [[ -n "${SUDO_USER:-}" ]]; then
+  cargo_env+=("CARGO_HOME=$work/cargo-home")
+fi
+cargo_bin="${CRYPTO_AB_CARGO:-}"
+if [[ -z "$cargo_bin" ]]; then
+  cargo_bin="$(command -v cargo 2>/dev/null || true)"
+fi
+if [[ -z "$cargo_bin" ]]; then
+  for cand in "$HOME/.cargo/bin/cargo" /home/runner/.cargo/bin/cargo \
+              /root/.cargo/bin/cargo /usr/local/cargo/bin/cargo; do
+    if [[ -x "$cand" ]]; then cargo_bin="$cand"; break; fi
+  done
+fi
+if [[ -z "$cargo_bin" ]]; then
+  echo "[crypto-ab] cargo not found; sudo strips ~/.cargo/bin from PATH" >&2
+  exit 1
+fi
+if [[ "$cargo_bin" == *"/.cargo/bin/cargo" ]]; then
+  cargo_home_root="${cargo_bin%/.cargo/bin/cargo}"
+  if [[ -n "${SUDO_USER:-}" && -z "${RUSTUP_HOME:-}" ]]; then
+    cargo_env+=("RUSTUP_HOME=$cargo_home_root/.rustup")
+  fi
+fi
+
 build_provider() {
   # One `local` statement per assignment dependency: bash expands every word
   # of a single `local` before any of them lands, so referencing $provider in
@@ -87,7 +118,7 @@ for path in (Path("src/main.rs"), Path("src/client.rs"), Path("examples/interop_
 PY
   fi
   echo "[crypto-ab] building provider=$provider"
-  CARGO_TARGET_DIR="$target_dir" cargo build --release --bin tlsvpn
+  env "${cargo_env[@]}" CARGO_TARGET_DIR="$target_dir" "$cargo_bin" build --release --bin tlsvpn
   cp "$target_dir/release/tlsvpn" "$bin"
   chmod +x "$bin"
   test -x "$bin"
