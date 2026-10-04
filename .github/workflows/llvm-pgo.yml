@@ -1,0 +1,119 @@
+name: LLVM PGO Real-TAP candidate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/pgo_build.sh'
+      - 'scripts/pgo_train_real_tap.sh'
+      - 'scripts/pgo_abba.sh'
+      - 'scripts/pgo_gate.py'
+      - '.github/workflows/llvm-pgo.yml'
+
+jobs:
+  pgo-real-tap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Checkout Go control implementation
+        uses: actions/checkout@v4
+        with:
+          repository: NNdroid/tlsvpn
+          path: go-impl
+
+      - name: Install benchmark dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iperf3 traceroute
+
+      - name: Build Go control
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd go-impl && bash scripts/build.sh)
+          test -x go-impl/bin/tlsvpn_linux_amd64
+
+      - name: Build baseline and PGO instrumented Rust binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/pgo_build.sh baseline
+          bash scripts/pgo_build.sh instrument
+          file dist/pgo/tlsvpn-baseline dist/pgo/tlsvpn-instrumented
+
+      - name: Train LLVM profile on representative Real-TAP traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E env \
+            RS_BIN="$GITHUB_WORKSPACE/dist/pgo/tlsvpn-instrumented" \
+            GO_BIN="$GITHUB_WORKSPACE/go-impl/bin/tlsvpn_linux_amd64" \
+            PGO_RAW_DIR="$GITHUB_WORKSPACE/target/pgo/raw" \
+            PGO_TRAIN_SECONDS=6 \
+            bash scripts/pgo_train_real_tap.sh
+          find target/pgo/raw -type f -name '*.profraw' -printf '%p %s bytes\n'
+
+      - name: Merge profile and build profile-use binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/pgo_build.sh merge
+          bash scripts/pgo_build.sh optimize
+          test -s target/pgo/merged.profdata
+          file dist/pgo/tlsvpn-pgo
+          ls -lh dist/pgo target/pgo/merged.profdata
+
+      - name: Source regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --all-targets
+
+      - name: Real-TAP B/A/A/B promotion gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E env \
+            BASE_BIN="$GITHUB_WORKSPACE/dist/pgo/tlsvpn-baseline" \
+            PGO_BIN="$GITHUB_WORKSPACE/dist/pgo/tlsvpn-pgo" \
+            GO_BIN="$GITHUB_WORKSPACE/go-impl/bin/tlsvpn_linux_amd64" \
+            PGO_ABBA_SECONDS=5 \
+            PGO_ENFORCE=1 \
+            PGO_MIN_GEOMEAN=1.01 \
+            PGO_MIN_CASE_RATIO=0.97 \
+            PGO_MAX_CPU_EFF_RATIO=1.02 \
+            bash scripts/pgo_abba.sh
+
+      - name: Publish PGO summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f perf-results/pgo/abba/pgo-summary.md ]]; then
+            cat perf-results/pgo/abba/pgo-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'PGO summary unavailable; inspect training/ABBA logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PGO evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-pgo-real-tap-evidence
+          if-no-files-found: warn
+          path: |
+            perf-results/pgo/
+            target/pgo/merged.profdata
+            dist/pgo/tlsvpn-baseline
+            dist/pgo/tlsvpn-pgo
