@@ -29,6 +29,13 @@ done
 for size in 8 16 32; do
   run_case "tx-size-$size" rs-rs 5 TLSVPN_TX_BATCH=1 "TLSVPN_TX_BATCH_SIZE=$size"
 done
+
+# Compare rustls' outer TLS crypto provider without changing the production
+# manifest: the helper builds ring/aws-lc variants from this exact source tree,
+# restores Cargo.toml/Cargo.lock, then runs same-runner B/A/A/B Real-TAP cases.
+GO_BIN="$GO_BIN" RX_PERF_OUTPUT="${RX_PERF_OUTPUT:-perf-results/rx-real-tap}" \
+  bash scripts/crypto_backend_ab.sh
+
 trial=0
 for enabled in 0 1 1 0; do
   trial=$((trial + 1))
