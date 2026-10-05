@@ -32,12 +32,16 @@ done
 
 # The netperf matrix shows the Rust server falling behind the go/go control at
 # conns=4 (rs-rs down 1226 vs 2874 Mbps on 2026-10-04) while go_srv <- rs_cli
-# keeps pace, so the server TX path is the suspect. These c4 controls give the
-# server-side candidates evidence at that width; the c1 sweeps cannot.
-for flag in TLSVPN_TX_BATCH TLSVPN_SWITCH_BATCH; do
-  for enabled in 0 1; do
-    run_case "$flag-c4-$enabled" rs-rs 5 "PERF_CONNS=4" "$flag=$enabled"
-  done
+# keeps pace, so the server TX path is the suspect. First single-draw c4 A/Bs
+# (2026-10-05) put SWITCH_BATCH up +35% and TX_BATCH down -26%, but c4 spreads
+# 25%+ between same-config runs, so these ABBA trials at 10 s with a go/go
+# control per trial firm the signals up before any server-side default change.
+trial=0
+for enabled in 0 1 1 0; do
+  trial=$((trial + 1))
+  run_case "c4-control-trial$trial" go-go 10 "PERF_CONNS=4"
+  run_case "sw-batch-c4-trial$trial" rs-rs 10 "PERF_CONNS=4" "TLSVPN_SWITCH_BATCH=$enabled"
+  run_case "tx-batch-c4-trial$trial" rs-rs 10 "PERF_CONNS=4" "TLSVPN_TX_BATCH=$enabled"
 done
 
 # Compare rustls' outer TLS crypto provider without changing the production
