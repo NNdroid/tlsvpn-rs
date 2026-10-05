@@ -40,8 +40,15 @@ run_case() {
   grep -Fq VPN_METRICS "$log" || exit 1
   grep -Fq LOAD_LATENCY "$log" || exit 1
 }
-for flag in TLSVPN_RX_OWNED TLSVPN_TX_BATCH TLSVPN_RX_COMPACT TLSVPN_SWITCH_BATCH; do
-  for enabled in 0 1; do run_case "$flag-$enabled" rs-rs 5 "$flag=$enabled"; done
+# Single-draw flag A/Bs flipped sign between runner days (SWITCH_BATCH c1 up:
+# -11% on 2026-10-04, +1.7% on 2026-10-05), so every flag now gets the same
+# 10 s ABBA treatment the conns=4 cases use before a default change.
+trial=0
+for enabled in 0 1 1 0; do
+  trial=$((trial + 1))
+  for flag in TLSVPN_RX_OWNED TLSVPN_TX_BATCH TLSVPN_RX_COMPACT TLSVPN_SWITCH_BATCH; do
+    run_case "$flag-abba-trial$trial" rs-rs 10 "$flag=$enabled"
+  done
 done
 for size in 8 16 32; do
   run_case "tx-size-$size" rs-rs 5 TLSVPN_TX_BATCH=1 "TLSVPN_TX_BATCH_SIZE=$size"
