@@ -291,9 +291,15 @@ traceroute_check() {
 
 # ---------------------------------------------------------------------------
 # Adaptive multipath diagnostics. Upload is scheduled by the client; download
-# is scheduled by the server. Every configured path must carry real payload
-# (>= 1 MiB assigned bytes; handshake-only paths do not count), and no single
-# path may monopolize more than 80% of assigned bytes.
+# by the server. The scheduler widens/narrows the active path set with demand
+# (active_target, Go-aligned), so "all N paths must carry traffic" is NOT the
+# contract anymore. What must hold:
+#   1. at least one participating path (>= 1 MiB assigned bytes; handshake
+#      dust left on deactivated paths does not count),
+#   2. every path the scheduler marks active must be participating — an
+#      active-but-starved path is a real scheduling defect,
+#   3. with >= 2 participating paths, none may hold > 80% of the bytes; a lone
+#      active path is the scheduler's deliberate low-demand concentration.
 # ---------------------------------------------------------------------------
 scheduler_diag() {
   local direction="$1" ns role
@@ -328,21 +334,25 @@ rows = [r for r in rows if isinstance(r.get("scheduler"), dict)][:want]
 if len(rows) < want:
     raise SystemExit(f"scheduler telemetry has {len(rows)}/{want} paths for {role}")
 assigned = [int((r.get("scheduler") or {}).get("assigned_bytes", 0) or 0) for r in rows]
+active = [bool((r.get("scheduler") or {}).get("active", False)) for r in rows]
 total = sum(assigned)
 if total <= 0:
     raise SystemExit(f"scheduler assigned no bytes: {assigned}")
-# "Real payload" floor: handshake/control traffic leaves paths at hundreds of
-# bytes, which once passed a three-path striping run as 4/4 used. 1 MiB is an
-# order of magnitude above control-plane volume and far below any striped
-# payload share at throughput-test rates.
+# "Real payload" floor: handshake/control traffic leaves deactivated paths at
+# hundreds of bytes. 1 MiB is an order of magnitude above control-plane volume
+# and far below any striped payload share at throughput-test rates.
 real_payload = 1 << 20
-used = sum(v >= real_payload for v in assigned)
-shares = [v / total for v in assigned]
-print(f"[netperf] scheduler {direction}/{role}: assigned={assigned} shares={[round(x, 4) for x in shares]}")
-if used != want:
-    raise SystemExit(f"adaptive scheduler used {used}/{want} paths (>= {real_payload} bytes each): {assigned}")
-if max(shares) > 0.80:
-    raise SystemExit(f"adaptive scheduler path monopoly {max(shares) * 100:.1f}%: {shares}")
+participating = [i for i in range(want) if assigned[i] >= real_payload]
+starved = [i for i in range(want) if active[i] and assigned[i] < real_payload]
+print(f"[netperf] scheduler {direction}/{role}: assigned={assigned} active={active} participating={participating}")
+if not participating:
+    raise SystemExit(f"adaptive scheduler has no participating path (>= {real_payload} bytes): {assigned}")
+if starved:
+    raise SystemExit(f"adaptive scheduler active-but-starved paths {starved}: {assigned}")
+if len(participating) > 1:
+    worst = max(assigned[i] for i in participating) / sum(assigned[i] for i in participating)
+    if worst > 0.80:
+        raise SystemExit(f"adaptive scheduler path monopoly {worst * 100:.1f}% among participating paths: {assigned}")
 PY
 }
 
