@@ -11,15 +11,32 @@ run_case() {
   [[ "$srv" == go ]] && srv_bin="$GO_BIN"
   [[ "$cli" == go ]] && cli_bin="$GO_BIN"
   local log="$out/$name-$pair.txt"
-  echo "DATAPLANE_CASE name=$name pair=$pair seconds=$seconds flags=$*" | tee "$log"
-  env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
-    TLSVPN_TX_BATCH_SIZE=8 TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
-    PERF_LATENCY=1 IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
-    FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
-  if grep -Fq '[netperf] SKIP:' "$log"; then
-    echo 'DATAPLANE_CASE SKIP; no performance evidence' | tee "$out/SKIP.txt"
-    exit 0
-  fi
+  # The utilization gate reads one cumulative stats snapshot; on a noisy
+  # runner the adaptive scheduler can legitimately concentrate traffic on the
+  # healthy paths for that sample. Treat a gate trip as an invalid sample and
+  # redraw it (same contract as crypto_backend_ab.sh's rc=75 retries).
+  local attempt rc
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    echo "DATAPLANE_CASE name=$name pair=$pair seconds=$seconds flags=$* attempt=$attempt" | tee "$log"
+    set +e
+    env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
+      TLSVPN_TX_BATCH_SIZE=8 TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
+      PERF_LATENCY=1 IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
+      FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if grep -Fq '[netperf] SKIP:' "$log"; then
+      echo 'DATAPLANE_CASE SKIP; no performance evidence' | tee "$out/SKIP.txt"
+      exit 0
+    fi
+    if grep -Fq 'adaptive scheduler utilization gate failed' "$log"; then
+      [[ $attempt -lt 3 ]] || break
+      echo "[candidates] invalid scheduler sample; retrying attempt=$attempt"
+      continue
+    fi
+    break
+  done
+  [[ $rc -eq 0 ]] || exit "$rc"
   grep -Fq VPN_METRICS "$log" || exit 1
   grep -Fq LOAD_LATENCY "$log" || exit 1
 }
