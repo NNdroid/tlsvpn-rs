@@ -8,7 +8,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const HOT_FRAME_CLASS: usize = 2048;
 const FRAME_CLASSES: [usize; 7] = [
     2 * 1024,
     4 * 1024,
@@ -426,6 +425,9 @@ impl ReorderBuffer {
 mod tests {
     use super::*;
 
+    // 生产代码用 FRAME_CLASSES[0] 表达同一档位；该常量只服务这些断言。
+    const HOT_FRAME_CLASS: usize = 2048;
+
     #[test]
     fn direct_batch_preserves_gap_replay_and_resume_semantics() {
         let traces: &[&[u32]] = &[
@@ -636,7 +638,7 @@ mod tests {
 
     #[test]
     fn deduplicator_uses_fixed_sequence_slots() {
-        let mut d = DeDuplicator::new();
+        let d = DeDuplicator::new();
         assert!(!d.is_duplicate(1));
         assert!(d.is_duplicate(1));
 

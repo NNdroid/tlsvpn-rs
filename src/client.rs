@@ -1574,7 +1574,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
     // 5. 会话级协商（对齐 Go sessionMu 段）
     let mut use_xor_fec = false;
-    let mut is_new_session = false;
+    // 会话判定只在下方协商块内赋值一次后读取，无需先给占位初值。
+    let is_new_session;
     let mut actor_reconfigure = false;
     let mut actor_fec_k = 0usize;
     {

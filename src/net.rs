@@ -106,7 +106,9 @@ pub struct BrutalApplyResult {
 enum BrutalSockError {
     Locked,
     NoVersion,
-    Other(String),
+    // 载荷经派生 Debug 进入 TCP_CONGESTION 错误串（"…failed: Other(\"…\")"），
+    // dead_code 分析不把 Debug 视作读取，这里显式豁免。
+    Other(#[allow(dead_code)] String),
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1629,36 +1631,6 @@ impl AsyncPort {
         Some((rtt as u64 + penalty).min(u32::MAX as u64) as u32)
     }
 
-    /// MinRTT + 积压评分，并为当前路径保留 12.5% RTT（最低 5ms）滞回。
-    /// 返回后端索引，避免在每帧路径构造/升级 Weak Arc。
-    fn pick_backend_index(&self, backends: &[Arc<Backend>]) -> Option<usize> {
-        let mut best_idx = None;
-        let mut min_score = u32::MAX;
-        for (idx, b) in backends.iter().enumerate() {
-            let Some(score) = Self::backend_score(b) else {
-                continue;
-            };
-            if score < min_score {
-                min_score = score;
-                best_idx = Some(idx);
-            }
-        }
-
-        let mut selected = best_idx.or_else(|| (!backends.is_empty()).then_some(0))?;
-        let current = self.preferred.load(Ordering::Relaxed);
-        if current < backends.len() && current != selected {
-            if let Some(current_score) = Self::backend_score(&backends[current]) {
-                let hysteresis =
-                    5_000u32.max(backends[current].rtt_cache.load(Ordering::Relaxed) / 8);
-                if current_score as u64 <= min_score as u64 + hysteresis as u64 {
-                    selected = current;
-                }
-            }
-        }
-        self.preferred.store(selected, Ordering::Relaxed);
-        Some(selected)
-    }
-
     /// Adaptive byte-aware data-path selection. Parity keeps the legacy health picker.
     fn selected_data_backend_index(
         &self,
@@ -2478,54 +2450,6 @@ mod tests {
         for f in rx1.try_iter() {
             f.data.release();
         }
-    }
-
-    #[test]
-    fn async_port_keeps_sticky_path_until_backpressure() {
-        let port = AsyncPort::new("sticky".into());
-        let (tx_a, _rx_a) = crossbeam_channel::bounded(32);
-        let (tx_b, _rx_b) = crossbeam_channel::bounded(32);
-        let a = Arc::new(Backend {
-            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
-            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
-            ch: tx_a,
-            owned_batches: None,
-            conn_id: Arc::new(Mutex::new(String::new())),
-            rtt_cache: Arc::new(AtomicU32::new(250_000)),
-            notify: None,
-        });
-        let b = Arc::new(Backend {
-            fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
-            scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
-            ch: tx_b,
-            owned_batches: None,
-            conn_id: Arc::new(Mutex::new(String::new())),
-            rtt_cache: Arc::new(AtomicU32::new(240_000)),
-            notify: None,
-        });
-        let backends = vec![a.clone(), b.clone()];
-        assert_eq!(port.pick_backend_index(&backends), Some(1));
-
-        a.rtt_cache.store(240_000, Ordering::Relaxed);
-        b.rtt_cache.store(255_000, Ordering::Relaxed);
-        assert_eq!(
-            port.pick_backend_index(&backends),
-            Some(1),
-            "hysteresis should keep the current path"
-        );
-
-        while b.ch.len() < b.ch.capacity().unwrap() - 2 {
-            b.ch.try_send(VPNFrame {
-                seq: 0,
-                data: FramePayload::Owned(Vec::new()),
-            })
-            .unwrap();
-        }
-        assert_eq!(
-            port.pick_backend_index(&backends),
-            Some(0),
-            "near-full preferred queue must trigger an immediate switch"
-        );
     }
 
     #[test]

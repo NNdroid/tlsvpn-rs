@@ -220,6 +220,7 @@ fn load_config_file(path: &str) -> Result<Args, String> {
     // 区间默认取协议边界，即未配置时不额外限制
     let (fec_group_min, fec_group_max) =
         crate::fec::normalize_fec_group_bounds(cfg.server.fec_group_min, cfg.server.fec_group_max);
+    let encrypt = if encrypt_present { cfg.encrypt } else { true };
     let mut args = Args {
         mode: cfg.mode.clone(),
         psk: cfg.psk,
@@ -237,8 +238,8 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         up: cfg.up,
         down: cfg.down,
-        encrypt: if encrypt_present { cfg.encrypt } else { true },
-        enc_algo: if (if encrypt_present { cfg.encrypt } else { true }) {
+        encrypt,
+        enc_algo: if encrypt {
             if cfg.enc_algo.is_empty() {
                 "gcm256".into()
             } else {
