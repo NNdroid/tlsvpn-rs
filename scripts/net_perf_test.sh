@@ -291,8 +291,9 @@ traceroute_check() {
 
 # ---------------------------------------------------------------------------
 # Adaptive multipath diagnostics. Upload is scheduled by the client; download
-# is scheduled by the server. Every configured path must carry real payload,
-# and no single path may monopolize more than 80% of assigned bytes.
+# is scheduled by the server. Every configured path must carry real payload
+# (>= 1 MiB assigned bytes; handshake-only paths do not count), and no single
+# path may monopolize more than 80% of assigned bytes.
 # ---------------------------------------------------------------------------
 scheduler_diag() {
   local direction="$1" ns role
@@ -330,11 +331,16 @@ assigned = [int((r.get("scheduler") or {}).get("assigned_bytes", 0) or 0) for r 
 total = sum(assigned)
 if total <= 0:
     raise SystemExit(f"scheduler assigned no bytes: {assigned}")
-used = sum(v > 0 for v in assigned)
+# "Real payload" floor: handshake/control traffic leaves paths at hundreds of
+# bytes, which once passed a three-path striping run as 4/4 used. 1 MiB is an
+# order of magnitude above control-plane volume and far below any striped
+# payload share at throughput-test rates.
+real_payload = 1 << 20
+used = sum(v >= real_payload for v in assigned)
 shares = [v / total for v in assigned]
 print(f"[netperf] scheduler {direction}/{role}: assigned={assigned} shares={[round(x, 4) for x in shares]}")
 if used != want:
-    raise SystemExit(f"adaptive scheduler used {used}/{want} paths: {assigned}")
+    raise SystemExit(f"adaptive scheduler used {used}/{want} paths (>= {real_payload} bytes each): {assigned}")
 if max(shares) > 0.80:
     raise SystemExit(f"adaptive scheduler path monopoly {max(shares) * 100:.1f}%: {shares}")
 PY
