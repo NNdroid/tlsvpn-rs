@@ -866,7 +866,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         };
         let dev = builder.build_sync().unwrap();
         #[cfg(target_os = "linux")]
-        if std::env::var("TLSVPN_TX_BATCH").as_deref() == Ok("1") {
+        // 批量读默认开启：real-TAP A/B（rs-rs 单开关）up +9.9% / down +5.4%，
+        // TLSVPN_TX_BATCH=0 退回逐帧路径。
+        if std::env::var("TLSVPN_TX_BATCH").as_deref() != Ok("0") {
             dev.set_nonblocking(true).expect("TAP nonblocking mode for batched reads");
         }
         Arc::new(dev)
@@ -960,7 +962,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
         let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
-            let batch_tx = std::env::var("TLSVPN_TX_BATCH").as_deref() == Ok("1");
+            // 与上面 TAP 设备的 nonblocking 开关同源：默认开，TLSVPN_TX_BATCH=0 退出。
+            let batch_tx = std::env::var("TLSVPN_TX_BATCH").as_deref() != Ok("0");
             let mut frames = Vec::with_capacity(crate::net::tx_batch_size());
             loop {
                 if EXIT.load(Ordering::Relaxed) {
