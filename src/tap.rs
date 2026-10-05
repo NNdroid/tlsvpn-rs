@@ -15,9 +15,12 @@ pub fn tap_read_buffer_size(mtu: u16) -> usize {
 pub trait TapDevice: Send + Sync {
     fn send(&self, data: &[u8]) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
-    /// Opportunistic drain by the device's sole reader; never wait for a batch.
-    fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::WouldBlock.into())
+    /// Zero-timeout readability probe that gates the opportunistic TX drain.
+    /// The fd stays blocking so the TAP delivery writer keeps paying a single
+    /// blocking write syscall; devices without a poll-able fd report "not
+    /// readable" and the drain degenerates to one frame per wake.
+    fn poll_readable(&self, _timeout_ms: i32) -> io::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -40,11 +43,20 @@ impl TapDevice for SyncDevice {
             }
         }
     }
+    /// Only used by the sole reader to gate each opportunistic drain frame.
     #[cfg(target_os = "linux")]
-    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // Only used by the sole reader after opting into nonblocking TAP mode.
-        // No per-packet readiness syscall: EAGAIN ends the opportunistic batch.
-        SyncDevice::recv(self, buf)
+    fn poll_readable(&self, timeout_ms: i32) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd { fd: self.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        loop {
+            let n = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            return Ok(n > 0 && fd.revents & libc::POLLIN != 0);
+        }
     }
 }
 

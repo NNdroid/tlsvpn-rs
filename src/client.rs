@@ -865,12 +865,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             builder
         };
         let dev = builder.build_sync().unwrap();
-        #[cfg(target_os = "linux")]
-        // 批量读默认开启：real-TAP A/B（rs-rs 单开关）up +9.9% / down +5.4%，
-        // TLSVPN_TX_BATCH=0 退回逐帧路径。
-        if std::env::var("TLSVPN_TX_BATCH").as_deref() != Ok("0") {
-            dev.set_nonblocking(true).expect("TAP nonblocking mode for batched reads");
-        }
+        // fd 保持阻塞：TX_BATCH 的机会式排水用零超时 poll 门控（见读线程），
+        // 不能让 delivery 写入侧背上 EAGAIN/poll/重写的系统调用税——
+        // conns=4 下载实测该税 −12%（三次受控复现）。
         Arc::new(dev)
     };
 
@@ -962,7 +959,7 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         // MTU 不含 L2 头；默认 1500 + headroom 仍落入 2KB thread-local 热池。
         let tap_read_size = crate::tap::tap_read_buffer_size(args.mtu);
         std::thread::spawn(move || {
-            // 与上面 TAP 设备的 nonblocking 开关同源：默认开，TLSVPN_TX_BATCH=0 退出。
+            // 批量读默认开（real-TAP A/B 两次独立复现上行正增益），TLSVPN_TX_BATCH=0 退出。
             let batch_tx = std::env::var("TLSVPN_TX_BATCH").as_deref() != Ok("0");
             let mut frames = Vec::with_capacity(crate::net::tx_batch_size());
             loop {
@@ -978,8 +975,14 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
                         if batch_tx {
                             frames.push(crate::frame::FramePayload::Owned(frame));
                             while frames.len() < crate::net::tx_batch_size() {
+                                // 零超时 poll 门控每帧排水：fd 保持阻塞，
+                                // delivery 写入侧不受 nonblocking 影响。
+                                match dev.poll_readable(0) {
+                                    Ok(true) => {}
+                                    _ => break,
+                                }
                                 let mut next = acquire_frame_vec_overwrite(tap_read_size);
-                                match dev.try_recv(&mut next) {
+                                match dev.recv(&mut next) {
                                     Ok(n) if n > 0 => {
                                         next.truncate(n);
                                         frames.push(crate::frame::FramePayload::Owned(next));

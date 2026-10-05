@@ -89,9 +89,12 @@ change:
   combined when both variants are present. The session batch mutex remains.
 * `TLSVPN_TX_BATCH=0`: disables the default client TX batching. The TAP reader
   drains already-readable packets
-  without waiting. On Linux its fd is nonblocking and EAGAIN ends the batch;
-  normal recv/send wait for readiness only on EAGAIN, preserving their blocking
-  behavior without a per-packet poll syscall. A single-backend/no-FEC port assigns sequences and queues
+  without waiting. On Linux each drain attempt is gated by a zero-timeout
+  poll so the fd stays blocking — the TAP delivery writer keeps its
+  single-syscall blocking write instead of paying an EAGAIN/poll/rewrite
+  round trip when the device queue saturates under multipath load
+  (measured −12% download at conns=4 with the earlier nonblocking fd).
+  A single-backend/no-FEC port assigns sequences and queues
   the batch under one queue lock, with one wake. FEC/multipath keeps the existing
   scheduler/fence path. Queue headroom and sequence exhaustion still drop safely.
   The default flip follows the hosted-runner real-TAP A/B (rs-rs, single flag,
