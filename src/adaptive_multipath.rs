@@ -176,16 +176,6 @@ impl SchedulerBackendState {
         self.sample_start_us.store(now.max(1), Ordering::Relaxed);
     }
 
-    #[inline]
-    fn effective_rate(&self) -> u64 {
-        let v = self.rate_bytes_per_sec.load(Ordering::Relaxed);
-        if v == 0 {
-            FALLBACK_RATE_BYTES_PER_SEC
-        } else {
-            v
-        }
-    }
-
     pub fn snapshot(&self) -> SchedulerSnapshot {
         SchedulerSnapshot {
             queued_bytes: self.queued_bytes.load(Ordering::Relaxed),

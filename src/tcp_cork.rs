@@ -1,3 +1,5 @@
+// net 辅助只被 Linux 门控的拥塞控制路径调用，非 Linux 构建休眠该 import。
+#[cfg(target_os = "linux")]
 use crate::net::{get_tcp_mss, get_tcp_rtt};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};

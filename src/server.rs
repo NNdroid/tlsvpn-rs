@@ -2862,7 +2862,7 @@ fn on_conn_closed(
     if let (Some(c_sess), Some(backend)) = (c_sess, backend) {
         c_sess.port.unregister_backend(&backend.ch);
         if brutal_applied {
-            let _ = c_sess.brutal_applied_conns.fetch_update(
+            let _ = c_sess.brutal_applied_conns.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |v| Some(v.saturating_sub(1)),
