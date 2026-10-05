@@ -220,7 +220,7 @@ jobs:
         BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
         FLAVOR_SRV: rs
         FLAVOR_CLI: rs
-      run: sudo -E bash scripts/net_perf_test.sh
+      run: sudo -E bash scripts/netperf_retry.sh bash scripts/net_perf_test.sh
 
     - name: rs_srv <- go_cli (cross-language)
       id: netperf_rs_go
@@ -230,7 +230,7 @@ jobs:
         BIN_CLI: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
         FLAVOR_SRV: rs
         FLAVOR_CLI: go
-      run: sudo -E bash scripts/net_perf_test.sh
+      run: sudo -E bash scripts/netperf_retry.sh bash scripts/net_perf_test.sh
 
     - name: go_srv <- rs_cli (cross-language)
       id: netperf_go_rs
@@ -240,7 +240,7 @@ jobs:
         BIN_CLI: ${{ github.workspace }}/dist/tlsvpn
         FLAVOR_SRV: go
         FLAVOR_CLI: rs
-      run: sudo -E bash scripts/net_perf_test.sh
+      run: sudo -E bash scripts/netperf_retry.sh bash scripts/net_perf_test.sh
 
     # Runner control: neither endpoint contains Rust. This gives each run a
     # same-machine reference for hosted-runner CPU/network scheduling noise,
@@ -253,7 +253,7 @@ jobs:
         BIN_CLI: ${{ github.workspace }}/go-impl/bin/tlsvpn_linux_amd64
         FLAVOR_SRV: go
         FLAVOR_CLI: go
-      run: sudo -E bash scripts/net_perf_test.sh
+      run: sudo -E bash scripts/netperf_retry.sh bash scripts/net_perf_test.sh
 
     - name: Require every real-TAP matrix group
       if: always()
