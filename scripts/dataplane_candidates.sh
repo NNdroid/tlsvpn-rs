@@ -20,6 +20,7 @@ run_case() {
     echo "DATAPLANE_CASE name=$name pair=$pair seconds=$seconds flags=$* attempt=$attempt" | tee "$log"
     set +e
     env TLSVPN_RX_OWNED=0 TLSVPN_TX_BATCH=0 TLSVPN_RX_COMPACT=0 TLSVPN_SWITCH_BATCH=0 \
+      TLSVPN_PORT_DISPATCH=0 \
       TLSVPN_TX_BATCH_SIZE=8 TLSVPN_RX_BATCH_SIZE=16 TLSVPN_RX_BYPASS=1 PERF_CONNS=1 \
       PERF_LATENCY=1 IPERF_SECONDS="$seconds" BIN_SRV="$srv_bin" BIN_CLI="$cli_bin" \
       FLAVOR_SRV="$srv" FLAVOR_CLI="$cli" "$@" bash scripts/net_perf_test.sh 2>&1 | tee -a "$log"
@@ -50,6 +51,15 @@ for enabled in 0 1 1 0; do
     run_case "$flag-abba-trial$trial" rs-rs 10 "$flag=$enabled"
   done
 done
+
+# PORT_DISPATCH moves per-frame seq allocation, adaptive pick and batch enqueue
+# off the shared TAP reader onto a per-port dispatch thread (Go AsyncPort.run
+# parity). Same-width ABBA before any default flip.
+trial=0
+for enabled in 0 1 1 0; do
+  trial=$((trial + 1))
+  run_case "port-dispatch-abba-trial$trial" rs-rs 10 "TLSVPN_PORT_DISPATCH=$enabled"
+done
 for size in 8 16 32; do
   run_case "tx-size-$size" rs-rs 5 TLSVPN_TX_BATCH=1 "TLSVPN_TX_BATCH_SIZE=$size"
 done
@@ -66,6 +76,7 @@ for enabled in 0 1 1 0; do
   run_case "c4-control-trial$trial" go-go 10 "PERF_CONNS=4"
   run_case "sw-batch-c4-trial$trial" rs-rs 10 "PERF_CONNS=4" "TLSVPN_SWITCH_BATCH=$enabled"
   run_case "tx-batch-c4-trial$trial" rs-rs 10 "PERF_CONNS=4" "TLSVPN_TX_BATCH=$enabled"
+  run_case "port-dispatch-c4-trial$trial" rs-rs 10 "PERF_CONNS=4" "TLSVPN_PORT_DISPATCH=$enabled"
 done
 
 # Compare rustls' outer TLS crypto provider without changing the production

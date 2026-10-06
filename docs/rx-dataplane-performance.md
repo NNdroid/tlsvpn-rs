@@ -111,6 +111,21 @@ change:
 * `TLSVPN_TX_BATCH_SIZE=8|16|32`: selects the maximum frame count for ownership
   batches and opportunistic TAP drains. The existing 8 KiB byte bound remains;
   default stays 8. Invalid values use 8. No timer waits for a full batch.
+* `TLSVPN_PORT_DISPATCH=1`: moves per-port downlink dispatch onto a dedicated
+  thread (Go `AsyncPort.run` parity). The server TAP reader only performs the
+  MAC lookup and one bounded enqueue per frame; the dispatch thread allocates
+  wire sequences, coalesces up to 12 KiB per batch (one 150 µs coalescing
+  opportunity when the input queue looks empty), runs the adaptive backend
+  pick once per batch instead of once per frame, and issues one batch enqueue
+  and one wake. Frames already wait for a free backend slot before a sequence
+  is consumed, so saturation drops stop manufacturing line sequence holes.
+  Sessions without the flag keep the direct per-frame dispatch path; FEC
+  sessions keep the existing per-frame fence/parity semantics. Opt-in until
+  same-width conns=1 and conns=4 ABBA evidence justifies a default change.
+  `cargo test --release bench_port_dispatch -- --ignored --nocapture` runs a
+  same-binary producer/consumer microbenchmark (conns configurable via
+  `TLSVPN_DISPATCH_BENCH_CONNS`) that isolates dispatch mechanics without TLS
+  or a kernel TAP.
 
 `scripts/dataplane_candidates.sh` tests each candidate separately, TX batch
 limits, then a 10-second off/on/on/off combined sweep of rs/rs, rs/go, go/rs and

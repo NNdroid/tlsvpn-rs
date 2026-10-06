@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use dashmap::{mapref::entry::Entry, DashMap};
 use mio;
@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::adaptive_multipath::{
     AdaptiveBackend, AdaptivePortState, SchedulerBackendState, SchedulerSnapshot,
 };
-use crate::buffer::release_frame_vec;
+use crate::buffer::{release_frame_vec, release_shared_frame};
 use crate::crypto::*;
 use crate::fec::FecEncoder;
 use crate::frame::{FramePayload, VPNFrame, VPNFrameBatch};
@@ -1189,6 +1189,12 @@ impl BackendNotify {
     pub fn consume_wake(&self) {
         self.pending.store(false, Ordering::Release);
     }
+
+    /// 是否有尚未被 consumer 消费的唤醒（定时扫描的 flush gate 用）。
+    #[inline]
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
 }
 
 const OWNED_BATCH_MAX_FRAMES: usize = 8;
@@ -1216,6 +1222,9 @@ struct OwnedBatchQueueInner {
 /// channel backpressure semantics seen by the adaptive scheduler.
 pub struct OwnedBatchQueue {
     inner: Mutex<OwnedBatchQueueInner>,
+    // 与 inner.frames 同点维护的免锁近似值，供热路径健康检查读取
+    // （backend_score 每帧都要看队列水位，不值得为此抢一次 mutex）。
+    frames_hint: AtomicUsize,
     capacity_frames: usize,
     max_batch_frames: usize,
 }
@@ -1227,9 +1236,15 @@ impl OwnedBatchQueue {
                 batches: VecDeque::new(),
                 frames: 0,
             }),
+            frames_hint: AtomicUsize::new(0),
             capacity_frames: capacity_frames.max(1),
             max_batch_frames: tx_batch_size(),
         }
+    }
+
+    #[inline]
+    pub fn len_hint(&self) -> usize {
+        self.frames_hint.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -1239,6 +1254,7 @@ impl OwnedBatchQueue {
             return Err(frame);
         }
         Self::push_locked(&mut inner, frame, bytes, self.max_batch_frames);
+        self.frames_hint.store(inner.frames, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1273,6 +1289,7 @@ impl OwnedBatchQueue {
             bytes += n;
             Self::push_locked(&mut inner, frame, n, self.max_batch_frames);
         }
+        self.frames_hint.store(inner.frames, Ordering::Relaxed);
         (count, bytes)
     }
 
@@ -1293,6 +1310,7 @@ impl OwnedBatchQueue {
         #[cfg(feature = "alloc-profile")]
         crate::alloc_profile::popped(batch.frames.len(), batch.queued_at.elapsed());
         inner.frames = inner.frames.saturating_sub(batch.frames.len());
+        self.frames_hint.store(inner.frames, Ordering::Relaxed);
         Some(batch)
     }
 
@@ -1389,7 +1407,25 @@ pub struct AsyncPort {
     dropped: AtomicU64,
     parity_sent: AtomicU64,
     sequence_exhausted: AtomicBool,
+    // dispatch 模式（enable_dispatch）：生产者只做有界入队，seq 分配/成批/
+    // 自适应选路/唤醒全部移到端口自己的 dispatch 线程——对齐 Go AsyncPort.run，
+    // 把这些每帧成本从共享的 TAP 读线程上摘掉并按批摊薄。
+    dispatch_tx: std::sync::OnceLock<Sender<FramePayload>>,
 }
+
+/// TLSVPN_PORT_DISPATCH=1 启用端口级 dispatch 线程（候选旗标，ABBA 证据出来前默认关）。
+pub fn port_dispatch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TLSVPN_PORT_DISPATCH").as_deref() == Ok("1"))
+}
+
+const DISPATCH_QUEUE_FRAMES: usize = 4096;
+// 对齐 Go streamTLSBatchSoftLimit 的单批字节上限。
+const DISPATCH_BATCH_MAX_BYTES: u64 = 12 * 1024;
+// Go：交互突发给一次极短合批机会；持续满载时队列非空，热路径不睡眠。
+const DISPATCH_COALESCE_US: u64 = 150;
+// Go waitForBackendSlot 的拥塞等待步长。
+const DISPATCH_SLOT_WAIT_US: u64 = 50;
 
 impl AsyncPort {
     pub fn new(id: String) -> Self {
@@ -1406,6 +1442,38 @@ impl AsyncPort {
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
+            dispatch_tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 启用端口级 dispatch 线程（冷路径，每端口最多一次）。
+    ///
+    /// 线程持有 Weak：端口销毁时 input Sender 随之释放，recv 断开即退出，
+    /// 不会把端口生命周期钉在线程上。
+    pub fn enable_dispatch(port: &Arc<AsyncPort>) {
+        let (tx, rx) = bounded::<FramePayload>(DISPATCH_QUEUE_FRAMES);
+        if port.dispatch_tx.set(tx).is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(port);
+        let name = format!("port-dispatch-{}", port.id);
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || dispatch_loop(weak, rx))
+            .expect("spawn port dispatch thread");
+    }
+
+    #[inline]
+    fn dispatch_enqueued(&self, payload: FramePayload) {
+        match self.dispatch_tx.get() {
+            Some(tx) => match tx.try_send(payload) {
+                Ok(()) => {}
+                Err(TrySendError::Full(p)) | Err(TrySendError::Disconnected(p)) => {
+                    self.drop_n(1);
+                    p.release();
+                }
+            },
+            None => self.write_payload(payload),
         }
     }
 
@@ -1617,8 +1685,14 @@ impl AsyncPort {
     }
 
     fn backend_score(b: &Backend) -> Option<u32> {
-        let q_len = b.ch.len();
-        let capacity = b.ch.capacity().unwrap_or(4096);
+        // 生产后端都挂 owned_batches；水位必须读真正的队列而不是恒空的
+        // legacy 通道，否则"全部满载则分配 seq 前预丢弃"保护在生产路径上
+        // 永远不会触发，fallback 也不会跳过真正满的后端。
+        let (q_len, capacity) = if let Some(queue) = b.owned_batches.as_deref() {
+            (queue.len_hint(), queue.capacity_frames())
+        } else {
+            (b.ch.len(), b.ch.capacity().unwrap_or(4096))
+        };
         if capacity <= 2 || q_len >= capacity - 2 {
             return None;
         }
@@ -1685,16 +1759,32 @@ impl AsyncPort {
     /// VSwitch/reorder 入口：上游确实共享时保留 Arc；若当前已是唯一 owner，
     /// 立即 try_unwrap 回 pooled Vec，让 backend/TLS 热路径不再承担 Arc 生命周期。
     pub fn write_frame(&self, frame: Arc<Vec<u8>>) {
-        self.write_payload(FramePayload::from_shared(frame));
+        self.write_owned_payload(FramePayload::from_shared(frame));
     }
 
     /// Client TAP 等天然唯一 owner 的入口：直接移动 pooled Vec，避免每个以太帧
     /// 都为 Arc 控制块做一次 heap allocation/free。
     pub fn write_owned_frame(&self, frame: Vec<u8>) {
-        self.write_payload(FramePayload::Owned(frame));
+        self.write_owned_payload(FramePayload::Owned(frame));
+    }
+
+    /// write_frame/write_owned_frame 的统一入口：dispatch 模式下只做有界入队
+    /// （seq/选路/成批移交给 dispatch 线程），否则维持原直发语义。
+    pub fn write_owned_payload(&self, payload: FramePayload) {
+        if payload.is_empty() {
+            payload.release();
+            return;
+        }
+        self.dispatch_enqueued(payload);
     }
 
     pub fn write_payload_batch(&self, frames: &mut Vec<FramePayload>) {
+        if self.dispatch_tx.get().is_some() {
+            for data in frames.drain(..) {
+                self.write_owned_payload(data);
+            }
+            return;
+        }
         let backends = self.backends.read();
         let queue = if backends.len() == 1 && !self.encoder_enabled.load(Ordering::Acquire) {
             backends[0].owned_batches.as_deref()
@@ -1812,6 +1902,193 @@ impl AsyncPort {
                 return Some(current + 1);
             }
         }
+    }
+
+    /// Go waitForBackendSlot：在消耗线路 seq 之前确认至少一个后端有空位。
+    /// dispatch 线程是这些后端唯一的批量生产者，因此观察到空位后、
+    /// 后续批量入队前不会被其它生产者抢走；拥塞时在这里等待，帧在
+    /// input 队列入口丢弃（seq 尚未分配，不制造线路序号洞）。
+    /// 返回 false = 无后端或进程退出，调用方直接丢弃当前帧。
+    fn wait_backend_slot(&self) -> bool {
+        loop {
+            let backends = self.backends.read();
+            if backends.is_empty() {
+                return false;
+            }
+            let ready = backends
+                .iter()
+                .any(|b| Self::backend_score(b).is_some());
+            drop(backends);
+            if ready {
+                return true;
+            }
+            if crate::client::EXIT.load(Ordering::Relaxed) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(DISPATCH_SLOT_WAIT_US));
+        }
+    }
+
+    /// dispatch 线程的成批下发：每批一次自适应选路（Go 语义，按批字节计费）、
+    /// 一次批量入队、一次唤醒。FEC 挂载时退回逐帧 write_payload，保持
+    /// fence/parity 的既有语义不变。
+    fn dispatch_owned_batch(&self, batch: &mut Vec<FramePayload>, batch_bytes: u64) {
+        if batch.is_empty() {
+            return;
+        }
+        if self.encoder_enabled.load(Ordering::Relaxed) {
+            for f in batch.drain(..) {
+                self.write_payload(f);
+            }
+            return;
+        }
+        let total_frames = batch.len() as u64;
+        let backends = self.backends.read();
+        if backends.is_empty() {
+            drop(backends);
+            self.drop_n(total_frames);
+            for f in batch.drain(..) {
+                f.release();
+            }
+            return;
+        }
+        let current = self.preferred.load(Ordering::Relaxed);
+        let preferred = (current < backends.len()).then_some(current);
+        let picked = self.adaptive.pick(&backends, preferred, batch_bytes);
+        if let Some(idx) = picked {
+            self.preferred.store(idx, Ordering::Relaxed);
+        }
+        let Some(mut idx) = picked else {
+            drop(backends);
+            self.drop_n(total_frames);
+            for f in batch.drain(..) {
+                f.release();
+            }
+            return;
+        };
+
+        // seq 在等待空位之后分配：溢出时帧直接归池，不占用序号。
+        let mut frames: Vec<VPNFrame> = Vec::with_capacity(batch.len());
+        let mut seq_bytes = 0u64;
+        for f in batch.drain(..) {
+            match self.next_seq() {
+                Some(seq) => {
+                    seq_bytes += f.len() as u64;
+                    frames.push(VPNFrame { seq, data: f });
+                }
+                None => {
+                    self.drop_n(1);
+                    f.release();
+                }
+            }
+        }
+        if frames.is_empty() {
+            return;
+        }
+
+        // FIFO 前缀批量入队；等待空位 + 本线程是唯一生产者保证首选后端
+        // 足以容纳整批，fallback 循环只是防御（后端在等待期被注销等冷路径）。
+        let mut remaining_bytes = seq_bytes;
+        let mut attempts = 0usize;
+        loop {
+            if frames.is_empty() || attempts > backends.len() {
+                break;
+            }
+            attempts += 1;
+            let Some(b) = backends.get(idx) else {
+                break;
+            };
+            match b.owned_batches.as_deref() {
+                Some(queue) => {
+                    b.scheduler.add_queued(remaining_bytes);
+                    let (count, accepted_bytes) = queue.try_push_batch(&mut frames);
+                    if accepted_bytes < remaining_bytes {
+                        b.scheduler.complete_queued(remaining_bytes - accepted_bytes);
+                    }
+                    remaining_bytes = remaining_bytes.saturating_sub(accepted_bytes);
+                    if count != 0 {
+                        b.scheduler.note_assigned(accepted_bytes);
+                        if let Some(n) = &b.notify {
+                            n.wake();
+                        }
+                    }
+                    if frames.is_empty() {
+                        break;
+                    }
+                }
+                None => {
+                    // legacy 通道后端（TAP 汇聚/测试）：逐帧 send_payload_to。
+                    for f in frames.drain(..) {
+                        let bytes = f.data.len() as u64;
+                        let dropped = self.send_payload_to(b, f.seq, f.data);
+                        if dropped == 0 {
+                            b.scheduler.note_assigned(bytes);
+                        }
+                    }
+                    break;
+                }
+            }
+            // 换下一个健康后端继续收尾；全满则丢剩余帧（seq 已分配，
+            // 与 send_data_payload_to_any 的 fallback 语义一致）。
+            let next = (0..backends.len())
+                .find(|&i| i != idx && Self::backend_score(&backends[i]).is_some());
+            match next {
+                Some(i) => idx = i,
+                None => break,
+            }
+        }
+        let leftover = frames.len() as u64;
+        if leftover != 0 {
+            self.drop_n(leftover);
+            for f in frames.drain(..) {
+                f.data.release();
+            }
+        }
+    }
+}
+
+/// 端口 dispatch 线程主循环（对齐 Go AsyncPort.run 的数据分支）：
+/// 阻塞收帧 → 等待后端空位 → 成批（12KiB 上限，队列瞬时为空时给一次
+/// 150µs 合批机会）→ 每批一次选路 + 一次入队 + 一次唤醒。
+fn dispatch_loop(port: std::sync::Weak<AsyncPort>, rx: Receiver<FramePayload>) {
+    let mut batch: Vec<FramePayload> = Vec::with_capacity(16);
+    loop {
+        // 全部 Sender 释放（端口销毁）→ 退出。Weak 让端口不被线程钉住。
+        let Ok(frame) = rx.recv() else {
+            return;
+        };
+        let Some(p) = port.upgrade() else {
+            frame.release();
+            return;
+        };
+        if frame.is_empty() {
+            frame.release();
+            continue;
+        }
+        if !p.wait_backend_slot() {
+            frame.release();
+            p.drop_n(1);
+            continue;
+        }
+        let mut batch_bytes = frame.len() as u64;
+        batch.push(frame);
+        if rx.is_empty() && batch_bytes < DISPATCH_BATCH_MAX_BYTES {
+            std::thread::sleep(Duration::from_micros(DISPATCH_COALESCE_US));
+        }
+        while batch_bytes < DISPATCH_BATCH_MAX_BYTES {
+            match rx.try_recv() {
+                Ok(f) => {
+                    if f.is_empty() {
+                        f.release();
+                        continue;
+                    }
+                    batch_bytes += f.len() as u64;
+                    batch.push(f);
+                }
+                Err(_) => break,
+            }
+        }
+        p.dispatch_owned_batch(&mut batch, batch_bytes);
     }
 }
 
@@ -1964,7 +2241,13 @@ impl VSwitch {
     }
 
     pub fn process_frame(&self, src_port_id: &str, frame: Arc<Vec<u8>>) {
-        self.process_frame_inner(src_port_id, None, frame)
+        self.process_frame_inner(src_port_id, None, FramePayload::from_shared(frame));
+    }
+
+    /// 天然唯一 owner 的入口（本机 TAP 读线程）：直接移交 pooled Vec，
+    /// 免掉 Arc::new + try_unwrap 的每帧控制块分配/释放（对齐 Go ProcessOwnedFrame）。
+    pub fn process_owned_frame(&self, src_port_id: &str, frame: Vec<u8>) {
+        self.process_frame_inner(src_port_id, None, FramePayload::Owned(frame));
     }
 
     /// 已认证 session 热路径：registered_mac 在握手期已经固定并写入 static
@@ -1975,7 +2258,7 @@ impl VSwitch {
         registered_mac: [u8; 6],
         frame: Arc<Vec<u8>>,
     ) {
-        self.process_frame_inner(src_port_id, Some(registered_mac), frame)
+        self.process_frame_inner(src_port_id, Some(registered_mac), FramePayload::from_shared(frame));
     }
 
     /// Only contiguous authenticated unicast runs are grouped. Keep the shard
@@ -2013,9 +2296,10 @@ impl VSwitch {
         &self,
         src_port_id: &str,
         registered_mac: Option<[u8; 6]>,
-        frame: Arc<Vec<u8>>,
+        frame: FramePayload,
     ) {
         if frame.len() < 14 {
+            frame.release();
             return;
         }
         tracing::trace!(
@@ -2032,6 +2316,7 @@ impl VSwitch {
         if let Some(registered) = registered_mac.filter(|m| *m != [0u8; 6]) {
             if src_mac != registered {
                 self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                frame.release();
                 return;
             }
         } else {
@@ -2048,6 +2333,7 @@ impl VSwitch {
 
             if static_elsewhere && src_port_id != self.trusted_port {
                 self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                frame.release();
                 return;
             }
 
@@ -2060,6 +2346,7 @@ impl VSwitch {
                             src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                             src_port_id
                         );
+                        frame.release();
                         return;
                     }
                 }
@@ -2078,6 +2365,7 @@ impl VSwitch {
                         if was_static && different_port {
                             if src_port_id != self.trusted_port {
                                 self.spoof_drops.fetch_add(1, Ordering::Relaxed);
+                                frame.release();
                                 return;
                             }
                         } else {
@@ -2105,12 +2393,13 @@ impl VSwitch {
         if (dst_mac[0] & 1) == 0 {
             if let Some(entry) = self.mac_table.get(&dst_mac) {
                 if entry.port_id == src_port_id {
+                    frame.release();
                     return;
                 }
                 if let Some(port) = entry.port.as_ref() {
                     // write_frame 是有界非阻塞入队；持 mac_table shard 读 guard 到
                     // 本次发送完成，使 remove_port/retain 等待这一小段临界区。
-                    port.write_frame(frame);
+                    port.write_owned_payload(frame);
                     return;
                 }
                 // 兼容历史/测试 entry：只有没缓存端口时才 clone id + 二次 lookup。
@@ -2120,7 +2409,9 @@ impl VSwitch {
 
         if let Some(target) = fallback_target {
             if let Some(port) = self.ports.get(&target) {
-                port.write_frame(frame);
+                port.write_owned_payload(frame);
+            } else {
+                frame.release();
             }
         } else {
             self.flood(src_port_id, frame);
@@ -2133,20 +2424,28 @@ impl VSwitch {
     ///
     /// 豁免端口（本机 TAP）不受预算限制：网关自己发起的 ARP/mDNS 不应被
     /// 自己削掉。
-    fn flood(&self, exclude_port_id: &str, frame: Arc<Vec<u8>>) {
+    fn flood(&self, exclude_port_id: &str, frame: FramePayload) {
         if exclude_port_id != self.trusted_port && !self.allow_flood(exclude_port_id) {
             self.flood_drops.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 "VSWITCH drop flooded frame over budget from port {}",
                 exclude_port_id
             );
+            frame.release();
             return;
         }
+        // 洪泛需要多端口共享：owned 缓冲只升级一次 Arc，各端口 clone 引用，
+        // 最后一份归还热帧池。
+        let shared = match frame {
+            FramePayload::Owned(buf) => Arc::new(buf),
+            FramePayload::Shared(arc) => arc,
+        };
         for ref_multi in self.ports.iter() {
             if *ref_multi.key() != exclude_port_id {
-                ref_multi.value().write_frame(frame.clone());
+                ref_multi.value().write_frame(shared.clone());
             }
         }
+        release_shared_frame(shared);
     }
 
     /// 消耗一个洪泛令牌；令牌按时间线性回充，容量 flood_burst。
@@ -2189,6 +2488,7 @@ pub type SharedFlag = Arc<AtomicBool>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::acquire_frame_vec_overwrite;
     use std::sync::atomic::AtomicU32;
 
     fn owned_test_frame(seq: u32, bytes: usize) -> VPNFrame {
@@ -2328,6 +2628,325 @@ mod tests {
             rx,
         )
     }
+
+    fn make_owned_backend(rtt_us: u32) -> (Arc<Backend>, Receiver<VPNFrame>) {
+        let (tx, rx) = bounded(1024);
+        (
+            Arc::new(Backend {
+                fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
+                scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
+                ch: tx,
+                owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
+                conn_id: Arc::new(Mutex::new(String::new())),
+                rtt_cache: Arc::new(AtomicU32::new(rtt_us)),
+                notify: None,
+            }),
+            rx,
+        )
+    }
+
+    /// 从后端队列搬空所有帧到 `out`，返回本次搬出的帧数。
+    fn drain_backend(b: &Backend, legacy_rx: &Receiver<VPNFrame>, out: &mut Vec<VPNFrame>) -> usize {
+        let mut n = 0;
+        loop {
+            let Some(batch) = try_recv_backend_batch(Some(b), legacy_rx, usize::MAX) else {
+                break;
+            };
+            n += batch.frames.len();
+            out.extend(batch.frames);
+        }
+        n
+    }
+
+    #[test]
+    fn dispatch_mode_delivers_all_frames_in_order_single_backend() {
+        let port = Arc::new(AsyncPort::new("dispatch-single".into()));
+        AsyncPort::enable_dispatch(&port);
+        let (b, rx) = make_owned_backend(50_000);
+        port.register_backend(b);
+
+        const N: usize = 200;
+        for i in 0..N {
+            let mut f = vec![0u8; 1400];
+            f[0] = (i & 0xff) as u8;
+            port.write_owned_frame(f);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = Vec::new();
+        while got.len() < N && Instant::now() < deadline {
+            drain_backend(&port.backends.read()[0], &rx, &mut got);
+            if got.len() < N {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(got.len(), N, "all frames must be delivered");
+        let seqs: Vec<u32> = got.iter().map(|f| f.seq).collect();
+        let expected: Vec<u32> = (1..=N as u32).collect();
+        assert_eq!(seqs, expected, "FIFO order and sequence numbering preserved");
+        for f in got {
+            f.data.release();
+        }
+        assert_eq!(port.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dispatch_mode_assigns_unique_sequences_across_backends() {
+        let port = Arc::new(AsyncPort::new("dispatch-multi".into()));
+        AsyncPort::enable_dispatch(&port);
+        let mut rxs = Vec::new();
+        for (i, rtt) in [20_000u32, 21_000, 22_000, 23_000].into_iter().enumerate() {
+            let (b, rx) = make_owned_backend(rtt);
+            let _ = i;
+            port.register_backend(b);
+            rxs.push(rx);
+        }
+
+        const N: usize = 400;
+        for i in 0..N {
+            let mut f = vec![0u8; 1400];
+            f[0] = (i & 0xff) as u8;
+            port.write_owned_frame(f);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seqs = Vec::new();
+        while seqs.len() < N && Instant::now() < deadline {
+            let backends = port.backends.read();
+            for (idx, b) in backends.iter().enumerate() {
+                let mut out = Vec::new();
+                drain_backend(b, &rxs[idx], &mut out);
+                seqs.extend(out.iter().map(|f| f.seq));
+                for f in out {
+                    f.data.release();
+                }
+            }
+            if seqs.len() < N {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(seqs.len(), N, "all frames delivered across 4 backends");
+        seqs.sort_unstable();
+        let expected: Vec<u32> = (1..=N as u32).collect();
+        assert_eq!(seqs, expected, "sequences unique, dense and in-range");
+        assert_eq!(port.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dispatch_mode_without_backends_drops_before_sequence() {
+        let port = Arc::new(AsyncPort::new("dispatch-nobackend".into()));
+        AsyncPort::enable_dispatch(&port);
+        for _ in 0..8 {
+            port.write_owned_frame(vec![0x5a; 1400]);
+        }
+        // 无后端：帧在 input 队列入口被丢（等待函数立即失败），不消耗线路 seq。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while port.dropped.load(Ordering::Relaxed) < 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(port.dropped.load(Ordering::Relaxed), 8);
+        assert_eq!(port.tx_seq.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn process_owned_frame_unicast_and_flood_reach_ports() {
+        let vs = VSwitch::new();
+        let port = Arc::new(AsyncPort::new("owned-unicast".into()));
+        let (b, rx) = make_owned_backend(50_000);
+        port.register_backend(b);
+        vs.add_port("P1".into(), port.clone());
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        vs.add_static_mac("P1".into(), dst_mac);
+
+        // 单播：owned Vec 直接移交目标端口，不经过 Arc。
+        let mut frame = vec![0u8; 1400];
+        frame[..6].copy_from_slice(&dst_mac);
+        frame[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        vs.process_owned_frame(crate::net::TAP_PORT_ID, frame);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.is_empty() && Instant::now() < deadline {
+            drain_backend(&port.backends.read()[0], &rx, &mut got);
+            if got.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(got.len(), 1, "unicast owned frame reaches the port");
+        assert_eq!(got[0].seq, 1);
+        for f in got {
+            f.data.release();
+        }
+
+        // 洪泛：owned 缓冲升级成 Arc 一次，广播到其它端口。
+        let flood_port = Arc::new(AsyncPort::new("owned-flood-target".into()));
+        let (fb, frx) = make_owned_backend(50_000);
+        flood_port.register_backend(fb);
+        vs.add_port("P2".into(), flood_port.clone());
+        let mut frame = vec![0u8; 1400];
+        frame[..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        frame[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        vs.process_owned_frame(crate::net::TAP_PORT_ID, frame);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_flood = Vec::new();
+        while got_flood.is_empty() && Instant::now() < deadline {
+            drain_backend(&flood_port.backends.read()[0], &frx, &mut got_flood);
+            if got_flood.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(got_flood.len(), 1, "flooded owned frame reaches other ports");
+        for f in got_flood {
+            f.data.release();
+        }
+    }
+
+    /// 端口 dispatch 路径微基准（ABBA 由外部进程按 TLSVPN_PORT_DISPATCH 驱动）。
+    ///
+    /// 生产者线程模拟本机 TAP 读线程逐帧 process_owned_frame；每后端一个
+    /// 消费者线程模拟 TLS writer 批量拉取。直接模式（旗标关）在同一生产者
+    /// 线程里逐帧走 write_payload 全流程；dispatch 模式（旗标开）经 input
+    /// 队列 + dispatch 线程。输出 PORT_DISPATCH_BENCH 行供脚本汇总。
+    #[test]
+    #[ignore]
+    fn bench_port_dispatch() {
+        let frames: usize = std::env::var("TLSVPN_DISPATCH_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let rounds: usize = std::env::var("TLSVPN_DISPATCH_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let conns: usize = std::env::var("TLSVPN_DISPATCH_BENCH_CONNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(4);
+        let mode = if port_dispatch_enabled() {
+            "dispatch"
+        } else {
+            "direct"
+        };
+
+        let mut poll = mio::Poll::new().expect("bench poll");
+        let waker = Arc::new(
+            mio::Waker::new(poll.registry(), mio::Token(9_999)).expect("bench waker"),
+        );
+
+        for round in 1..=rounds {
+            let vs = VSwitch::new();
+            let port = Arc::new(AsyncPort::new("bench-port".into()));
+            if port_dispatch_enabled() {
+                AsyncPort::enable_dispatch(&port);
+            }
+            let dirty: Arc<ArrayQueue<mio::Token>> = Arc::new(ArrayQueue::new(4096));
+            let mut rxs = Vec::new();
+            for i in 0..conns {
+                let (tx, rx) = bounded(1024);
+                port.register_backend(Arc::new(Backend {
+                    fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
+                    scheduler: Arc::new(
+                        crate::adaptive_multipath::SchedulerBackendState::default(),
+                    ),
+                    ch: tx,
+                    owned_batches: Some(Arc::new(OwnedBatchQueue::new(1024))),
+                    conn_id: Arc::new(Mutex::new(String::new())),
+                    rtt_cache: Arc::new(AtomicU32::new(20_000 + i as u32 * 1_000)),
+                    notify: Some(Arc::new(BackendNotify::new(
+                        waker.clone(),
+                        dirty.clone(),
+                        mio::Token(10_000 + i),
+                    ))),
+                }));
+                rxs.push(rx);
+            }
+            vs.add_port("bench-port".into(), port.clone());
+            let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+            vs.add_static_mac("bench-port".into(), dst_mac);
+
+            let delivered = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut consumers = Vec::new();
+            for (i, rx) in rxs.into_iter().enumerate() {
+                let port = port.clone();
+                let delivered = delivered.clone();
+                let stop = stop.clone();
+                consumers.push(std::thread::spawn(move || {
+                    let b = port.backends.read()[i].clone();
+                    let mut out: Vec<VPNFrame> = Vec::with_capacity(64);
+                    while !stop.load(Ordering::Relaxed) {
+                        out.clear();
+                        let n = drain_backend(&b, &rx, &mut out);
+                        if n == 0 {
+                            std::thread::sleep(Duration::from_micros(100));
+                            continue;
+                        }
+                        delivered.fetch_add(n, Ordering::Relaxed);
+                        for f in out.drain(..) {
+                            f.data.release();
+                        }
+                    }
+                    // 收尾再搬一轮，确保统计完整。
+                    out.clear();
+                    let n = drain_backend(&b, &rx, &mut out);
+                    delivered.fetch_add(n, Ordering::Relaxed);
+                    for f in out {
+                        f.data.release();
+                    }
+                }));
+            }
+
+            let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+            let start = Instant::now();
+            for i in 0..frames {
+                let mut frame = acquire_frame_vec_overwrite(1500);
+                frame[..6].copy_from_slice(&dst_mac);
+                frame[6..12].copy_from_slice(&src_mac);
+                if i % 1024 == 0 {
+                    // 排空 bench 侧唤醒管道，避免 waker/dirty 队列无界积压。
+                    let mut events = mio::Events::with_capacity(16);
+                    let _ = poll.poll(&mut events, Some(Duration::ZERO));
+                    while dirty.pop().is_some() {}
+                }
+                vs.process_owned_frame(crate::net::TAP_PORT_ID, frame);
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut done = delivered.load(Ordering::Relaxed);
+            let mut dropped = port.dropped.load(Ordering::Relaxed) as usize;
+            while done + dropped < frames && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                done = delivered.load(Ordering::Relaxed);
+                dropped = port.dropped.load(Ordering::Relaxed) as usize;
+            }
+            let elapsed = start.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            for c in consumers {
+                let _ = c.join();
+            }
+            done = delivered.load(Ordering::Relaxed);
+            dropped = port.dropped.load(Ordering::Relaxed) as usize;
+            let pps = done as f64 / elapsed.as_secs_f64();
+            let mbps = pps * 1400.0 * 8.0 / 1_000_000.0;
+            println!(
+                "PORT_DISPATCH_BENCH mode={} conns={} round={} delivered={} dropped={} elapsed_ms={} pps={:.0} mbps={:.1}",
+                mode,
+                conns,
+                round,
+                done,
+                dropped,
+                elapsed.as_millis(),
+                pps,
+                mbps
+            );
+            assert_eq!(
+                done + dropped,
+                frames,
+                "every frame must be delivered or explicitly dropped"
+            );
+        }
+    }
+
 
     #[test]
     fn async_port_sequence_stops_before_wrap() {

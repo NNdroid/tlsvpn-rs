@@ -302,6 +302,9 @@ struct MioSession {
     reorder_input: Vec<(u32, Arc<Vec<u8>>)>,
     write_stalled: Option<Instant>,
     queued_payload_pending: u64,
+    // 上一轮 flush 命中批量上限、队列里可能还有帧；定时扫描据此决定
+    // 是否必须再 flush（与 BackendNotify 的 pending 唤醒互补）。
+    tx_leftover: bool,
     brutal_applied: bool,
 }
 
@@ -1126,6 +1129,10 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
+    if crate::net::port_dispatch_enabled() {
+        // 下行热路径：TAP 读线程只做查表 + 入队，seq/成批/选路移交 dispatch 线程。
+        AsyncPort::enable_dispatch(&tap_port);
+    }
     tap_port.register_backend(Arc::new(Backend {
         fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
@@ -1154,9 +1161,9 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
             match dev_reader.recv(&mut frame) {
                 Ok(n) if n > 0 => {
                     frame.truncate(n);
-                    // VSwitch 本身用 Arc<Vec<u8>> 传递所有权/共享洪泛；直接让
-                    // TAP 填充 pooled Vec，消除 temp-buffer -> pool memcpy。
-                    vs_for_tap.process_frame(TAP_PORT_ID, Arc::new(frame));
+                    // 本机 TAP 是天然唯一 owner：直接移交 pooled Vec（对齐 Go
+                    // ProcessOwnedFrame），不为每帧造一次 Arc 控制块。
+                    vs_for_tap.process_owned_frame(TAP_PORT_ID, frame);
                 }
                 Ok(_) => release_frame_vec(frame),
                 Err(_) => {
@@ -1448,6 +1455,7 @@ fn worker_loop(
                     reorder_input: Vec::with_capacity(crate::rx_actor::rx_batch_size()),
                     write_stalled: None,
                     queued_payload_pending: 0,
+                    tx_leftover: false,
                     brutal_applied: false,
                 },
             );
@@ -1570,9 +1578,21 @@ fn worker_loop(
                 }
             }
 
-            // 从端口通道拉帧成批发送（对齐 Go 下行写协程）
+            // 从端口通道拉帧成批发送（对齐 Go 下行写协程）。空闲会话在
+            // 无唤醒、无残留积压、无写阻塞时跳过，省掉一次队列锁往返；
+            // 有任何一项成立则必须 flush。
+            let wake_pending = sess
+                .tx_backend
+                .as_ref()
+                .and_then(|b| b.notify.as_ref())
+                .map(|n| n.pending())
+                .unwrap_or(false);
             let mut close = false;
-            flush_outbound(sess, &mut close);
+            if wake_pending || sess.tx_leftover || sess.tls.wants_write()
+                || sess.write_stalled.is_some()
+            {
+                flush_outbound(sess, &mut close);
+            }
             if close {
                 closed_tokens.push(*token);
             }
@@ -2040,19 +2060,21 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
     }
 
+    // 一次读锁同时取 ic_tx 和 epoch 校验结果（encrypt=off 时 ic_tx 合法为 None，
+    // 不能用 None 判断 epoch 失配）。
+    let mut epoch_mismatch = false;
     let ic_tx = sess.client_session.as_ref().and_then(|s| {
         let epoch = s.epoch_state.read();
         if epoch.epoch != sess.session_epoch {
+            epoch_mismatch = true;
             None
         } else {
             epoch.ic_tx.clone()
         }
     });
-    if let Some(s) = &sess.client_session {
-        if s.epoch_state.read().epoch != sess.session_epoch {
-            *close = true;
-            return;
-        }
+    if epoch_mismatch {
+        *close = true;
+        return;
     }
 
     // Stay below rustls' bounded outgoing plaintext buffer. A 256KiB
@@ -2063,13 +2085,23 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     let mut written_batch = TxFrameTotals::default();
     let mut last_frame_start = None;
     sess.send_buf.clear();
-    while let Some(batch) = try_recv_backend_batch(
-        sess.tx_backend.as_deref(),
-        &sess.rx,
-        MAX_TLS_PLAINTEXT_RECORD
-            .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
-            .saturating_sub(sess.send_buf.len()),
-    ) {
+    // 命中批量上限时队列里可能还有帧：置 tx_leftover，供无新唤醒时的
+    // 定时扫描补一轮 drain；drain 到队列为空则自动清除。
+    let mut hit_drain_limit = false;
+    loop {
+        if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
+            hit_drain_limit = true;
+            break;
+        }
+        let Some(batch) = try_recv_backend_batch(
+            sess.tx_backend.as_deref(),
+            &sess.rx,
+            MAX_TLS_PLAINTEXT_RECORD
+                .saturating_sub(STREAM_PAD_ABSOLUTE_LIMIT)
+                .saturating_sub(sess.send_buf.len()),
+        ) else {
+            break;
+        };
         let batch_bytes = batch.bytes;
         let batch_frames = batch.frames.len() as u64;
         for f in batch.frames {
@@ -2086,10 +2118,8 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         }
         pulled_payload = pulled_payload.saturating_add(batch_bytes);
         pulled = pulled.saturating_add(batch_frames);
-        if sess.send_buf.len() >= TLS_WRITE_BATCH_BYTES || pulled >= 2048 {
-            break;
-        }
     }
+    sess.tx_leftover = hit_drain_limit;
     let pad_bytes_batch = if pulled != 0 {
         pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit)
     } else {
@@ -2599,6 +2629,10 @@ fn handle_handshake(
             stat.enc_algo.store(enc_algo, Ordering::Relaxed);
 
             let port = Arc::new(AsyncPort::new(client_id.clone()));
+            if crate::net::port_dispatch_enabled() {
+                // 会话端口的下行分发同样移交 dispatch 线程（seq/成批/选路按批摊薄）。
+                AsyncPort::enable_dispatch(&port);
+            }
             if fec_enc_k > 0 {
                 port.attach_encoder(fec_enc_k as usize, fec_tx);
             }
