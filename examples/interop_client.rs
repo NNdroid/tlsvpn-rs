@@ -317,7 +317,14 @@ impl ProbeScanner {
             match reader.read(&mut tmp) {
                 Ok(0) => return Ok(None),
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                // 读超时周期唤醒：返回 Ok(None) 让主循环发一次 keepalive 再重试，
+                // 否则 probe 阻塞在数据帧等待中无法保活，服务端读超时会判死。
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None)
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -751,6 +758,10 @@ fn main() {
     }
 
     // 6. 收帧循环
+    // 读超时周期唤醒阻塞读：probe 等待数据帧（服务端单客户端模式不回显）期间
+    // 仍能每轮发送 keepalive，避免服务端读超时判死（对齐 Go probe 行为）。
+    // 仅在握手完成后设置，避免中断握手读。
+    let _ = tls.sock.set_read_timeout(Some(Duration::from_millis(500)));
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
     let mut got_frames = 0usize;
     let mut got_parity = 0usize;

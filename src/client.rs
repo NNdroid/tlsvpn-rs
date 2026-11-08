@@ -2237,7 +2237,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // 写超时收敛到 3s（对齐 Go datapathWriteTimeout）：socket 发送缓冲已满且
         // 对端停止读取时快速判死，避免死路径持续接收数据。判定瞬间标记 stalled，
         // 调度器立即跳过该后端，不等连接循环自然退出。
-        if last_write_progress.elapsed() > Duration::from_secs(3) {
+        //
+        // 仅当 write_blocked（订阅 WRITABLE 等待背压恢复）时检查：空闲连接每 4s
+        // 发一次心跳，无条件用 last_write_progress 判死会因 3s < 4s 心跳间隔而误杀
+        // 健康空闲连接。Go 的 3s 是"单次写阻塞上限"，Rust 以 write_blocked 标志
+        // 对齐该语义——只有真正在背压等待、且 3s 无任何写进展，才说明对端停止读取。
+        if write_blocked && last_write_progress.elapsed() > Duration::from_secs(3) {
             close_reason = "write stalled for >3s".into();
             warn!("write stalled for >3s; closing the connection");
             backend.scheduler.mark_stalled();
