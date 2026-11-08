@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -17,7 +17,11 @@ const CARRY_BONUS_US: u64 = 150;
 const STICKY_MIN_US: u64 = 500;
 const STICKY_MAX_US: u64 = 5_000;
 const RTT_HYSTERESIS_MIN_US: u32 = 5_000;
-const UNKNOWN_RTT_US: u32 = 50_000;
+pub const UNKNOWN_RTT_US: u32 = 50_000;
+
+/// 连续 RTT 采样失败达到该次数即置 stalled。RTT 每 200ms 采样一次，
+/// 3 次 ≈ 600ms，足以过滤瞬时 syscall 抖动（对齐 Go rttFailuresStall）。
+const RTT_FAILURES_STALL: u32 = 3;
 
 #[inline]
 fn mono_us() -> u64 {
@@ -77,6 +81,10 @@ pub struct SchedulerBackendState {
     pub fec_assigned_bytes: AtomicU64,
     pub fec_assigned_batches: AtomicU64,
     pub virtual_finish_ns: AtomicI64,
+    // 健康感知：stalled 标记该后端已被判定为不健康，调度器不再向其分配数据。
+    // rtt_failures 是连续 RTT 采样失败计数（对齐 Go backend_health.go）。
+    pub stalled: AtomicBool,
+    pub rtt_failures: AtomicU32,
     sample_bytes: AtomicU64,
     sample_start_us: AtomicU64,
 }
@@ -94,6 +102,8 @@ impl Default for SchedulerBackendState {
             fec_assigned_bytes: AtomicU64::new(0),
             fec_assigned_batches: AtomicU64::new(0),
             virtual_finish_ns: AtomicI64::new(0),
+            stalled: AtomicBool::new(false),
+            rtt_failures: AtomicU32::new(0),
             sample_bytes: AtomicU64::new(0),
             sample_start_us: AtomicU64::new(0),
         }
@@ -126,6 +136,35 @@ impl SchedulerBackendState {
         if n != 0 {
             self.fec_assigned_bytes.fetch_add(n, Ordering::Relaxed);
             self.fec_assigned_batches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // ---- 健康感知（对齐 Go backend_health.go） ----
+
+    /// mark_stalled 置位 stalled 标记（幂等）。调度器不再向该后端分配数据。
+    #[inline]
+    pub fn mark_stalled(&self) {
+        self.stalled.store(true, Ordering::Relaxed);
+    }
+
+    /// is_stalled 返回该后端是否已被判定为不健康。
+    #[inline]
+    pub fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed)
+    }
+
+    /// note_rtt_success 记录一次成功的 RTT 采样并清零失败计数。
+    #[inline]
+    pub fn note_rtt_success(&self) {
+        self.rtt_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// note_rtt_failure 记录一次失败的 RTT 采样；连续 RTT_FAILURES_STALL 次
+    /// 即置 stalled（对齐 Go noteRTTFailure）。
+    #[inline]
+    pub fn note_rtt_failure(&self) {
+        if self.rtt_failures.fetch_add(1, Ordering::Relaxed) + 1 >= RTT_FAILURES_STALL {
+            self.mark_stalled();
         }
     }
 
@@ -187,6 +226,7 @@ impl SchedulerBackendState {
             assigned_batches: self.assigned_batches.load(Ordering::Relaxed),
             fec_assigned_bytes: self.fec_assigned_bytes.load(Ordering::Relaxed),
             fec_assigned_batches: self.fec_assigned_batches.load(Ordering::Relaxed),
+            stalled: self.is_stalled(),
         }
     }
 }
@@ -202,6 +242,7 @@ pub struct SchedulerSnapshot {
     pub assigned_batches: u64,
     pub fec_assigned_bytes: u64,
     pub fec_assigned_batches: u64,
+    pub stalled: bool,
 }
 
 pub trait AdaptiveBackend {
@@ -312,8 +353,31 @@ impl AdaptivePortState {
 
     #[inline]
     fn healthy<B: AdaptiveBackend>(b: &B) -> bool {
+        // stalled 后端已被判定为不健康（读写失败/连续 RTT 采样失败），立即跳过，
+        // 不再把数据送进死路径（对齐 Go adaptive_multipath.go isStalled）。
+        if b.scheduler_state().is_stalled() {
+            return false;
+        }
         let cap = b.scheduler_queue_capacity();
         cap > 2 && b.scheduler_queue_len() < cap.saturating_sub(2)
+    }
+
+    /// 所有后端均不可用（stalled/满队列/RTT 超限）时的兜底选路。优先选一条未
+    /// stalled 的后端，避免回退到死路径；全部 stalled 时才取 preferred/首条兜底
+    /// （对齐 Go client.go pickAdaptiveBackend 的兜底逻辑）。
+    fn fallback_idx<B: AdaptiveBackend>(backends: &[Arc<B>], preferred: Option<usize>) -> usize {
+        if let Some(p) = preferred.filter(|i| *i < backends.len()) {
+            if !backends[p].scheduler_state().is_stalled() {
+                return p;
+            }
+        }
+        if let Some(i) = backends
+            .iter()
+            .position(|b| !b.scheduler_state().is_stalled())
+        {
+            return i;
+        }
+        preferred.filter(|i| *i < backends.len()).unwrap_or(0)
     }
 
     /// Rust dispatches one VPNFrame at a time, so incoming_bytes is the frame
@@ -350,14 +414,15 @@ impl AdaptivePortState {
             min_rtt = min_rtt.min(rtt);
         }
         if min_rtt == u32::MAX {
+            let fallback = Self::fallback_idx(backends, preferred);
             for (i, b) in backends.iter().enumerate() {
-                b.scheduler_state().active.store(i == 0, Ordering::Relaxed);
+                b.scheduler_state().active.store(i == fallback, Ordering::Relaxed);
                 b.scheduler_state()
                     .virtual_finish_ns
                     .store(0, Ordering::Relaxed);
             }
             self.active_paths.store(1, Ordering::Relaxed);
-            return Some(0);
+            return Some(fallback);
         }
         let rtt_slack = RTT_HYSTERESIS_MIN_US.max(min_rtt / 4);
         let max_rtt = min_rtt as u64 + rtt_slack as u64;
@@ -419,7 +484,9 @@ impl AdaptivePortState {
         }
         if cands.is_empty() {
             self.active_paths.store(1, Ordering::Relaxed);
-            return Some(preferred.filter(|i| *i < backends.len()).unwrap_or(0));
+            // 所有后端均不可用（stalled/满队列/RTT 超限）。优先选一条未 stalled 的
+            // 后端，避免回退到死路径；全部 stalled 时才取 preferred/首条兜底。
+            return Some(Self::fallback_idx(backends, preferred));
         }
         cands.sort_by_key(|c| (c.base_us, c.rtt_us, c.idx));
         let active = Self::active_target(pressure, demand_rate, cands.len());
@@ -640,6 +707,36 @@ mod tests {
         s.complete_queued(1400);
         assert_eq!(s.queued_bytes.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn stalled_backend_is_unhealthy() {
+        let b = TestBackend::new(20_000);
+        assert!(AdaptivePortState::healthy(&b));
+        b.sched.mark_stalled();
+        assert!(!AdaptivePortState::healthy(&b));
+    }
+
+    #[test]
+    fn pick_falls_back_to_first_non_stalled_when_all_unhealthy() {
+        let p = AdaptivePortState::default();
+        // 三条都被判 stalled（队列为空但 stalled），pick 应回退到首条非 stalled 兜底
+        // 或 preferred。全部 stalled 时取 preferred/0。
+        let paths: Vec<_> = (0..3).map(|_| Arc::new(TestBackend::new(20_000))).collect();
+        for b in &paths {
+            b.sched.mark_stalled();
+        }
+        let idx = p.pick(&paths, Some(2), ACTIVE4_PRESSURE).unwrap();
+        assert_eq!(idx, 2, "全部 stalled 时回退 preferred");
+
+        // 首条非 stalled 优先：preferred 是 stalled 的 1 号，应选 0 号。
+        let paths2 = vec![
+            Arc::new(TestBackend::new(20_000)),
+            Arc::new(TestBackend::new(20_000)),
+        ];
+        paths2[1].sched.mark_stalled();
+        let idx2 = p.pick(&paths2, Some(1), ACTIVE4_PRESSURE).unwrap();
+        assert_eq!(idx2, 0, "preferred stalled 时回退首条非 stalled");
+    }
 }
 
 #[cfg(test)]
@@ -656,5 +753,34 @@ mod fec_assignment_telemetry_tests {
         assert_eq!(snap.assigned_batches, 1);
         assert_eq!(snap.fec_assigned_bytes, 300);
         assert_eq!(snap.fec_assigned_batches, 1);
+    }
+
+    #[test]
+    fn rtt_failures_stall_after_threshold() {
+        let s = SchedulerBackendState::default();
+        assert!(!s.is_stalled());
+        // RTT_FAILURES_STALL 次失败后置 stalled。
+        for _ in 0..RTT_FAILURES_STALL {
+            s.note_rtt_failure();
+        }
+        assert!(s.is_stalled());
+        // 成功采样清零失败计数；但 stalled 一旦置位不自动清除（对齐 Go）。
+        s.note_rtt_success();
+        assert_eq!(s.rtt_failures.load(Ordering::Relaxed), 0);
+        assert!(s.is_stalled());
+        // 新对象：未达阈值前不 stalled。
+        let s2 = SchedulerBackendState::default();
+        s2.note_rtt_failure();
+        s2.note_rtt_failure();
+        assert!(!s2.is_stalled());
+        assert_eq!(s2.rtt_failures.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stalled_is_reported_in_snapshot() {
+        let s = SchedulerBackendState::default();
+        assert!(!s.snapshot().stalled);
+        s.mark_stalled();
+        assert!(s.snapshot().stalled);
     }
 }

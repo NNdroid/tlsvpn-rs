@@ -1897,9 +1897,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // RTT 采样在连接线程内完成，消除每连接一个 200ms sleeper thread。
         if !proxied && Instant::now() >= next_rtt_refresh {
             if let Some(s) = std_for_rtt.as_ref() {
-                let rtt = get_tcp_rtt(s);
-                if rtt > 0 {
-                    rtt_cache.store(rtt, Ordering::Relaxed);
+                match get_tcp_rtt(s) {
+                    Ok(rtt) if rtt > 0 => {
+                        rtt_cache.store(rtt, Ordering::Relaxed);
+                        backend.scheduler.note_rtt_success();
+                    }
+                    // rtt==0 是引导期正常状态（尚未取得采样），不算失败，不计入
+                    // 失败计数（对齐 Go：err==nil && rtt==0 时既不 success 也不 failure）。
+                    Ok(_) => {}
+                    Err(_) => {
+                        // 连续多次 RTT 采样失败说明连接正在关闭/已不可用，尽早把
+                        // 该后端标记为 stalled，调度器不再向其分配数据。
+                        backend.scheduler.note_rtt_failure();
+                    }
                 }
             }
             next_rtt_refresh = Instant::now() + Duration::from_millis(200);
@@ -1929,6 +1939,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 match tls.read_tls(&mut sock) {
                     Ok(0) => {
                         close_reason = "tls.read_tls returned EOF".into();
+                        backend.scheduler.mark_stalled();
                         conn_closed = true;
                         break 'socket_read;
                     }
@@ -1936,6 +1947,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                         last_rx = Instant::now();
                         if let Err(e) = tls.process_new_packets() {
                             close_reason = format!("tls.process_new_packets failed: {e}");
+                            backend.scheduler.mark_stalled();
                             conn_closed = true;
                             break 'socket_read;
                         }
@@ -1948,6 +1960,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     }
                     Err(e) => {
                         close_reason = format!("tls.read_tls failed: {e}");
+                        backend.scheduler.mark_stalled();
                         conn_closed = true;
                         break 'socket_read;
                     }
@@ -2047,6 +2060,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                         Ok(None) => break,
                         Err(e) => {
                             close_reason = format!("frame scanner failed: {e}");
+                            backend.scheduler.mark_stalled();
                             conn_closed = true;
                             break 'socket_read;
                         }
@@ -2141,6 +2155,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
             if let Err(e) = tls.writer().write_all(&send_buf) {
                 close_reason = format!("tls plaintext writer failed: {e}");
+                backend.scheduler.mark_stalled();
                 break;
             }
             if tx_packets_batch != 0 {
@@ -2160,6 +2175,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             match tls.write_tls(&mut sock) {
                 Ok(0) => {
                     close_reason = "tls.write_tls returned zero".into();
+                    backend.scheduler.mark_stalled();
                     conn_closed = true;
                     break;
                 }
@@ -2192,6 +2208,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                 }
                 Err(e) => {
                     close_reason = format!("tls.write_tls failed: {e}");
+                    backend.scheduler.mark_stalled();
                     conn_closed = true;
                     break;
                 }
@@ -2217,13 +2234,20 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             }
         }
 
-        if last_write_progress.elapsed() > Duration::from_secs(10) {
-            close_reason = "write stalled for >10s".into();
-            warn!("write stalled for >10s; closing the connection");
+        // 写超时收敛到 3s（对齐 Go datapathWriteTimeout）：socket 发送缓冲已满且
+        // 对端停止读取时快速判死，避免死路径持续接收数据。判定瞬间标记 stalled，
+        // 调度器立即跳过该后端，不等连接循环自然退出。
+        if last_write_progress.elapsed() > Duration::from_secs(3) {
+            close_reason = "write stalled for >3s".into();
+            warn!("write stalled for >3s; closing the connection");
+            backend.scheduler.mark_stalled();
             conn_closed = true;
         }
-        if last_rx.elapsed() > Duration::from_secs(15) {
-            close_reason = "no TLS receive progress for >15s".into();
+        // 读超时收敛到 8s（对齐 Go datapathReadTimeout）：4s 心跳下容忍一次丢失
+        // 后判死，把半开/死连接尽快踢出调度器。
+        if last_rx.elapsed() > Duration::from_secs(8) {
+            close_reason = "no TLS receive progress for >8s".into();
+            backend.scheduler.mark_stalled();
             conn_closed = true;
         }
     }

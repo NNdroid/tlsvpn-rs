@@ -1495,14 +1495,17 @@ fn worker_loop(
         for (token, sess) in mio_sessions.iter_mut() {
             sess.batch_cork.maybe_flush(&sess.socket, Instant::now());
             let idle_time = sess.last_rx.elapsed().as_secs();
-            // 15s 无下行数据视为链路死亡（对齐 Go 15s 读超时）。4s 心跳下
-            // 30s = 丢 3 个心跳才判死；15s = 丢 2 个，直接缩短用户看到的
-            // "connection lost: timeout" 窗口。
-            if idle_time > 15 {
+            // 8s 无下行数据视为链路死亡（对齐 Go datapathReadTimeout）。4s 心跳下
+            // 8s = 丢 2 个心跳即判死，直接缩短用户看到的 "connection lost: timeout"
+            // 窗口，并把半开/死连接尽快踢出调度器。判定瞬间标记 stalled。
+            if idle_time > 8 {
                 debug!(
                     "closing token {:?}: no TLS receive progress for {}s",
                     token, idle_time
                 );
+                if let Some(backend) = &sess.tx_backend {
+                    backend.scheduler.mark_stalled();
+                }
                 closed_tokens.push(*token);
                 continue;
             }
@@ -1514,12 +1517,20 @@ fn worker_loop(
             // 每 200ms 刷新 RTT（对齐 Go startRTTPoller）
             if sess.rtt_timer.elapsed() > Duration::from_millis(200) {
                 if let Some(backend) = &sess.tx_backend {
-                    let rtt = if idle_time >= 5 {
-                        100000
+                    if idle_time >= 5 {
+                        // 空闲太久无法获得可靠 RTT 采样，按一次失败累计。
+                        backend.scheduler.note_rtt_failure();
                     } else {
-                        get_tcp_rtt(&sess.socket)
-                    };
-                    backend.rtt_cache.store(rtt, Ordering::Relaxed);
+                        match get_tcp_rtt(&sess.socket) {
+                            Ok(rtt) if rtt > 0 => {
+                                backend.rtt_cache.store(rtt, Ordering::Relaxed);
+                                backend.scheduler.note_rtt_success();
+                            }
+                            // rtt==0 引导期正常状态，不计失败。
+                            Ok(_) => {}
+                            Err(_) => backend.scheduler.note_rtt_failure(),
+                        }
+                    }
                 }
                 sess.rtt_timer = Instant::now();
             }
@@ -1569,10 +1580,14 @@ fn worker_loop(
                 }
             }
 
-            // 写积压超过 10s 视为对端卡死（对齐 Go SetWriteDeadline(10s)）
+            // 写积压超过 3s 视为对端卡死（对齐 Go datapathWriteTimeout）。
+            // 判定瞬间标记 stalled，调度器立即跳过该后端。
             if let Some(stalled_at) = sess.write_stalled {
-                if stalled_at.elapsed() > Duration::from_secs(10) {
-                    debug!("closing token {:?}: TLS write stalled for >10s", token);
+                if stalled_at.elapsed() > Duration::from_secs(3) {
+                    debug!("closing token {:?}: TLS write stalled for >3s", token);
+                    if let Some(backend) = &sess.tx_backend {
+                        backend.scheduler.mark_stalled();
+                    }
                     closed_tokens.push(*token);
                     continue;
                 }

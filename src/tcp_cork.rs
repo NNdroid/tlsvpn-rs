@@ -106,7 +106,10 @@ impl TlsBatchCork {
 
         #[cfg(target_os = "linux")]
         {
-            let Some(delay) = policy_for_rtt(get_tcp_rtt(stream)) else {
+            // 采样失败时以 rtt=0（未知）求策略，得到最大聚合延迟（保守默认），
+            // 保持与改造前的行为一致。
+            let rtt = get_tcp_rtt(stream).unwrap_or(0);
+            let Some(delay) = policy_for_rtt(rtt) else {
                 return Self::disabled();
             };
             let measured_mss = get_tcp_mss(stream);

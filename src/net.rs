@@ -520,28 +520,31 @@ pub fn get_tcp_mss<S>(_stream: &S) -> usize {
 }
 
 #[cfg(target_os = "linux")]
-pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> u32 {
+pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> std::io::Result<u32> {
     let fd = stream.as_raw_fd();
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-    unsafe {
-        if libc::getsockopt(
+    let rc = unsafe {
+        libc::getsockopt(
             fd,
             libc::SOL_TCP,
             libc::TCP_INFO,
             &mut info as *mut _ as *mut _,
             &mut len,
-        ) == 0
-        {
-            return info.tcpi_rtt;
-        }
+        )
+    };
+    if rc == 0 {
+        Ok(info.tcpi_rtt)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    50000
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_tcp_rtt<S: AsRawFd>(_stream: &S) -> u32 {
-    50000
+pub fn get_tcp_rtt<S: AsRawFd>(_stream: &S) -> std::io::Result<u32> {
+    // 非 Linux 无法测量 TCP RTT。返回 Ok(UNKNOWN_RTT_US) 而非 Err：等效 Go 的
+    // 非 Linux startRTTPoller 不采样（永不失败），避免 RTT 失败计数误伤 stalled。
+    Ok(crate::adaptive_multipath::UNKNOWN_RTT_US)
 }
 
 /// 直连拨号前打 SO_MARK（对齐 Go socketMarkControl：mark 影响连接时的
