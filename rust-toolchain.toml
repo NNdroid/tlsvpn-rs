@@ -1,0 +1,11 @@
+# rustc 1.99.x (used by CI "stable" since ~2026-10) regressed: it emits far more
+# aggressive inlining of #[target_feature] runtime-gated code (sha2/ring/aes/chacha
+# AVX2/BMI2/ADX/SHA-NI paths, src/fec.rs), producing extra BMI2/AVX2 instruction
+# copies that crash with SIGILL on CPUs lacking those features (e.g. Intel Xeon
+# E5-2680 v2 / Ivy Bridge, which has AVX but no AVX2/BMI2/ADX/SHA-NI). 1.95.0 is
+# the last toolchain verified to emit the same instruction profile as the
+# v1.0.20261002 release (the last known-good build). Pin it so releases stay
+# reproducible and runnable on such CPUs. Revisit when a newer toolchain is
+# verified against an AVX2-less host.
+[toolchain]
+channel = "1.95.0"

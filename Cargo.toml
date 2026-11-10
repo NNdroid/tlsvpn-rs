@@ -49,11 +49,10 @@ aes-gcm = "0.10"
 libc = "0.2"
 
 [profile.release]
-# fat LTO + codegen-units=1 caused LLVM to inline #[target_feature] runtime-gated
-# functions (sha2/ring/aes/chacha AVX2/BMI2/ADX/SHA-NI paths, plus src/fec.rs) into
-# callers without the gate, so a CPU lacking those features (e.g. Ivy Bridge E5-2680
-# v2) died with SIGILL. Thin LTO keeps most of the benefit while making the
-# cross-crate inlining that bypassed is_x86_feature_detected!/cpufeatures unlikely.
+# The SIGILL-on-Ivy-Bridge regression came from the rustc 1.99.x toolchain, not
+# from LTO (see rust-toolchain.toml, which pins 1.95.0). We keep thin LTO anyway:
+# fat LTO + codegen-units=1 makes the #[target_feature] runtime gates easier to
+# bypass by cross-crate inlining, and thin LTO retains most of the LTO benefit.
 lto = "thin"
 codegen-units = 16
 panic = "abort"
