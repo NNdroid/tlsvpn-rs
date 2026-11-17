@@ -112,6 +112,12 @@ pub struct SchedulerBackendState {
     pub ret_one_way_us: AtomicU64,
     // 最近一次探针重算的 Unix 毫秒时刻（对齐 Go probeUpdatedAt；0=未收敛）。
     pub probe_updated_at: AtomicU64,
+    // 双向时钟偏移 θ（ns，客户端视角相对服务端）+ 不确定度 U（µs）+ 是否可信。
+    // 由 AsyncPort 的 set_clock_offset_theta 在快照前发布（对齐 Go
+    // schedulerConnJSON.clock_offset_*）；0/0/false=未收敛。
+    pub clock_offset_ns: AtomicI64,
+    pub clock_offset_unc_us: AtomicU64,
+    pub clock_offset_converged: AtomicBool,
     // oneWayMode：0=roundtrip 兼容（等价 rtt/2）、1=fwd（本端 egress）、2=ret。
     // 对齐 Go client.go 的 oneWayMode* 常量；egress 方向两端均为 fwd。
     pub one_way_mode: AtomicI32,
@@ -140,6 +146,9 @@ impl Default for SchedulerBackendState {
             fwd_one_way_us: AtomicU64::new(0),
             ret_one_way_us: AtomicU64::new(0),
             probe_updated_at: AtomicU64::new(0),
+            clock_offset_ns: AtomicI64::new(0),
+            clock_offset_unc_us: AtomicU64::new(0),
+            clock_offset_converged: AtomicBool::new(false),
             one_way_mode: AtomicI32::new(crate::routing_policy::ONE_WAY_MODE_FWD),
             sample_bytes: AtomicU64::new(0),
             sample_start_us: AtomicU64::new(0),
@@ -253,6 +262,8 @@ impl SchedulerBackendState {
     }
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
+        // min_rtt 未知（0 或哨兵）时省略（omitempty），不可当作真实值暴露。
+        let (min_rtt, unknown) = self.min_rtt_known();
         SchedulerSnapshot {
             queued_bytes: self.queued_bytes.load(Ordering::Relaxed),
             rate_mbps: self.rate_bytes_per_sec.load(Ordering::Relaxed) as f64 * 8.0 / 1_000_000.0,
@@ -264,6 +275,23 @@ impl SchedulerBackendState {
             fec_assigned_bytes: self.fec_assigned_bytes.load(Ordering::Relaxed),
             fec_assigned_batches: self.fec_assigned_batches.load(Ordering::Relaxed),
             stalled: self.is_stalled(),
+            fwd_oneway_us: self.fwd_one_way_us.load(Ordering::Relaxed),
+            ret_oneway_us: self.ret_one_way_us.load(Ordering::Relaxed),
+            min_rtt_us: if unknown { 0 } else { min_rtt as u64 },
+            probe_at_ms: self.probe_updated_at.load(Ordering::Relaxed),
+            clock_offset_ns: self.clock_offset_ns.load(Ordering::Relaxed),
+            clock_offset_unc_us: self.clock_offset_unc_us.load(Ordering::Relaxed),
+            clock_offset_converged: self.clock_offset_converged.load(Ordering::Relaxed),
+        }
+    }
+
+    /// min_rtt 已知值 + 是否未知（0 或哨兵视为未知）。
+    fn min_rtt_known(&self) -> (u32, bool) {
+        let v = self.min_rtt_cache.load(Ordering::Relaxed);
+        if v == 0 || v == UNKNOWN_RTT_US {
+            (0, true)
+        } else {
+            (v, false)
         }
     }
 }
@@ -280,6 +308,30 @@ pub struct SchedulerSnapshot {
     pub fec_assigned_bytes: u64,
     pub fec_assigned_batches: u64,
     pub stalled: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fwd_oneway_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ret_oneway_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub min_rtt_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub probe_at_ms: u64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub clock_offset_ns: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub clock_offset_unc_us: u64,
+    #[serde(skip_serializing_if = "is_false")]
+    pub clock_offset_converged: bool,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 pub trait AdaptiveBackend {

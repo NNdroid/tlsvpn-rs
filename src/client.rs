@@ -165,6 +165,9 @@ pub struct ConnInfo {
     // 当前活动的物理连接 Backend（跨路径探针 resolver 用；None = 未连接/重连中）。
     // 对齐 Go connInfo.backend（atomic.Pointer[Backend]）。
     pub backend: Mutex<Option<Arc<crate::net::Backend>>>,
+    // 本连接客户端观测到的服务端证书 SHA-256 指纹（hex，空=未观测/非 TLS）。
+    // 对齐 Go connJSON.CertSHA256。
+    pub peer_cert_sha: Mutex<String>,
 }
 
 impl ConnInfo {
@@ -183,6 +186,7 @@ impl ConnInfo {
             brutal: Mutex::new(BrutalApplyResult::default()),
             scheduler: Mutex::new(None),
             backend: Mutex::new(None),
+            peer_cert_sha: Mutex::new(String::new()),
         }
     }
 
@@ -213,6 +217,7 @@ impl ConnInfo {
             "brutal_version": brutal.version,
             "brutal_group_id": brutal.group_id,
             "brutal_rule_managed": brutal.rule_managed,
+            "cert_sha256": self.peer_cert_sha.lock().clone(),
             "scheduler": scheduler,
             "age_sec": if linked_at > 0 {
                 (now_unix_ms() / 1000).saturating_sub(linked_at) as u64
@@ -1191,6 +1196,19 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     };
     let client = Arc::new(client);
 
+    // 注入会话级双向时钟偏移 θ 读取器（供连接快照暴露收敛状态；对齐 Go
+    // SetClockOffsetTheta）。θ 由探针调度器发布，快照路径读取并发布到后端原子。
+    tx_port.set_clock_offset_theta({
+        let cl = client.clone();
+        move || {
+            cl.clock_offset
+                .lock()
+                .as_ref()
+                .map(|c| c.theta_ns())
+                .unwrap_or((0, 0, false))
+        }
+    });
+
     crate::api::start_dashboard_sampler(client.clone(), ctx.clone());
 
     if !args.web.is_empty() {
@@ -1495,6 +1513,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let _ = poll
         .registry()
         .reregister(&mut sock, TOKEN_CONN, client_socket_interest(false));
+
+    // 客户端观测到的对端（服务端）证书叶子证书 DER 的 SHA-256 指纹（hex）。
+    // 对齐 Go peerCertSHA256 / connJSON.CertSHA256。
+    let peer_cert_sha = tls
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|der| {
+            let mut hasher = Sha256::new();
+            hasher.update(der.as_ref());
+            hex::encode(hasher.finalize())
+        })
+        .unwrap_or_default();
+    *ci.peer_cert_sha.lock() = peer_cert_sha;
 
     // 3. 握手请求（对齐 Go）
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带

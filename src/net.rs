@@ -1537,6 +1537,9 @@ pub struct AsyncPort {
     // 自适应选路/唤醒全部移到端口自己的 dispatch 线程——对齐 Go AsyncPort.run，
     // 把这些每帧成本从共享的 TAP 读线程上摘掉并按批摊薄。
     dispatch_tx: std::sync::OnceLock<Sender<FramePayload>>,
+    // 本端口所属会话的双向时钟偏移 θ 读取器（快照暴露收敛状态；对齐 Go
+    // SetClockOffsetTheta）。None = 未注入（测试直构/无探针）。
+    clock_offset_theta: Mutex<Option<Arc<dyn Fn() -> (i64, u64, bool) + Send + Sync>>>,
 }
 
 /// TLSVPN_PORT_DISPATCH=1 启用端口级 dispatch 线程（候选旗标，ABBA 证据出来前默认关）。
@@ -1573,6 +1576,7 @@ impl AsyncPort {
             parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
             dispatch_tx: std::sync::OnceLock::new(),
+            clock_offset_theta: Mutex::new(None),
         }
     }
 
@@ -1580,6 +1584,12 @@ impl AsyncPort {
     /// 读取，配置变更即生效）。未知值归一化为 auto。
     pub fn set_routing_algo(&self, algo: &str) {
         self.adaptive.set_routing_algo(algo);
+    }
+
+    /// 注入本端口所属会话的双向时钟偏移 θ 读取器（供快照暴露收敛状态；对齐 Go
+    /// SetClockOffsetTheta）。θ 是会话级状态，快照路径统一读取并发布到各后端原子。
+    pub fn set_clock_offset_theta(&self, f: impl Fn() -> (i64, u64, bool) + Send + Sync + 'static) {
+        *self.clock_offset_theta.lock() = Some(Arc::new(f));
     }
 
     /// 热更 FEC parity 分发策略 + near 窗口（对齐 Go AsyncPort.SetFecStrategy/窗口
@@ -1686,6 +1696,17 @@ impl AsyncPort {
     }
 
     pub fn diagnostic_paths(&self) -> Vec<(String, u32, SchedulerSnapshot)> {
+        // 会话级 θ 统一发布到各后端原子，快照读取（对齐 Go schedulerSnapshot 的
+        // clockOffsetTheta 注入）。仅当已注入且已收敛时发布非零值。
+        let theta = self.clock_offset_theta.lock().as_ref().map(|f| f());
+        if let Some((th, unc, ok)) = theta {
+            for b in self.backends.read().iter() {
+                let st = &b.scheduler;
+                st.clock_offset_ns.store(th, Ordering::Relaxed);
+                st.clock_offset_unc_us.store(unc, Ordering::Relaxed);
+                st.clock_offset_converged.store(ok, Ordering::Relaxed);
+            }
+        }
         self.backends
             .read()
             .iter()

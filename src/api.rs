@@ -108,6 +108,10 @@ pub struct TLSHandshakeInfo {
     pub offered_groups: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offered_alpn: Vec<String>,
+    /// 客户端观测到的对端（服务端）证书叶子证书 DER 的 SHA-256 指纹（hex）。
+    /// 对齐 Go tls_info.go CertSHA256。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cert_sha256: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]

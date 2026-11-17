@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, ServerConnection};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -486,6 +487,9 @@ pub struct ServerCore {
     // FEC parity 分发策略（对齐 Go fec_strategy）+ near 窗口（ms），会话端口构造时设置。
     pub fec_strategy: String,
     pub fec_near_window_ms: i64,
+    // 本机 TLS 证书叶子证书 DER 的 SHA-256 指纹（hex，空=未加载）。对齐 Go
+    // serverCertSHA256；server_conns 快照的 cert_sha256 展示本机证书供用户锁定。
+    pub server_cert_sha256: String,
     // 多 worker 共用的会话回收节流，避免每次断线创建一个睡眠 OS 线程。
     pub last_session_reap_ms: AtomicU64,
 }
@@ -666,6 +670,7 @@ impl WebStatsProvider for ServerCore {
                     "remote": format!("path #{}", idx + 1),
                     "state": "up",
                     "rtt_ms": rtt / 1000,
+                    "cert_sha256": self.server_cert_sha256.clone(),
                     "tx_bytes": scheduler.assigned_bytes,
                     "rx_bytes": 0,
                     "age_sec": 0,
@@ -982,6 +987,19 @@ fn build_server_tls_from_paths(cert: &str, key: &str) -> Result<Arc<ServerConfig
     Ok(Arc::new(cfg))
 }
 
+/// 本机 TLS 证书叶子证书 DER 的 SHA-256 指纹（hex）。对齐 Go
+/// serverCertFingerprint / crypto.go serverCertSHA256。
+fn server_cert_sha256_from_path(cert: &str) -> String {
+    match load_certs(cert) {
+        Ok(certs) if !certs.is_empty() => {
+            let mut hasher = Sha256::new();
+            hasher.update(certs[0].as_ref());
+            hex::encode(hasher.finalize())
+        }
+        _ => String::new(),
+    }
+}
+
 fn generate_persistent_self_signed(cert_path: &str, key_path: &str) -> Result<(), String> {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -1088,6 +1106,11 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         probe_min_half_rtt_us: args.probe_min_half_rtt_us.max(0) as u64,
         fec_strategy: args.fec_strategy.clone(),
         fec_near_window_ms: args.fec_near_window_ms,
+        server_cert_sha256: server_cert_sha256_from_path(if !args.cert.is_empty() {
+            &args.cert
+        } else {
+            SELF_SIGNED_CERT_FILE
+        }),
     });
 
     // 源 MAC 归属校验（对齐 Go validateSrcMAC）：会话端口只能声明本会话
@@ -1202,8 +1225,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     let tls_config = match build_server_tls(&args.cert, &args.key) {
         Ok(c) => c,
-        Err(e) => return Err(format!("Invalid configuration: {e}")),
-    };
+        Err(e) => return Err(format!("Invalid configuration: {e}")),    };
 
     let n_workers = if args.workers > 0 {
         args.workers.max(1) as usize
@@ -2942,6 +2964,18 @@ fn handle_handshake(
             );
             *c_sess.clock_offset.lock() = Some(clock);
         }
+        // 注入会话级双向时钟偏移 θ 读取器到会话端口（快照暴露；对齐 Go
+        // server.go SetClockOffsetTheta）。θ 由探针调度器发布，快照路径发布到后端原子。
+        c_sess.port.set_clock_offset_theta({
+            let s = c_sess.clone();
+            move || {
+                s.clock_offset
+                    .lock()
+                    .as_ref()
+                    .map(|c| c.theta_ns())
+                    .unwrap_or((0, 0, false))
+            }
+        });
         if req.rtt_probe {
             if let Some(r) = c_sess.rtt_probe.lock().as_ref() {
                 r.enable();
