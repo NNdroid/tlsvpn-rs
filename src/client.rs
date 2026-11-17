@@ -159,9 +159,12 @@ pub struct ConnInfo {
     pub rx_bytes: AtomicU64,
     pub retries: AtomicU64,
     pub linked_at: AtomicI64,
-    // 本连接的内核实际状态；不能再用“无错误字符串”推断已生效。
+    // 本连接的内核实际状态；不能再用”无错误字符串”推断已生效。
     pub brutal: Mutex<BrutalApplyResult>,
     pub scheduler: Mutex<Option<Arc<crate::adaptive_multipath::SchedulerBackendState>>>,
+    // 当前活动的物理连接 Backend（跨路径探针 resolver 用；None = 未连接/重连中）。
+    // 对齐 Go connInfo.backend（atomic.Pointer[Backend]）。
+    pub backend: Mutex<Option<Arc<crate::net::Backend>>>,
 }
 
 impl ConnInfo {
@@ -179,6 +182,7 @@ impl ConnInfo {
             linked_at: AtomicI64::new(0),
             brutal: Mutex::new(BrutalApplyResult::default()),
             scheduler: Mutex::new(None),
+            backend: Mutex::new(None),
         }
     }
 
@@ -431,8 +435,13 @@ pub struct Client {
     // 内存中的身份状态；多条物理连接的握手会并发落盘，故加锁
     pub identity: Mutex<crate::client_state::ClientState>,
     pub config: Arc<ClientConfig>,
-    pub conn_infos: Vec<Arc<ConnInfo>>,
+    pub conn_infos: Arc<Vec<Arc<ConnInfo>>>,
     pub socks5: Option<Arc<Socks5Proxy>>,
+    // 跨路径探针调度器（每客户端一个；握手协商 RTTProbe/ClockOffset 后 enable）。
+    pub rtt_probe: Mutex<Option<Arc<crate::probe_scheduler::RttProbeScheduler>>>,
+    pub clock_offset: Mutex<Option<Arc<crate::probe_scheduler::ClockOffsetScheduler>>>,
+    // probe_min_half_rtt_us 配置值：物理锚定下界（µs），探针调度器每次重算读取。
+    pub probe_min_half_rtt_us: u64,
     // 面板统计
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
@@ -581,7 +590,7 @@ impl WebStatsProvider for Client {
         // 逐连接统计 setsockopt 成功过的条数，而不是"配置了 brutal 就全算生效"
         let mut applied_conns = 0usize;
         let mut brutal_errors = Vec::<String>::new();
-        for conn in &self.conn_infos {
+        for conn in self.conn_infos.iter() {
             let result = conn.brutal.lock();
             if result.applied {
                 applied_conns += 1;
@@ -953,6 +962,8 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     // TAP 读线程 → 端口（对齐 Go 客户端 TAP 读协程）
     let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
+    tx_port.set_routing_algo(&args.routing_algo);
+    tx_port.set_fec_strategy(&args.fec_strategy, args.fec_near_window_ms);
     {
         let dev = device.clone();
         let port = tx_port.clone();
@@ -1037,9 +1048,63 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         0
     };
 
-    let conn_infos: Vec<Arc<ConnInfo>> = (0..args.conns as usize)
-        .map(|i| Arc::new(ConnInfo::new(targets[i % targets.len()].clone())))
-        .collect();
+    let conn_infos: Arc<Vec<Arc<ConnInfo>>> = Arc::new(
+        (0..args.conns as usize)
+            .map(|i| Arc::new(ConnInfo::new(targets[i % targets.len()].clone())))
+            .collect(),
+    );
+
+    // 跨路径探针调度器（每客户端一个）。resolve/active 闭包捕获 conn_infos 的 Arc
+    // 克隆：resolver 按 index 查当前 Backend，active 按 index 升序列存活连接。
+    // minHalfRefUS 读配置值（加载期一次，非热更），对齐 Go probe_min_half_rtt_us。
+    let probe_min_half = args.probe_min_half_rtt_us.max(0) as u64;
+    let rtt_probe = crate::probe_scheduler::RttProbeScheduler::new(
+        Box::new({
+            let ci = conn_infos.clone();
+            move |i: usize| {
+                ci.get(i).and_then(|c| {
+                    c.backend
+                        .lock()
+                        .as_ref()
+                        .map(|b| b.clone() as Arc<dyn crate::probe_scheduler::ProbeTarget>)
+                })
+            }
+        }),
+        Box::new({
+            let ci = conn_infos.clone();
+            move || {
+                ci.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.backend.lock().is_some())
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        }),
+        Box::new(move || probe_min_half),
+    );
+    let clock_offset = crate::probe_scheduler::ClockOffsetScheduler::new(
+        Box::new({
+            let ci = conn_infos.clone();
+            move |i: usize| {
+                ci.get(i).and_then(|c| {
+                    c.backend
+                        .lock()
+                        .as_ref()
+                        .map(|b| b.clone() as Arc<dyn crate::probe_scheduler::ProbeTarget>)
+                })
+            }
+        }),
+        Box::new({
+            let ci = conn_infos.clone();
+            move || {
+                ci.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.backend.lock().is_some())
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        }),
+    );
 
     // 冷启动回带：状态文件按 client_id（MAC+PSK 派生）绑定，配置变更后旧令牌
     // 自动失效；带上令牌的第一次握手就能接回既有会话，不必等 120 秒销毁期。
@@ -1097,6 +1162,9 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         config: config.clone(),
         conn_infos,
         socks5: socks5.clone(),
+        rtt_probe: Mutex::new(Some(rtt_probe)),
+        clock_offset: Mutex::new(Some(clock_offset)),
+        probe_min_half_rtt_us: probe_min_half,
         tx_bytes: AtomicU64::new(0),
         rx_bytes: AtomicU64::new(0),
         tx_packets: AtomicU64::new(0),
@@ -1449,9 +1517,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         } else {
             0
         },
-        // Phase 2 接入跨路径探针调度器后改为 true；当前不声明，行为不变。
-        rtt_probe: false,
-        clock_offset: false,
+        // 声明支持跨路径 RTT 探针 + 双向时钟偏移探针；服务端同意后才启用调度器
+        // （对齐 Go client.go 握手请求，恒声明）。
+        rtt_probe: true,
+        clock_offset: true,
         brutal_groups: true,
         brutal_total_tx: cl.brutal_up,
         brutal_total_rx: cl.brutal_down,
@@ -1491,6 +1560,18 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             resp.protocol_version
         );
         return Duration::ZERO;
+    }
+
+    // 握手协商：双方同意后才启用探针调度器（对齐 Go client.go 2484-2490）。
+    if resp.rtt_probe {
+        if let Some(r) = cl.rtt_probe.lock().as_ref() {
+            r.enable();
+        }
+    }
+    if resp.clock_offset {
+        if let Some(c) = cl.clock_offset.lock().as_ref() {
+            c.enable();
+        }
     }
 
     // TLS + TLSVPN 握手都已完成，现在才启用 Brutal。优先采用服务端裁剪后的
@@ -1773,6 +1854,8 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         Arc::new(mio::Waker::new(poll.registry(), TOKEN_WAKE).expect("Waker init"));
     let rtt_cache = Arc::new(AtomicU32::new(50000));
     let (tx, rx) = bounded(1024);
+    // 跨路径探针投递通道（cap 8，对齐 Go backend.probeCh）。发送循环在下方排空。
+    let (probe_tx, probe_rx) = bounded(8);
     let backend = Arc::new(Backend {
         fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
@@ -1786,9 +1869,18 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             Arc::new(ArrayQueue::new(1)),
             TOKEN_WAKE,
         ))),
+        probe_ch: Mutex::new(Some(probe_tx)),
     });
     cl.tx_port.register_backend(backend.clone());
     *ci.scheduler.lock() = Some(backend.scheduler.clone());
+    *ci.backend.lock() = Some(backend.clone());
+    // 后端注册：事件驱动探针调度器立即发起一轮（对齐 Go 注册后 rttProbe.kick）。
+    if let Some(r) = cl.rtt_probe.lock().as_ref() {
+        r.kick();
+    }
+    if let Some(c) = cl.clock_offset.lock().as_ref() {
+        c.kick();
+    }
 
     cl.live_conns.fetch_add(1, Ordering::Relaxed);
     *ci.rtt_cache.lock() = rtt_cache.clone();
@@ -1898,11 +1990,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         // RTT 采样在连接线程内完成，消除每连接一个 200ms sleeper thread。
+        // min_rtt（内核 tcpi_min_rtt，无拥塞地板）与 SRTT 同轮采样：排名/包络用
+        // min_rtt，ETA 遥测用 SRTT（对齐 Go sampleRTT / path_quality.go）。
         if !proxied && Instant::now() >= next_rtt_refresh {
             if let Some(s) = std_for_rtt.as_ref() {
-                match get_tcp_rtt(s) {
-                    Ok(rtt) if rtt > 0 => {
+                match get_tcp_rtt_and_min(s) {
+                    Ok((rtt, min_rtt)) if rtt > 0 => {
                         rtt_cache.store(rtt, Ordering::Relaxed);
+                        if min_rtt > 0 {
+                            backend
+                                .scheduler
+                                .min_rtt_cache
+                                .store(min_rtt, Ordering::Relaxed);
+                        }
                         backend.scheduler.note_rtt_success();
                     }
                     // rtt==0 是引导期正常状态（尚未取得采样），不算失败，不计入
@@ -2002,9 +2102,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
                             // 跨路径 RTT/时钟偏移探针（seq==0, kind 0x03-0x06）前置
                             // 拦截，与 Go 读循环一致（server.go/client.go）：探针在
-                            // FEC 门控之前被拦截，即使无 FEC 会话也可用。Phase 2 接入
-                            // 探针调度器后改为投递；当前丢弃（防御性，绝不因探针断连）。
+                            // FEC 门控之前被拦截，即使无 FEC 会话也可用。协商后
+                            // 投递给调度器（非阻塞 on_frame），否则丢弃（防御性，
+                            // 绝不因探针断连）。
                             if seq == 0 && crate::clock_offset::is_probe_payload(&data) {
+                                if crate::rtt_probe::is_rtt_probe_frame(&data) {
+                                    if let Some(r) = cl.rtt_probe.lock().as_ref() {
+                                        r.on_frame(&data, conn_index);
+                                    }
+                                } else if crate::clock_offset::is_clock_offset_frame(&data) {
+                                    if let Some(c) = cl.clock_offset.lock().as_ref() {
+                                        c.on_frame(&data, conn_index);
+                                    }
+                                }
                                 release_frame_vec(data);
                                 continue;
                             }
@@ -2154,6 +2264,25 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             };
         }
 
+        // 排空跨路径探针帧（RTT/时钟偏移，seq==0 控制帧）：与数据帧同批写出，
+        // 探针在 Write 前 patch send_ts（固定偏移），即使排队也测得精确发送时刻。
+        // 对齐 Go writeProbe（appendPaddedFrame 逐帧随机桶尺寸，与记录/保活同尺寸
+        // 分布，消除流量特征）。
+        while let Ok(payload) = probe_rx.try_recv() {
+            let start = send_buf.len();
+            append_padded_frame_with_limit(&mut send_buf, 0, &payload, None, pad_record_limit);
+            let kind = payload.first().copied().unwrap_or(0);
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            if kind == crate::protocol::CONTROL_KIND_RTT_PROBE {
+                crate::rtt_probe::patch_rtt_probe_send_ts_at(&mut send_buf, start, now_ns);
+            } else if kind == crate::protocol::CONTROL_KIND_CLOCK_PROBE {
+                crate::clock_offset::patch_clock_offset_send_ts_at(&mut send_buf, start, now_ns);
+            }
+        }
+
         if send_buf.is_empty()
             && !tls.wants_write()
             && last_keepalive.elapsed() > Duration::from_secs(4)
@@ -2285,6 +2414,14 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
     cl.tx_port.unregister_backend(&tx);
     *ci.scheduler.lock() = None;
+    *ci.backend.lock() = None;
+    // 后端消失：探针调度器重算时跳过该连接（对齐 Go 断开后 probeActiveConns 收窄）。
+    if let Some(r) = cl.rtt_probe.lock().as_ref() {
+        r.kick();
+    }
+    if let Some(c) = cl.clock_offset.lock().as_ref() {
+        c.kick();
+    }
     cl.live_conns.fetch_sub(1, Ordering::Relaxed);
     *ci.state.lock() = "retrying".into();
     linked_at.elapsed()

@@ -100,7 +100,13 @@ pub fn is_rtt_probe_frame(payload: &[u8]) -> bool {
 /// （0x04）保留回显值。send_buffer 为 appendPaddedFrame 输出，探针载荷起点 = 10
 /// （帧头）。
 pub fn patch_rtt_probe_send_ts(send_buffer: &mut [u8], now_ns: u64) {
-    let off = 10 + RTT_PROBE_OFF_SEND_TS;
+    patch_rtt_probe_send_ts_at(send_buffer, 0, now_ns);
+}
+
+/// 带 frame_start 的变体：探针帧可能不在 send_buffer 起始（与数据帧同批混排），
+/// 需按实际帧起点定位载荷。
+pub fn patch_rtt_probe_send_ts_at(send_buffer: &mut [u8], frame_start: usize, now_ns: u64) {
+    let off = frame_start + 10 + RTT_PROBE_OFF_SEND_TS;
     if off + 8 > send_buffer.len() {
         return;
     }

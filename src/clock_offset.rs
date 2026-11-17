@@ -129,7 +129,12 @@ pub fn is_clock_offset_frame(payload: &[u8]) -> bool {
 
 /// 发送循环在 Write 前写入发送时间戳（固定偏移）。仅探针（0x05）需要。
 pub fn patch_clock_offset_send_ts(send_buffer: &mut [u8], now_ns: u64) {
-    let off = 10 + CLOCK_OFF_OFF_SEND_TS;
+    patch_clock_offset_send_ts_at(send_buffer, 0, now_ns);
+}
+
+/// 带 frame_start 的变体：探针帧可能不在 send_buffer 起始（与数据帧同批混排）。
+pub fn patch_clock_offset_send_ts_at(send_buffer: &mut [u8], frame_start: usize, now_ns: u64) {
+    let off = frame_start + 10 + CLOCK_OFF_OFF_SEND_TS;
     if off + 8 > send_buffer.len() {
         return;
     }

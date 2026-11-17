@@ -243,6 +243,9 @@ impl FecRxFenceState {
 #[derive(Debug, Default)]
 pub struct FecTxModeState {
     seen_multipath: bool,
+    // hadTraffic 守卫（对齐 Go fec_encoder.go）：任何数据帧（seq≠0）被观察过才
+    // 允许合成 SUSPEND。零流量时 2→1 不合成启动 SUSPEND（RX 无动态状态可挂起）。
+    saw_data: bool,
     suspended: bool,
     generation: u64,
     current: Option<FecModeControl>,
@@ -263,31 +266,32 @@ impl FecTxModeState {
 
     /// Observe the physical sender topology immediately before dispatching seq.
     /// Startup 1→2 is not a transition until a real SUSPEND has existed.
+    /// SUSPEND 只在确有数据流过（hadTraffic）后合成，零流量 2→1 不发射（对齐 Go
+    /// fec_encoder.setPhysicalPathCount 的 hadTraffic 守卫）。
     pub fn observe(&mut self, paths: usize, seq: u32, k: usize) -> Option<FecModeControl> {
-        if paths >= 2 {
+        let control = if paths >= 2 {
             if !self.seen_multipath {
                 self.seen_multipath = true;
-                return None;
-            }
-            if self.suspended {
+                None
+            } else if self.suspended {
                 let boundary = fec_next_group_start(seq, k);
                 if boundary == 0 {
-                    return None;
+                    None
+                } else {
+                    self.generation = self.generation.saturating_add(1).max(1);
+                    let control = FecModeControl {
+                        generation: self.generation,
+                        op: FEC_MODE_RESUME,
+                        boundary,
+                    };
+                    self.suspended = false;
+                    self.current = Some(control);
+                    Some(control)
                 }
-                self.generation = self.generation.saturating_add(1).max(1);
-                let control = FecModeControl {
-                    generation: self.generation,
-                    op: FEC_MODE_RESUME,
-                    boundary,
-                };
-                self.suspended = false;
-                self.current = Some(control);
-                return Some(control);
+            } else {
+                None
             }
-            return None;
-        }
-
-        if paths == 1 && self.seen_multipath && !self.suspended {
+        } else if paths == 1 && self.seen_multipath && !self.suspended && self.saw_data {
             self.generation = self.generation.saturating_add(1).max(1);
             let control = FecModeControl {
                 generation: self.generation,
@@ -296,9 +300,14 @@ impl FecTxModeState {
             };
             self.suspended = true;
             self.current = Some(control);
-            return Some(control);
-        }
-        None
+            Some(control)
+        } else {
+            None
+        };
+        // 记录本次观察到的数据帧（seq≠0），供后续 SUSPEND 决策。在决策之后更新：
+        // 首次数据帧自身不触发 SUSPEND（对齐 Go lastSeq==0 时不视为 hadTraffic）。
+        self.saw_data = self.saw_data || seq != 0;
+        control
     }
 }
 
@@ -429,6 +438,22 @@ mod tests {
         let resume = tx.observe(2, 7, 4).unwrap();
         assert_eq!(resume.op, FEC_MODE_RESUME);
         assert_eq!(resume.boundary, 9);
+    }
+
+    #[test]
+    fn zero_traffic_2_to_1_does_not_emit_suspend() {
+        // 2 后端零数据（仅 seq==0 保活/控制）后降为 1：hadTraffic 守卫抑制合成
+        // SUSPEND（对齐 Go fec_encoder.go；RX 无动态状态可挂起）。
+        let mut tx = FecTxModeState::default();
+        assert_eq!(tx.observe(2, 0, 4), None, "首次多路径不发射");
+        assert_eq!(tx.observe(1, 0, 4), None, "零流量 2→1 必须抑制 SUSPEND");
+        assert!(!tx.suspended());
+
+        // 有数据（seq≠0）后 2→1 才合成 SUSPEND。
+        assert_eq!(tx.observe(2, 2, 4), None);
+        let suspend = tx.observe(1, 7, 4).unwrap();
+        assert_eq!(suspend.op, FEC_MODE_SUSPEND);
+        assert!(tx.suspended());
     }
 
     #[test]

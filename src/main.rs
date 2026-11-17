@@ -26,6 +26,8 @@ pub mod hooks;
 pub mod net;
 pub mod peer_info;
 pub mod protocol;
+pub mod probe_scheduler;
+pub mod routing_policy;
 pub mod rtt_probe;
 pub mod rx_actor;
 pub mod server;

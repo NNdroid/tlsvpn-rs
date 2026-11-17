@@ -6,7 +6,7 @@ use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
@@ -538,6 +538,91 @@ pub fn get_tcp_rtt<S: AsRawFd>(stream: &S) -> std::io::Result<u32> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// 内核 `struct tcp_info` 的前缀（linux/tcp.h UAPI，稳定 ABI：字段只追加、不重排）。
+/// libc 0.2.186 的 gnu `tcp_info` 只到 tcpi_total_retrans，未暴露 tcpi_min_rtt
+/// （内核 ≥4.9 才有，位于 4×u64 + 3×u32 之后）。这里本地复刻到 tcpi_min_rtt，
+/// 布局与 musl 的 libc tcp_info 及内核一致，保证 getsockopt 读到的偏移正确。
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelTcpInfoPrefix {
+    // 8 字节 u8 区：state/ca/retransmits/probes/backoff/options + snd_rcv_wscale
+    // + delivery_fastopen（旧内核是填充字节，必须占位以对齐到 u32）。
+    tcpi_state: u8,
+    tcpi_ca_state: u8,
+    tcpi_retransmits: u8,
+    tcpi_probes: u8,
+    tcpi_backoff: u8,
+    tcpi_options: u8,
+    tcpi_snd_rcv_wscale: u8,
+    tcpi_delivery_fastopen: u8,
+    // u32 区（24 个）：rto … total_retrans。
+    tcpi_rto: u32,
+    tcpi_ato: u32,
+    tcpi_snd_mss: u32,
+    tcpi_rcv_mss: u32,
+    tcpi_unacked: u32,
+    tcpi_sacked: u32,
+    tcpi_lost: u32,
+    tcpi_retrans: u32,
+    tcpi_fackets: u32,
+    tcpi_last_data_sent: u32,
+    tcpi_last_ack_sent: u32,
+    tcpi_last_data_recv: u32,
+    tcpi_last_ack_recv: u32,
+    tcpi_pmtu: u32,
+    tcpi_rcv_ssthresh: u32,
+    tcpi_rtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_advmss: u32,
+    tcpi_reordering: u32,
+    tcpi_rcv_rtt: u32,
+    tcpi_rcv_space: u32,
+    tcpi_total_retrans: u32,
+    // u64 区（4 个）：pacing_rate … bytes_received。
+    tcpi_pacing_rate: u64,
+    tcpi_max_pacing_rate: u64,
+    tcpi_bytes_acked: u64,
+    tcpi_bytes_received: u64,
+    // u32 区（3 个）：segs_out / segs_in / notsent_bytes，然后 tcpi_min_rtt。
+    tcpi_segs_out: u32,
+    tcpi_segs_in: u32,
+    tcpi_notsent_bytes: u32,
+    tcpi_min_rtt: u32,
+}
+
+/// 一次 getsockopt 同时取 SRTT（tcpi_rtt）与内核 min_rtt（tcpi_min_rtt，µs）。
+/// 仅 Linux：非 Linux 无法测量，等效 Go 非 Linux 分支不采样。min_rtt 0 = 尚未
+/// 观测到（引导期），调用方按"未知"处理（对齐 Go adaptiveBackendMinRTT）。
+#[cfg(target_os = "linux")]
+pub fn get_tcp_rtt_and_min<S: AsRawFd>(stream: &S) -> std::io::Result<(u32, u32)> {
+    let fd = stream.as_raw_fd();
+    let mut info: KernelTcpInfoPrefix = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<KernelTcpInfoPrefix>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut _,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok((info.tcpi_rtt, info.tcpi_min_rtt))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// 非 Linux：min_rtt 无法测量，返回 (UNKNOWN_RTT_US, 0)（0 = 未知）。
+#[cfg(not(target_os = "linux"))]
+pub fn get_tcp_rtt_and_min<S>(_stream: &S) -> std::io::Result<(u32, u32)> {
+    Ok((crate::adaptive_multipath::UNKNOWN_RTT_US, 0))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1365,6 +1450,10 @@ pub struct Backend {
     pub rtt_cache: Arc<AtomicU32>,
     pub notify: Option<Arc<BackendNotify>>,
     pub scheduler: Arc<SchedulerBackendState>,
+    /// 跨路径探针/回包投递通道（cap 8，对齐 Go backend.probeCh）。发送循环排空，
+    /// 读循环经 on_frame 投递回调度器。None = 探针未接线（该连接不参与探针）。
+    /// Mutex 包裹以允许 Arc<Backend> 后的延迟设置（服务端握手时才有 connIndex）。
+    pub probe_ch: Mutex<Option<Sender<Vec<u8>>>>,
 }
 
 impl AdaptiveBackend for Backend {
@@ -1392,6 +1481,36 @@ impl AdaptiveBackend for Backend {
     }
 }
 
+/// 探针调度器的目标抽象实现：Backend 提供 probe_ch 投递与单向时延发布。
+impl crate::probe_scheduler::ProbeTarget for Backend {
+    #[inline]
+    fn push_probe(&self, payload: Vec<u8>) -> bool {
+        match self.probe_ch.lock().as_ref() {
+            Some(tx) => tx.try_send(payload).is_ok(),
+            None => false,
+        }
+    }
+
+    #[inline]
+    fn publish_one_way(
+        &self,
+        fwd: Option<(u64, u64)>, // (选路 rank 编码, 显示 µs)
+        ret: Option<(u64, u64)>,
+        updated_ms: u64,
+    ) {
+        let st = &self.scheduler;
+        if let Some((rank, display)) = fwd {
+            st.fwd_rank_us.store(rank, Ordering::Relaxed);
+            st.fwd_one_way_us.store(display, Ordering::Relaxed);
+        }
+        if let Some((rank, display)) = ret {
+            st.ret_rank_us.store(rank, Ordering::Relaxed);
+            st.ret_one_way_us.store(display, Ordering::Relaxed);
+        }
+        st.probe_updated_at.store(updated_ms, Ordering::Relaxed);
+    }
+}
+
 /// 异步聚合端口，分发行为对齐 Go AsyncPort.dispatchBatch：
 /// - 挂载 XOR FEC 编码器时：数据帧 MinRTT 单路发送，校验帧只发一份并在健康连接间轮转；
 /// - 普通模式：MinRTT 单路发送。
@@ -1407,6 +1526,10 @@ pub struct AsyncPort {
     encoder: Mutex<Option<FecEncoder>>,
     fec_mode: Mutex<FecTxModeState>,
     encoder_enabled: AtomicBool,
+    // parity 分发策略码（0=auto, 1=near，对齐 Go fecStrategy）与 near 窗口（µs，
+    // 对齐 Go fecNearWindowUS）。set_fec_strategy 热更，pick 每帧读取。
+    fec_strategy: AtomicI32,
+    fec_near_window_us: AtomicU64,
     dropped: AtomicU64,
     parity_sent: AtomicU64,
     sequence_exhausted: AtomicBool,
@@ -1442,11 +1565,34 @@ impl AsyncPort {
             encoder: Mutex::new(None),
             fec_mode: Mutex::new(FecTxModeState::default()),
             encoder_enabled: AtomicBool::new(false),
+            fec_strategy: AtomicI32::new(0),
+            fec_near_window_us: AtomicU64::new(
+                (crate::fec::FEC_NEAR_WINDOW_DEFAULT_MS as u64) * 1000,
+            ),
             dropped: AtomicU64::new(0),
             parity_sent: AtomicU64::new(0),
             sequence_exhausted: AtomicBool::new(false),
             dispatch_tx: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 热更 routing_algo（对齐 Go AsyncPort.routingAlgo 的原子 store；pick 每批
+    /// 读取，配置变更即生效）。未知值归一化为 auto。
+    pub fn set_routing_algo(&self, algo: &str) {
+        self.adaptive.set_routing_algo(algo);
+    }
+
+    /// 热更 FEC parity 分发策略 + near 窗口（对齐 Go AsyncPort.SetFecStrategy/窗口
+    /// 的原子 store；pick 每帧读取，配置变更即生效）。窗口夹取到 [1,100]ms。
+    pub fn set_fec_strategy(&self, strategy: &str, near_window_ms: i64) {
+        self.fec_strategy
+            .store(crate::fec::fec_strategy_code(strategy), Ordering::Relaxed);
+        let ms = near_window_ms.clamp(
+            crate::fec::FEC_NEAR_WINDOW_MIN_MS,
+            crate::fec::FEC_NEAR_WINDOW_MAX_MS,
+        );
+        self.fec_near_window_us
+            .store((ms as u64) * 1000, Ordering::Relaxed);
     }
 
     /// 启用端口级 dispatch 线程（冷路径，每端口最多一次）。
@@ -1725,6 +1871,9 @@ impl AsyncPort {
 
     /// parity 只需被会话级 decoder 收到一份。多连接时从轮转游标开始，
     /// 优先选择与当前 data path 不同且队列健康的后端，兼顾路径分散和 1/K 带宽。
+    /// near 策略（fec_strategy=near）额外要求候选去程单程时延 ≤ 数据路径 fwd +
+    /// 窗口；全部后端都不合格时返回 None，由调用方抑制本次 parity（对齐 Go
+    /// pickParityBackend）。
     fn parity_backend_index(
         &self,
         backends: &[Arc<Backend>],
@@ -1733,11 +1882,17 @@ impl AsyncPort {
         if backends.is_empty() {
             return None;
         }
+        let near_only = self.fec_strategy.load(Ordering::Relaxed) == 1;
+        let window_us = self.fec_near_window_us.load(Ordering::Relaxed);
         let start = self.parity_cursor.fetch_add(1, Ordering::Relaxed) % backends.len();
+        let data = data_idx.and_then(|i| backends.get(i));
         if backends.len() > 1 {
             for offset in 0..backends.len() {
                 let idx = (start + offset) % backends.len();
                 if Some(idx) == data_idx {
+                    continue;
+                }
+                if near_only && !Self::parity_near_eligible(&backends[idx], data, window_us) {
                     continue;
                 }
                 if Self::backend_score(&backends[idx]).is_some() {
@@ -1752,11 +1907,41 @@ impl AsyncPort {
         }
         for offset in 0..backends.len() {
             let idx = (start + offset) % backends.len();
+            if near_only && !Self::parity_near_eligible(&backends[idx], data, window_us) {
+                continue;
+            }
             if Self::backend_score(&backends[idx]).is_some() {
                 return Some(idx);
             }
         }
-        Some(start)
+        // 全部后端都不合格（stalled/队满，或 near 下全部窗口外）：抑制 parity。
+        // 原实现无条件返回 Some(start)，是 near 语义的违例出口，且大概率入队失败丢帧。
+        None
+    }
+
+    /// near 窗口资格：候选去程单程时延 ≤ 数据路径 fwd + 窗口。任一侧探针未收敛
+    /// 时宽松返回 true（对齐 Go parityNearEligible：跨尺度比较会把未收敛候选
+    /// 系统性排除在窗口外，bootstrap 期 parity 全部退化到数据路径）。
+    fn parity_near_eligible(
+        b: &Arc<Backend>,
+        data: Option<&Arc<Backend>>,
+        window_us: u64,
+    ) -> bool {
+        let Some(data) = data else {
+            return false;
+        };
+        if b.scheduler_one_way_converged().is_none()
+            || data.scheduler_one_way_converged().is_none()
+        {
+            return true;
+        }
+        let b_us = crate::adaptive_multipath::AdaptivePortState::backend_one_way_us(
+            b.as_ref(),
+        );
+        let d_us = crate::adaptive_multipath::AdaptivePortState::backend_one_way_us(
+            data.as_ref(),
+        );
+        b_us <= d_us + window_us as i64
     }
 
     /// VSwitch/reorder 入口：上游确实共享时保留 Arc；若当前已是唯一 owner，
@@ -2627,6 +2812,7 @@ mod tests {
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
+                probe_ch: Mutex::new(None),
             }),
             rx,
         )
@@ -2643,6 +2829,7 @@ mod tests {
                 conn_id: Arc::new(Mutex::new(String::new())),
                 rtt_cache: Arc::new(AtomicU32::new(rtt_us)),
                 notify: None,
+                probe_ch: Mutex::new(None),
             }),
             rx,
         )
@@ -2861,6 +3048,7 @@ mod tests {
                         dirty.clone(),
                         mio::Token(10_000 + i),
                     ))),
+                    probe_ch: Mutex::new(None),
                 }));
                 rxs.push(rx);
             }
@@ -2976,6 +3164,7 @@ mod tests {
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
+            probe_ch: Mutex::new(None),
         });
         // backend_score reserves two slots as the high-water mark.
         tx.try_send(VPNFrame {
@@ -3024,6 +3213,7 @@ mod tests {
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
+            probe_ch: Mutex::new(None),
         });
         let (tx1, rx1) = crossbeam_channel::bounded(8);
         let b1 = Arc::new(Backend {
@@ -3034,6 +3224,7 @@ mod tests {
             conn_id: Arc::new(Mutex::new(String::new())),
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
+            probe_ch: Mutex::new(None),
         });
         port.register_backend(b0);
         port.register_backend(b1);
@@ -3401,6 +3592,29 @@ mod tests {
         }
         assert_eq!(data, 2);
         assert_eq!(parity, 1, "one FEC group must emit exactly one parity copy");
+    }
+
+    #[test]
+    fn fec_near_eligibility_filters_by_window() {
+        // 数据路径 fwd = 1ms；near 候选 = 2ms（窗口内）；far 候选 = 20ms（窗口外）。
+        let b_data = make_backend();
+        let b_near = make_backend();
+        let b_far = make_backend();
+        let enc = |raw: i64| crate::routing_policy::one_way_rank_encode(raw);
+        b_data.0.scheduler.fwd_rank_us.store(enc(1000), Ordering::Relaxed);
+        b_near.0.scheduler.fwd_rank_us.store(enc(2000), Ordering::Relaxed);
+        b_far.0.scheduler.fwd_rank_us.store(enc(20000), Ordering::Relaxed);
+        let window_us = 10_000u64; // 10ms
+        assert!(AsyncPort::parity_near_eligible(&b_near.0, Some(&b_data.0), window_us));
+        assert!(
+            !AsyncPort::parity_near_eligible(&b_far.0, Some(&b_data.0), window_us),
+            "20ms 候选在 1ms 数据路径 + 10ms 窗口之外，必须排除"
+        );
+        // 未收敛任一侧：宽松 true（bootstrap 期不误排）。
+        let b_unknown = make_backend();
+        assert!(AsyncPort::parity_near_eligible(&b_unknown.0, Some(&b_data.0), window_us));
+        // 无数据路径基准：不可判定，返回 false。
+        assert!(!AsyncPort::parity_near_eligible(&b_near.0, None, window_us));
     }
 
     #[test]

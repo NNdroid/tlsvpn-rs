@@ -16,6 +16,33 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+// ======================= FEC 策略（对齐 Go fec_strategy.go） =======================
+/// near 策略窗口默认值（毫秒）与校验边界。
+pub const FEC_NEAR_WINDOW_DEFAULT_MS: i64 = 10;
+pub const FEC_NEAR_WINDOW_MIN_MS: i64 = 1;
+pub const FEC_NEAR_WINDOW_MAX_MS: i64 = 100;
+
+/// 把策略标识映射为 int32 码（0 = auto；未知归一化为 0，热路径零分配读取）。
+pub fn fec_strategy_code(strategy: &str) -> i32 {
+    match strategy {
+        "near" => 1,
+        _ => 0,
+    }
+}
+
+/// 把 int32 码映射为策略字符串；未知码回退 auto。
+pub fn fec_strategy_for_code(code: i32) -> &'static str {
+    match code {
+        1 => "near",
+        _ => "auto",
+    }
+}
+
+/// 校验策略标识是否合法（配置校验用）。
+pub fn valid_fec_strategy(strategy: &str) -> bool {
+    matches!(strategy, "auto" | "near")
+}
+
 use crate::buffer::{acquire_frame_vec, release_frame_vec};
 use crate::crypto::*;
 use crate::protocol::*;

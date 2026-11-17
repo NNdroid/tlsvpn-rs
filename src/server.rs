@@ -220,6 +220,13 @@ pub struct ClientSession {
     // 物理连接级计数；不能让后建立的一条失败连接覆盖此前成功连接的状态。
     pub brutal_applied_conns: AtomicU64,
     pub brutal_error: Mutex<String>,
+    // 跨路径探针调度器（每会话一组；握手协商 RTTProbe/ClockOffset 后 enable）。
+    // conn_registry 把"客户端声明下标"→Backend，与 Go server.go 的 session.conns
+    // + probeResolveConn/probeActiveConns 对齐（connIndex = req.BrutalConnIndex）。
+    pub rtt_probe: Mutex<Option<Arc<crate::probe_scheduler::RttProbeScheduler>>>,
+    pub clock_offset: Mutex<Option<Arc<crate::probe_scheduler::ClockOffsetScheduler>>>,
+    pub conn_registry: Mutex<std::collections::HashMap<usize, Arc<Backend>>>,
+    pub probe_min_half_rtt_us: u64,
 }
 
 impl ClientSession {
@@ -306,6 +313,11 @@ struct MioSession {
     // 是否必须再 flush（与 BackendNotify 的 pending 唤醒互补）。
     tx_leftover: bool,
     brutal_applied: bool,
+    // 跨路径探针：客户端声明下标（=req.BrutalConnIndex，探针路由用）+ 探针投递
+    // 通道（发送循环排空；probe_tx 供 handle_handshake 设置 backend.probe_ch）。
+    conn_index: usize,
+    probe_tx: Option<Sender<Vec<u8>>>,
+    probe_rx: Option<Receiver<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -467,6 +479,13 @@ pub struct ServerCore {
     // 会让它多付 N/K 冗余开销而不自知（见 handle_handshake 的拒连闸）。
     pub fec_group_min: i64,
     pub fec_group_max: i64,
+    // 选路算法（对齐 Go routingAlgo；会话端口构造时按此初始化，热更经 set_routing_algo）。
+    pub routing_algo: String,
+    // probe_min_half_rtt_us 配置值：探针物理锚定下界（µs），会话构造时传给探针调度器。
+    pub probe_min_half_rtt_us: u64,
+    // FEC parity 分发策略（对齐 Go fec_strategy）+ near 窗口（ms），会话端口构造时设置。
+    pub fec_strategy: String,
+    pub fec_near_window_ms: i64,
     // 多 worker 共用的会话回收节流，避免每次断线创建一个睡眠 OS 线程。
     pub last_session_reap_ms: AtomicU64,
 }
@@ -1065,6 +1084,10 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         gw_v6: gw_v6.clone(),
         v4_mask_bits,
         v6_mask_bits,
+        routing_algo: args.routing_algo.clone(),
+        probe_min_half_rtt_us: args.probe_min_half_rtt_us.max(0) as u64,
+        fec_strategy: args.fec_strategy.clone(),
+        fec_near_window_ms: args.fec_near_window_ms,
     });
 
     // 源 MAC 归属校验（对齐 Go validateSrcMAC）：会话端口只能声明本会话
@@ -1129,6 +1152,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     let (tap_tx, tap_rx) = bounded::<VPNFrame>(1024);
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
+    tap_port.set_routing_algo(&args.routing_algo);
+    tap_port.set_fec_strategy(&args.fec_strategy, args.fec_near_window_ms);
     if crate::net::port_dispatch_enabled() {
         // 下行热路径：TAP 读线程只做查表 + 入队，seq/成批/选路移交 dispatch 线程。
         AsyncPort::enable_dispatch(&tap_port);
@@ -1141,6 +1166,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         conn_id: Arc::new(Mutex::new(String::new())),
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
+        probe_ch: Mutex::new(None),
     }));
     vswitch.add_port(TAP_PORT_ID.to_string(), tap_port);
     std::thread::spawn(move || {
@@ -1416,6 +1442,7 @@ fn worker_loop(
                     dirty_tokens.clone(),
                     t,
                 ))),
+                probe_ch: Mutex::new(None),
             });
             // 首帧是握手 JSON（<2KB）：认证前用小上限，防 10 字节帧头声明
             // 131070 长度把扫描缓冲扩到 131KB/连接；认证通过后恢复全量上限
@@ -1457,6 +1484,9 @@ fn worker_loop(
                     queued_payload_pending: 0,
                     tx_leftover: false,
                     brutal_applied: false,
+                    conn_index: 0,
+                    probe_tx: None,
+                    probe_rx: None,
                 },
             );
         }
@@ -1521,9 +1551,15 @@ fn worker_loop(
                         // 空闲太久无法获得可靠 RTT 采样，按一次失败累计。
                         backend.scheduler.note_rtt_failure();
                     } else {
-                        match get_tcp_rtt(&sess.socket) {
-                            Ok(rtt) if rtt > 0 => {
+                        match get_tcp_rtt_and_min(&sess.socket) {
+                            Ok((rtt, min_rtt)) if rtt > 0 => {
                                 backend.rtt_cache.store(rtt, Ordering::Relaxed);
+                                if min_rtt > 0 {
+                                    backend
+                                        .scheduler
+                                        .min_rtt_cache
+                                        .store(min_rtt, Ordering::Relaxed);
+                                }
                                 backend.scheduler.note_rtt_success();
                             }
                             // rtt==0 引导期正常状态，不计失败。
@@ -1876,9 +1912,20 @@ fn process_plain_frames(
 
                     // 跨路径 RTT/时钟偏移探针（seq==0, kind 0x03-0x06）前置拦截，
                     // 与 Go 读循环一致：探针在 FEC 门控之前被拦截，即使无 FEC 会话
-                    // 也可用。Phase 2 接入探针调度器后改为投递；当前丢弃（防御性，
-                    // 绝不因探针断连）。
+                    // 也可用。协商后投递给会话调度器（非阻塞 on_frame），否则丢弃
+                    // （防御性，绝不因探针断连）。
                     if seq == 0 && crate::clock_offset::is_probe_payload(&data) {
+                        if let Some(c_sess) = &sess.client_session {
+                            if crate::rtt_probe::is_rtt_probe_frame(&data) {
+                                if let Some(r) = c_sess.rtt_probe.lock().as_ref() {
+                                    r.on_frame(&data, sess.conn_index);
+                                }
+                            } else if crate::clock_offset::is_clock_offset_frame(&data) {
+                                if let Some(c) = c_sess.clock_offset.lock().as_ref() {
+                                    c.on_frame(&data, sess.conn_index);
+                                }
+                            }
+                        }
                         release_frame_vec(data);
                         continue;
                     }
@@ -2144,6 +2191,30 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
         pulled = pulled.saturating_add(batch_frames);
     }
     sess.tx_leftover = hit_drain_limit;
+    // 排空跨路径探针帧（RTT/时钟偏移，seq==0 控制帧）：与数据帧同批写出，探针在
+    // Write 前 patch send_ts（固定偏移）。对齐 Go writeProbe。
+    if let Some(probe_rx) = &sess.probe_rx {
+        while let Ok(payload) = probe_rx.try_recv() {
+            let start = sess.send_buf.len();
+            append_padded_frame_with_limit(
+                &mut sess.send_buf,
+                0,
+                &payload,
+                None,
+                sess.pad_record_limit,
+            );
+            let kind = payload.first().copied().unwrap_or(0);
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            if kind == crate::protocol::CONTROL_KIND_RTT_PROBE {
+                crate::rtt_probe::patch_rtt_probe_send_ts_at(&mut sess.send_buf, start, now_ns);
+            } else if kind == crate::protocol::CONTROL_KIND_CLOCK_PROBE {
+                crate::clock_offset::patch_clock_offset_send_ts_at(&mut sess.send_buf, start, now_ns);
+            }
+        }
+    }
     let pad_bytes_batch = if pulled != 0 {
         pad_stream_batch_tail(&mut sess.send_buf, last_frame_start, sess.pad_record_limit)
     } else {
@@ -2653,6 +2724,8 @@ fn handle_handshake(
             stat.enc_algo.store(enc_algo, Ordering::Relaxed);
 
             let port = Arc::new(AsyncPort::new(client_id.clone()));
+            port.set_routing_algo(&core.routing_algo);
+            port.set_fec_strategy(&core.fec_strategy, core.fec_near_window_ms);
             if crate::net::port_dispatch_enabled() {
                 // 会话端口的下行分发同样移交 dispatch 线程（seq/成批/选路按批摊薄）。
                 AsyncPort::enable_dispatch(&port);
@@ -2762,6 +2835,10 @@ fn handle_handshake(
                 brutal_rx: AtomicU64::new(0),
                 brutal_applied_conns: AtomicU64::new(0),
                 brutal_error: Mutex::new(String::new()),
+                rtt_probe: Mutex::new(None),
+                clock_offset: Mutex::new(None),
+                conn_registry: Mutex::new(std::collections::HashMap::new()),
+                probe_min_half_rtt_us: core.probe_min_half_rtt_us,
             });
             sess.stat.active_conns.store(1, Ordering::Release);
             sessions.insert(client_id.clone(), sess.clone());
@@ -2803,6 +2880,81 @@ fn handle_handshake(
         .register_backend(sess.tx_backend.as_ref().unwrap().clone());
     sess.rx_producer = c_sess.rx_actor.as_ref().map(|actor| actor.producer());
     sess.client_session = Some(c_sess.clone());
+
+    // ---- 跨路径探针设置（对齐 Go server.go 1797-1810/2023）----
+    // connIndex 用客户端声明下标（req.BrutalConnIndex），与客户端探针路由对称。
+    // 首次进入会话创建调度器（注册表闭包读 conn_registry），此后仅注册后端 +
+    // 按协商 enable。探针读循环/写循环在 worker 主循环处理。
+    sess.conn_index = req.brutal_conn_index.max(0) as usize;
+    if let Some(b) = sess.tx_backend.clone() {
+        let (probe_tx, probe_rx) = bounded(8);
+        *b.probe_ch.lock() = Some(probe_tx.clone());
+        sess.probe_tx = Some(probe_tx);
+        sess.probe_rx = Some(probe_rx);
+        c_sess
+            .conn_registry
+            .lock()
+            .insert(sess.conn_index, b.clone());
+        if c_sess.rtt_probe.lock().is_none() {
+            let s = c_sess.clone();
+            let rtt = crate::probe_scheduler::RttProbeScheduler::new(
+                Box::new({
+                    let s2 = s.clone();
+                    move |i: usize| {
+                        s2.conn_registry.lock().get(&i).map(|b| {
+                            b.clone() as Arc<dyn crate::probe_scheduler::ProbeTarget>
+                        })
+                    }
+                }),
+                Box::new({
+                    let s2 = s.clone();
+                    move || {
+                        let mut v: Vec<usize> =
+                            s2.conn_registry.lock().keys().copied().collect();
+                        v.sort_unstable();
+                        v
+                    }
+                }),
+                Box::new(move || s.probe_min_half_rtt_us),
+            );
+            *c_sess.rtt_probe.lock() = Some(rtt);
+        }
+        if c_sess.clock_offset.lock().is_none() {
+            let s = c_sess.clone();
+            let clock = crate::probe_scheduler::ClockOffsetScheduler::new(
+                Box::new({
+                    let s2 = s.clone();
+                    move |i: usize| {
+                        s2.conn_registry.lock().get(&i).map(|b| {
+                            b.clone() as Arc<dyn crate::probe_scheduler::ProbeTarget>
+                        })
+                    }
+                }),
+                Box::new({
+                    let s2 = s.clone();
+                    move || {
+                        let mut v: Vec<usize> =
+                            s2.conn_registry.lock().keys().copied().collect();
+                        v.sort_unstable();
+                        v
+                    }
+                }),
+            );
+            *c_sess.clock_offset.lock() = Some(clock);
+        }
+        if req.rtt_probe {
+            if let Some(r) = c_sess.rtt_probe.lock().as_ref() {
+                r.enable();
+                r.kick();
+            }
+        }
+        if req.clock_offset {
+            if let Some(c) = c_sess.clock_offset.lock().as_ref() {
+                c.enable();
+                c.kick();
+            }
+        }
+    }
 
     // Brutal 速率协商（对齐 Go）。两个方向的预算不能混：server_tx_rate 是
     // 服务端→客户端（下行），由本端 socket 整形，受本端下行预算约束；
@@ -2923,6 +3075,17 @@ fn on_conn_closed(
 ) {
     if let (Some(c_sess), Some(backend)) = (c_sess, backend) {
         c_sess.port.unregister_backend(&backend.ch);
+        // 探针注册表移除本连接（按 Arc 指针匹配），并唤醒调度器重算。
+        c_sess
+            .conn_registry
+            .lock()
+            .retain(|_, b| !Arc::ptr_eq(b, &backend));
+        if let Some(r) = c_sess.rtt_probe.lock().as_ref() {
+            r.kick();
+        }
+        if let Some(c) = c_sess.clock_offset.lock().as_ref() {
+            c.kick();
+        }
         if brutal_applied {
             let _ = c_sess.brutal_applied_conns.try_update(
                 Ordering::Relaxed,
