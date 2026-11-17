@@ -76,7 +76,7 @@ impl SessionStore {
     }
 }
 
-fn constant_time_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn constant_time_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let mut diff = 0u8;
     for i in 0..32 {
         diff |= a[i] ^ b[i];

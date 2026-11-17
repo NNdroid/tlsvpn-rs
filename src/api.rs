@@ -462,8 +462,8 @@ impl LogRing {
     }
 }
 
-// 当地时间不可用时以 UTC 呈现（仅面板展示用途）
-fn wall_clock_hms() -> String {
+// 当地时间不可用时以 UTC 呈现（仅面板展示用途）；MCP 访问日志复用同一格式。
+pub(crate) fn wall_clock_hms() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -613,6 +613,8 @@ pub struct RuntimeCtx {
     pub cfg: RwLock<serde_json::Value>,
     pub system: serde_json::Value,
     pub web: WebParityState,
+    // MCP 端点认证配置（对齐 Go web.mcp）；从 Args 构建，供 MCP handler 认证。
+    pub mcp: crate::mcp_auth::McpAuthConfig,
 }
 
 impl Default for RuntimeCtx {
@@ -621,6 +623,7 @@ impl Default for RuntimeCtx {
             cfg: RwLock::new(json!({})),
             system: json!({}),
             web: WebParityState::new(""),
+            mcp: crate::mcp_auth::McpAuthConfig::default(),
         }
     }
 }
@@ -687,6 +690,7 @@ impl RuntimeCtx {
             cfg: RwLock::new(cfg),
             system: system_info(cfg_path),
             web: WebParityState::new(cfg_path),
+            mcp: args.web_mcp.clone(),
         }
     }
 }
@@ -823,8 +827,8 @@ fn respond_json(req: tiny_http::Request, body: String, status: u16) {
     let _ = req.respond(resp);
 }
 
-/// 常量时间比较，避免时序侧信道
-fn ct_eq(a: &str, b: &str) -> bool {
+/// 常量时间比较，避免时序侧信道；MCP 认证（mcp_auth.rs）复用同一实现。
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
     let ah = Sha256::digest(a.as_bytes());
     let bh = Sha256::digest(b.as_bytes());
     let mut diff = 0u8;
@@ -876,6 +880,151 @@ fn dashboard_authenticated(ctx: &RuntimeCtx, req: &tiny_http::Request, auth: &st
     basic_auth_credential(req)
         .map(|got| ct_eq(&got, auth))
         .unwrap_or(false)
+}
+
+/// 提取指定 HTTP header 值（无则空串）。tiny_http 的 HeaderField::equiv 只接受
+/// `&'static str`，这里用 as_str 做不区分大小写比较以接受运行时 header 名。
+fn header_value(req: &tiny_http::Request, name: &str) -> String {
+    for h in req.headers() {
+        if h.field.as_str().as_str().eq_ignore_ascii_case(name) {
+            return h.value.as_str().to_string();
+        }
+    }
+    String::new()
+}
+
+/// 提取 Bearer token（Authorization: Bearer <token>）。
+fn bearer_token(req: &tiny_http::Request) -> Option<String> {
+    crate::mcp_auth::bearer_token(&header_value(req, "Authorization"))
+}
+
+/// 提取 Basic 凭据（user:pass），base64 解码。
+fn basic_credential(req: &tiny_http::Request) -> Option<String> {
+    crate::mcp_auth::basic_credential(&header_value(req, "Authorization"))
+}
+
+/// 提取 API key（默认 X-API-Key 或配置的 header 名）。
+fn api_key(req: &tiny_http::Request, header: &str) -> Option<String> {
+    let name = if header.trim().is_empty() {
+        crate::mcp_auth::MCP_DEFAULT_API_KEY_HEADER
+    } else {
+        header
+    };
+    let v = header_value(req, name);
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// 请求远端地址字符串（host:port），供访问日志审计。
+fn remote_of(req: &tiny_http::Request) -> String {
+    match req.remote_addr() {
+        Some(addr) => addr.to_string(),
+        None => String::new(),
+    }
+}
+
+/// 判断并处理 MCP 请求。命中 MCP 路径返回 Ok(())（request 已消费），否则
+/// Err(request) 归还给调用方继续 dashboard 处理。MCP 有自己的认证策略
+/// （web.mcp.auth_mode），不依赖 dashboard 的 Basic Auth，因此在 dashboard
+/// 认证之前拦截。
+fn try_mcp_request(
+    provider: &Arc<dyn WebStatsProvider>,
+    ctx: &Arc<RuntimeCtx>,
+    mut request: tiny_http::Request,
+    url: &str,
+) -> Result<(), tiny_http::Request> {
+    let mcp = &ctx.mcp;
+    if mcp.effective_path().is_empty() || !mcp.matches_path(url) {
+        return Err(request);
+    }
+    // OAuth 保护资源 metadata 端点（/.well-known/oauth-protected-resource）。
+    if crate::mcp_auth::is_mcp_metadata_path(url) {
+        let body = crate::mcp_auth::oauth_metadata_json(&mcp.oauth).to_string();
+        let resp = Response::from_string(body)
+            .with_status_code(200)
+            .with_header(http_header("Content-Type", "application/json"));
+        let _ = request.respond(resp);
+        return Ok(());
+    }
+
+    // 认证（对齐 Go mcpAuthenticate）。
+    let web_auth = ctx.web.current_auth();
+    let session_ok = dashboard_authenticated(ctx, &request, &web_auth);
+    let basic = basic_credential(&request);
+    let bearer = bearer_token(&request);
+    let key = api_key(&request, &mcp.api_key_header);
+    let remote = remote_of(&request);
+    let auth_result = crate::mcp_auth::authenticate(
+        &mcp.auth_mode,
+        &mcp.username,
+        &mcp.credential_hash,
+        &mcp.api_key_header,
+        &mcp.oauth,
+        &web_auth,
+        session_ok,
+        basic.as_deref(),
+        bearer.as_deref(),
+        key.as_deref(),
+        &remote,
+    );
+    if let Err(e) = auth_result {
+        let body = json!({"error": e.message}).to_string();
+        let resp = Response::from_string(body)
+            .with_status_code(e.status as u16)
+            .with_header(http_header("Content-Type", "application/json"));
+        let _ = request.respond(resp);
+        return Ok(());
+    }
+
+    // 读请求体（上限 1MB，对齐 Go mcpMaxRequestBodyBytes）。
+    const MAX_BODY: usize = 1 << 20;
+    if request.body_length().map_or(false, |n| n > MAX_BODY) {
+        let resp = Response::from_string(r#"{"error":"request too large"}"#)
+            .with_status_code(413)
+            .with_header(http_header("Content-Type", "application/json"));
+        let _ = request.respond(resp);
+        return Ok(());
+    }
+    let mut body = Vec::new();
+    if request
+        .as_reader()
+        .take((MAX_BODY + 1) as u64)
+        .read_to_end(&mut body)
+        .is_err()
+        || body.len() > MAX_BODY
+    {
+        let resp = Response::from_string(r#"{"error":"invalid request"}"#)
+            .with_status_code(400)
+            .with_header(http_header("Content-Type", "application/json"));
+        let _ = request.respond(resp);
+        return Ok(());
+    }
+
+    // 访问日志：记录 JSON-RPC 方法/工具。
+    let (method, tool) = crate::mcp_access::mcp_request_method(&body);
+    let start = std::time::Instant::now();
+    let mc = crate::mcp_server::McpCtx {
+        provider: provider.clone(),
+        ctx: ctx.clone(),
+    };
+    let response_body = crate::mcp_server::handle_mcp_request(&mc, &body);
+    let dur = start.elapsed().as_millis() as i64;
+    let ok = !response_body.contains(r#""error""#);
+    crate::mcp_access::add_mcp_access(crate::mcp_access::McpAccessLine {
+        seq: 0,
+        time: String::new(),
+        remote,
+        level: if ok { "info".into() } else { "warn".into() },
+        method,
+        tool,
+        status: Some(if ok { 200 } else { 400 }),
+        dur_ms: Some(dur),
+        msg: String::new(),
+    });
+    let resp = Response::from_string(response_body)
+        .with_status_code(200)
+        .with_header(http_header("Content-Type", "application/json"));
+    let _ = request.respond(resp);
+    Ok(())
 }
 
 fn dashboard_cookie(token: &str, secure: bool, clear: bool) -> Header {
@@ -1094,10 +1243,17 @@ fn serve_listener(
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let Some(mut request) = next else {
+        let Some(request) = next else {
             continue;
         };
         let url = request.url().split('?').next().unwrap_or("").to_string();
+
+        // MCP 端点在 dashboard 认证之前拦截：MCP 有自己的认证策略
+        // （web.mcp.auth_mode），不依赖 dashboard 的 Basic Auth。
+        let mut request = match try_mcp_request(&provider, &ctx, request, &url) {
+            Ok(()) => continue,
+            Err(req) => req,
+        };
 
         // Browser authentication matches the Go dashboard: web.auth remains the
         // credential source, but successful login uses an HttpOnly SameSite cookie.

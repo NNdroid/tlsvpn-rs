@@ -22,6 +22,10 @@ pub mod clock_offset;
 pub mod crypto;
 pub mod fec;
 pub mod frame;
+pub mod mcp_access;
+pub mod mcp_auth;
+pub mod mcp_oauth;
+pub mod mcp_server;
 pub mod hooks;
 pub mod net;
 pub mod peer_info;
@@ -88,6 +92,8 @@ pub struct Args {
     // 只填一个视为配置错误（validate_args 挡下）。
     pub web_cert: String,
     pub web_key: String,
+    // MCP 端点配置（对齐 Go web.mcp）；由 WebConfigFile.mcp 转换。
+    pub web_mcp: crate::mcp_auth::McpAuthConfig,
     pub encrypt: bool,
     pub enc_algo: String, // gcm256（默认）| gcm128 | chacha20 | xchacha20
     // 配置文件里是否显式写了 encrypt。bool 无法自辨"字段缺失"与"显式 false"，
@@ -370,6 +376,22 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         },
         web_cert: cfg.web.cert,
         web_key: cfg.web.key,
+        web_mcp: crate::mcp_auth::McpAuthConfig::from_file(
+            &cfg.web.mcp.auth_mode,
+            &cfg.web.mcp.username,
+            &cfg.web.mcp.credential,
+            &cfg.web.mcp.api_key_header,
+            &cfg.web.mcp.deploy,
+            &cfg.web.mcp.path,
+            &crate::mcp_auth::McpOAuthJwtConfig {
+                jwks_url: cfg.web.mcp.oauth.jwks_url,
+                issuer: cfg.web.mcp.oauth.issuer,
+                audience: cfg.web.mcp.oauth.audience,
+                resource: cfg.web.mcp.oauth.resource,
+                authorization_servers: cfg.web.mcp.oauth.authorization_servers,
+                required_scopes: cfg.web.mcp.oauth.required_scopes,
+            },
+        ),
         v4cidr: if cfg.server.v4_cidr.is_empty() {
             "10.0.0.0/24".into()
         } else {
