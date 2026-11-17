@@ -992,6 +992,9 @@ impl DashboardStream {
             &dashboard_stats_json(&self.provider, &self.ctx),
         );
         sse_json(&mut out, "trend", &self.ctx.web.trend_json(&self.range));
+        // 诊断快照与 trend 同 range（对齐 Go web_stream.go 的 emit 顺序：
+        // stats、trend、diagnostics、logs、events、mcp_logs）。
+        sse_json(&mut out, "diagnostics", &self.ctx.web.diagnostics_json(&self.range));
         let logs = log_ring_snapshot(self.log_after);
         if let Some(seq) = logs
             .last()
@@ -1271,6 +1274,16 @@ fn serve_listener(
                     .unwrap_or("2m")
                     .to_string();
                 respond_json(request, ctx.web.trend_json(&range).to_string(), 200);
+            }
+            (&Method::Get, "/api/diagnostics") => {
+                let range = request
+                    .url()
+                    .split_once('?')
+                    .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("range=")))
+                    .unwrap_or("1h")
+                    .to_string();
+                let body = ctx.web.diagnostics_json(&range);
+                respond_json(request, body.to_string(), 200);
             }
             (&Method::Get, "/api/events") => {
                 let after = query_u64(request.url(), "after");
@@ -1947,6 +1960,70 @@ mod tests {
             wait_closed(&addr, Duration::from_secs(3)),
             "stop 后端口必须已释放"
         );
+    }
+
+    /// /api/diagnostics 必须消费 record_diagnostics 写入的历史并返回合法快照，
+    /// 而不是永远空。这是诊断中心从采样到 HTTP 的端到端接线（对齐 Go
+    /// api.go 的 /api/diagnostics handler + mgr.diagnostics.snapshot）。
+    #[test]
+    fn diagnostics_endpoint_returns_recorded_history() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let ctx = Arc::new(RuntimeCtx::default());
+        // 预填两帧采样：第一条建立基线，第二条（1 秒后）产生真实速率点。
+        ctx.web.record_diagnostics(&json!({
+            "mode": "client",
+            "instance_id": "diag-test",
+            "active_clients": 1,
+            "conns": [{"conn_id": "c1", "target": "peer", "tx_bytes": 1000, "rx_bytes": 500}]
+        }));
+        std::thread::sleep(Duration::from_millis(1100));
+        ctx.web.record_diagnostics(&json!({
+            "mode": "client",
+            "instance_id": "diag-test",
+            "active_clients": 1,
+            "conns": [{"conn_id": "c1", "target": "peer", "tx_bytes": 3000, "rx_bytes": 1500}]
+        }));
+
+        let stop_task = stop.clone();
+        let addr_task = addr.clone();
+        let ctx_task = ctx.clone();
+        let handle = std::thread::spawn(move || {
+            serve_listener(
+                addr_task,
+                String::new(),
+                String::new(),
+                String::new(),
+                Arc::new(StubProvider),
+                ctx_task,
+                Some(tx),
+                stop_task,
+            );
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false),
+            "bind 应成功"
+        );
+        assert!(wait_http(&addr, Duration::from_secs(3)), "监听应能响应请求");
+
+        let body = http_get(&addr, "/api/diagnostics?range=2m").expect("GET /api/diagnostics");
+        let json_start = body.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let payload: serde_json::Value =
+            serde_json::from_str(&body[json_start..]).expect("diagnostics 响应必须是 JSON");
+        assert_eq!(payload["instance_id"], "diag-test");
+        let points = payload["points"].as_array().expect("points 是数组");
+        assert_eq!(points.len(), 2, "两帧采样都应保留在 recent 桶");
+        // 最后一帧应产出真实 up 速率（2000 字节 / ~1.1 秒）。
+        let last = &points[1];
+        let c1 = last["conns"]
+            .as_array()
+            .and_then(|a| a.iter().find(|c| c["id"] == "c1"))
+            .expect("conn c1 present");
+        assert!(c1["metrics"]["up"].is_number(), "第二帧应产出 up 速率");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(handle.join().is_ok());
     }
 
     /// 回归：采纳必须逐个进行。旧实现「全有或全无」会让一个地址绑不上时

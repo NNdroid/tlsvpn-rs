@@ -37,6 +37,7 @@ pub mod tap;
 pub mod tcp_cork;
 pub mod utils;
 pub mod web_parity;
+pub mod web_diagnostics;
 
 use crate::api::{init_logging, RuntimeCtx};
 use crate::buffer::*;

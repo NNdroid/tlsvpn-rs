@@ -274,6 +274,9 @@ struct TapDelivery {
     owned_pool_tx: Sender<Vec<Vec<u8>>>,
     owned_pool_rx: Receiver<Vec<Vec<u8>>>,
     dropped: AtomicU64,
+    // TAP 交付失败帧数（对齐 Go client.go tapWriteErrs）：worker 线程在写 TAP
+    // 失败时递增，stats_json 经 tap_write_errors() 读取，供诊断中心 tap_error。
+    tap_write_errors: Arc<AtomicU64>,
 }
 
 impl TapDelivery {
@@ -288,6 +291,8 @@ impl TapDelivery {
         let worker_pool = pool_tx.clone();
         let (owned_pool_tx, owned_pool_rx) = bounded::<Vec<Vec<u8>>>(TAP_RETURN_POOL);
         let worker_owned_pool = owned_pool_tx.clone();
+        let tap_write_errors = Arc::new(AtomicU64::new(0));
+        let worker_tap_write_errors = tap_write_errors.clone();
         std::thread::spawn(move || {
             while let Ok(work) = rx.recv() {
                 let mut batch = match work {
@@ -295,7 +300,13 @@ impl TapDelivery {
                     TapWork::Owned(mut batch) => {
                         let mut keep = 0;
                         for index in 0..batch.len() {
-                            let _ = tap.send(&batch[index]);
+                            // TAP 交付失败计数（对齐 Go reportTapWriteErr）。
+                            if let Err(e) = tap.send(&batch[index]) {
+                                let n = worker_tap_write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n == 1 || n % 1000 == 0 {
+                                    warn!("[Client] TAP write failed #{}: {}", n, e);
+                                }
+                            }
                             if recycle && keep < TAP_RETURN_FRAMES
                                 && batch[index].capacity() == TAP_RETURN_MAX_CAPACITY {
                                 batch.swap(keep, index);
@@ -309,7 +320,13 @@ impl TapDelivery {
                 };
                 let mut keep = 0;
                 for index in 0..batch.len() {
-                    let _ = tap.send(&batch[index]);
+                    // TAP 交付失败计数（对齐 Go reportTapWriteErr）。
+                    if let Err(e) = tap.send(&batch[index]) {
+                        let n = worker_tap_write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 1000 == 0 {
+                            warn!("[Client] TAP write failed #{}: {}", n, e);
+                        }
+                    }
                     if recycle && keep < TAP_RETURN_FRAMES
                         && batch[index].capacity() == TAP_RETURN_MAX_CAPACITY
                     {
@@ -330,7 +347,14 @@ impl TapDelivery {
             owned_pool_tx,
             owned_pool_rx,
             dropped: AtomicU64::new(0),
+            tap_write_errors,
         }
+    }
+
+    /// TAP 交付失败累计帧数（供 stats_json 的 tap_write_errors）。
+    #[inline]
+    fn tap_write_errors(&self) -> u64 {
+        self.tap_write_errors.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -657,6 +681,8 @@ impl WebStatsProvider for Client {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": self.tx_port.dropped(),
+            "reconnect_attempts": self.reconnects.load(Ordering::Relaxed),
+            "tap_write_errors": self.tap_delivery.tap_write_errors(),
             "fec": {"enabled": self.fec_mode, "parity_tx": written.parity_frames, "data_tx": written.data_frames, "control_tx": written.control_frames, "data_wire_bytes": written.data_wire_bytes, "parity_wire_bytes": written.parity_wire_bytes, "counter_domain": "written", "enabled_sessions": if self.fec_mode { 1 } else { 0 }, "tx_active_sessions": if self.tx_port.fec_tx_armed() { 1 } else { 0 }, "rx_bypass_sessions": if rx_bypass { 1 } else { 0 }, "recovered": rec, "lost": lost},
             "padding": {"wire_bytes": pad_wire, "pad_bytes": pad_bytes, "overhead_pct": if pad_wire > 0 { pad_bytes as f64 * 100.0 / pad_wire as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder.gap_events, "timeout_flushes": reorder.timeout_flushes, "skipped_frames": reorder.skipped_frames},

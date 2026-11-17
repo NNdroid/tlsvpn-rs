@@ -492,6 +492,9 @@ pub struct ServerCore {
     pub server_cert_sha256: String,
     // 多 worker 共用的会话回收节流，避免每次断线创建一个睡眠 OS 线程。
     pub last_session_reap_ms: AtomicU64,
+    // TAP 交付失败帧数（对齐 Go server.go tapWriteErrs：写 TAP 失败不再静默
+    // 吞掉，计入诊断中心的 tap_error 指标；第一次与每 1000 次记 warn）。
+    pub tap_write_errors: AtomicU64,
 }
 
 impl ServerCore {
@@ -732,6 +735,7 @@ impl WebStatsProvider for ServerCore {
             "log_level": current_log_level_name(),
             "pad_mode": pad_mode_name(),
             "dropped_frames": dropped,
+            "tap_write_errors": self.tap_write_errors.load(Ordering::Relaxed),
             "fec": {"enabled": enabled_sessions > 0, "parity_tx": parity, "data_tx": data_tx, "control_tx": control_tx, "data_wire_bytes": data_wire, "parity_wire_bytes": parity_wire, "counter_domain": "written", "enabled_sessions": enabled_sessions, "tx_active_sessions": tx_active_sessions, "rx_bypass_sessions": rx_bypass_sessions, "recovered": rec, "lost": lost},
             "padding": {"wire_bytes": padding_snapshot().0, "pad_bytes": padding_snapshot().1, "overhead_pct": if padding_snapshot().0 > 0 { padding_snapshot().1 as f64 * 100.0 / padding_snapshot().0 as f64 } else { 0.0 }},
             "reorder": {"gap_events": reorder_gap, "timeout_flushes": reorder_flushes, "skipped_frames": reorder_skipped},
@@ -1087,6 +1091,7 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         fec_group_min,
         fec_group_max,
         last_session_reap_ms: AtomicU64::new(0),
+        tap_write_errors: AtomicU64::new(0),
         brutal: args.brutal,
         brutal_up: args.brutal_up,
         brutal_down: args.brutal_down,
@@ -1192,10 +1197,17 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         probe_ch: Mutex::new(None),
     }));
     vswitch.add_port(TAP_PORT_ID.to_string(), tap_port);
+    let core_for_tap = core.clone();
     std::thread::spawn(move || {
         while let Ok(f) = tap_rx.recv() {
             if !f.data.is_empty() {
-                let _ = dev_writer.send(f.data.as_slice());
+                // TAP 交付失败计数（对齐 Go reportTapWriteErr：不再静默吞掉）。
+                if let Err(e) = dev_writer.send(f.data.as_slice()) {
+                    let n = core_for_tap.tap_write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n % 1000 == 0 {
+                        warn!("[Server] TAP write failed #{}: {}", n, e);
+                    }
+                }
             }
             // TAP 是该分支终点；Owned 直接归 Vec 池，Shared 在最后 owner 时归池。
             f.data.release();

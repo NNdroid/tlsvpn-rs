@@ -504,6 +504,8 @@ pub struct WebParityState {
     sampler_started: AtomicBool,
     pub events: EventHub,
     sessions: SessionStore,
+    // 诊断中心：消费 stats_json 做基线差分速率历史（对齐 Go diagnosticHistory）。
+    diagnostics: Mutex<crate::web_diagnostics::DiagnosticHistory>,
 }
 
 impl WebParityState {
@@ -524,7 +526,18 @@ impl WebParityState {
             sampler_started: AtomicBool::new(false),
             events: EventHub::default(),
             sessions: SessionStore::default(),
+            diagnostics: Mutex::new(crate::web_diagnostics::DiagnosticHistory::new()),
         }
+    }
+
+    /// 记录一次诊断采样（stats_json；对齐 Go sampleDiagnostics 的 record）。
+    pub fn record_diagnostics(&self, stats: &Value) {
+        self.diagnostics.lock().record(stats);
+    }
+
+    /// 诊断快照 JSON（range: 2m/1h/24h）。
+    pub fn diagnostics_json(&self, range: &str) -> Value {
+        self.diagnostics.lock().snapshot(range).to_value()
     }
 
     pub fn config_path(&self) -> &Path {
@@ -583,6 +596,9 @@ impl WebParityState {
         self.trend.lock().observe(up, down);
         self.traffic.lock().observe(stats);
         self.observe_client_events(stats);
+        // 诊断中心：与趋势/流量同源采样，基线差分速率历史（对齐 Go
+        // WebManager.Run 中 sampleDiagnostics 的 record）。
+        self.record_diagnostics(stats);
     }
 
     pub fn trend_json(&self, range: &str) -> Value {
