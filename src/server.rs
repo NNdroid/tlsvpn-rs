@@ -1874,6 +1874,15 @@ fn process_plain_frames(
                         }
                     }
 
+                    // 跨路径 RTT/时钟偏移探针（seq==0, kind 0x03-0x06）前置拦截，
+                    // 与 Go 读循环一致：探针在 FEC 门控之前被拦截，即使无 FEC 会话
+                    // 也可用。Phase 2 接入探针调度器后改为投递；当前丢弃（防御性，
+                    // 绝不因探针断连）。
+                    if seq == 0 && crate::clock_offset::is_probe_payload(&data) {
+                        release_frame_vec(data);
+                        continue;
+                    }
+
                     let c_sess = match &sess.client_session {
                         Some(c) => c.clone(),
                         None => {
@@ -2854,6 +2863,10 @@ fn handle_handshake(
         brutal_total_rx: server_tx_rate,
         fec: req.fec,
         fec_group: c_sess.fec_enc_k,
+        // Phase 2 接入跨路径探针调度器后改为 req.rtt_probe && 本端支持；
+        // 当前不声明，行为不变。
+        rtt_probe: false,
+        clock_offset: false,
         encrypt: core.encrypt,
         enc_algo: response_enc_algo,
         enc_salt: response_enc_salt,

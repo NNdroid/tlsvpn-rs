@@ -2,6 +2,7 @@ use chacha20poly1305::{
     aead::{AeadInPlace as _, KeyInit as _},
     ChaCha20Poly1305, Nonce as ChaChaNonce, Tag as ChaChaTag, XChaCha20Poly1305, XNonce,
 };
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::aead::{self, Aad, LessSafeKey, Nonce as RingNonce, Tag as RingTag, UnboundKey};
 use sha2::{Digest, Sha256};
@@ -264,14 +265,20 @@ pub const CHACHA_KEY_LABEL: &str = "_enc_chacha20";
 pub const XCHACHA_KEY_LABEL: &str = "_enc_xchacha20";
 pub const XCHACHA_NONCE_LABEL: &str = "tlsvpn-xchacha20-nonce-v1";
 
-/// 按标签派生 32 字节材料。AES-128 使用独立 label 的前 16 字节；
-/// 与 Go 的 sha256(psk + label) 完全一致。
-fn derive_key_labeled(psk: &str, label: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}{}", psk, label).as_bytes());
-    let out = hasher.finalize();
+/// 按标签派生 32 字节材料：HKDF-SHA256(ikm=psk, salt=encSalt, info=label)。
+/// 对齐 Go crypto.go 的 hkdf.Key(sha256.New, []byte(psk), salt, label, keyLen)。
+/// Go 自 2026-11-16（提交 68ae122）起从裸 sha256(psk+label) 改为带盐 HKDF，这是
+/// 数据面不兼容变更：握手认证（hashPSK）不变，但派生出的 AEAD 密钥不同，旧端连
+/// 新端会在数据面解密失败。加盐后每个方向（EncSalt/EncSalt2）、每个会话、每个
+/// domain 的密钥彼此独立。
+///
+/// AES-128 使用独立 label 的前 16 字节：HKDF-SHA256 expand 的 32B 输出前 16B
+/// 与 Go 的 keyLen=16 输出逐字节一致（二者都取同一 T(1)=HMAC(PRK,info||0x01) 块）。
+fn derive_key_hkdf(psk: &str, salt: &[u8], label: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), psk.as_bytes());
     let mut key = [0u8; 32];
-    key.copy_from_slice(&out);
+    hk.expand(label.as_bytes(), &mut key)
+        .expect("HKDF-SHA256 expand of 32 bytes cannot fail");
     key
 }
 
@@ -382,7 +389,7 @@ impl InnerCipher {
         } else {
             base.to_string()
         };
-        let key = derive_key_labeled(psk, &label);
+        let key = derive_key_hkdf(psk, salt, &label);
         let mut salt8 = [0u8; ENC_SALT_SIZE];
         salt8.copy_from_slice(salt);
 
@@ -971,8 +978,8 @@ mod tests {
 
         // 标签派生必须与 Go 的 gcmKeyLabel 逐字节一致，否则两端无法互通；
         // data 与 fec 两个域也必须用不同密钥
-        let data_key = derive_key_labeled("gcm_psk", GCM_KEY_LABEL);
-        let fec_key = derive_key_labeled("gcm_psk", "_enc_key_fec");
+        let data_key = derive_key_hkdf("gcm_psk", &salt, GCM_KEY_LABEL);
+        let fec_key = derive_key_hkdf("gcm_psk", &salt, "_enc_key_fec");
         assert_ne!(data_key, fec_key, "data 与 fec 域必须用不同密钥");
 
         // 盐长度非法、未知密钥域均拒绝构造
@@ -987,8 +994,10 @@ mod tests {
         let plain =
             hex::decode("746c7376706e2d67636d3132382d63726f73732d6c616e67756167652d766563746f72")
                 .unwrap();
+        // KDF 自 v2 起为 HKDF-SHA256(ikm=psk, salt=encSalt, info=label)，以下为
+        // 加盐派生后的跨语言已知答案向量（Go cipher_test.go 同步维护）。
         let want = hex::decode(
-            "fad2a4db0a2a0d73db601949351e36d354bb4698df7c2f27040f8229960d93d67066fe116d875cb38daa0877f281a3d5fbab9e",
+            "85d1c16cb4ff7f1429c7cc4470472e85808d26479439330c1443bcc80d80d927fb612c0d7050ddc8aa5aa08a21e0be7bcc0134",
         )
         .unwrap();
         let seq = 0x0102_0304u32;
@@ -1027,8 +1036,8 @@ mod tests {
             "AES-128 ciphertext must not authenticate under AES-256 key domain"
         );
 
-        let key128 = derive_key_labeled(psk, GCM128_KEY_LABEL);
-        let key256 = derive_key_labeled(psk, GCM_KEY_LABEL);
+        let key128 = derive_key_hkdf(psk, &salt, GCM128_KEY_LABEL);
+        let key256 = derive_key_hkdf(psk, &salt, GCM_KEY_LABEL);
         assert_ne!(&key128[..16], &key256[..16]);
         assert_eq!(enc_algo_from_config("gcm128"), ENC_ALGO_GCM128);
         assert_eq!(enc_algo_from_config(""), ENC_ALGO_GCM);
@@ -1169,42 +1178,42 @@ mod go_aead_known_answer_vectors {
             (
                 ENC_ALGO_GCM,
                 "data",
-                "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b",
+                "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932",
             ),
             (
                 ENC_ALGO_GCM,
                 "fec",
-                "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56",
+                "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f",
             ),
             (
                 ENC_ALGO_GCM128,
                 "data",
-                "aca23415a7f2daba74e4b585171732e8970a3346125a0ce7ff4a3681c5dc098b",
+                "5a5ae0190c897c08b3bd57616c7b5b9f5f02ba56ea9aafb8d34e213a7d7291c1",
             ),
             (
                 ENC_ALGO_GCM128,
                 "fec",
-                "46276ec436392e1ea49e5f00726d9079703524f0b623df8e1ccf582216a12375",
+                "47cee4d1b539be66eec6110fc17dca97015b80f565d7cbb4315864894a1bdc62",
             ),
             (
                 ENC_ALGO_CHACHA20,
                 "data",
-                "720c46b7bdec71fd38fbde65073f9bab7b0f40fa6bed33a973127531ce7f14d5",
+                "6c8cfe69b7093e921a6dbb35a2079b3c9636dc3ea4b91a8a33f8968524516c9f",
             ),
             (
                 ENC_ALGO_CHACHA20,
                 "fec",
-                "ba223e31950d27fe521b6629df45160df251cc361c649e3e7654bf6be23bd7b0",
+                "547f9884da8e227f725d96494fbc6a4a392a94a511fe3fabede13731eabfeb43",
             ),
             (
                 ENC_ALGO_XCHACHA20,
                 "data",
-                "dab95dcd60c7526fea52c69928fcce4fe639b2d03e02e543dc5158522649d397",
+                "22d72483819893a0dc0e40f9e64e9fed1178928504a377529bf8f01b6cee8e09",
             ),
             (
                 ENC_ALGO_XCHACHA20,
                 "fec",
-                "47fa22c20f87f0b4e46db710bace56dfab35bccf7ed17ca820ad3b4f35dad9d8",
+                "030fbc56a0f7af5fe626b958ca9ad5eff26e75aa3ac2055c5fa55056ed47e967",
             ),
         ];
         for (algo, domain, want) in vectors {

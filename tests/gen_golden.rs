@@ -15,6 +15,7 @@
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
 fn hash_psk(psk: &str) -> String {
@@ -23,18 +24,19 @@ fn hash_psk(psk: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// 密钥标签与 Go `gcmKeyLabel` 逐字一致：数据面 `sha256(psk ‖ "_enc_key")`，
-/// FEC 面再拼一个 "_fec" 后缀，实现两个域之间的密钥分离。
-fn gcm_key(psk: &str, domain: &str) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(psk.as_bytes());
+/// 密钥标签与 Go `gcmKeyLabel` 逐字一致：HKDF-SHA256(ikm=psk, salt=encSalt,
+/// info=label)，FEC 面再拼一个 "_fec" 后缀，实现两个域之间的密钥分离。自 Go
+/// commit 68ae122 起 KDF 为带盐 HKDF（数据面不兼容变更），此处必须同步。
+fn gcm_key(psk: &str, salt: &[u8], domain: &str) -> Vec<u8> {
     let label: &[u8] = if domain == "fec" {
         b"_enc_key_fec"
     } else {
         b"_enc_key"
     };
-    h.update(label);
-    h.finalize().to_vec()
+    let hk = Hkdf::<Sha256>::new(Some(salt), psk.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(label, &mut key).unwrap();
+    key.to_vec()
 }
 
 /// 与 src/crypto.rs::InnerCipher::gcm_domain 同构：nonce = seq‖salt，AAD = wireLen‖seq。
@@ -46,7 +48,7 @@ fn gcm_domain_ciphertext(
     plaintext: &[u8],
 ) -> String {
     let salt = hex::decode(salt_hex).unwrap();
-    let cipher = Aes256Gcm::new_from_slice(&gcm_key(psk, domain)).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&gcm_key(psk, &salt, domain)).unwrap();
     let mut nonce = [0u8; 12];
     nonce[..4].copy_from_slice(&seq.to_be_bytes());
     nonce[4..].copy_from_slice(&salt);

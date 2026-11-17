@@ -12,7 +12,9 @@
 // 以免在只有 Rust 仓库的环境里误报。
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -24,6 +26,7 @@ struct GoldenVectors {
     control_frames: Vec<ControlFrameVec>,
     psk_hashes: Vec<PSKHashVec>,
     gcm_domain_vectors: Vec<GcmDomainVec>,
+    aead_domain_vectors: Vec<AeadDomainVec>,
     frame_headers: Vec<FrameHeaderVec>,
     tls_fingerprint_vectors: Vec<TlsFingerprintVec>,
     handshake_req_keys: Vec<String>,
@@ -33,6 +36,17 @@ struct GoldenVectors {
 
 #[derive(Deserialize)]
 struct GcmDomainVec {
+    psk: String,
+    salt_hex: String,
+    domain: String,
+    seq: u32,
+    plaintext_hex: String,
+    ciphertext_hex: String,
+}
+
+#[derive(Deserialize)]
+struct AeadDomainVec {
+    algo: i64,
     psk: String,
     salt_hex: String,
     domain: String,
@@ -80,6 +94,98 @@ fn hash_psk(psk: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// HKDF-SHA256(ikm=psk, salt=encSalt, info=label)，对齐 Go crypto.go。这是
+/// 数据面密钥派生契约：两端必须逐字节一致，否则密文互解不开。
+fn derive_key_hkdf(psk: &str, salt: &[u8], label: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), psk.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(label.as_bytes(), &mut key).unwrap();
+    key
+}
+
+fn aead_label(algo: i64) -> &'static str {
+    match algo {
+        2 => "_enc_key",
+        4 => "_enc_key128",
+        5 => "_enc_chacha20",
+        6 => "_enc_xchacha20",
+        other => panic!("unsupported golden AEAD algo {}", other),
+    }
+}
+
+fn aad_for(wire_len: u32, seq: u32) -> [u8; 8] {
+    let mut aad = [0u8; 8];
+    aad[..4].copy_from_slice(&wire_len.to_be_bytes());
+    aad[4..].copy_from_slice(&seq.to_be_bytes());
+    aad
+}
+
+/// 跨语言 AEAD 密封：domain data/fec 使用独立 label，algo 2/4/5/6 覆盖
+/// GCM256/GCM128/ChaCha20/XChaCha20。nonce 构造与 Go crypto.go 逐字节一致。
+fn aead_seal(v: &AeadDomainVec) -> Vec<u8> {
+    let label = if v.domain == "fec" {
+        format!("{}_fec", aead_label(v.algo))
+    } else {
+        aead_label(v.algo).to_string()
+    };
+    let salt = hex::decode(&v.salt_hex).unwrap();
+    let key = derive_key_hkdf(&v.psk, &salt, &label);
+    let mut plaintext = hex::decode(&v.plaintext_hex).unwrap();
+    let wire_len = (plaintext.len() + 16) as u32;
+    let aad = aad_for(wire_len, v.seq);
+
+    match v.algo {
+        2 => {
+            let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&v.seq.to_be_bytes());
+            nonce[4..].copy_from_slice(&salt);
+            let tag = cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext)
+                .unwrap();
+            plaintext.extend_from_slice(&tag);
+            plaintext
+        }
+        4 => {
+            let cipher = Aes128Gcm::new_from_slice(&key[..16]).unwrap();
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&v.seq.to_be_bytes());
+            nonce[4..].copy_from_slice(&salt);
+            let tag = cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext)
+                .unwrap();
+            plaintext.extend_from_slice(&tag);
+            plaintext
+        }
+        5 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&v.seq.to_be_bytes());
+            nonce[4..].copy_from_slice(&salt);
+            let tag = cipher
+                .encrypt_in_place_detached(chacha20poly1305::Nonce::from_slice(&nonce), &aad, &mut plaintext)
+                .unwrap();
+            plaintext.extend_from_slice(&tag);
+            plaintext
+        }
+        6 => {
+            let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+            let mut h = Sha256::new();
+            h.update(b"tlsvpn-xchacha20-nonce-v1");
+            h.update(&salt);
+            let mut nonce = [0u8; 24];
+            nonce[..20].copy_from_slice(&h.finalize()[..20]);
+            nonce[20..].copy_from_slice(&v.seq.to_be_bytes());
+            let tag = cipher
+                .encrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, &mut plaintext)
+                .unwrap();
+            plaintext.extend_from_slice(&tag);
+            plaintext
+        }
+        other => panic!("unsupported golden AEAD algo {}", other),
+    }
+}
+
 fn gcm_domain_seal(v: &GcmDomainVec) -> Vec<u8> {
     // 数据面用 "_enc_key"，FEC 面再加 "_fec" 后缀——与 Go gcmKeyLabel 逐字一致。
     let label: &[u8] = if v.domain == "fec" {
@@ -87,19 +193,15 @@ fn gcm_domain_seal(v: &GcmDomainVec) -> Vec<u8> {
     } else {
         b"_enc_key"
     };
-    let mut h = Sha256::new();
-    h.update(v.psk.as_bytes());
-    h.update(label);
-    let cipher = Aes256Gcm::new_from_slice(&h.finalize()).unwrap();
     let salt = hex::decode(&v.salt_hex).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&derive_key_hkdf(&v.psk, &salt, std::str::from_utf8(label).unwrap()))
+        .unwrap();
     let mut nonce = [0u8; 12];
     nonce[..4].copy_from_slice(&v.seq.to_be_bytes());
     nonce[4..].copy_from_slice(&salt);
     let mut plaintext = hex::decode(&v.plaintext_hex).unwrap();
     let wire_len = (plaintext.len() + 16) as u32;
-    let mut aad = [0u8; 8];
-    aad[..4].copy_from_slice(&wire_len.to_be_bytes());
-    aad[4..].copy_from_slice(&v.seq.to_be_bytes());
+    let aad = aad_for(wire_len, v.seq);
     let tag = cipher
         .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext)
         .unwrap();
@@ -224,7 +326,8 @@ fn test_psk_hash_matches_go() {
 #[test]
 fn test_gcm_domain_known_answer_vectors() {
     // 离线固定向量：不依赖黄金文件也能守住密钥派生契约。数值取自 Go 仓库
-    // testdata/protocol_golden.json（数据面与 FEC 面各自独立的密钥标签）。
+    // testdata/protocol_golden.json（数据面与 FEC 面各自独立的密钥标签，
+    // KDF 为 HKDF-SHA256(ikm=psk, salt=encSalt, info=label)）。
     let psk = "cross-language-domain-vector";
     let salt_hex = "0011223344556677";
     let seq = 16909060u32;
@@ -232,11 +335,11 @@ fn test_gcm_domain_known_answer_vectors() {
     for (domain, want) in [
         (
             "data",
-            "6b7d896fdb4baed8b0775ea1ee38aba4097de242650d322e5a3a6775c4f07c8b",
+            "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932",
         ),
         (
             "fec",
-            "108721428cf9bacbba87a5b5ca28423d6a4af4d23d0c3338a676c8a584088b56",
+            "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f",
         ),
     ] {
         let v = GcmDomainVec {
@@ -252,6 +355,31 @@ fn test_gcm_domain_known_answer_vectors() {
             want,
             "domain={} 的密钥派生或 GCM 参数与 Go 端不一致 —— 数据面无法互通",
             domain
+        );
+    }
+}
+
+#[test]
+fn test_aead_domain_vectors_match_go() {
+    // 全部 4 种算法 × 2 个域（data/fec）的 HKDF 派生密文必须与 Go 金色向量
+    // 逐字节一致。Go 生成器在 commit 68ae122（HKDF 数据面不兼容变更）后重生成。
+    let g = golden_or_skip!();
+    assert_eq!(g.aead_domain_vectors.len(), 8, "Go golden 应有 8 个 AEAD 域向量");
+    let mut seen = std::collections::HashSet::new();
+    for v in &g.aead_domain_vectors {
+        assert!(
+            seen.insert((v.algo, v.domain.clone())),
+            "重复的 algo={} domain={} 向量",
+            v.algo,
+            v.domain
+        );
+        let got = aead_seal(v);
+        assert_eq!(
+            hex::encode(&got),
+            v.ciphertext_hex,
+            "algo={} domain={} 的 HKDF 派生或 AEAD 参数与 Go 端不一致 —— 数据面无法互通",
+            v.algo,
+            v.domain
         );
     }
 }

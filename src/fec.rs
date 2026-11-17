@@ -538,6 +538,13 @@ impl FecDecoder {
                 self.handle_mode_control(control);
                 Ok(())
             }
+            // 跨路径 RTT/时钟偏移探针由读循环前置拦截（probe.rs is_probe_payload）
+            // 投递给探针调度器；若仍到达此处（如无前置拦截路径）则防御性 no-op，
+            // 与 Go fec_decoder.go 一致——绝不因探针帧断连。
+            CONTROL_KIND_RTT_PROBE
+            | CONTROL_KIND_RTT_REPLY
+            | CONTROL_KIND_CLOCK_PROBE
+            | CONTROL_KIND_CLOCK_REPLY => Ok(()),
             kind => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
         }
     }
@@ -848,6 +855,11 @@ impl FecDecoder {
                 self.handle_mode_control_actor(control, reorder_expected);
                 Ok(None)
             }
+            // 跨路径 RTT/时钟偏移探针：防御性 no-op（读循环前置拦截后不应到达）。
+            CONTROL_KIND_RTT_PROBE
+            | CONTROL_KIND_RTT_REPLY
+            | CONTROL_KIND_CLOCK_PROBE
+            | CONTROL_KIND_CLOCK_REPLY => Ok(None),
             kind => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
         }
     }

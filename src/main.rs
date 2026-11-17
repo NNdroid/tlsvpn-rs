@@ -18,6 +18,7 @@ pub mod api;
 pub mod buffer;
 pub mod client;
 pub mod client_state;
+pub mod clock_offset;
 pub mod crypto;
 pub mod fec;
 pub mod frame;
@@ -25,6 +26,7 @@ pub mod hooks;
 pub mod net;
 pub mod peer_info;
 pub mod protocol;
+pub mod rtt_probe;
 pub mod rx_actor;
 pub mod server;
 pub mod socks5;
@@ -98,6 +100,15 @@ pub struct Args {
     // 越界的 FEC 请求按请求形态错误拒连，不夹取：见 server::handle_handshake。
     pub fec_group_min: i64,
     pub fec_group_max: i64,
+    // 调度/FEC 策略（对齐 Go config.go，阶段 2 接入调度器后消费）。
+    pub routing_algo: String,
+    pub fec_strategy: String,
+    pub fec_near_window_ms: i64,
+    // 数据面写队列优先级（[0,10]；默认 control=7/data=5）。仅本地写出顺序。
+    pub priority_control: i64,
+    pub priority_data: i64,
+    // 跨路径探针物理锚定下界（µs，默认 1000）。观察/分解用，不进线路格式。
+    pub probe_min_half_rtt_us: i64,
 }
 
 // ======================= JSON 配置文件（对齐 Go config.go） =======================
@@ -130,6 +141,25 @@ struct ConfigFile {
     traffic_days: i64,
     #[serde(default)]
     traffic_file: String,
+    // 多路径调度器选路算法（auto / latency_strict / latency_sticky /
+    // min_rtt_strict / min_rtt_adaptive / roundtrip_strict），可热更。
+    #[serde(default)]
+    routing_algo: String,
+    // FEC 奇偶帧分发策略（auto / near），可热更。
+    #[serde(default)]
+    fec_strategy: String,
+    // near 策略的选路窗口（ms，[1,100]），仅在 fec_strategy=near 时有意义。
+    #[serde(default)]
+    fec_near_window_ms: i64,
+    // 数据面写队列优先级（[0,10]，默认 control=7/data=5）。*int 语义：
+    // None=未配置（回落默认），Some(0)=合法最低优先级。不进线路格式。
+    #[serde(default)]
+    priority_control: Option<i64>,
+    #[serde(default)]
+    priority_data: Option<i64>,
+    // 跨路径探针的物理锚定下界（µs，[0,3600000]，默认 1000）。不进线路格式。
+    #[serde(default)]
+    probe_min_half_rtt_us: Option<i64>,
     workers: i32,
     mtu: u16,
     web: WebConfigFile,
@@ -147,6 +177,48 @@ struct WebConfigFile {
     // 错误。留空 = 明文 HTTP，Go 的示例配置里恒有这两项所以必须能解析。
     cert: String,
     key: String,
+    // MCP 服务器配置（对齐 Go mcp_auth.go MCPConfig）。Rust 接受该字段以便
+    // 真实 Go 配置可解析；MCP 端点实现见阶段 4（当前接受但未启动 MCP）。
+    #[serde(default)]
+    mcp: McpConfigFile,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields, default)]
+struct McpConfigFile {
+    // inherit_web | none | basic | bearer | api_key | oauth_jwt
+    #[serde(default)]
+    auth_mode: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    credential: String,
+    #[serde(default)]
+    api_key_header: String,
+    // internal | public | both
+    #[serde(default)]
+    deploy: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    oauth: McpOAuthJwtConfigFile,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields, default)]
+struct McpOAuthJwtConfigFile {
+    #[serde(default)]
+    jwks_url: String,
+    #[serde(default)]
+    issuer: String,
+    #[serde(default)]
+    audience: String,
+    #[serde(default)]
+    resource: String,
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    required_scopes: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -345,6 +417,26 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         } else {
             cfg.client.fec_group
         },
+        // 调度/FEC 策略（对齐 Go config.go applyDefaults）
+        routing_algo: if cfg.routing_algo.is_empty() {
+            "auto".into()
+        } else {
+            cfg.routing_algo
+        },
+        fec_strategy: if cfg.fec_strategy.is_empty() {
+            "auto".into()
+        } else {
+            cfg.fec_strategy
+        },
+        fec_near_window_ms: if cfg.fec_near_window_ms == 0 {
+            10
+        } else {
+            cfg.fec_near_window_ms
+        },
+        // *int 语义：None=未配置回落默认；Some(0)=显式最低优先级（合法）
+        priority_control: cfg.priority_control.unwrap_or(7),
+        priority_data: cfg.priority_data.unwrap_or(5),
+        probe_min_half_rtt_us: cfg.probe_min_half_rtt_us.unwrap_or(1000),
     };
     if args.mode == "server" && args.addr.is_empty() {
         args.addr = "0.0.0.0:4000".into();
@@ -419,6 +511,41 @@ fn validate_args(args: &Args) -> Result<(), String> {
             )
         }
         _ => {}
+    }
+    // 调度/FEC 策略字段（对齐 Go config.go Validate，所有 mode 校验）。
+    if !matches!(
+        args.routing_algo.as_str(),
+        "auto"
+            | "latency_strict"
+            | "latency_sticky"
+            | "min_rtt_strict"
+            | "min_rtt_adaptive"
+            | "roundtrip_strict"
+    ) {
+        return Err(format!(
+            "invalid routing_algo {:?} (want auto, latency_strict, latency_sticky, min_rtt_strict, min_rtt_adaptive or roundtrip_strict)",
+            args.routing_algo
+        ));
+    }
+    if !matches!(args.fec_strategy.as_str(), "auto" | "near") {
+        return Err(format!(
+            "invalid fec_strategy {:?} (want auto or near)",
+            args.fec_strategy
+        ));
+    }
+    if !(1..=100).contains(&args.fec_near_window_ms) {
+        return Err("fec_near_window_ms must be in [1, 100]".into());
+    }
+    // 优先级 [0,10]，0=最低（合法）；对齐 Go config.go:429-434。
+    if !(0..=10).contains(&args.priority_control) {
+        return Err("priority_control must be in [0, 10]".into());
+    }
+    if !(0..=10).contains(&args.priority_data) {
+        return Err("priority_data must be in [0, 10]".into());
+    }
+    // 物理锚定下界 [0,3600000]µs；对齐 Go config.go:437-439。
+    if !(0..=3_600_000).contains(&args.probe_min_half_rtt_us) {
+        return Err("probe_min_half_rtt_us must be in [0, 3600000]".into());
     }
     // log_level 是闭集（对齐 Go 的 zapcore.Level.UnmarshalText）。之前不校验，
     // 任意拼错的串都塞进 EnvFilter，只会得到「日志行为莫名变化」这种最难受的
@@ -862,6 +989,18 @@ mod tests {
     use std::io::Read;
     use std::time::Instant;
 
+    /// Args::default() 是未归一化的原始结构，新字段是空串/0；校验假设 Args 已
+    /// 归一化，所以测试用 default() 做基线时必须显式补齐这些默认（镜像
+    /// load_config_file 的 applyDefaults 语义：auto/auto/10/7/5/1000）。
+    fn fill_stage1_defaults(a: &mut Args) {
+        a.routing_algo = "auto".into();
+        a.fec_strategy = "auto".into();
+        a.fec_near_window_ms = 10;
+        a.priority_control = 7;
+        a.priority_data = 5;
+        a.probe_min_half_rtt_us = 1000;
+    }
+
     #[test]
     fn lifecycle_hook_paths_must_be_absolute() {
         assert!(super::validate_hook_path("up", "relative.sh").is_err());
@@ -872,7 +1011,8 @@ mod tests {
 
     // ---------- 配置文件兼容性（与 Go 仓库 config.*.json 逐字段对齐） ----------
 
-    // Go 仓库 config.server.json 的原样内容
+    // Go 仓库 config.server.json 的原样内容（同步 2026-11-17：routing_algo /
+    // fec_strategy / fec_near_window_ms / web.mcp 已加入 Go 配置，Rust 必须能原样读入）
     const GO_SERVER_CONFIG: &str = r#"{
   "mode": "server",
   "psk": "test-only-high-entropy-secret-4e390397818f",
@@ -881,10 +1021,14 @@ mod tests {
   "up": "",
   "down": "",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "pad_mode": "bucket",
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
+  "routing_algo": "auto",
+  "fec_strategy": "auto",
+  "fec_near_window_ms": 10,
   "tap": "tap0",
   "mac": "",
   "web": {
@@ -892,7 +1036,23 @@ mod tests {
     "bind": "tunnel",
     "auth": "admin:test-only-password-9b9f5d25",
     "cert": "",
-    "key": ""
+    "key": "",
+    "mcp": {
+      "auth_mode": "inherit_web",
+      "username": "",
+      "credential": "",
+      "api_key_header": "X-API-Key",
+      "deploy": "internal",
+      "path": "/0123456789abcdef0123",
+      "oauth": {
+        "jwks_url": "",
+        "issuer": "",
+        "audience": "",
+        "resource": "",
+        "authorization_servers": [],
+        "required_scopes": []
+      }
+    }
   },
   "server": {
     "v4_cidr": "10.0.0.0/24",
@@ -913,11 +1073,15 @@ mod tests {
   "up": "",
   "down": "",
   "encrypt": true,
+  "enc_algo": "gcm256",
   "pad_mode": "bucket",
   "brutal": true,
   "brutal_up": 100,
   "brutal_down": 500,
   "socks5": "",
+  "routing_algo": "auto",
+  "fec_strategy": "auto",
+  "fec_near_window_ms": 10,
   "tap": "tap0",
   "mac": "",
   "web": {
@@ -925,7 +1089,23 @@ mod tests {
     "bind": "tunnel",
     "auth": "admin:test-only-password-9b9f5d25",
     "cert": "",
-    "key": ""
+    "key": "",
+    "mcp": {
+      "auth_mode": "inherit_web",
+      "username": "",
+      "credential": "",
+      "api_key_header": "X-API-Key",
+      "deploy": "internal",
+      "path": "/0123456789abcdef0123",
+      "oauth": {
+        "jwks_url": "",
+        "issuer": "",
+        "audience": "",
+        "resource": "",
+        "authorization_servers": [],
+        "required_scopes": []
+      }
+    }
   },
   "client": {
     "interface_manager": "self",
@@ -1060,6 +1240,7 @@ mod tests {
 
         // Args::default() 未经归一化，这里补齐 load_config_file 会给的默认值
         let mut a = Args::default();
+        fill_stage1_defaults(&mut a);
         a.mode = "server".into();
         a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "0.0.0.0:4000".into();
@@ -1137,6 +1318,7 @@ mod tests {
         // Args::default() 未经归一化，两个端点都是 0；validate_args 内部自行归一，
         // 因此 flag 默认路径不需要调用方先填边界。
         let mut a = Args::default();
+        fill_stage1_defaults(&mut a);
         a.mode = "server".into();
         a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "0.0.0.0:4000".into();
@@ -1268,6 +1450,7 @@ mod tests {
     fn min_enc_validation_matches_go() {
         // Args::default() 未经归一化，log_level 显式给默认值
         let mut a = Args::default();
+        fill_stage1_defaults(&mut a);
         a.mode = "client".into();
         a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "127.0.0.1:1".into();
@@ -1335,6 +1518,7 @@ mod tests {
         // 合法基线：client 模式不需要地址池，v4/v6 cidr 留空即可。
         // validate_args 假设 Args 已归一化，所以 log_level 显式给默认值。
         let mut a = Args::default();
+        fill_stage1_defaults(&mut a);
         a.mode = "client".into();
         a.psk = "test-only-high-entropy-secret-4e390397818f".into();
         a.addr = "10.0.0.1:4000".into();

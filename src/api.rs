@@ -58,6 +58,13 @@ pub struct HandshakeReq {
     pub fec: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub fec_group: i64,
+    // 跨路径 RTT 探针（0x03/0x04，去程/回程单向时延选路）。仅当两端都声明支持
+    // 时启用；旧端收不到 0x03/0x04 控制帧，不破坏兼容。对齐 Go frame.go。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rtt_probe: bool,
+    // 双向时钟偏移探针（0x05/0x06，解出参考连接不对称度）。与 RTTProbe 独立协商。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clock_offset: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub encrypt: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -132,6 +139,12 @@ pub struct HandshakeResp {
     pub fec: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub fec_group: i64,
+    // 服务端是否同意启用跨路径 RTT 探针（与客户端声明取交集）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rtt_probe: bool,
+    // 服务端是否同意启用双向时钟偏移探针（与客户端声明取交集）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clock_offset: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub encrypt: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]

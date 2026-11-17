@@ -345,6 +345,12 @@ fn process_item(
     let data = item.data;
 
     if seq == 0 {
+        // 跨路径 RTT/时钟偏移探针：防御性 no-op（读循环前置拦截后不应到达，但
+        // actor 通道可能由其它路径喂入），与 Go fec_decoder.go 一致——绝不因探针断连。
+        if crate::clock_offset::is_probe_payload(&data) {
+            release_shared_frame(data);
+            return Ok(());
+        }
         let expected = state.reorder.expected_seq_snapshot();
         let Some(dec) = state.fec.as_mut() else {
             release_shared_frame(data);

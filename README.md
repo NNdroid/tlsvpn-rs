@@ -123,6 +123,12 @@ Session resume tokens are a mandatory protocol-v3 property and are always enable
 | `brutal_up` / `brutal_down` | `100` / `500` | — | Brutal rates in Mbps |
 | `traffic_days` | `30` | — | Daily traffic retention in local-calendar days (`1`–`3650`), hot-applicable from the dashboard |
 | `traffic_file` | `tlsvpn-traffic.json` beside the config | — | Persistent aggregate traffic store; per-client history uses the sibling `-clients.json` file |
+| `routing_algo` | `auto` | — | Multipath routing policy: `auto`, `latency_strict`, `latency_sticky`, `min_rtt_strict`, `min_rtt_adaptive` or `roundtrip_strict`. Accepted so Go configs parse verbatim; the non-`auto` policies are wired into the scheduler in stage 2 |
+| `fec_strategy` | `auto` | — | FEC parity scheduling: `auto` or `near` (restrict parity to a recent-window set). `near` wiring lands in stage 2 |
+| `fec_near_window_ms` | `10` | — | Near-window length in ms (`1`–`100`); meaningful only with `fec_strategy=near` |
+| `priority_control` | `7` | — | Local write-queue priority for control frames (`0`–`10`); not carried on the wire |
+| `priority_data` | `5` | — | Local write-queue priority for data frames (`0`–`10`); not carried on the wire |
+| `probe_min_half_rtt_us` | `1000` | — | Physical anchor floor for cross-path probes in µs (`0`–`3600000`); not carried on the wire |
 | `workers` | `0` | — | **Rust-only extension** — Go rejects this key. Worker event-loop threads (0 = auto, one per CPU up to 8) |
 | `mtu` | `1500` | — | **Rust-only extension** — Go rejects this key. TAP MTU, validated in the `576`–`9000` range. Use the same intended L2 MTU on both tunnel endpoints |
 | `tap` | `tap0` | — | TAP device name. `"mem"` is an in-memory backend (CI/e2e, no kernel device) |
@@ -133,6 +139,7 @@ Session resume tokens are a mandatory protocol-v3 property and are always enable
 | `web.auth` | (required when enabled) | — | Credential source as `user:pass`. Browser login exchanges it for an HttpOnly SameSite session cookie; explicit Basic Auth remains accepted for scripts. Known example credentials are rejected |
 | `web.bind` | `all` | — | `all` = every interface; `tunnel` = tunnel IPs only (server: pool gateway v4+v6, client: assigned IP; rebinds within 2s as IPs appear). Binds are **per address**: if the v6 gateway is tentative or disabled it retries on its own while the v4 listener keeps serving. On Linux the tunnel addresses are brought `up` first and the v6 address gets `nodad` — without it a v6 address that has no RA to answer for stays tentative forever, and `[fd00::1]:8080` never binds |
 | `web.cert` / `web.key` | (empty) | — | Dashboard HTTPS pair. Required when `web.bind=all` exposes a non-loopback listener |
+| `web.mcp` | (disabled) | — | MCP endpoint block (`auth_mode`, `deploy`, `path`, `oauth`, …). Accepted so Go configs parse verbatim; the MCP server itself is served in stage 4 |
 | `server.v4_cidr` | `10.0.0.0/24` | server | IPv4 pool for clients (gateway = first host). Bare IPs are accepted; garbage is refused rather than silently downgrading to the default pool |
 | `server.v6_cidr` | `fd00::/64` | server | IPv6 pool for clients |
 | `server.cert` / `server.key` | (empty) | server | TLS certificate pair (PEM). When both are empty, generate and persist `tlsvpn-selfsigned-cert.pem` / `tlsvpn-selfsigned-key.pem` like Go; when either is set, both must be set and valid |

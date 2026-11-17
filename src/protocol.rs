@@ -5,6 +5,12 @@ pub const PROTOCOL_VERSION: i64 = 3;
 
 pub const CONTROL_KIND_FEC_PARITY: u8 = 0x01;
 pub const CONTROL_KIND_FEC_MODE: u8 = 0x02;
+// 跨路径 RTT 探针（去程/回程单向时延选路）与双向时钟偏移探针（解出参考连接
+// 不对称度、恢复 fwd+ret=RTT 自洽）。与 Go rtt_probe.go / clock_offset.go 对齐。
+pub const CONTROL_KIND_RTT_PROBE: u8 = 0x03;
+pub const CONTROL_KIND_RTT_REPLY: u8 = 0x04;
+pub const CONTROL_KIND_CLOCK_PROBE: u8 = 0x05;
+pub const CONTROL_KIND_CLOCK_REPLY: u8 = 0x06;
 
 pub const FEC_MODE_SUSPEND: u8 = 1;
 pub const FEC_MODE_RESUME: u8 = 2;
@@ -65,7 +71,12 @@ pub fn control_kind(payload: &[u8]) -> Result<u8, String> {
         .copied()
         .ok_or_else(|| "empty payload is KEEPALIVE, not a typed control".to_string())?;
     match kind {
-        CONTROL_KIND_FEC_PARITY | CONTROL_KIND_FEC_MODE => Ok(kind),
+        CONTROL_KIND_FEC_PARITY
+        | CONTROL_KIND_FEC_MODE
+        | CONTROL_KIND_RTT_PROBE
+        | CONTROL_KIND_RTT_REPLY
+        | CONTROL_KIND_CLOCK_PROBE
+        | CONTROL_KIND_CLOCK_REPLY => Ok(kind),
         _ => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
     }
 }

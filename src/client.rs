@@ -1449,6 +1449,9 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         } else {
             0
         },
+        // Phase 2 接入跨路径探针调度器后改为 true；当前不声明，行为不变。
+        rtt_probe: false,
+        clock_offset: false,
         brutal_groups: true,
         brutal_total_tx: cl.brutal_up,
         brutal_total_rx: cl.brutal_down,
@@ -1995,6 +1998,15 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                         }
                                     }
                                 }
+                            }
+
+                            // 跨路径 RTT/时钟偏移探针（seq==0, kind 0x03-0x06）前置
+                            // 拦截，与 Go 读循环一致（server.go/client.go）：探针在
+                            // FEC 门控之前被拦截，即使无 FEC 会话也可用。Phase 2 接入
+                            // 探针调度器后改为投递；当前丢弃（防御性，绝不因探针断连）。
+                            if seq == 0 && crate::clock_offset::is_probe_payload(&data) {
+                                release_frame_vec(data);
+                                continue;
                             }
 
                             if owned_rx && seq != 0 {
