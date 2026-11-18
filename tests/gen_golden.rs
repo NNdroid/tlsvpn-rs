@@ -39,7 +39,8 @@ fn gcm_key(psk: &str, salt: &[u8], domain: &str) -> Vec<u8> {
     key.to_vec()
 }
 
-/// 与 src/crypto.rs::InnerCipher::gcm_domain 同构：nonce = seq‖salt，AAD = wireLen‖seq。
+/// 与 src/crypto.rs::InnerCipher::gcm_domain 同构：nonce = seq‖salt，
+/// AAD = wireLen‖padLen(0)‖seq（v4 起绑定帧头 padLen）。
 fn gcm_domain_ciphertext(
     psk: &str,
     domain: &str,
@@ -53,9 +54,12 @@ fn gcm_domain_ciphertext(
     nonce[..4].copy_from_slice(&seq.to_be_bytes());
     nonce[4..].copy_from_slice(&salt);
     let wire_len = (plaintext.len() + 16) as u32;
-    let mut aad = [0u8; 8];
+    // v4 起 AAD 绑定帧头 padLen：golden 域向量经 Go sealInPlace（cold path,
+    // padLen=0）生成，padLen 字节为 0x0000（对齐 Go crypto.go nonceAAD）。
+    let mut aad = [0u8; 10];
     aad[..4].copy_from_slice(&wire_len.to_be_bytes());
-    aad[4..].copy_from_slice(&seq.to_be_bytes());
+    aad[4..6].copy_from_slice(&0u16.to_be_bytes());
+    aad[6..].copy_from_slice(&seq.to_be_bytes());
     let mut buf = plaintext.to_vec();
     let tag = cipher
         .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut buf)

@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 5,
   "psk_hashes": [
     {
       "psk": "",
@@ -29,7 +29,7 @@
       "domain": "data",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932"
+      "ciphertext_hex": "748fb092d80eca55e9dd426863c47a84e22ca8c1227e23285f4bf25a8a03feb0"
     },
     {
       "psk": "cross-language-domain-vector",
@@ -37,7 +37,7 @@
       "domain": "fec",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f"
+      "ciphertext_hex": "fead4ada2394a9aba0993564634155c6d64f578e69cc6208518f2daf5e84c4e3"
     }
   ],
   "aead_domain_vectors": [
@@ -48,7 +48,7 @@
       "domain": "data",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932"
+      "ciphertext_hex": "748fb092d80eca55e9dd426863c47a84e22ca8c1227e23285f4bf25a8a03feb0"
     },
     {
       "algo": 2,
@@ -57,7 +57,7 @@
       "domain": "fec",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f"
+      "ciphertext_hex": "fead4ada2394a9aba0993564634155c6d64f578e69cc6208518f2daf5e84c4e3"
     },
     {
       "algo": 4,
@@ -66,7 +66,7 @@
       "domain": "data",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "5a5ae0190c897c08b3bd57616c7b5b9f5f02ba56ea9aafb8d34e213a7d7291c1"
+      "ciphertext_hex": "5a5ae0190c897c08b3bd57616c7b5b9f3a14fcee26f27bd954713638dfd6ce50"
     },
     {
       "algo": 4,
@@ -75,7 +75,7 @@
       "domain": "fec",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "47cee4d1b539be66eec6110fc17dca97015b80f565d7cbb4315864894a1bdc62"
+      "ciphertext_hex": "47cee4d1b539be66eec6110fc17dca97fd07342ce2b2c74391f37d7f38882ecd"
     },
     {
       "algo": 5,
@@ -84,7 +84,7 @@
       "domain": "data",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "6c8cfe69b7093e921a6dbb35a2079b3c9636dc3ea4b91a8a33f8968524516c9f"
+      "ciphertext_hex": "6c8cfe69b7093e921a6dbb35a2079b3c06e9ede208e17e79511648f115c4639d"
     },
     {
       "algo": 5,
@@ -93,7 +93,7 @@
       "domain": "fec",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "547f9884da8e227f725d96494fbc6a4a392a94a511fe3fabede13731eabfeb43"
+      "ciphertext_hex": "547f9884da8e227f725d96494fbc6a4a18c76772d74ba1e3e2a1f43054caf173"
     },
     {
       "algo": 6,
@@ -102,7 +102,7 @@
       "domain": "data",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "22d72483819893a0dc0e40f9e64e9fed1178928504a377529bf8f01b6cee8e09"
+      "ciphertext_hex": "22d72483819893a0dc0e40f9e64e9fedf9b838fa84fde72745051978ea077894"
     },
     {
       "algo": 6,
@@ -111,7 +111,7 @@
       "domain": "fec",
       "seq": 16909060,
       "plaintext_hex": "65746865726e65742d7061796c6f6164",
-      "ciphertext_hex": "030fbc56a0f7af5fe626b958ca9ad5eff26e75aa3ac2055c5fa55056ed47e967"
+      "ciphertext_hex": "030fbc56a0f7af5fe626b958ca9ad5ef5635c6b614e6fb274974a13c4e86ba5c"
     }
   ],
   "frame_headers": [

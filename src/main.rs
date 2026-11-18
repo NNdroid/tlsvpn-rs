@@ -1758,7 +1758,8 @@ mod tests {
         for _ in 0..iter_count {
             let (mut data, seq) = scanner.read_frame(&mut reader).unwrap().unwrap();
             let wire_len = data.len() as u32;
-            ic.open_in_place(&mut data, seq, wire_len).unwrap();
+            ic.open_in_place(&mut data, seq, wire_len, scanner.last_pad_len)
+                .unwrap();
             crate::buffer::release_frame_vec(data);
         }
         let elapsed = start.elapsed().as_secs_f64();

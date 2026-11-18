@@ -113,10 +113,14 @@ fn aead_label(algo: i64) -> &'static str {
     }
 }
 
-fn aad_for(wire_len: u32, seq: u32) -> [u8; 8] {
-    let mut aad = [0u8; 8];
+/// 数据帧 AAD（对齐 Go crypto.go nonceAAD，v4 起绑定帧头 padLen）：
+/// wireLen(4B) ‖ padLen(2B) ‖ seq(4B)。golden 域向量经 Go sealInPlace 生成，
+/// 它走 cold path（padLen=0），故调用点一律传 0；parity 走独立描述符 AAD。
+fn aad_for(wire_len: u32, pad_len: u16, seq: u32) -> [u8; 10] {
+    let mut aad = [0u8; 10];
     aad[..4].copy_from_slice(&wire_len.to_be_bytes());
-    aad[4..].copy_from_slice(&seq.to_be_bytes());
+    aad[4..6].copy_from_slice(&pad_len.to_be_bytes());
+    aad[6..].copy_from_slice(&seq.to_be_bytes());
     aad
 }
 
@@ -132,7 +136,9 @@ fn aead_seal(v: &AeadDomainVec) -> Vec<u8> {
     let key = derive_key_hkdf(&v.psk, &salt, &label);
     let mut plaintext = hex::decode(&v.plaintext_hex).unwrap();
     let wire_len = (plaintext.len() + 16) as u32;
-    let aad = aad_for(wire_len, v.seq);
+    // padLen=0：Go golden 由 sealInPlace（cold path, padLen=0）生成，AAD 绑定
+    // 帧头 padLen 时该字节为 0x0000。
+    let aad = aad_for(wire_len, 0, v.seq);
 
     match v.algo {
         2 => {
@@ -201,7 +207,8 @@ fn gcm_domain_seal(v: &GcmDomainVec) -> Vec<u8> {
     nonce[4..].copy_from_slice(&salt);
     let mut plaintext = hex::decode(&v.plaintext_hex).unwrap();
     let wire_len = (plaintext.len() + 16) as u32;
-    let aad = aad_for(wire_len, v.seq);
+    // padLen=0：Go golden 由 sealInPlace（cold path, padLen=0）生成。
+    let aad = aad_for(wire_len, 0, v.seq);
     let tag = cipher
         .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut plaintext)
         .unwrap();
@@ -291,7 +298,10 @@ macro_rules! golden_or_skip {
 #[test]
 fn test_protocol_v3_typed_controls_match_go() {
     let g = golden_or_skip!();
-    assert_eq!(g.version, 3, "Go golden contract must be protocol v3");
+    // control_frames 是 v3 引入的 typed-control 家族契约（含 v5 的 0x07
+    // active-paths）。golden 的 version 号随协议演进递增，这里锁定当前协议
+    // v5，与 Go 端 protocolVersion 一致；升级时需同步更新。
+    assert_eq!(g.version, 5, "Go golden contract must be current protocol v5");
     let controls: std::collections::HashMap<_, _> = g
         .control_frames
         .iter()
@@ -335,11 +345,11 @@ fn test_gcm_domain_known_answer_vectors() {
     for (domain, want) in [
         (
             "data",
-            "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932",
+            "748fb092d80eca55e9dd426863c47a84e22ca8c1227e23285f4bf25a8a03feb0",
         ),
         (
             "fec",
-            "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f",
+            "fead4ada2394a9aba0993564634155c6d64f578e69cc6208518f2daf5e84c4e3",
         ),
     ] {
         let v = GcmDomainVec {

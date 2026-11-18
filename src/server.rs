@@ -228,6 +228,9 @@ pub struct ClientSession {
     pub clock_offset: Mutex<Option<Arc<crate::probe_scheduler::ClockOffsetScheduler>>>,
     pub conn_registry: Mutex<std::collections::HashMap<usize, Arc<Backend>>>,
     pub probe_min_half_rtt_us: u64,
+    // 0x07 active-paths 广播器只启动一次（会话首个连接创建时），后续连接复用
+    // 同一广播线程（对齐 Go AsyncPort.startPeerActiveBroadcaster 的一次性启动）。
+    pub peer_active_bcast: std::sync::OnceLock<()>,
 }
 
 impl ClientSession {
@@ -1195,6 +1198,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         rtt_cache: Arc::new(AtomicU32::new(0)),
         notify: None,
         probe_ch: Mutex::new(None),
+        conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        peer_active_at: std::sync::atomic::AtomicU64::new(0),
     }));
     vswitch.add_port(TAP_PORT_ID.to_string(), tap_port);
     let core_for_tap = core.clone();
@@ -1477,6 +1482,8 @@ fn worker_loop(
                     t,
                 ))),
                 probe_ch: Mutex::new(None),
+                conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                peer_active_at: std::sync::atomic::AtomicU64::new(0),
             });
             // 首帧是握手 JSON（<2KB）：认证前用小上限，防 10 字节帧头声明
             // 131070 长度把扫描缓冲扩到 131KB/连接；认证通过后恢复全量上限
@@ -1930,7 +1937,10 @@ fn process_plain_frames(
                     if seq != 0 {
                         if let Some(ic) = &sess.ic_rx {
                             let wire_len = data.len() as u32;
-                            match ic.open_in_place(&mut data, seq, wire_len) {
+                            // AAD 绑定帧头 padLen（v4）：解密必须用与发送端封印时
+                            // 一致的 padLen（对齐 Go openInPlaceWithScratch）。
+                            let pad_len = sess.scanner.last_pad_len;
+                            match ic.open_in_place(&mut data, seq, wire_len, pad_len) {
                                 Ok(plain) => {
                                     let plen = plain.len();
                                     data.truncate(plen);
@@ -1957,6 +1967,28 @@ fn process_plain_frames(
                             } else if crate::clock_offset::is_clock_offset_frame(&data) {
                                 if let Some(c) = c_sess.clock_offset.lock().as_ref() {
                                     c.on_frame(&data, sess.conn_index);
+                                }
+                            }
+                        }
+                        release_frame_vec(data);
+                        continue;
+                    }
+
+                    // 0x07 active-paths 前置拦截：客户端上行调度器选中槽位的位图，
+                    // 按本端 conn_registry 的槽位编号刷新各自的对端活跃时刻。与探针
+                    // 同属旁路信号，不参与 FEC 门控（对齐 Go server.go 的
+                    // dispatchRxControlFrame / applyPeerActiveBitmap）。
+                    if seq == 0 && crate::protocol::is_active_paths_frame(&data) {
+                        if let Some(bitmap) = crate::protocol::parse_active_paths_frame(&data) {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            if let Some(c_sess) = &sess.client_session {
+                                for (idx, b) in c_sess.conn_registry.lock().iter() {
+                                    if *idx < 16 && bitmap & (1u16 << *idx) != 0 {
+                                        b.peer_active_at.store(now, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -2453,6 +2485,81 @@ fn rotate_session_epoch(
     Ok(())
 }
 
+/// 0x07 active-paths 广播器（服务端下行）：每 500ms 把本端调度器的活跃槽位位图
+/// 以 0x07 控制帧投给轮转后端的 probeCh（writer 的控制帧优先通道，与 RTT 探针同路）。
+/// 位图 bit i = 本端调度器当前选中 connIndex i；客户端 RX 按自己的握手槽位编号判定
+/// "我这条在服务端是否活跃"。会话关闭（后端表清空）时线程退出，避免泄漏。
+/// 对齐 Go server.go startPeerActiveBroadcaster。
+fn start_server_peer_active_broadcaster(c_sess: Arc<ClientSession>) {
+    let _ = std::thread::Builder::new()
+        .name("srv-peer-active".into())
+        .spawn(move || {
+            let mut rotate = 0usize;
+            // 会话关闭（后端表清空）后空转计数器：连续 240 轮（120s，对齐
+            // destroy_deadline 销毁期）无后端即退出，避免会话复活（销毁期内重连）
+            // 后广播停止，同时不无限泄漏空转线程。
+            let mut empty_rounds = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let port = &c_sess.port;
+                let backends = port.backend_snapshot();
+                // 会话关闭（后端表清空）即退出广播线程。
+                if backends.is_empty() {
+                    empty_rounds += 1;
+                    if empty_rounds > 240 {
+                        return;
+                    }
+                    continue;
+                }
+                empty_rounds = 0;
+                let mut bitmap = 0u16;
+                for b in &backends {
+                    if let Some(idx) = b.conn_index() {
+                        if idx < 16 && b.scheduler.active.load(Ordering::Relaxed) {
+                            bitmap |= 1u16 << idx;
+                        }
+                    }
+                }
+                // 空闲隧道无数据批：先 preferred 回落，再单后端唯一路径（对齐 Go）。
+                if bitmap == 0 {
+                    if let Some(pb) = port.preferred_conn_index() {
+                        if pb < 16 {
+                            bitmap = 1u16 << pb;
+                        }
+                    } else if backends.len() == 1 {
+                        if let Some(idx) = backends[0].conn_index() {
+                            if idx < 16 {
+                                bitmap = 1u16 << idx;
+                            }
+                        }
+                    }
+                }
+                let cands: Vec<Arc<Backend>> = backends
+                    .iter()
+                    .filter(|b| {
+                        b.conn_index().map(|i| i < 16).unwrap_or(false)
+                            && b.probe_ch.lock().is_some()
+                    })
+                    .cloned()
+                    .collect();
+                if cands.is_empty() {
+                    continue;
+                }
+                // 取所有权避免借用跨 `cands` 生命周期；克隆 Sender 并在独立块内
+                // 释放 MutexGuard，避免临时存活到 block 末尾。
+                let b = cands[rotate % cands.len()].clone();
+                rotate = (rotate + 1) % cands.len();
+                let tx = {
+                    let guard = b.probe_ch.lock();
+                    guard.as_ref().cloned()
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(crate::protocol::append_active_paths_frame(bitmap));
+                }
+            }
+        });
+}
+
 fn handle_handshake(
     sess: &mut MioSession,
     core: &Arc<ServerCore>,
@@ -2488,10 +2595,22 @@ fn handle_handshake(
         !req.session_token.is_empty()
     );
 
-    // 常量时间比较：pskHash 本身就是握手凭据，字符串 != 的逐字节短路会把匹配
-    // 前缀长度泄露在响应时延里（远程时序预言机，可逐字节重建 pskHash）。
-    if !constant_time_eq(req.psk.as_bytes(), core.psk_hash.as_bytes()) {
-        warn!("PSK verification failed (hash mismatch).");
+    // 握手 PSK 证明绑定本条 TLS 连接的 exporter 密钥材料（协议 v4）：录制的
+    // 历史握手无法在其他连接上重放。exporter 在 TLS 握手完成后可用；导出失败
+    // fail-closed（对齐 Go crypto.go handshakePSKVerify）。常量时间比较：证明本身
+    // 是握手凭据，字符串 != 的逐字节短路会把匹配前缀长度泄露在响应时延里。
+    let mut exporter = [0u8; crate::crypto::PSK_PROOF_LEN];
+    if sess
+        .tls
+        .export_keying_material(&mut exporter, crate::crypto::PSK_PROOF_LABEL, None)
+        .is_err()
+    {
+        warn!("PSK verification failed (TLS exporter unavailable).");
+        return HandshakeOutcome::TarpitClose;
+    }
+    let want_proof = crate::crypto::psk_proof(&core.psk, &exporter);
+    if !constant_time_eq(req.psk.as_bytes(), want_proof.as_bytes()) {
+        warn!("PSK verification failed (proof mismatch).");
         return HandshakeOutcome::TarpitClose;
     }
     // 加密配置不匹配 → 焦油坑（对齐 Go）
@@ -2873,6 +2992,7 @@ fn handle_handshake(
                 clock_offset: Mutex::new(None),
                 conn_registry: Mutex::new(std::collections::HashMap::new()),
                 probe_min_half_rtt_us: core.probe_min_half_rtt_us,
+                peer_active_bcast: std::sync::OnceLock::new(),
             });
             sess.stat.active_conns.store(1, Ordering::Release);
             sessions.insert(client_id.clone(), sess.clone());
@@ -2915,6 +3035,12 @@ fn handle_handshake(
     sess.rx_producer = c_sess.rx_actor.as_ref().map(|actor| actor.producer());
     sess.client_session = Some(c_sess.clone());
 
+    // 0x07 active-paths 广播器（服务端下行调度器活跃槽位）：会话首个连接时启动
+    // 一次，后续连接复用（OnceLock）。与 Go 一致，每 500ms 周期广播。
+    c_sess
+        .peer_active_bcast
+        .get_or_init(|| start_server_peer_active_broadcaster(c_sess.clone()));
+
     // ---- 跨路径探针设置（对齐 Go server.go 1797-1810/2023）----
     // connIndex 用客户端声明下标（req.BrutalConnIndex），与客户端探针路由对称。
     // 首次进入会话创建调度器（注册表闭包读 conn_registry），此后仅注册后端 +
@@ -2923,6 +3049,9 @@ fn handle_handshake(
     if let Some(b) = sess.tx_backend.clone() {
         let (probe_tx, probe_rx) = bounded(8);
         *b.probe_ch.lock() = Some(probe_tx.clone());
+        // 登记本槽位：服务端下行调度器的活跃槽位广播（0x07）按 conn_index 构造
+        // 位图，与客户端声明的下标（握手同步）一致。
+        b.set_conn_index(sess.conn_index);
         sess.probe_tx = Some(probe_tx);
         sess.probe_rx = Some(probe_rx);
         c_sess

@@ -33,6 +33,30 @@ pub fn hash_psk(psk: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+// ======================= 握手 PSK 证明 =======================
+//
+// 协议 v3 及以前，握手"证明"就是静态的 sha256(PSK) 本身：拿到一次握手明文
+// （harvest-now-decrypt-later / CA 失陷）即可在其他连接上永久重放该 hash。
+// v4 把证明绑定到当前 TLS 连接的 exporter 密钥材料（RFC 5705）：同一连接两端
+// 导出相同值，不同连接（包括录制的旧握手）导出值必然不同，静态凭据重放被消除。
+// hashPSK 仍保留用于会话复活时校验"同一 PSK 创建的会话"（对齐 Go crypto.go）。
+
+/// 握手 PSK 证明的 TLS exporter label，两端硬编码一致。
+pub const PSK_PROOF_LABEL: &[u8] = b"tlsvpn psk proof v1";
+
+/// exporter 导出长度（字节）。
+pub const PSK_PROOF_LEN: usize = 32;
+
+/// 计算握手 PSK 证明：hex(HMAC-SHA256(key=sha256(psk), msg=exporter))。
+/// exporter 由调用方从各自 TLS 连接上导出（两端同连接同值）。
+/// 对齐 Go pskProofHex（crypto.go:368）。
+pub fn psk_proof(psk: &str, exporter: &[u8]) -> String {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&psk_key(psk)).expect("HMAC accepts any key length");
+    mac.update(exporter);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// 常量时间比较（对齐 Go hmac.Equal / subtle.ConstantTimeCompare）。
 ///
 /// PSK 哈希与会话复活分支的 MAC 都是对端可控的等长秘密（pskHash 本身就是握手
@@ -458,11 +482,11 @@ impl InnerCipher {
         nonce
     }
 
-    pub fn seal_in_place(&self, region: &mut [u8], pt_len: usize, seq: u32, wire_len: u32) {
+    pub fn seal_in_place(&self, region: &mut [u8], pt_len: usize, seq: u32, wire_len: u32, pad_len: u16) {
         if pt_len == 0 {
             return;
         }
-        let aad = gcm_aad(wire_len, seq);
+        let aad = gcm_aad(wire_len, pad_len, seq);
         let (ct, tag_space) = region.split_at_mut(pt_len);
         match self {
             InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
@@ -489,11 +513,44 @@ impl InnerCipher {
         }
     }
 
+    /// FEC parity 专用变体：nonce 仍由 (seq, salt) 派生，AAD 由调用方整体提供
+    /// （描述符 kind+groupStart+K+成员长度表）。对齐 Go sealInPlaceWithAAD。
+    pub fn seal_in_place_with_aad(&self, region: &mut [u8], pt_len: usize, seq: u32, aad: &[u8]) {
+        if pt_len == 0 {
+            return;
+        }
+        let (ct, tag_space) = region.split_at_mut(pt_len);
+        match self {
+            InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
+                let nonce = RingNonce::assume_unique_for_key(Self::standard_nonce(salt, seq));
+                let tag = aead
+                    .seal_in_place_separate_tag(nonce, Aad::from(aad), ct)
+                    .expect("AES-GCM encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_ref());
+            }
+            InnerCipher::ChaCha20 { aead, salt } => {
+                let nonce = Self::standard_nonce(salt, seq);
+                let tag = aead
+                    .encrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), aad, ct)
+                    .expect("ChaCha20-Poly1305 encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
+            }
+            InnerCipher::XChaCha20 { aead, nonce_prefix } => {
+                let nonce = Self::xchacha_nonce(nonce_prefix, seq);
+                let tag = aead
+                    .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, ct)
+                    .expect("XChaCha20-Poly1305 encryption cannot fail");
+                tag_space[..GCM_TAG_SIZE].copy_from_slice(tag.as_slice());
+            }
+        }
+    }
+
     pub fn open_in_place<'a>(
         &self,
         data: &'a mut [u8],
         seq: u32,
         wire_len: u32,
+        pad_len: u16,
     ) -> Result<&'a mut [u8], ()> {
         if data.is_empty() {
             return Ok(data);
@@ -501,7 +558,7 @@ impl InnerCipher {
         if data.len() < GCM_TAG_SIZE {
             return Err(());
         }
-        let aad = gcm_aad(wire_len, seq);
+        let aad = gcm_aad(wire_len, pad_len, seq);
         let (ct, tag_bytes) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
         match self {
             InnerCipher::Gcm256 { aead, salt } | InnerCipher::Gcm128 { aead, salt } => {
@@ -566,10 +623,15 @@ impl InnerCipher {
     }
 }
 
-fn gcm_aad(wire_len: u32, seq: u32) -> [u8; 8] {
-    let mut aad = [0u8; 8];
+/// AAD = wireLen(4B) ‖ padLen(2B) ‖ seq(4B)：绑定帧头中除明文长度外全部完整性
+/// 相关字段。padLen 此前不被认证，能改内层流量的攻击者可翻转它使 padding 字节
+/// 被重新解析为下一帧头（连接级去同步 DoS）；纳入 AAD 后两端按帧头实际 padLen
+/// 校验，篡改即解密失败（对齐 Go crypto.go nonceAAD / gcmAAD）。
+fn gcm_aad(wire_len: u32, pad_len: u16, seq: u32) -> [u8; 10] {
+    let mut aad = [0u8; 10];
     aad[0..4].copy_from_slice(&wire_len.to_be_bytes());
-    aad[4..8].copy_from_slice(&seq.to_be_bytes());
+    aad[4..6].copy_from_slice(&pad_len.to_be_bytes());
+    aad[6..10].copy_from_slice(&seq.to_be_bytes());
     aad
 }
 
@@ -968,13 +1030,13 @@ mod tests {
         let rx = InnerCipher::gcm("gcm_psk", &salt).unwrap();
         let mut buf = vec![0u8; pt.len() + GCM_TAG_SIZE];
         buf[..pt.len()].copy_from_slice(pt);
-        tx.seal_in_place(&mut buf, pt.len(), 42, wire);
-        let plain = rx.open_in_place(&mut buf, 42, wire).expect("gcm open");
+        tx.seal_in_place(&mut buf, pt.len(), 42, wire, 0);
+        let plain = rx.open_in_place(&mut buf, 42, wire, 0).expect("gcm open");
         assert_eq!(&plain[..pt.len()], pt);
 
         // 密钥只与 psk 绑定：不同 psk 打开不了彼此的密文
         let wrong = InnerCipher::gcm("other_psk", &salt).unwrap();
-        assert!(wrong.open_in_place(&mut buf, 42, wire).is_err());
+        assert!(wrong.open_in_place(&mut buf, 42, wire, 0).is_err());
 
         // 标签派生必须与 Go 的 gcmKeyLabel 逐字节一致，否则两端无法互通；
         // data 与 fec 两个域也必须用不同密钥
@@ -997,7 +1059,7 @@ mod tests {
         // KDF 自 v2 起为 HKDF-SHA256(ikm=psk, salt=encSalt, info=label)，以下为
         // 加盐派生后的跨语言已知答案向量（Go cipher_test.go 同步维护）。
         let want = hex::decode(
-            "85d1c16cb4ff7f1429c7cc4470472e85808d26479439330c1443bcc80d80d927fb612c0d7050ddc8aa5aa08a21e0be7bcc0134",
+            "85d1c16cb4ff7f1429c7cc4470472e85808d26479439330c1443bcc80d80d927fb612c9ec8dfa764161f8a1d395957e7253fd0",
         )
         .unwrap();
         let seq = 0x0102_0304u32;
@@ -1006,7 +1068,7 @@ mod tests {
         let cipher = InnerCipher::gcm_for_algo(psk, &salt, ENC_ALGO_GCM128).unwrap();
         let mut wire = vec![0u8; wire_len as usize];
         wire[..plain.len()].copy_from_slice(&plain);
-        cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len);
+        cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len, 0);
         assert_eq!(wire, want);
     }
 
@@ -1023,16 +1085,16 @@ mod tests {
 
         let mut wire = vec![0u8; wire_len as usize];
         wire[..pt.len()].copy_from_slice(&pt);
-        g128_tx.seal_in_place(&mut wire, pt.len(), 77, wire_len);
+        g128_tx.seal_in_place(&mut wire, pt.len(), 77, wire_len, 0);
         let mut roundtrip = wire.clone();
         let plain = g128_rx
-            .open_in_place(&mut roundtrip, 77, wire_len)
+            .open_in_place(&mut roundtrip, 77, wire_len, 0)
             .expect("AES-128-GCM roundtrip");
         assert_eq!(plain, pt.as_slice());
 
         let mut wrong = wire.clone();
         assert!(
-            g256.open_in_place(&mut wrong, 77, wire_len).is_err(),
+            g256.open_in_place(&mut wrong, 77, wire_len, 0).is_err(),
             "AES-128 ciphertext must not authenticate under AES-256 key domain"
         );
 
@@ -1056,10 +1118,10 @@ mod tests {
         let mut fec_wire = vec![0u8; wire_len as usize];
         data_wire[..plain.len()].copy_from_slice(plain);
         fec_wire[..plain.len()].copy_from_slice(plain);
-        data.seal_in_place(&mut data_wire, plain.len(), 77, wire_len);
-        fec.seal_in_place(&mut fec_wire, plain.len(), 77, wire_len);
+        data.seal_in_place(&mut data_wire, plain.len(), 77, wire_len, 0);
+        fec.seal_in_place(&mut fec_wire, plain.len(), 77, wire_len, 0);
         assert_ne!(data_wire, fec_wire);
-        assert!(data.open_in_place(&mut fec_wire, 77, wire_len).is_err());
+        assert!(data.open_in_place(&mut fec_wire, 77, wire_len, 0).is_err());
     }
 
     #[test]
@@ -1115,17 +1177,17 @@ mod chacha_inner_tests {
             let mut buf = vec![0u8; pt.len() + GCM_TAG_SIZE];
             buf[..pt.len()].copy_from_slice(pt);
             let wire_len = buf.len() as u32;
-            tx.seal_in_place(&mut buf, pt.len(), 0x10203040, wire_len);
-            let out = rx.open_in_place(&mut buf, 0x10203040, wire_len).unwrap();
+            tx.seal_in_place(&mut buf, pt.len(), 0x10203040, wire_len, 0);
+            let out = rx.open_in_place(&mut buf, 0x10203040, wire_len, 0).unwrap();
             assert_eq!(out, pt);
 
             let mut bad = vec![0u8; pt.len() + GCM_TAG_SIZE];
             bad[..pt.len()].copy_from_slice(pt);
             let bad_wire = bad.len() as u32;
-            tx.seal_in_place(&mut bad, pt.len(), 7, bad_wire);
+            tx.seal_in_place(&mut bad, pt.len(), 7, bad_wire, 0);
             let last = bad.len() - 1;
             bad[last] ^= 1;
-            assert!(rx.open_in_place(&mut bad, 7, bad_wire).is_err());
+            assert!(rx.open_in_place(&mut bad, 7, bad_wire, 0).is_err());
         }
     }
 
@@ -1178,42 +1240,42 @@ mod go_aead_known_answer_vectors {
             (
                 ENC_ALGO_GCM,
                 "data",
-                "748fb092d80eca55e9dd426863c47a846a5eb9724e4666f9801b86acc8b24932",
+                "748fb092d80eca55e9dd426863c47a84e22ca8c1227e23285f4bf25a8a03feb0",
             ),
             (
                 ENC_ALGO_GCM,
                 "fec",
-                "fead4ada2394a9aba0993564634155c6f6ab52b11c5c1e640d820c56512c241f",
+                "fead4ada2394a9aba0993564634155c6d64f578e69cc6208518f2daf5e84c4e3",
             ),
             (
                 ENC_ALGO_GCM128,
                 "data",
-                "5a5ae0190c897c08b3bd57616c7b5b9f5f02ba56ea9aafb8d34e213a7d7291c1",
+                "5a5ae0190c897c08b3bd57616c7b5b9f3a14fcee26f27bd954713638dfd6ce50",
             ),
             (
                 ENC_ALGO_GCM128,
                 "fec",
-                "47cee4d1b539be66eec6110fc17dca97015b80f565d7cbb4315864894a1bdc62",
+                "47cee4d1b539be66eec6110fc17dca97fd07342ce2b2c74391f37d7f38882ecd",
             ),
             (
                 ENC_ALGO_CHACHA20,
                 "data",
-                "6c8cfe69b7093e921a6dbb35a2079b3c9636dc3ea4b91a8a33f8968524516c9f",
+                "6c8cfe69b7093e921a6dbb35a2079b3c06e9ede208e17e79511648f115c4639d",
             ),
             (
                 ENC_ALGO_CHACHA20,
                 "fec",
-                "547f9884da8e227f725d96494fbc6a4a392a94a511fe3fabede13731eabfeb43",
+                "547f9884da8e227f725d96494fbc6a4a18c76772d74ba1e3e2a1f43054caf173",
             ),
             (
                 ENC_ALGO_XCHACHA20,
                 "data",
-                "22d72483819893a0dc0e40f9e64e9fed1178928504a377529bf8f01b6cee8e09",
+                "22d72483819893a0dc0e40f9e64e9fedf9b838fa84fde72745051978ea077894",
             ),
             (
                 ENC_ALGO_XCHACHA20,
                 "fec",
-                "030fbc56a0f7af5fe626b958ca9ad5eff26e75aa3ac2055c5fa55056ed47e967",
+                "030fbc56a0f7af5fe626b958ca9ad5ef5635c6b614e6fb274974a13c4e86ba5c",
             ),
         ];
         for (algo, domain, want) in vectors {
@@ -1221,8 +1283,94 @@ mod go_aead_known_answer_vectors {
             let mut wire = vec![0u8; plain.len() + GCM_TAG_SIZE];
             wire[..plain.len()].copy_from_slice(&plain);
             let wire_len = wire.len() as u32;
-            cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len);
+            cipher.seal_in_place(&mut wire, plain.len(), seq, wire_len, 0);
             assert_eq!(hex::encode(&wire), want, "algo={} domain={}", algo, domain);
         }
+    }
+
+    /// padLen 现在进入数据帧 AEAD AAD（v4）：用不同 pad_len 封装的密文在
+    /// 错误 pad_len 下必须解密失败。对齐 Go nonceAAD（crypto.go:233）。
+    #[test]
+    fn pad_len_is_bound_into_data_frame_aad() {
+        let salt = [0x33u8; ENC_SALT_SIZE];
+        let psk = "padlen-aad-psk";
+        let pt = b"frame payload with padding";
+        let seq = 77;
+        let wire_len = (pt.len() + GCM_TAG_SIZE) as u32;
+
+        let tx = InnerCipher::gcm(psk, &salt).unwrap();
+        let rx = InnerCipher::gcm(psk, &salt).unwrap();
+
+        // pad_len=0 封装：必须能用自己的 pad_len 打开，不能用别的 pad_len 打开
+        let mut wire0 = vec![0u8; wire_len as usize];
+        wire0[..pt.len()].copy_from_slice(pt);
+        tx.seal_in_place(&mut wire0, pt.len(), seq, wire_len, 0);
+        assert!(rx.open_in_place(&mut wire0.clone(), seq, wire_len, 0).is_ok());
+        assert!(
+            rx.open_in_place(&mut wire0.clone(), seq, wire_len, 1).is_err(),
+            "pad_len 篡改必须导致解密失败（AAD 绑定）"
+        );
+
+        // pad_len=42 封装：同样绑定
+        let mut wire42 = vec![0u8; wire_len as usize];
+        wire42[..pt.len()].copy_from_slice(pt);
+        tx.seal_in_place(&mut wire42, pt.len(), seq, wire_len, 42);
+        assert!(rx.open_in_place(&mut wire42.clone(), seq, wire_len, 42).is_ok());
+        assert!(rx.open_in_place(&mut wire42.clone(), seq, wire_len, 0).is_err());
+        assert!(rx.open_in_place(&mut wire42.clone(), seq, wire_len, 41).is_err());
+    }
+
+    /// psk_proof 与 Go pskProofHex 的黄金向量（HMAC-SHA256(key=sha256(psk),
+    /// msg=exporter)）。向量由 Go crypto.go 算法独立产出并交叉核对。
+    #[test]
+    fn psk_proof_matches_go_golden_and_binds_connection() {
+        // Go 端：pskProofHex("e2e_secret", 00..0f) 直接输出。HMAC-SHA256 由
+        // openssl 交叉核对：key = sha256("e2e_secret")。
+        let psk = "e2e_secret";
+        let exporter: Vec<u8> = (0..16u8).collect();
+        let proof = psk_proof(psk, &exporter);
+        assert_eq!(proof.len(), 64, "证明必须是 64 位 hex");
+        assert_eq!(
+            proof,
+            "09444b4daeb93bf136268d3b744a5e300651de411d119a38f22f8dcfb71d3b2d",
+            "psk_proof 与 Go pskProofHex 必须逐字节一致"
+        );
+        // exporter 绑定：不同连接（不同 exporter）证明不同，静态重放失效
+        assert_ne!(proof, psk_proof(psk, &[0xAA; 16]));
+        assert_ne!(proof, psk_proof(psk, &[]));
+        // PSK 绑定：不同 PSK 不同证明
+        assert_ne!(proof, psk_proof("other_psk", &exporter));
+        // 确定性
+        assert_eq!(proof, psk_proof(psk, &exporter));
+        // 空 exporter 也是合法输入（HMAC 接受任意长度）
+        assert_eq!(psk_proof(psk, &[]).len(), 64);
+    }
+
+    /// seal_in_place_with_aad：nonce 仍由 (seq, salt) 派生，AAD 由调用方提供
+    /// （FEC parity 描述符整体绑定）。对齐 Go sealInPlaceWithAAD。
+    #[test]
+    fn seal_with_aad_binds_full_aad() {
+        let salt = [0x11u8; ENC_SALT_SIZE];
+        let psk = "aad-psk";
+        let pt = b"parity xor body";
+        let seq = 3;
+        let desc_aad = [0x01u8, 0, 0, 0, 0, 0x02, 0, 0, 0, 0x03];
+        let other_aad = [0x99u8; 10];
+
+        let tx = InnerCipher::gcm(psk, &salt).unwrap();
+        let rx = InnerCipher::gcm(psk, &salt).unwrap();
+        let mut wire = vec![0u8; pt.len() + GCM_TAG_SIZE];
+        wire[..pt.len()].copy_from_slice(pt);
+        tx.seal_in_place_with_aad(&mut wire, pt.len(), seq, &desc_aad);
+        assert!(
+            rx.open_to(&mut vec![0u8; pt.len()], &wire, seq, &desc_aad)
+                .is_ok(),
+            "正确描述符 AAD 必须通过"
+        );
+        assert!(
+            rx.open_to(&mut vec![0u8; pt.len()], &wire, seq, &other_aad)
+                .is_err(),
+            "篡改描述符 AAD 必须失败"
+        );
     }
 }

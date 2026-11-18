@@ -353,12 +353,16 @@ impl FecEncoder {
         }
         buf[off..off + max_len].copy_from_slice(&self.acc[..max_len]);
         if let Some(ic) = &self.ic {
-            // 校验帧线路负载 = 描述符 + 加密后的异或载荷，以 groupStart 为 seq
-            ic.seal_in_place(
-                &mut buf[off..off + max_len + tag_len],
+            // 校验帧线路负载 = 描述符 + 加密后的异或载荷，以 groupStart 为 seq。
+            // AAD 整体绑定描述符（kind+groupStart+K+成员长度表）：描述符此前是
+            // parity 路径唯一的未认证字段，成员长度被篡改只能靠下游自洽性检查兜底
+            // （对齐 Go fec_encoder.go buildParity / sealInPlaceWithAAD）。
+            let (desc, body) = buf.split_at_mut(off);
+            ic.seal_in_place_with_aad(
+                &mut body[..max_len + tag_len],
                 max_len,
                 self.seqs[0],
-                (max_len + tag_len) as u32,
+                &desc[..off],
             );
         }
         buf
@@ -713,15 +717,14 @@ impl FecDecoder {
 
         let mut pb = acquire_frame_vec(max_len);
         if let Some(ic) = &self.ic {
-            let mut aad = [0u8; 8];
-            aad[0..4].copy_from_slice(&((max_len + tag_len) as u32).to_be_bytes());
-            aad[4..8].copy_from_slice(&start.to_be_bytes());
+            // AAD 整体绑定描述符（kind+groupStart+K+成员长度表），与发送端
+            // buildParity 的 sealInPlaceWithAAD 一致（对齐 Go fec_decoder.go）。
             let plain = ic
                 .open_to(
                     &mut pb,
                     &payload[desc_len..desc_len + max_len + tag_len],
                     start,
-                    &aad,
+                    &payload[..desc_len],
                 )
                 .map_err(|_| "FEC_PARITY AEAD failure".to_string())?;
             let n = plain.len();
@@ -929,14 +932,13 @@ impl FecDecoder {
         }
         let mut pb = acquire_frame_vec(max_len);
         if let Some(ic) = &self.ic {
-            let mut aad = [0u8; 8];
-            aad[0..4].copy_from_slice(&((max_len + tag_len) as u32).to_be_bytes());
-            aad[4..8].copy_from_slice(&start.to_be_bytes());
+            // AAD 整体绑定描述符（kind+groupStart+K+成员长度表），与发送端
+            // buildParity 的 sealInPlaceWithAAD 一致（对齐 Go fec_decoder.go）。
             match ic.open_to(
                 &mut pb,
                 &payload[desc_len..desc_len + max_len + tag_len],
                 start,
-                &aad,
+                &payload[..desc_len],
             ) {
                 Ok(plain) => {
                     let n = plain.len();
@@ -1457,5 +1459,20 @@ mod tests {
         .encode();
         bad[2] = 1;
         assert!(dec.on_control(&bad, &mut sink).is_err());
+    }
+
+    /// FEC parity 描述符布局与 Go golden（protocol_golden.json fec_parity_k2）
+    /// 逐字节一致：kind + groupStart + K + 成员长度表 + 异或载荷。
+    #[test]
+    fn fec_parity_k2_matches_go_golden_layout() {
+        let mut enc = FecEncoder::new(2, None);
+        assert!(enc.add(1, &[0x01, 0x02]).is_none());
+        let parity = enc.add(2, &[0x03, 0x04]).expect("K=2 组满应产出校验帧");
+        // 对齐 Go buildGoldenVectors 的 fec_parity_k2 向量（未加密）。
+        assert_eq!(
+            hex::encode(&parity),
+            "01000000010200000002000000020206",
+            "parity 描述符布局必须与 Go golden 逐字节一致"
+        );
     }
 }

@@ -55,6 +55,7 @@ pub fn append_padded_frame_with_limit(
                     data_len,
                     seq,
                     wire_len,
+                    pad_len as u16,
                 );
             }
         }
@@ -169,6 +170,10 @@ pub struct FrameScanner {
     // 全量上限（见 set_max_data_len）。默认给全量上限，这样只在握手路径上
     // 需要显式收紧。
     max_data_len: usize,
+    // last_pad_len 最近一次成功 read_frame 的帧头 padLen。数据帧内层 AEAD 的
+    // AAD 绑定该值（与发送端封印时一致），调用方解密时传入，篡改 padLen 即
+    // 解密失败（对齐 Go FrameScanner.lastPadLen）。
+    pub last_pad_len: u16,
 }
 
 // 与 Go FrameScanner 对齐的常量
@@ -188,6 +193,7 @@ impl FrameScanner {
             lazy_compact: std::env::var("TLSVPN_RX_COMPACT").as_deref() == Ok("1"),
             offset: 0,
             max_data_len: MAX_DATA_LENGTH,
+            last_pad_len: 0,
         }
     }
 
@@ -220,6 +226,9 @@ impl FrameScanner {
         let data_len = BigEndian::read_u32(&self.buffer[self.offset..self.offset + 4]) as usize;
         let pad_len = BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]) as usize;
         let seq = BigEndian::read_u32(&self.buffer[self.offset + 6..self.offset + 10]);
+        // 记录帧头 padLen，供调用方解密数据帧时作为 AEAD AAD 的 padLen 分量
+        // （对齐 Go FrameScanner.lastPadLen）。
+        self.last_pad_len = BigEndian::read_u16(&self.buffer[self.offset + 4..self.offset + 6]);
 
         if data_len > self.max_data_len {
             self.buffer.clear();
@@ -740,5 +749,39 @@ mod tests {
         }
 
         let _ = crate::crypto::set_pad_mode(&prev);
+    }
+
+    /// last_pad_len 必须反映最近一帧的帧头 padLen：数据帧解密以它为 AEAD AAD
+    /// 的 padLen 分量（v4）。空帧（心跳）与填充帧都要如实记录。
+    #[test]
+    fn scanner_records_last_pad_len_for_decrypt() {
+        let mut stream = Vec::new();
+        // 帧1：pad=5；帧2：pad=0（心跳）；帧3：pad=300（jumbo 填充）
+        append_frame_head(&mut stream, 3, 5, 11);
+        stream.extend_from_slice(b"abc");
+        stream.extend_from_slice(&[0u8; 5]);
+        append_frame_head(&mut stream, 0, 0, 12);
+        append_frame_head(&mut stream, 4, 300, 13);
+        stream.extend_from_slice(b"defg");
+        stream.extend_from_slice(&[0xEE; 300]);
+
+        let mut scanner = FrameScanner::new();
+        let mut cursor = std::io::Cursor::new(stream);
+        let (f1, s1) = scanner.read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!((f1.as_slice(), s1), (&b"abc"[..], 11));
+        assert_eq!(scanner.last_pad_len, 5, "帧1 pad=5 必须被记录");
+        release_frame_vec(f1);
+
+        let (f2, s2) = scanner.read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(s2, 12);
+        assert!(f2.is_empty());
+        assert_eq!(scanner.last_pad_len, 0, "心跳帧 pad=0 必须被记录");
+        release_frame_vec(f2);
+
+        let (f3, s3) = scanner.read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(s3, 13);
+        assert_eq!(f3, b"defg");
+        assert_eq!(scanner.last_pad_len, 300, "jumbo 填充帧 pad=300 必须被记录");
+        release_frame_vec(f3);
     }
 }

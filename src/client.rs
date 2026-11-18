@@ -168,6 +168,9 @@ pub struct ConnInfo {
     // 本连接客户端观测到的服务端证书 SHA-256 指纹（hex，空=未观测/非 TLS）。
     // 对齐 Go connJSON.CertSHA256。
     pub peer_cert_sha: Mutex<String>,
+    // peer_active_at 最近一次收到服务端 0x07 active-paths 帧且本槽位在其活跃
+    // 位图中的时刻（unix ns；0=从未）。快照按窗口判过期（对齐 Go connInfo.peerActiveAt）。
+    pub peer_active_at: AtomicU64,
 }
 
 impl ConnInfo {
@@ -187,6 +190,7 @@ impl ConnInfo {
             scheduler: Mutex::new(None),
             backend: Mutex::new(None),
             peer_cert_sha: Mutex::new(String::new()),
+            peer_active_at: AtomicU64::new(0),
         }
     }
 
@@ -839,6 +843,73 @@ fn persist_session_state(cl: &Client, session_id: &str, token: &str, epoch: u64)
     }
 }
 
+/// 0x07 active-paths 广播器（客户端上行）：每 500ms 把本端调度器的活跃槽位位图
+/// 以 0x07 控制帧投给轮转后端的 probeCh（writer 的控制帧优先通道，与 RTT 探针同路）。
+/// 位图 bit i = 本端调度器当前选中 connIndex i；服务端 RX 按自己的握手槽位编号判定
+/// "我这条在客户端是否活跃"。probeCh 满则跳过本轮（writer 忙，下轮再试）。
+/// 对齐 Go client.go startPeerActiveBroadcaster。
+fn start_client_peer_active_broadcaster(cl: &Arc<Client>) {
+    let cl = cl.clone();
+    let _ = std::thread::Builder::new()
+        .name("peer-active-bcast".into())
+        .spawn(move || {
+            let mut rotate = 0usize;
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let port = &cl.tx_port;
+                let backends = port.backend_snapshot();
+                // 活跃槽位：bit i = connIndex i 的 Backend 本批 active。
+                // 负槽位（本机 TAP）与 ≥16 越界不参与（对齐 Go buildActivePathsBitmap）。
+                let mut bitmap = 0u16;
+                for b in &backends {
+                    if let Some(idx) = b.conn_index() {
+                        if idx < 16 && b.scheduler.active.load(Ordering::Relaxed) {
+                            bitmap |= 1u16 << idx;
+                        }
+                    }
+                }
+                // 空闲隧道没有数据批，active 不会被本轮刷新——两级回落让对端徽章在
+                // 无流量时保持稳定而不是闪断：先 preferred（调度器的"上次选择"），仍无
+                // 则单后端拓扑直接取唯一路径。多路径空闲且从未 dispatch 时位图为空。
+                if bitmap == 0 {
+                    if let Some(pb) = port.preferred_conn_index() {
+                        if pb < 16 {
+                            bitmap = 1u16 << pb;
+                        }
+                    } else if backends.len() == 1 {
+                        if let Some(idx) = backends[0].conn_index() {
+                            if idx < 16 {
+                                bitmap = 1u16 << idx;
+                            }
+                        }
+                    }
+                }
+                let cands: Vec<Arc<Backend>> = backends
+                    .iter()
+                    .filter(|b| {
+                        b.conn_index().map(|i| i < 16).unwrap_or(false)
+                            && b.probe_ch.lock().is_some()
+                    })
+                    .cloned()
+                    .collect();
+                if cands.is_empty() {
+                    continue;
+                }
+                // 取所有权避免借用跨 `cands` 生命周期；克隆 Sender 并在独立块内
+                // 释放 MutexGuard，避免临时存活到 block 末尾。
+                let b = cands[rotate % cands.len()].clone();
+                rotate = (rotate + 1) % cands.len();
+                let tx = {
+                    let guard = b.probe_ch.lock();
+                    guard.as_ref().cloned()
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(crate::protocol::append_active_paths_frame(bitmap));
+                }
+            }
+        });
+}
+
 pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Result<(), String> {
     info!("Starting TCP TLS client process...");
 
@@ -1237,6 +1308,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
 
     crate::api::start_dashboard_sampler(client.clone(), ctx.clone());
 
+    // 0x07 active-paths 广播器（客户端上行调度器活跃槽位）：与 Go 一致，每 500ms
+    // 周期广播，进程退出时随客户端消亡。
+    start_client_peer_active_broadcaster(&client);
+
     if !args.web.is_empty() {
         match args.web_bind.as_str() {
             "tunnel" => start_web_server_tunnel(
@@ -1556,6 +1631,18 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     // 3. 握手请求（对齐 Go）
     // 会话令牌：上一次握手收到的令牌，重连同一 client_id 时回带
     let session_token = cl.session.lock().session_token.clone();
+    // 握手 PSK 证明绑定本条 TLS 连接的 exporter 密钥材料（协议 v4）：录制的
+    // 历史握手无法在其他连接上重放。exporter 在 TLS 握手完成后可用；导出失败
+    // fail-closed（对齐 Go client.go 2544-2547）。
+    let mut exporter = [0u8; crate::crypto::PSK_PROOF_LEN];
+    if let Err(e) = tls.export_keying_material(
+        &mut exporter,
+        crate::crypto::PSK_PROOF_LABEL,
+        None,
+    ) {
+        *ci.last_error.lock() = format!("export TLS keying material for psk proof: {}", e);
+        return Duration::ZERO;
+    }
     let conn_id = uuid::Uuid::new_v4().to_string();
     *ci.conn_id.lock() = conn_id.clone();
     let req = HandshakeReq {
@@ -1563,7 +1650,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         client_instance: instance_id,
         conn_id: conn_id.clone(),
         client_id: cl.client_id.clone(),
-        psk: hash_psk(&cl.psk),
+        psk: crate::crypto::psk_proof(&cl.psk, &exporter),
         mac: cl.mac.clone(),
         ipv4: cl.req_v4.clone(),
         ipv6: cl.req_v6.clone(),
@@ -1927,7 +2014,12 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             TOKEN_WAKE,
         ))),
         probe_ch: Mutex::new(Some(probe_tx)),
+        conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        peer_active_at: AtomicU64::new(0),
     });
+    // 本端（客户端上行）调度器的活跃槽位广播（0x07）：连接建立即登记本槽位，
+    // 供广播器按 conn_index 构造位图。客户端声明的下标与服务端握手同步。
+    backend.set_conn_index(conn_index);
     cl.tx_port.register_backend(backend.clone());
     *ci.scheduler.lock() = Some(backend.scheduler.clone());
     *ci.backend.lock() = Some(backend.clone());
@@ -2143,7 +2235,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                             if seq != 0 {
                                 if let Some(ic) = &ic_rx {
                                     let wire_len = data.len() as u32;
-                                    match ic.open_in_place(&mut data, seq, wire_len) {
+                                    // AAD 绑定帧头 padLen（v4）：解密必须用与
+                                    // 发送端封印时一致的 padLen（对齐 Go
+                                    // openInPlaceWithScratch 传 scanner.lastPadLen）。
+                                    let pad_len = scanner.last_pad_len;
+                                    match ic.open_in_place(&mut data, seq, wire_len, pad_len) {
                                         Ok(plain) => {
                                             let n = plain.len();
                                             data.truncate(n);
@@ -2170,6 +2266,27 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                                 } else if crate::clock_offset::is_clock_offset_frame(&data) {
                                     if let Some(c) = cl.clock_offset.lock().as_ref() {
                                         c.on_frame(&data, conn_index);
+                                    }
+                                }
+                                release_frame_vec(data);
+                                continue;
+                            }
+
+                            // 0x07 active-paths 前置拦截：本槽位被对端调度器选中则
+                            // 刷新对端活跃时刻。与探针同属旁路信号，不参与 FEC 门控
+                            //（对齐 Go client.go dispatchRxControlFrame）。
+                            if seq == 0 && crate::protocol::is_active_paths_frame(&data) {
+                                if let Some(bitmap) =
+                                    crate::protocol::parse_active_paths_frame(&data)
+                                {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as u64)
+                                        .unwrap_or(0);
+                                    for (idx, ci) in cl.conn_infos.iter().enumerate() {
+                                        if idx < 16 && bitmap & (1u16 << idx) != 0 {
+                                            ci.peer_active_at.store(now, Ordering::Relaxed);
+                                        }
                                     }
                                 }
                                 release_frame_vec(data);

@@ -1,7 +1,10 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const PROTOCOL_VERSION: i64 = 3;
+// v4 绑定内层 AEAD AAD 到帧头 padLen（数据帧）与 FEC parity 描述符（校验帧）。
+// v5 新增 0x07 active-paths 控制帧：两端周期广播调度器选中的 connIndex 位图，
+// 对端面板据此标注对端活跃连接。未知控制 kind 一律断链，混合 v4/v5 无法互连。
+pub const PROTOCOL_VERSION: i64 = 5;
 
 pub const CONTROL_KIND_FEC_PARITY: u8 = 0x01;
 pub const CONTROL_KIND_FEC_MODE: u8 = 0x02;
@@ -11,6 +14,33 @@ pub const CONTROL_KIND_RTT_PROBE: u8 = 0x03;
 pub const CONTROL_KIND_RTT_REPLY: u8 = 0x04;
 pub const CONTROL_KIND_CLOCK_PROBE: u8 = 0x05;
 pub const CONTROL_KIND_CLOCK_REPLY: u8 = 0x06;
+// 0x07 active-paths：本端调度器活跃槽位位图广播（对齐 Go protocol_v3.go）。
+pub const CONTROL_KIND_ACTIVE_PATHS: u8 = 0x07;
+
+// 0x07 帧载荷长度：[1B kind][2B connIndex 位图(BE)]。位图 16 位覆盖
+// maxConnectionsPerIP=16 的全部合法槽位。
+pub const ACTIVE_PATHS_WIRE_LEN: usize = 3;
+
+/// 构建本端调度器活跃槽位位图帧（[0]=0x07, [1:3]=bitmap BE）。
+pub fn append_active_paths_frame(bitmap: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; ACTIVE_PATHS_WIRE_LEN];
+    buf[0] = CONTROL_KIND_ACTIVE_PATHS;
+    buf[1..3].copy_from_slice(&bitmap.to_be_bytes());
+    buf
+}
+
+/// 解析 0x07 帧；长度/类型不符返回 None。
+pub fn parse_active_paths_frame(payload: &[u8]) -> Option<u16> {
+    if payload.len() != ACTIVE_PATHS_WIRE_LEN || payload[0] != CONTROL_KIND_ACTIVE_PATHS {
+        return None;
+    }
+    Some(u16::from_be_bytes([payload[1], payload[2]]))
+}
+
+/// 快速前置识别（读循环在 FEC 门控之前分流认领）。
+pub fn is_active_paths_frame(payload: &[u8]) -> bool {
+    payload.len() == ACTIVE_PATHS_WIRE_LEN && payload[0] == CONTROL_KIND_ACTIVE_PATHS
+}
 
 pub const FEC_MODE_SUSPEND: u8 = 1;
 pub const FEC_MODE_RESUME: u8 = 2;
@@ -76,7 +106,8 @@ pub fn control_kind(payload: &[u8]) -> Result<u8, String> {
         | CONTROL_KIND_RTT_PROBE
         | CONTROL_KIND_RTT_REPLY
         | CONTROL_KIND_CLOCK_PROBE
-        | CONTROL_KIND_CLOCK_REPLY => Ok(kind),
+        | CONTROL_KIND_CLOCK_REPLY
+        | CONTROL_KIND_ACTIVE_PATHS => Ok(kind),
         _ => Err(format!("unsupported protocol-v3 control kind 0x{kind:02x}")),
     }
 }
@@ -339,8 +370,29 @@ mod tests {
     fn v3_control_kind_is_strict() {
         assert_eq!(control_kind(&[CONTROL_KIND_FEC_PARITY]).unwrap(), 0x01);
         assert_eq!(control_kind(&[CONTROL_KIND_FEC_MODE]).unwrap(), 0x02);
+        assert_eq!(control_kind(&[CONTROL_KIND_ACTIVE_PATHS]).unwrap(), 0x07);
         assert!(control_kind(&[0x7f]).is_err());
         assert!(control_kind(&[]).is_err());
+    }
+
+    #[test]
+    fn active_paths_codec_roundtrip_and_reject() {
+        // 往返：bitmap 逐位映射，BE 编码
+        for bitmap in [0u16, 1, 0x00ff, 0x8000, 0xffff] {
+            let wire = append_active_paths_frame(bitmap);
+            assert_eq!(wire.len(), ACTIVE_PATHS_WIRE_LEN);
+            assert_eq!(wire[0], CONTROL_KIND_ACTIVE_PATHS);
+            assert_eq!(parse_active_paths_frame(&wire), Some(bitmap));
+            assert!(is_active_paths_frame(&wire));
+        }
+        // 长度/类型不符拒绝
+        assert!(parse_active_paths_frame(&[CONTROL_KIND_ACTIVE_PATHS, 0]).is_none());
+        assert!(parse_active_paths_frame(&[0x00, 0, 0]).is_none());
+        assert!(parse_active_paths_frame(&[]).is_none());
+        assert!(!is_active_paths_frame(&[CONTROL_KIND_ACTIVE_PATHS, 0, 0, 0]));
+        assert!(!is_active_paths_frame(&[0x00, 0, 0]));
+        // 与 Go 布局逐字节一致
+        assert_eq!(hex::encode(append_active_paths_frame(0x0003)), "070003");
     }
 
     #[test]

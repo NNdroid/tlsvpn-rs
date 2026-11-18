@@ -1454,6 +1454,33 @@ pub struct Backend {
     /// 读循环经 on_frame 投递回调度器。None = 探针未接线（该连接不参与探针）。
     /// Mutex 包裹以允许 Arc<Backend> 后的延迟设置（服务端握手时才有 connIndex）。
     pub probe_ch: Mutex<Option<Sender<Vec<u8>>>>,
+    /// 本后端所属的物理连接槽位编号（握手 BrutalConnIndex，两端同槽位编号）。
+    /// 0x07 active-paths 位图据此构造：bit i = connIndex i 的 Backend 活跃。
+    /// usize::MAX = 未注册（本机 TAP 等无槽位语义路径），注册时写入
+    /// （对齐 Go Backend.connIndex，-1 表示无槽位）。
+    pub conn_index: AtomicUsize,
+    /// peer_active_at 最近一次收到对端 0x07 active-paths 帧且本槽位在其活跃
+    /// 位图中的时刻（unix ns；0=从未）。快照按窗口判过期。挂在 Backend 上，
+    /// 服务端 conn_registry（index→Backend）据此刷新（对齐 Go connInfo.peerActiveAt）。
+    pub peer_active_at: AtomicU64,
+}
+
+impl Backend {
+    /// 读取 connIndex；未注册返回 None。
+    #[inline]
+    pub fn conn_index(&self) -> Option<usize> {
+        let idx = self.conn_index.load(Ordering::Relaxed);
+        if idx == usize::MAX {
+            None
+        } else {
+            Some(idx)
+        }
+    }
+
+    #[inline]
+    pub fn set_conn_index(&self, idx: usize) {
+        self.conn_index.store(idx, Ordering::Relaxed);
+    }
 }
 
 impl AdaptiveBackend for Backend {
@@ -1729,6 +1756,26 @@ impl AsyncPort {
             .retain(|b| !b.ch.same_channel(ch_to_remove));
         // 后端删除会改变 Vec 索引；这是冷路径，直接让下一帧重新评分。
         self.preferred.store(usize::MAX, Ordering::Release);
+    }
+
+    /// 0x07 active-paths 广播器只读快照：当前后端表克隆（持锁期间复制 Arc）。
+    /// 广播是 500ms 周期旁路信号，非热路径，锁成本可忽略。
+    pub fn backend_snapshot(&self) -> Vec<Arc<Backend>> {
+        self.backends.read().clone()
+    }
+
+    /// 0x07 广播器的 preferred 回落：返回当前首选后端的 connIndex（无则 None）。
+    /// preferred 存的是 backends 数组索引（对齐 Go preferred *Backend），
+    /// 索引可能过期（后端被摘除后 CAS 清成 MAX），需回表校验。
+    pub fn preferred_conn_index(&self) -> Option<usize> {
+        let idx = self.preferred.load(Ordering::Acquire);
+        if idx == usize::MAX {
+            return None;
+        }
+        self.backends
+            .read()
+            .get(idx)
+            .and_then(|b| b.conn_index())
     }
 
     fn drop_n(&self, n: u64) {
@@ -2834,6 +2881,8 @@ mod tests {
                 rtt_cache: Arc::new(AtomicU32::new(50000)),
                 notify: None,
                 probe_ch: Mutex::new(None),
+                conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                peer_active_at: std::sync::atomic::AtomicU64::new(0),
             }),
             rx,
         )
@@ -2851,6 +2900,8 @@ mod tests {
                 rtt_cache: Arc::new(AtomicU32::new(rtt_us)),
                 notify: None,
                 probe_ch: Mutex::new(None),
+                conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                peer_active_at: std::sync::atomic::AtomicU64::new(0),
             }),
             rx,
         )
@@ -3070,6 +3121,8 @@ mod tests {
                         mio::Token(10_000 + i),
                     ))),
                     probe_ch: Mutex::new(None),
+                    conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                    peer_active_at: std::sync::atomic::AtomicU64::new(0),
                 }));
                 rxs.push(rx);
             }
@@ -3186,6 +3239,8 @@ mod tests {
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
             probe_ch: Mutex::new(None),
+            conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            peer_active_at: std::sync::atomic::AtomicU64::new(0),
         });
         // backend_score reserves two slots as the high-water mark.
         tx.try_send(VPNFrame {
@@ -3235,6 +3290,8 @@ mod tests {
             rtt_cache: Arc::new(AtomicU32::new(1_000)),
             notify: None,
             probe_ch: Mutex::new(None),
+            conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            peer_active_at: std::sync::atomic::AtomicU64::new(0),
         });
         let (tx1, rx1) = crossbeam_channel::bounded(8);
         let b1 = Arc::new(Backend {
@@ -3246,6 +3303,8 @@ mod tests {
             rtt_cache: Arc::new(AtomicU32::new(2_000)),
             notify: None,
             probe_ch: Mutex::new(None),
+            conn_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            peer_active_at: std::sync::atomic::AtomicU64::new(0),
         });
         port.register_backend(b0);
         port.register_backend(b1);
