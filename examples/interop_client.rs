@@ -10,6 +10,8 @@ use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce as AesNonce, Tag as AesTag};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce as ChaChaNonce, Tag as ChaChaTag, XChaCha20Poly1305, XNonce,
 };
+use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -18,6 +20,8 @@ use std::time::{Duration, Instant};
 const ENC_SALT_SIZE: usize = 8;
 const GCM_TAG_SIZE: usize = 16;
 const CONTROL_KIND_FEC_PARITY: u8 = 0x01;
+const PSK_PROOF_LABEL: &[u8] = b"tlsvpn psk proof v1";
+const PSK_PROOF_LEN: usize = 32;
 
 #[derive(serde::Serialize)]
 struct HandshakeReq {
@@ -70,10 +74,17 @@ fn is_zero(v: &i64) -> bool {
     *v == 0
 }
 
-fn hash_psk(psk: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(psk.as_bytes());
-    hex::encode(h.finalize())
+// 协议 v4 起握手 PSK 证明绑定本条 TLS 连接的 exporter 密钥材料（RFC 5705），
+// 静态 hashPSK 不再作为可重放凭据。与主实现 src/crypto.rs psk_proof 和 Go
+// crypto.go pskProofHex 逐字节一致：HMAC-SHA256(key=sha256(psk), msg=exporter)。
+fn psk_proof(psk: &str, exporter: &[u8]) -> String {
+    let mut key = Sha256::new();
+    key.update(psk.as_bytes());
+    let key = key.finalize();
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("HMAC accepts any key length");
+    mac.update(exporter);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<&ProbeCipher>) {
@@ -95,6 +106,7 @@ fn append_padded_frame(buf: &mut Vec<u8>, seq: u32, data: &[u8], ic: Option<&Pro
                     &mut buf[start + 10..start + 10 + data.len() + enc_tag],
                     data.len(),
                     seq,
+                    pad_len as u16,
                 );
             }
         }
@@ -138,10 +150,14 @@ impl ProbeCipher {
             6 => "_enc_xchacha20",
             _ => return Err(format!("unsupported inner cipher {}", algo)),
         };
-        let mut h = Sha256::new();
-        h.update(psk.as_bytes());
-        h.update(label.as_bytes());
-        let key = h.finalize();
+        // 协议 v2 起密钥派生为带盐 HKDF-SHA256(ikm=psk, salt=encSalt, info=label)，
+        // 对齐主实现 src/crypto.rs derive_key_hkdf 与 Go crypto.go hkdf.Key。
+        // 旧的裸 sha256(psk‖label) 无盐派生已废弃（域分离弱）。AES-128 用
+        // HKDF 输出的前 16 字节（HKDF expand 流式，与派生 16B 的结果一致）。
+        let hk = Hkdf::<Sha256>::new(Some(salt), psk.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(label.as_bytes(), &mut key)
+            .map_err(|_| "bad hkdf expand")?;
         let mut salt8 = [0u8; ENC_SALT_SIZE];
         salt8.copy_from_slice(salt);
         match algo {
@@ -187,16 +203,19 @@ impl ProbeCipher {
         n[20..].copy_from_slice(&seq.to_be_bytes());
         n
     }
-    fn aad(wire_len: u32, seq: u32) -> [u8; 8] {
-        let mut a = [0u8; 8];
+    // v4 起数据帧 AAD 绑定帧头 padLen：wireLen(4) ‖ padLen(2) ‖ seq(4)，
+    // 与主实现（src/crypto.rs gcm_aad）和 Go crypto.go nonceAAD 逐字节一致。
+    fn aad(wire_len: u32, pad_len: u16, seq: u32) -> [u8; 10] {
+        let mut a = [0u8; 10];
         a[0..4].copy_from_slice(&wire_len.to_be_bytes());
-        a[4..8].copy_from_slice(&seq.to_be_bytes());
+        a[4..6].copy_from_slice(&pad_len.to_be_bytes());
+        a[6..10].copy_from_slice(&seq.to_be_bytes());
         a
     }
 
-    fn seal(&self, region: &mut [u8], pt_len: usize, seq: u32) {
+    fn seal(&self, region: &mut [u8], pt_len: usize, seq: u32, pad_len: u16) {
         let wire_len = region.len() as u32;
-        let aad = Self::aad(wire_len, seq);
+        let aad = Self::aad(wire_len, pad_len, seq);
         let (ct, tag_space) = region.split_at_mut(pt_len);
         let tag = match self {
             Self::Aes256 { aead, salt } => aead
@@ -235,12 +254,12 @@ impl ProbeCipher {
         tag_space[..GCM_TAG_SIZE].copy_from_slice(&tag);
     }
 
-    fn open<'a>(&self, data: &'a mut [u8], seq: u32) -> Result<&'a mut [u8], ()> {
+    fn open<'a>(&self, data: &'a mut [u8], seq: u32, pad_len: u16) -> Result<&'a mut [u8], ()> {
         if data.len() < GCM_TAG_SIZE {
             return Err(());
         }
         let wire_len = data.len() as u32;
-        let aad = Self::aad(wire_len, seq);
+        let aad = Self::aad(wire_len, pad_len, seq);
         let (ct, tag) = data.split_at_mut(data.len() - GCM_TAG_SIZE);
         match self {
             Self::Aes256 { aead, salt } => aead
@@ -296,7 +315,7 @@ impl ProbeScanner {
         &mut self,
         reader: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
         deadline: Instant,
-    ) -> std::io::Result<Option<(Vec<u8>, u32)>> {
+    ) -> std::io::Result<Option<(Vec<u8>, u32, u16)>> {
         let mut tmp = [0u8; 16384];
         loop {
             if self.buf.len() >= 10 {
@@ -307,8 +326,10 @@ impl ProbeScanner {
                 let seq = u32::from_be_bytes([self.buf[6], self.buf[7], self.buf[8], self.buf[9]]);
                 if self.buf.len() >= 10 + data_len + pad_len {
                     let data = self.buf[10..10 + data_len].to_vec();
+                    // 帧头 padLen 是数据帧 AEAD AAD 的 padLen 分量（v4），解密必须用它。
+                    let pad = u16::from_be_bytes([self.buf[4], self.buf[5]]);
                     self.buf.drain(..10 + data_len + pad_len);
-                    return Ok(Some((data, seq)));
+                    return Ok(Some((data, seq, pad)));
                 }
             }
             if Instant::now() > deadline {
@@ -535,17 +556,29 @@ fn main() {
     let mut tls = rustls::StreamOwned::new(conn, tcp);
 
     // 3. 握手
+    // 协议 v4 起握手 PSK 证明绑定本条 TLS 连接的 exporter 密钥材料（RFC 5705）。
+    // StreamOwned 不会自动完成握手：先驱动 TLS 握手（complete_io），再导出
+    // exporter（需握手完成），用 psk_proof 替换 v3 的静态 hashPSK。与 Go
+    // probe 的 tls.Dial（同步握手）+ ExportKeyingMaterial 行为一致。
+    tls.conn
+        .complete_io(&mut tls.sock)
+        .unwrap_or_else(|e| fail(&format!("tls handshake: {}", e)));
+    let mut exporter = [0u8; PSK_PROOF_LEN];
+    tls.conn
+        .export_keying_material(&mut exporter, PSK_PROOF_LABEL, None)
+        .unwrap_or_else(|e| fail(&format!("export keying material: {}", e)));
+
     // 服务端把 ClientID 校验为 UUID 形态（8-4-4-4-12），探针派生同样的形状；
     // 由 mac+psk 确定，保证同一身份重连时 ID 恒定
     let ns = uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_URL, b"my_vpn_tunnel");
     let client_id =
         uuid::Uuid::new_v5(&ns, format!("{}{}", mac.to_lowercase(), psk).as_bytes()).to_string();
     let req = HandshakeReq {
-        protocol_version: 3,
+        protocol_version: 5,
         client_instance: "interop-probe-instance-00000001".into(),
         conn_id: uuid::Uuid::new_v4().to_string(),
         client_id: client_id.clone(),
-        psk: hash_psk(&psk),
+        psk: psk_proof(&psk, &exporter),
         mac: mac.clone(),
         ipv4: "10.7.0.77".into(),
         fec,
@@ -574,9 +607,9 @@ fn main() {
     if !resp.success {
         fail(&format!("handshake rejected: {}", resp.message));
     }
-    if resp.protocol_version != Some(3) || resp.session_epoch.unwrap_or(0) == 0 {
+    if resp.protocol_version != Some(5) || resp.session_epoch.unwrap_or(0) == 0 {
         fail(&format!(
-            "server lacks protocol-v3 key epochs: version={:?} epoch={:?}",
+            "server lacks protocol-v5 key epochs: version={:?} epoch={:?}",
             resp.protocol_version, resp.session_epoch
         ));
     }
@@ -667,7 +700,7 @@ fn main() {
                 &mut tls,
                 stay_deadline.min(Instant::now() + Duration::from_millis(500)),
             ) {
-                Ok(Some((mut body, seq))) => {
+                Ok(Some((mut body, seq, pad_len))) => {
                     if seq == 0 {
                         if body.len() >= 7 && body[0] == CONTROL_KIND_FEC_PARITY {
                             // 校验帧：解析描述符并用 s2c 盐以 groupStart 解密
@@ -698,7 +731,7 @@ fn main() {
                                     region.copy_from_slice(
                                         &body[desc_len..desc_len + max_len + tag_len],
                                     );
-                                    if ic.open(&mut region, start).is_ok() {
+                                    if ic.open(&mut region, start, pad_len).is_ok() {
                                         ok = true;
                                     }
                                 }
@@ -715,7 +748,7 @@ fn main() {
                         continue;
                     }
                     if let Some(ic) = &ic_rx {
-                        match ic.open(&mut body, seq) {
+                        match ic.open(&mut body, seq, pad_len) {
                             Ok(plain) => {
                                 let n = plain.len().min(60);
                                 println!(
@@ -772,7 +805,7 @@ fn main() {
             &mut tls,
             deadline.min(Instant::now() + Duration::from_secs(2)),
         ) {
-            Ok(Some((mut body, seq))) => {
+            Ok(Some((mut body, seq, pad_len))) => {
                 if seq == 0 {
                     if body.len() >= 7 && body[0] == CONTROL_KIND_FEC_PARITY {
                         got_parity += 1;
@@ -783,7 +816,7 @@ fn main() {
                     continue;
                 }
                 if let Some(ic) = &ic_rx {
-                    match ic.open(&mut body, seq) {
+                    match ic.open(&mut body, seq, pad_len) {
                         Ok(plain) => {
                             let n = plain.len().min(40);
                             println!(
