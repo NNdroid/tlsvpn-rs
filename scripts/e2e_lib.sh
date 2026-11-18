@@ -62,7 +62,9 @@ E2E_GO_PROBE="${E2E_GO_PROBE:-$E2E_GO_DIR/interop/probe$E2E_EXE}"
 E2E_CERT="$(e2e_drvpath "${E2E_CERT:-$E2E_REPO/e2e_cert.pem}")"
 E2E_KEY="$(e2e_drvpath "${E2E_KEY:-$E2E_REPO/e2e_key.pem}")"
 
-E2E_PSK="${E2E_PSK:-e2e_secret}"
+# Go 服务端要求 PSK >= 16 字节（config.go "psk must be at least 16 bytes"），
+# 默认值必须满足，否则 srv=go 的 e2e 用例在服务端启动阶段就失败。
+E2E_PSK="${E2E_PSK:-e2e_secret_0123456789}"
 
 
 
