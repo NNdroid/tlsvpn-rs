@@ -40,6 +40,7 @@ PROBE_BIN="$E2E_RS_PROBE"; [ "$PROBE" = go ] && PROBE_BIN="$E2E_GO_PROBE"
 
 e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
+CERT_SHA256="$(e2e_cert_sha256 "$CERT")"
 KEY="$E2E_KEY"
 
 e2e_kill_port "$PORT"

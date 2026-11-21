@@ -13,6 +13,8 @@ function applyI18n(){
   applyTheme();
   // 下拉框文案取自 option 文本，换语言后要跟着重画
   syncSelects();
+  // 标签文本宽度随语言变化，指示条宽度要跟着校准
+  moveTabInd();
 }
 function fmtDur(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   if(d>0)return d+t('u.day')+h+t('u.hour');if(h>0)return h+t('u.hour')+m+t('u.min');
@@ -29,10 +31,59 @@ function encBadge(a){if(a===null||a===undefined)return '<span class="badge b-off
   if(a===5)return '<span class="badge b-on">ChaCha20-Poly1305</span>';
   if(a===6)return '<span class="badge b-on">XChaCha20-Poly1305</span>';
   return '<span class="badge b-off">'+t('badge.plain')+'</span>';}
+// FEC parity 分发策略小徽章（auto/near），与 FEC 分组徽章并列显示。空/未知不显示。
+function fecStratBadge(strategy){
+  if(!strategy)return '';
+  const label=t('fecstrat.'+strategy)||strategy;
+  const cls=strategy==='near'?'b-dup':'b-off';
+  return ' <span class="badge '+cls+'" style="font-size:.66em;padding:1px 6px">'+esc(label)+'</span>';
+}
+// FEC 策略 tooltip 描述：策略全名 +（near 时）窗口。
+function fecStratTip(strategy,windowMs){
+  if(!strategy)return '';
+  const desc=t('fecstrat.'+strategy+'_desc')||strategy;
+  if(strategy==='near'&&windowMs>0)return desc+' · '+t('fecstrat.win').replace('{n}',String(windowMs));
+  return desc;
+}
+// 本连接承载的 FEC parity 占比（%）：fec_assigned_bytes / assigned_bytes。
+// 真实可归因到单条连接（该连接实际送出的 parity 占其总负载比例）。
+// 0=尚无分配（连接建立初期或 FEC 未启用）；null=缺数据。保留 1 位小数。
+function fecParityPct(fecAssigned,assigned){
+  if(!assigned||assigned<=0)return null;
+  if(!fecAssigned)return 0;
+  return Math.min(100,fecAssigned/assigned*100);
+}
+// FEC 列 tooltip：分组徽章 + 策略 + parity 占比 + 会话级 recover/lost。
+// fecText 为 "xor K=4" 徽章文本；fecStats 为会话级 {recovered,lost}（或空）。
+function fecCellTip(fecText,strategy,windowMs,parityPct,fecStats,nearState){
+  const parts=[];
+  if(fecText&&fecText!=='off')parts.push(fecText);
+  const s=fecStratTip(strategy,windowMs);
+  if(s)parts.push(s);
+  if(parityPct!==null&&parityPct!==undefined)parts.push(t('fecstrat.parity').replace('{n}',parityPct.toFixed(1)));
+  if(fecStats&&(fecStats.recovered||fecStats.lost))
+    parts.push(t('fecstrat.rec').replace('{r}',String(fecStats.recovered||0)).replace('{l}',String(fecStats.lost||0)));
+  // near 成员资格三态：窗口内拿到 parity / 探针未收敛的 bootstrap 宽限 / 窗口外。
+  // 后端只在 near 策略下发布该值，auto 策略为空串即不显示。
+  if(nearState){
+    const nl=t('sched.near_'+nearState);
+    parts.push(t('sched.near')+' '+(nl!=='sched.near_'+nearState?nl:nearState));
+  }
+  return parts.join(' · ');
+}
 function stBadge(s){if(s==='up')return '<span class="badge b-on">'+t('st.up')+'</span>';
   if(s==='connecting')return '<span class="badge b-dup">'+t('st.connecting')+'</span>';
   return '<span class="badge b-off">'+(s||'-')+'</span>';}
 function shortId(id,n){return id.length>n?id.slice(0,n)+'…':id;}
+// fmtMsUs 把 µs 精度的时延转成可读 ms 文本，自适应小数位：µs 数据被整数 ms
+// （round(us/1000)）压掉小数后，亚毫秒路径（LAN/回环，真实 0.2-0.9ms）会全部
+// 显示成"1 ms"——旧 max(1,·) 地板把伪值从 1µs 换成了 1ms。这里 ≥100ms 取整数、
+// ≥10ms 一位、≥1ms 两位、<1ms 三位小数（保留 µs 分辨率），Number() 去尾零。
+// 调用方负责 0=未收敛哨兵（显示 '-'），本函数只管 >0 的数值。
+function fmtMsUs(us){
+  const ms=us/1000,d=ms>=100?0:ms>=10?1:ms>=1?2:3;
+  return String(Number(ms.toFixed(d)));
+}
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\x22/g,'&quot;').replace(/\x27/g,'&#39;');}
 // hi 在已转义的文本上高亮首个命中（查询词为小写）；无命中原样返回
 function hi(s,q){
@@ -44,18 +95,71 @@ function showPane(id){
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.pane===id));
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
   document.getElementById('pane-'+id).classList.add('on');
-  // 事件在后台一直攒着，面板不在前台时不渲染；切过来补一次全量绘制
+  moveTabInd();
+  // 事件在后台一直攒着，面板不在前台时不渲染；切过来补一次全量绘制。
+  // 诊断/安全/拓扑同理：stats 帧只渲染可见面板，这里补切页后的那次。
   if(id==='events')evRender(false);
-  if(id==='events')evRender(false);
-  if(id==='sec'||id==='topo'){if(lastStats){renderSec(lastStats);renderTopo(lastStats);}}
+  if(id==='diag'||id==='sec'||id==='topo'){if(lastStats){
+    if(id==='diag')renderDiag(lastStats);
+    if(id==='sec'||id==='topo'){renderSec(lastStats);renderTopo(lastStats);}
+  }}
   if(id==='settings')loadConfig();
   // 刚显示的面板之前在 display:none 里量不到宽度，按钮的 min-width 还是 0
   syncSelects();
 }
+// 标签页滑动指示条：跟随当前激活按钮，切换时平滑滑到新位置。
+// 容器滚动（窄屏 12 个标签溢出）时指示条相对内容定位，跟随内容滚动。
+function moveTabInd(){
+  const tabs=document.getElementById('tabs');
+  const ind=document.getElementById('tab-ind');
+  if(!tabs||!ind)return;
+  const btn=tabs.querySelector('button.on');
+  if(!btn){tabs.classList.remove('ind-on');return;}
+  ind.style.left=btn.offsetLeft+'px';
+  ind.style.width=btn.offsetWidth+'px';
+  tabs.classList.add('ind-on');
+}
+// 标签页横向滚动：窄屏溢出时两侧箭头点击滚动，滚动时更新箭头禁用态。
+// 箭头是鼠标/触摸辅助（容器 overflow-x:auto 本身仍支持触控拖动与滚轮），故
+// aria-hidden + tabindex=-1，不挤占 tab 按钮的键盘 Tab 序。指示条相对内容定位，
+// 滚动时随内容移动，无需在滚动事件里重算。
+function tabScrollUpdate(){
+  const tabs=document.getElementById('tabs');
+  const prev=document.getElementById('tab-prev');
+  const next=document.getElementById('tab-next');
+  if(!tabs||!prev||!next)return;
+  const over=tabs.scrollWidth>tabs.clientWidth+1;
+  prev.disabled=!over||tabs.scrollLeft<=1;
+  next.disabled=!over||tabs.scrollLeft>=tabs.scrollWidth-tabs.clientWidth-1;
+}
+function tabScroll(dir){
+  const tabs=document.getElementById('tabs');
+  if(!tabs)return;
+  const step=(tabs.clientWidth||300)*0.8;
+  tabs.scrollBy({left:dir*step,behavior:'smooth'});
+}
+document.getElementById('tab-prev').addEventListener('click',function(){tabScroll(-1);});
+document.getElementById('tab-next').addEventListener('click',function(){tabScroll(1);});
+document.getElementById('tabs').addEventListener('scroll',tabScrollUpdate);
+window.addEventListener('resize',tabScrollUpdate);
+tabScrollUpdate();
 document.getElementById('tabs').addEventListener('click',function(ev){
   const btn=ev.target.closest('button');if(!btn)return;
   showPane(btn.dataset.pane);
 });
+
+// MAC 表与封禁仅在服务端提供：客户端模式隐藏这两个页签，避免露出"仅服务端"
+// 空态。运行时 mode 由进程固定，本函数幂等，随每次 stats 快照应用。
+function applyModeTabs(isServer){
+  document.querySelectorAll('#tabs button[data-srv]').forEach(function(b){
+    b.style.display=isServer?'':'none';
+  });
+  const on=document.querySelector('#tabs button.on');
+  if(on&&on.dataset.srv&&!isServer){showPane('clients');tabScrollUpdate();return;}
+  moveTabInd();
+  // 模式切换会隐藏/显示两个页签，溢出状态随之变化：重算箭头禁用态。
+  tabScrollUpdate();
+}
 
 // ---------- 通用折线图渲染：纵轴刻度 + 末端标签防裁剪 + 悬停提示 ----------
 const chartState={};
@@ -84,30 +188,42 @@ function renderLineChart(canvasId,pts,opts){
   // Reserve the measured label width, the axis gap, and an outer gutter.
   const L=Math.max(56,Math.ceil(Math.max(...ticks.map(s=>ctx.measureText(s).width)))+14);
   const R=16,T=16,B=24,pw=W-L-R,ph=H-T-B;
-  // 网格 + 纵坐标刻度
-  ctx.strokeStyle=cssv('--grid');ctx.lineWidth=1;
+  // 网格 + 纵坐标刻度（虚线让网格更轻，不抢折线的视觉重心）
+  ctx.strokeStyle=cssv('--grid');ctx.lineWidth=1;ctx.setLineDash([3,4]);
   ctx.fillStyle=cssv('--sub');ctx.font='10px sans-serif';ctx.textAlign='right';
   for(let g=0;g<=4;g++){
     const y=T+ph*g/4;
     ctx.beginPath();ctx.moveTo(L,y+.5);ctx.lineTo(W-R,y+.5);ctx.stroke();
     ctx.fillText(ticks[g],L-6,y+3);
   }
+  ctx.setLineDash([]);
   ctx.textAlign='left';
   if(!pts||pts.length<2){
     chartState[canvasId]={pts:[],plot:{l:L,r:W-R,t:T,b:H-B},hover:-1};
     return;
   }
-  // 上下行：面积填充 + 折线
+  // 上下行：平滑曲线（Catmull-Rom→Bezier）+ 数据点 + 柔和面积渐变
+  const pt=(p,get)=>({x:L+p.x*pw,y:T+(1-get(p)/max)*ph});
   const plot=(get,col)=>{
+    const P=pts.map(p=>pt(p,get));
+    // 平滑折线路径
     ctx.beginPath();
-    pts.forEach((p,i)=>{
-      const x=L+p.x*pw,y=T+(1-get(p)/max)*ph;
-      if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);
-    });
+    ctx.moveTo(P[0].x,P[0].y);
+    for(let i=0;i<P.length-1;i++){
+      const p0=P[Math.max(0,i-1)],p1=P[i],p2=P[i+1],p3=P[Math.min(P.length-1,i+2)];
+      const c1x=p1.x+(p2.x-p0.x)/6,c1y=p1.y+(p2.y-p0.y)/6;
+      const c2x=p2.x-(p3.x-p1.x)/6,c2y=p2.y-(p3.y-p1.y)/6;
+      ctx.bezierCurveTo(c1x,c1y,c2x,c2y,p2.x,p2.y);
+    }
     ctx.strokeStyle=col;ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();
+    // 数据点：密度大时稀疏点缀，稀疏时逐点；不抢折线视觉重心
+    const every=Math.max(1,Math.round(P.length/16));
+    ctx.fillStyle=col;
+    P.forEach((q,i)=>{if(i%every===0||i===P.length-1){ctx.beginPath();ctx.arc(q.x,q.y,1.8,0,Math.PI*2);ctx.fill();}});
+    // 面积填充：更通透的双层渐变
     const grad=ctx.createLinearGradient(0,T,0,H-B);
-    grad.addColorStop(0,col+'3d');grad.addColorStop(1,col+'00');
-    ctx.lineTo(L+pts[pts.length-1].x*pw,H-B);ctx.lineTo(L,H-B);ctx.closePath();
+    grad.addColorStop(0,col+'2e');grad.addColorStop(.55,col+'14');grad.addColorStop(1,col+'00');
+    ctx.lineTo(P[P.length-1].x,H-B);ctx.lineTo(P[0].x,H-B);ctx.closePath();
     ctx.fillStyle=grad;ctx.fill();
   };
   plot(p=>p.down,cssv('--down'));
@@ -159,7 +275,9 @@ function renderLineChart(canvasId,pts,opts){
     let bx=px+10;if(bx+bw>W-R)bx=px-10-bw;
     const by=T;
     ctx.globalAlpha=.95;ctx.fillStyle=cssv('--card');
+    ctx.shadowColor='rgba(0,0,0,.35)';ctx.shadowBlur=14;ctx.shadowOffsetY=4;
     roundRectPath(ctx,bx,by,bw,bh,7);ctx.fill();
+    ctx.shadowColor='transparent';ctx.shadowBlur=0;ctx.shadowOffsetY=0;
     ctx.globalAlpha=1;ctx.strokeStyle=cssv('--border2');ctx.lineWidth=1;
     roundRectPath(ctx,bx,by,bw,bh,7);ctx.stroke();
     lines.forEach((s,i)=>{
@@ -448,9 +566,26 @@ function tpl(s,o){
 // 原生 <select> 的弹层是操作系统画的，CSS 染不上去（暗色面板配一个白底黑字菜单）。
 // 做法：select 留在 DOM 里继续当唯一取值来源（.dl-native 只把它缩成 1px 藏起来），
 // 外面套自绘的触发按钮和菜单；选中项只写 select.value 再派发一次原生 change 事件，
-// 所以各处 onchange（setLogLevel / renderTrafficView / setPageSize）和程序化写值
-// （服务端每轮轮询回写 log_level）一行都不用改。
+// 所以各处 onchange（setLogLevel / renderTrafficView / setPageSize）不用改。
 const DL=new WeakMap();
+// 自定义下拉只是原生 select 的「视图」，但视图同步只挂在原生 change 事件上——
+// programmatic 的 select.value= 赋值不派发 change：loadConfig 后 scheduler-settings /
+// mcp-settings 的 fromEditor 回填下拉这类写值，按钮文案会停在构建时的旧值，出现
+// 「原生新值、按钮旧值」分裂（设置页下拉显示默认值而 near/fwd 条件字段可见，即此因；
+// 此前 loglevel 轮询、tr-client 过滤靠各调用点手动补一次 syncSelect 兜住）。这里在
+// 原型上劫持 value setter：任何来源的赋值落原生值后自动同步已注册（DL 命中）的
+// 自定义 UI，未注册的 select 零开销；selectedIndex 直写不走此 setter（本仓库无此
+// 用法）。dlPick 写值后本就派发 change，会再同步一次——幂等，无副作用。
+(function(){
+  if(typeof HTMLSelectElement==='undefined')return;
+  const d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');
+  if(!d||!d.set)return;
+  Object.defineProperty(HTMLSelectElement.prototype,'value',{
+    configurable:true,enumerable:true,
+    get:function(){return d.get.call(this);},
+    set:function(v){d.set.call(this,v);if(DL.has(this))syncSelect(this);}
+  });
+})();
 let dlCur=null;
 let dlSerial=0;
 const DL_ARROW='<svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -742,9 +877,9 @@ const SORTCOLS={
     tx:function(r){return r.c.tx_bytes;},rx:function(r){return r.c.rx_bytes;},txs:function(r){return r.sx;},rxs:function(r){return r.sr;}
   },
   conns:{
-    owner:function(r){return r.owner;},target:function(r){return r.target||'';},remote:function(r){return r.remote||'';},
+    owner:function(r){return r.owner;},target:function(r){return r.target||'';},serverSeen:function(r){return r.serverSeen||'';},remote:function(r){return r.remote||'';},
     rtt:function(r){return r.rtt;},tx:function(r){return r.tx;},rx:function(r){return r.rx;},
-    txs:function(r){return r.sx;},rxs:function(r){return r.sr;},age:function(r){return r.age;}
+    txs:function(r){return r.sx;},rxs:function(r){return r.sr;},age:function(r){return r.age;},retries:function(r){return r.retries||0;}
   },
   traffic:{
     date:function(r){return r.date;},up:function(r){return r.up;},down:function(r){return r.down;},
@@ -856,10 +991,9 @@ function applyStats(data){
     if(chip)chip.classList.toggle('client',data.mode!=='server');
     document.getElementById('ver').innerText=data.version||'-';
     document.getElementById('uptime').innerText=fmtDur(data.uptime_sec||0);
-    // 级别来自服务端：直接写 value 不会触发 change，要顺手刷新自绘下拉框的文案
-    const lvSel=document.getElementById('loglevel');
-    lvSel.value=data.log_level||'info';
-    syncSelect(lvSel);
+    // 级别来自服务端：programmatic 写 value 不派发 change，自绘下拉按钮文案由
+    // 原型级 value setter 劫持自动同步（见自定义下拉框处的注释）。
+    document.getElementById('loglevel').value=data.log_level||'info';
     document.getElementById('tls-flag').innerText=location.protocol==='https:'?'HTTPS':t('tls_http');
 
     // 速率/总量统计覆盖全部客户端；过滤只作用于表格行
@@ -882,6 +1016,7 @@ function applyStats(data){
       globalPrev={tx:tTx,rx:tRx};
     }
     const isServer=data.mode==='server';
+    applyModeTabs(isServer);
     const upSpeed=isServer?tRxS:tTxS,downSpeed=isServer?tTxS:tRxS;
     txHist.push(upSpeed);rxHist.push(downSpeed);txTimes.push(Date.now());
     if(txHist.length>MAXPTS){txHist.shift();rxHist.shift();txTimes.shift();}
@@ -896,7 +1031,7 @@ function applyStats(data){
     document.getElementById('live-up').innerText=fmtBytes(upSpeed,true);
     document.getElementById('live-down').innerText=fmtBytes(downSpeed,true);
     renderClientsTable(data);
-    if(drawerOn())renderDrawer();
+    if(drawerOn()){renderDrawer();renderDrawerSchedLog(data);}
 
     const f=data.fec||{};
     document.getElementById('fec-kpi').innerHTML=(f.recovered||0)+' <small>/</small> '+(f.lost||0);
@@ -926,18 +1061,19 @@ function applyStats(data){
     document.getElementById('pps-up').innerText=Math.round(isServer?ppsRx:ppsTx).toLocaleString();
     document.getElementById('pps-down').innerText=Math.round(isServer?ppsTx:ppsRx).toLocaleString();
     const m=data.mem||{};
-    document.getElementById('mem').innerHTML=(m.heap_alloc_mb||0).toFixed(1)+'<small> MB</small>';
+    document.getElementById('mem').innerHTML=(m.heap_alloc_mb||0).toFixed(1)+'<small> MB</small>'+(m.sys_mb?'<small class="dim"> / sys '+m.sys_mb.toFixed(0)+'</small>':'');
     document.getElementById('goroutines').innerText=m.num_goroutine||0;
 
     if(data.ip_pool){document.getElementById('ippool-card').style.display='';
       document.getElementById('ippool-kpi').innerHTML=data.ip_pool.v4_used+'<small> / '+data.ip_pool.v4_total+'</small>';
       document.getElementById('v6used').innerText=data.ip_pool.v6_used;}
 
-    const meta=[];if(data.enc_algo===2)meta.push('AES-256-GCM');else if(data.enc_algo===4)meta.push('AES-128-GCM');
+    const meta=[];if(data.enc_algo!==undefined&&data.enc_algo!==0)meta.push(encName(data.enc_algo));
     if(data.fec_mode&&data.fec_mode!=='off')meta.push('FEC '+data.fec_mode);
     document.getElementById('meta').innerText=meta.join(' · ');
 
 	renderConnsTable(data,true);renderMacsTable(data);renderBansTable(data);renderTraffic(data);renderStatus(data);
+	renderSchedLog(data);
   }catch(e){console.error('stats render failed',e);}
 }
 
@@ -973,8 +1109,8 @@ function renderClientsTable(data){
       '<td class="num">'+fmtBytes(r.c.tx_bytes)+'</td><td class="num">'+fmtBytes(r.c.rx_bytes)+'</td>'+
       '<td class="num speed">'+fmtBytes(r.sx,true)+'</td><td class="num speed dn">'+fmtBytes(r.sr,true)+'</td>'+
       '<td class="hide-sm">'+badge(r.c.fec)+'</td><td class="hide-sm">'+encBadge(r.c.enc_algo)+'</td>'+
-      '<td>'+(data.mode==='server'?'<button class="btn danger sm" onclick="kickClient(\''+r.id+'\')">'+t('th.kick')+'</button>'+
-        '<button class="btn ghost sm" onclick="banClient(\''+r.id+'\',0)">'+t('th.ban')+'</button>':'-')+'</td></tr>';
+      '<td>'+(data.mode==='server'?'<button class="btn danger sm" data-act="kick" data-id="'+esc(r.id)+'">'+t('th.kick')+'</button>'+
+        '<button class="btn ghost sm" data-act="ban" data-id="'+esc(r.id)+'">'+t('th.ban')+'</button>':'-')+'</td></tr>';
   }).join('')||emptyTableRow('clients',12,all);
   setCount('client-count',f,total,all);
   renderPager('clients',total);
@@ -993,6 +1129,9 @@ function peerSummary(p){
   const a=[];
   if(p.hostname)a.push(p.hostname);
   const impl=[p.implementation,p.version].filter(Boolean).join(' ');if(impl)a.push(impl);
+  // 构建 commit/时间：版本排障时对齐两端二进制（同一 version 不同 commit 是常见坑）
+  if(p.git_commit)a.push(String(p.git_commit).slice(0,7));
+  if(p.build_time)a.push(p.build_time);
   const plat=[p.os,p.os_version,p.arch].filter(Boolean).join(' ');if(plat)a.push(plat);
   if(p.kernel)a.push('kernel '+p.kernel);
   return a.join(' · ');
@@ -1009,7 +1148,10 @@ function certCell(c){
     +(c.not_after?' <span class="mono" style="color:var(--sub)">'+esc(c.not_after)+'</span>':'')
     +(c.self_signed?' <span class="badge b-dup">self-signed</span>':'');
 }
-function encName(a){return a===2?'AES-256-GCM':(a===4?'AES-128-GCM':(a===0?'none (TLS only)':String(a)));}
+// encName/encLabel 与 encBadge 的算法名保持同一映射（encBadge 是唯一权威）：
+// 此前这里缺 5/6 分支，ChaCha20 会话显示成裸数字/"off"（明文），是错误读数。
+function encLabel(a){return a===2?'AES-256-GCM':a===4?'AES-128-GCM':a===5?'ChaCha20-Poly1305':a===6?'XChaCha20-Poly1305':'off';}
+function encName(a){return a===0?'none (TLS only)':(a===null||a===undefined)?String(a):encLabel(a);}
 function rateRange(lo,hi2){if(!lo&&!hi2)return '-';return (lo===hi2?String(lo):lo+'~'+hi2)+' Mbps';}
 function renderStatus(data){
   const sys=data.system||{},neg=data.negotiate||{},b=neg.brutal||{},tls=neg.tls||{},cfg=data.cfg||{},peer=data.peer||{};
@@ -1025,13 +1167,15 @@ function renderStatus(data){
     [t('stt.sys.cfgpath'),mtxt(sys.cfg_path||'-')],
     [t('stt.sys.ver'),mtxt(data.version||'-')+' · '+fmtDur(data.uptime_sec||0)],
   ];
-  // 系统指标尽力而为：Linux 才有负载/内存/文件描述符，缺位不占行
-  if(sys.load)sysRows.push([t('stt.sys.load'),'<span class="mono">'+sys.load.one.toFixed(2)+' / '+sys.load.five.toFixed(2)+' / '+sys.load.fifteen.toFixed(2)+'</span>']);
-  if(sys.mem)sysRows.push([t('stt.sys.mem'),'<span class="mono">'+fmtBytes(sys.mem.used_mb*1048576)+' / '+fmtBytes(sys.mem.total_mb*1048576)+'</span> ('+Math.round(sys.mem.used_mb/sys.mem.total_mb*100)+'%)']);
+  // 系统指标尽力而为：Linux 才有负载/内存/文件描述符，缺位不占行。
+  // 数值逐字段兜底：一帧里单个缺失字段不能把整帧渲染炸掉（catch 只能兜住
+  // 整个 applyStats，会让后续的 conns/status/diag 全部不渲染）。
+  if(sys.load)sysRows.push([t('stt.sys.load'),'<span class="mono">'+Number(sys.load.one||0).toFixed(2)+' / '+Number(sys.load.five||0).toFixed(2)+' / '+Number(sys.load.fifteen||0).toFixed(2)+'</span>']);
+  if(sys.mem)sysRows.push([t('stt.sys.mem'),'<span class="mono">'+fmtBytes((sys.mem.used_mb||0)*1048576)+' / '+fmtBytes((sys.mem.total_mb||0)*1048576)+'</span> ('+(sys.mem.total_mb?Math.round((sys.mem.used_mb||0)/sys.mem.total_mb*100)+'%':'-')+')']);
   if(sys.fd_open)sysRows.push([t('stt.sys.fd'),'<span class="mono">'+sys.fd_open+'</span>']);
-  if(sys.num_gc)sysRows.push([t('stt.sys.gc'),'<span class="mono">'+sys.num_gc+'</span> / <span class="mono">'+sys.gc_pause_ms.toFixed(1)+' ms</span>']);
+  if(sys.num_gc)sysRows.push([t('stt.sys.gc'),'<span class="mono">'+sys.num_gc+'</span> / <span class="mono">'+Number(sys.gc_pause_ms||0).toFixed(1)+' ms</span>']);
   // 证书有效期与进程 CPU 是"到期前就该看到"的指标，放在宿主块而不是靠翻告警
-  if(data.cpu)sysRows.push([t('stt.sys.cpu_use'),'<span class="mono">'+data.cpu.percent.toFixed(1)+'%</span>']);
+  if(data.cpu)sysRows.push([t('stt.sys.cpu_use'),'<span class="mono">'+Number(data.cpu.percent||0).toFixed(1)+'%</span>']);
   if(data.cert)sysRows.push([t('stt.sys.cert'),certCell(data.cert)]);
   kv(document.getElementById('st-sys'),sysRows);
   // 密钥代际与端到端 shaping 速率是"一条会话"的概念，服务端不消费单一会话，
@@ -1098,9 +1242,17 @@ function renderStatus(data){
   renderRouteStatus(data.routes);
   renderTapStatus(data.tap_link);
   renderOverview(data);
-  renderDiag(data);
-  renderSec(data);
-  renderTopo(data);
+  // 诊断/安全/拓扑是三块大 innerHTML（几百节点），每 2 秒全量重建成本高；
+  // 面板不可见时跳过，切页时由 showPane 补一次渲染（与事件面板同策略）。
+  if(paneOn('diag'))renderDiag(data);
+  if(paneOn('sec'))renderSec(data);
+  if(paneOn('topo'))renderTopo(data);
+}
+
+// paneOn 报告某页签当前是否可见；不存在/隐藏都算不可见。
+function paneOn(id){
+  const p=document.getElementById('pane-'+id);
+  return !!p&&p.classList.contains('on');
 }
 
 // ---------- 诊断中心：健康度环 + 分类自检清单 ----------
@@ -1183,6 +1335,17 @@ function dgRun(data){
   }else add('tunnel','rtt','skip',miss);
   const cerr=cr.filter(function(x){return !!x.last_error;}).length;
   add('tunnel','connerr',dgLevel('nonzero',cerr),cerr?t('dg.err_n').replace('{n}',N(cerr)):N(0));
+  // TCP 重传：聚合各路径最近采样窗的差分（Backend.noteRetrans）。时延地板
+  // （min_rtt / 探针 decayed-min）对丢包不敏感——一条"低时延但正在丢段"的
+  // 路径在 rtt/connerr 检查里都看不出来，重传是独立信号。nonzero → warn
+  //（单段重传可能是瞬态，不值得红牌）；路径数与总段数一起给出。
+  const retx=cr.filter(function(x){return (x.scheduler&&x.scheduler.retrans_delta)>0;});
+  if(cr.length){
+    const retxTot=retx.reduce(function(n,x){return n+Number(x.scheduler.retrans_delta||0);},0);
+    add('tunnel','retrans',dgLevel('nonzero',retx.length),
+        retx.length?t('dg.retrans_n').replace('{n}',N(retx.length)).replace('{t}',N(retxTot)):N(0),
+        t('sched.retrans_tip'));
+  }else add('tunnel','retrans','skip',miss);
 
   // ---- 路由 ----
   const prl=np.policy_routing;
@@ -1393,6 +1556,9 @@ function renderPadStatus(p){
   // 多付带宽比：每 1 字节填充，线路上实际传了多少字节
   rows.push([t('ov.pad_ratio'),wire&&pad?mtxt('1 : '+(wire/pad).toFixed(2)):ntxt()]);
   rows.push([t('ov.pad_pct'),'<span class="mono">'+(p.overhead_pct||0).toFixed(1)+'%</span>']);
+  // 填充策略代际：诊断图 pad 曲线的断点正是 epoch 变化触发（web_diagnostics），
+  // 显示当前 epoch 才能对上"为什么这里断线了"。
+  if(p.epoch!==undefined&&p.epoch!==null)rows.push([t('ov.pad_epoch'),'<span class="mono">#'+Number(p.epoch)+'</span>']);
   kv(document.getElementById('st-pad'),rows);
 }
 
@@ -1415,7 +1581,8 @@ function renderProtectStatus(pr){
   if(!psk.length){
     out.push([t('ov.prot.psk'),'<span style="color:var(--sub)">'+t('ov.prot.psk_empty')+'</span>']);
   }else{
-    out.push([t('ov.prot.psk'),'<span class="mono">'+psk.length+' / '+t('ov.prot.window')+'</span>']);
+    // 统计窗口（window_sec）随计数一并显示，否则不知道 count 是多长时间的口径
+    out.push([t('ov.prot.psk'),'<span class="mono">'+psk.length+' / '+t('ov.prot.window')+' '+((psk[0]&&psk[0].window_sec)||0)+'s</span>']);
     psk.slice(0,8).forEach(function(p){
       out.push(['<span class="mono">'+esc(p.remote)+'</span>','<span class="mono">'+(p.count||0)+'</span>']);
     });
@@ -1632,24 +1799,191 @@ function fmtSchedulerEta(us){
   if(us<1000)return Math.round(us)+' us';
   return (us/1000).toFixed(us<10000?2:1)+' ms';
 }
-function schedulerCell(s){
+function fmtMsUsUS(v){return fmtMsUs(v||0)+' ms';}
+// 被资格门排除的路径其排除原因 token（stalled/queue_full/cap_zero/envelope_out）。
+// 无排除（候选内）返回空串。
+function schedExclReason(s){return (s&&s.exclude_reason)||'';}
+// activePathMark 调度器当前选中路径的统一标识徽章：连接表 remote 列与抽屉
+// 连接块共用。stalled 行让位给 b-off 徽章（调度器已停止向其分配数据）。
+function activePathMark(s,stalled){
+  if(!s||!s.active||stalled)return '';
+  return ' <span class="badge b-on" title="'+esc(t('sched.active'))+'">▶ '+esc(t('sched.active'))+'</span>';
+}
+// peerActiveMark 对端调度器当前选中本连接的标识徽章（青色，与本端绿色区分）：
+// 数据源是 0x07 active-paths 位图（对端 500ms 广播、2s 窗口）。连接表 remote
+// 列、选路单元格与抽屉连接块共用。
+function peerActiveMark(s){
+  if(!s||!s.peer_active)return '';
+  const tip=t('sched.peer_active_tip')||t('sched.peer_active');
+  return ' <span class="badge b-peer" title="'+esc(tip)+'">⇄ '+esc(t('sched.peer_active'))+'</span>';
+}
+function schedulerCell(s,stalled){
   if(!s)return '<span class="dim">-</span>';
-  const cls=s.active?'b-on':'b-off';
-  const state=s.active?t('sched.active'):t('sched.standby');
+  // 连接被判定为不健康（stalled）：调度器已停止向其分配数据，独立于 active/standby。
+  if(stalled)return '<div class="sched-cell"><span class="badge b-off" title="'+esc(t('sched.stalled_tip'))+'">'+esc(t('sched.stalled'))+'</span><small class="dim">'+esc(t('sched.stalled_note'))+'</small></div>';
+  const excl=schedExclReason(s);
+  let cls, state;
+  if(excl){
+    cls='b-dup';
+    state=t('sched.excl_'+excl);
+    if(state==='sched.excl_'+excl)state=excl;
+  }else{
+    cls=s.active?'b-on':'b-off';
+    state=s.active?t('sched.active'):t('sched.standby');
+  }
   const rate=Number(s.rate_mbps||0);
-  const meta=t('sched.queue')+' '+fmtBytes(s.queued_bytes||0)+' · '+
+  let meta=t('sched.queue')+' '+fmtBytes(s.queued_bytes||0)+' · '+
     (rate?rate.toFixed(rate<10?1:0)+' Mbps':'-')+' · ETA '+fmtSchedulerEta(s.eta_us||0)+
     (s.carry_pending?' · '+t('sched.carry'):'')+' · '+t('th.tx')+' '+fmtBytes(s.assigned_bytes||0)+' / '+Number(s.assigned_batches||0);
-  return '<div class="sched-cell"><span class="badge '+cls+'">'+esc(state)+'</span><small class="dim">'+esc(meta)+'</small></div>';
+  // 资格包络：把"去程最快却待命"解释成包络外，而不是选路 bug。上限未建立时不显示
+  // 伪值（后端哨兵折半也会误导）。门维度按端口级 sched_envelope 选择展示哪一组：
+  // rtt 门是往返 min_rtt 区间，fwd 门是去程地板（单值，窗口由配置给）。
+  if(Number(s.group_fwd_floor_us)>0){
+    const retPart=(s.rtt_mode&&Number(s.group_ret_window_us)>0)?(' / '+t('sched.env_ret')+' ≤'+fmtMsUsUS(s.group_ret_window_us)):'';
+    meta+=' · '+t('sched.env')+' '+t('sched.env_fwd')+' '+fmtMsUsUS(s.group_fwd_floor_us)+retPart;
+  }else if(Number(s.group_min_rtt_us)>0){
+    const umax=Number(s.group_max_rtt_us);
+    meta+=' · '+t('sched.env')+' '+fmtMsUsUS(s.group_min_rtt_us)+(umax>0?'~'+fmtMsUsUS(umax):'');
+  }
+  if(s.near_state)meta+=' · '+t('sched.near')+' '+(t('sched.near_'+s.near_state)!==('sched.near_'+s.near_state)?t('sched.near_'+s.near_state):s.near_state);
+  return '<div class="sched-cell"><span class="badge '+cls+'">'+esc(state)+'</span>'+peerActiveMark(s)+'<small class="dim">'+esc(meta)+'</small></div>';
+}
+// schedulerTip 调度单元格悬停说明：排除原因/排名键/包络上下限/粘滞/near 资格。
+// 与 schedulerCell 同口径，放在 <td> 的 title 上（表头不占列宽）。
+function schedulerTip(r){
+  const s=r.sched;
+  if(!s)return '';
+  const parts=[];
+  const excl=schedExclReason(s);
+  if(excl){
+    const lab=t('sched.excl_'+excl);
+    // 比较式按门维度分列：rtt 门比 min_rtt 与上限，fwd 门比去程与地板+窗口，
+    // 双向吞吐区间的回程拥塞门比排队深度与窗口。量纲不同不共用一条文案
+    // （fwd 门的下限是相对量、可为负）。
+    const cmpFwd=(s.fwd_rank_known&&Number(s.group_fwd_floor_us)>0)?(t('sched.excl_cmp_fwd').replace('{a}',fmtMsUsUS(s.fwd_rank_us||0)).replace('{b}',fmtMsUsUS(s.group_fwd_floor_us))):'';
+    const cmpRet=(excl==='ret_congested'&&Number(s.ret_congest_us)>0&&Number(s.group_ret_window_us)>0)?(t('sched.excl_cmp_ret').replace('{a}',fmtMsUsUS(s.ret_congest_us)).replace('{b}',fmtMsUsUS(s.group_ret_window_us))):'';
+    const cmp=Number(s.min_rtt_us)>0&&Number(s.group_max_rtt_us)>0?(t('sched.excl_cmp').replace('{a}',fmtMsUsUS(s.min_rtt_us)).replace('{b}',fmtMsUsUS(s.group_max_rtt_us))):'';
+    const cmpAll=[cmpFwd,cmpRet,cmp].filter(Boolean).join(' · ');
+    parts.push((lab!=='sched.excl_'+excl?lab:excl)+(cmpAll?' ('+cmpAll+')':''));
+  }
+  if(s.rank_known)parts.push(t('sched.rank_key')+' '+(Number(s.rank_key_us)>=0?'+':'-')+fmtMsUsUS(Math.abs(Number(s.rank_key_us))));
+  // 容量权重与 TCP 重传：与 schedulerCell（metric-corrections 覆盖版）同口径，
+  // 悬停就能看到权重来源与丢包信号，不用进抽屉。
+  if(Number(s.deliver_rate_mbps)>0)parts.push(t('sched.weight')+' '+Number(s.deliver_rate_mbps).toFixed(Number(s.deliver_rate_mbps)<10?1:0)+' Mbps');
+  if(Number(s.retrans_delta)>0)parts.push(t('sched.retrans')+' ×'+Number(s.retrans_delta));
+  // 探针连续超时（黑洞嫌疑）：与重传并列的健康信号——旧 decayed-min 地板对
+  // 黑洞钝感，选路已按 streak 抬升其排名键（体现在 rank_key_us 抬升）。
+  if(Number(s.probe_timeout_streak)>0)parts.push(t('sched.probe_to')+' ×'+Number(s.probe_timeout_streak));
+  if(Number(s.group_fwd_floor_us)>0){
+    // 双向吞吐区间（rtt_mode）补显回程拥塞窗：去程地板之后的"回程排队上限"。
+    const retPart=(s.rtt_mode&&Number(s.group_ret_window_us)>0)?(' / '+t('sched.env_ret')+' ≤'+fmtMsUsUS(s.group_ret_window_us)):'';
+    parts.push(t('sched.env')+' '+t('sched.env_fwd')+' '+fmtMsUsUS(s.group_fwd_floor_us)+retPart);
+  }else if(Number(s.group_min_rtt_us)>0&&Number(s.group_max_rtt_us)>0)parts.push(t('sched.env')+' '+fmtMsUsUS(s.group_min_rtt_us)+'~'+fmtMsUsUS(s.group_max_rtt_us));
+  if(s.peer_active)parts.push(t('sched.peer_active_tip')||t('sched.peer_active'));
+  if(s.sticky_held)parts.push(t('sched.sticky_held'));
+  if(s.near_state){
+    const nl=t('sched.near_'+s.near_state);
+    parts.push(t('sched.near')+' '+(nl!=='sched.near_'+s.near_state?nl:s.near_state));
+  }
+  return parts.join(' · ');
+}
+// 选路理由流水数据源：客户端模式取顶层 sched_log；服务端模式逐会话，取首个非空。
+// schedLogEntries 返回选路决策流水，并把每条的 path（backends 下标）解析成连接 ID。
+//
+// 不解析就显示成"路径 0/1/2"，用户无从对应到具体哪条连接——面板上连接表有
+// conn_id，这里却没有，等于把可观测性做成了一堵墙。解析依据：
+// - client 模式：顶层 sched_log 是本端 txPort 的流水，conns[i].index 即 backends
+//   下标（connSnapshot 构造时 Index: i），按下标取 conn_id。
+// - server 模式：逐会话 sched_log，conn_id 就在同一会话快照里。
+// 找不到对应连接（连接已断、快照比流水新一拍）时退回下标，不谎报 ID。
+function schedLogEntries(data){
+  const byIdx={};
+  ((data&&data.conns)||[]).forEach(function(c){
+    if(c!==undefined&&c!==null&&c.conn_id!==undefined)byIdx[c.index]=c.conn_id;
+  });
+  const top=(data&&data.sched_log)||[];
+  if(top.length)return top.map(function(e){
+    const cid=e.path>=0?byIdx[e.path]:undefined;
+    return cid?Object.assign({},e,{cid:cid}):e;
+  });
+  const sc=(data&&data.server_conns)||[];
+  for(let i=0;i<sc.length;i++){
+    if(sc[i].sched_log&&sc[i].sched_log.length)return sc[i].sched_log.map(function(e){
+      const cid=sc[i].conn_id||undefined;
+      return cid?Object.assign({},e,{cid:cid}):e;
+    });
+  }
+  return [];
+}
+// 渲染"最近选路决策"折叠块：新近在上，只显示原因/路径/活跃数/相对时间。
+// 后端只记"相对末条发生变化"的决策，故条目天然低频、可读。
+function renderSchedLog(data){
+  const box=document.getElementById('sched-log');
+  if(!box)return;
+  const es=schedLogEntries(data);
+  if(!es.length){box.innerHTML='';return;}
+  // 轮询每 2 秒重建本容器。重建前必须留住展开态：details 的 open 属性不在
+  // innerHTML 里就等于每轮都被折回收起——用户刚点开，2 秒后它就自己缩回去，
+  // 看起来像"自动隐藏"。
+  const prev=box.querySelector('details.sched-log');
+  const wasOpen=prev?prev.open:false;
+  let rows='';
+  for(let i=es.length-1;i>=0;i--){
+    const e=es[i];
+    const key='sched.reason_'+e.reason;
+    const lab=t(key);
+    const ago=t('dg.updated').replace('{t}',fmtDur(Math.max(0,Math.round((Date.now()-Number(e.at_ms||0))/1000))));
+    // {a} 显示连接 ID（已解析），而非 backends 下标——下标对用户无意义。
+    // 解析不到（连接已断）才退回下标。
+    const who=e.cid!==undefined?e.cid:(e.path<0?'-':String(e.path));
+    rows+='<div class="slog-row"><span class="badge b-dup">'+esc(lab!==key?lab:String(e.reason))+'</span><small class="dim">'+
+      esc(t('sched.log_line').replace('{a}',String(who)).replace('{b}',String(Number(e.active||0))).replace('{c}',ago))+'</small></div>';
+  }
+  const last=es[es.length-1];
+  const llab=t('sched.reason_'+last.reason);
+  box.innerHTML='<details class="sched-log"'+(wasOpen?' open':'')+'><summary>'+esc(t('sched.log_title')+' · '+
+    t('sched.latest')+' '+(llab!=='sched.reason_'+last.reason?llab:String(last.reason)))+'</summary>'+rows+'</details>';
+}
+// renderDrawerSchedLog 把某条连接的选路决策流水填进客户端抽屉里该连接的卡片。
+//
+// 端口级流水在连接表里是"整个端口"的决策，用户看不出"路径 1"是不是自己点开
+// 的这条连接。这里按 conn_id 过滤：只留该连接的决策，标题也带上 conn_id。
+// 单路径端口下所有决策都属于同一条连接，故抽屉里能看到完整历史。
+function renderDrawerSchedLog(data){
+  const slots=document.querySelectorAll('[data-dc-sched]');
+  if(!slots.length)return;
+  const es=schedLogEntries(data);
+  Array.prototype.forEach.call(slots,function(slot){
+    const idx=parseInt(slot.getAttribute('data-dc-sched-idx'),10)||0;
+    const cid=slot.getAttribute('data-dc-sched');
+    const mine=es.filter(function(e){
+      if(e.cid!==undefined)return e.cid===cid;
+      return e.path===idx;
+    });
+    if(!mine.length){slot.innerHTML='';return;}
+    let rows='';
+    for(let i=mine.length-1;i>=0;i--){
+      const e=mine[i];
+      const key='sched.reason_'+e.reason;
+      const lab=t(key);
+      const ago=t('dg.updated').replace('{t}',fmtDur(Math.max(0,Math.round((Date.now()-Number(e.at_ms||0))/1000))));
+      rows+='<div class="slog-row"><span class="badge b-dup">'+esc(lab!==key?lab:String(e.reason))+'</span><small class="dim">'+
+        esc(t('sched.log_line').replace('{a}',String(e.cid!==undefined?e.cid:idx)).replace('{b}',String(Number(e.active||0))).replace('{c}',ago))+'</small></div>';
+    }
+    const last=mine[mine.length-1];
+    const llab=t('sched.reason_'+last.reason);
+    slot.innerHTML='<details class="sched-log" open><summary>'+esc(t('sched.log_title')+' · '+
+      t('sched.latest')+' '+(llab!=='sched.reason_'+last.reason?llab:String(last.reason)))+'</summary>'+rows+'</details>';
+  });
 }
 
 function renderConnsTable(data,fresh){
   const tb=document.getElementById('conns-body');
   let rows=[];
   if(data.mode==='server'){
-    (data.server_conns||[]).forEach(c=>rows.push({key:(c.conn_id||c.client_id+'|'+c.remote),owner:shortId(c.client_id,10),fullId:c.client_id,connid:c.conn_id||'',target:'',remote:c.remote,state:'up',rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,age:c.age_sec,epoch:c.session_epoch||0,err:'',enc:c.enc_algo,fec:c.fec||'',sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_cli_tx_mbps||0,down:c.brutal_srv_tx_mbps||0}));
+    (data.server_conns||[]).forEach(c=>rows.push({key:(c.conn_id||c.client_id+'|'+c.remote),owner:shortId(c.client_id,10),fullId:c.client_id,connid:c.conn_id||'',target:'',remote:c.remote,serverSeen:'',state:'up',rtt:c.rtt_ms,sched:c.scheduler||{},stalled:!!c.stalled,tx:c.tx_bytes,rx:c.rx_bytes,age:c.age_sec,epoch:c.session_epoch||0,err:'',enc:c.enc_algo,fec:c.fec||'',fecStrategy:c.fec_strategy||'',fecNearWindowMs:c.fec_near_window_ms||0,sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',cert:c.cert_sha256||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_cli_tx_mbps||0,down:c.brutal_srv_tx_mbps||0,fwd:((c.scheduler&&c.scheduler.fwd_oneway_us)||0),ret:((c.scheduler&&c.scheduler.ret_oneway_us)||0),minrtt:((c.scheduler&&c.scheduler.min_rtt_us)||0),probeat:((c.scheduler&&c.scheduler.probe_at_ms)||0),fecAsg:((c.scheduler&&c.scheduler.fec_assigned_bytes)||0),asg:((c.scheduler&&c.scheduler.assigned_bytes)||0)}));
   }else{
-    (data.conns||[]).forEach((c,i)=>rows.push({key:(c.conn_id||i+'|'+(c.target||'')+'|'+(c.remote||'')),owner:'local',fullId:null,connid:c.conn_id||'',target:c.target,remote:c.remote,state:c.state,rtt:c.rtt_ms,sched:c.scheduler||{},tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:c.session_epoch!==undefined?c.session_epoch:(data.session_epoch||0),err:c.last_error||'',enc:c.negotiated===false?null:(c.enc_algo!==undefined?c.enc_algo:data.enc_algo),fec:c.fec!==undefined?c.fec:(data.fec_mode||''),sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0}));
+    (data.conns||[]).forEach((c,i)=>rows.push({key:(c.conn_id||i+'|'+(c.target||'')+'|'+(c.remote||'')),owner:'local',fullId:null,connid:c.conn_id||'',target:c.target,remote:c.remote,serverSeen:c.server_seen_addr||'',state:c.state,rtt:c.rtt_ms,sched:c.scheduler||{},stalled:!!c.stalled,tx:c.tx_bytes,rx:c.rx_bytes,retries:c.retries,age:c.age_sec,epoch:c.session_epoch!==undefined?c.session_epoch:(data.session_epoch||0),err:c.last_error||'',enc:c.negotiated===false?null:(c.enc_algo!==undefined?c.enc_algo:data.enc_algo),fec:c.fec!==undefined?c.fec:(data.fec_mode||''),fecStrategy:c.fec_strategy||data.fec_strategy||'',fecNearWindowMs:(c.fec_near_window_ms!==undefined?c.fec_near_window_ms:(data.fec_near_window_ms||0)),sni:c.sni||'',tlsVer:c.tls_version||'',tlsCipher:c.tls_cipher||'',tlsAlpn:c.tls_alpn||'',cert:c.cert_sha256||'',brut:c.brutal_applied,brutErr:c.brutal_error||'',up:c.brutal_tx_mbps||0,down:c.brutal_rx_mbps||0,fwd:((c.scheduler&&c.scheduler.fwd_oneway_us)||0),ret:((c.scheduler&&c.scheduler.ret_oneway_us)||0),minrtt:((c.scheduler&&c.scheduler.min_rtt_us)||0),probeat:((c.scheduler&&c.scheduler.probe_at_ms)||0),fecAsg:((c.scheduler&&c.scheduler.fec_assigned_bytes)||0),asg:((c.scheduler&&c.scheduler.assigned_bytes)||0)}));
   }
   // 速率差分：fresh=true 仅在拿到新快照时（fetchStats），过滤重渲染沿用缓存
   const now=data.sample_time_ms===undefined?Date.now():Number(data.sample_time_ms);
@@ -1672,6 +2006,22 @@ function renderConnsTable(data,fresh){
     lastConnSpeeds={};
     rows.forEach(function(r){lastConnSpeeds[r.key]={sx:r.sx,sr:r.sr};});
   }
+  // 去/回显示重定基（纯前端，零后端/JSON 改动）：各连接的显示值共享同一次
+  // 重算的 δ 公共位移，列内相减即精确消掉——显示的是"比本组最快方向慢多少"
+  // 的纯差值（F_i−F_min / B_i−B_min，锚点半程偏移 θ 也一并消掉）。此前把
+  // 最快方向钉在 0.001ms（δ 抬到 1µs 的显示契约），读起来像物理不可能的
+  // 伪值。绝对单程本身受信息论极限限制（2N 方程对 2N+1 未知数），任何
+  // "绝对 ms"读数都必然携带未知偏移——绝对量级请看旁边的内核 min_rtt。
+  // 未收敛（0）不参与取最小；重定基只作用于本帧已收敛连接（同轮共享 δ）。
+  let minFwd=Infinity,minRet=Infinity;
+  rows.forEach(function(r){
+    if(r.fwd>0&&r.fwd<minFwd)minFwd=r.fwd;
+    if(r.ret>0&&r.ret<minRet)minRet=r.ret;
+  });
+  rows.forEach(function(r){
+    r.fwdRel=r.fwd>0?r.fwd-minFwd:0;
+    r.retRel=r.ret>0?r.ret-minRet:0;
+  });
   const f=Q.conns;
   const all=rows.length;
   // 质量指标基于过滤前的全量行：过滤条件不该改变统计口径。
@@ -1695,29 +2045,87 @@ function renderConnsTable(data,fresh){
     const st=r.state==='up'?'<span class="badge b-on">'+t('st.up')+'</span>':
       r.state==='connecting'?'<span class="badge b-dup">'+t('st.connecting')+'</span>':
       '<span class="badge b-off">'+esc(r.state||'-')+'</span>';
-    const rtt=r.rtt>=100000?'-':r.rtt+' ms';
+    // 跨路径 RTT 探针收敛后显示去/回单向时延（fwd/ret，µs→ms），一眼看出方向
+    // 不对称：较大的一侧加 .rtt-asym 轻着色。两侧都未收敛（0）退回显示 roundtrip RTT。
+    // rtt=0 是"尚未采样"（后端无 omitempty，新建连接为 0），与 fwd/ret 同口径
+    // 显示 '-'；>=100000 是未知哨兵。
+    let rtt=r.rtt>0&&r.rtt<100000?r.rtt+' ms':'-',rttTip='',rttCls='';
+    if(r.fwd>0||r.ret>0){
+      // 重定基后的纯差值（µs）：最快方向显示 0（本组基准），其余带 + 号标明
+      // "比最快慢多少"。未收敛显示 '-'。绝对单程无法显示（信息论极限），绝对
+      // 量级请看旁边的内核 min_rtt。0 不是零时延——它是"本组最快方向"。
+      const fw=r.fwd>0?(r.fwdRel===0?'0':'+'+fmtMsUs(r.fwdRel)):'-';
+      const rt=r.ret>0?(r.retRel===0?'0':'+'+fmtMsUs(r.retRel)):'-';
+      rtt=fw+'/'+rt;
+      // tooltip 里 '-' 写成可读词"不可测"，避免用户把 '-' 当零时延或缺失数据。
+      // 基准方向写成可读词"最快（基准）"。可测值自带 ms 后缀。
+      const fwTxt=fw==='-'?t('th.meas_na'):(fw==='0'?t('th.rtt_base'):fw+'ms');
+      const rtTxt=rt==='-'?t('th.meas_na'):(rt==='0'?t('th.rtt_base'):rt+'ms');
+      rttTip=t('th.rtt_tip').replace('{f}',fwTxt).replace('{r}',rtTxt).replace('{rt}',r.rtt);
+      // 不对称判断用原始 µs 值（比值与缩放无关），避免四舍五入在 2x 边界翻转。
+      if(r.fwd>0&&r.ret>0&&(r.fwd*2>r.ret||r.ret*2>r.fwd))rttCls=' rtt-asym';
+    }
+    // 内核 min_rtt 地板（µs→ms）一并显示在"去/回"旁，收敛与否都给出参考值。
+    if(r.minrtt>0){
+      const mn=fmtMsUs(r.minrtt);
+      rtt+=' <span class="dim">· '+t('ov.mn')+' '+mn+'</span>';
+      rttTip+=(rttTip?' · ':'')+t('ov.mn')+' '+mn+' ms';
+    }
+    // 有效内核 RTT 地板（decayed-min over SRTT，见 noteRTTSample）：资格包络与
+    // min_rtt_* 排名的实际输入。与 min 并置，两值背离（≥1ms）= 该连接存在
+    // min-ever 地板无法反映的持续劣化——这正是"面板 min 很快、调度却把它当慢
+    // 路径"的解释。未建立（字段缺省）不显示；与 min 一致（常态）也不显示，
+    // 常驻只添噪音。
+    const eff=Number(r.sched&&r.sched.eff_rtt_us)||0;
+    if(eff>0&&(r.minrtt===0||eff-r.minrtt>=1000)){
+      const ev=fmtMsUs(eff);
+      rtt+=' <span class="dim">· '+t('ov.eff')+' '+ev+'</span>';
+      rttTip+=(rttTip?' · ':'')+t('ov.eff')+' '+ev+' ms';
+    }
+    // 调度器实际用于排名的键（去程稳定地板，µs 有符号）：与上面带 δ 抬升的显示
+    // 读数是两条互不污染的数，并置才能看出"调度依据"与"面板读数"的差别。
+    if(r.sched&&r.sched.rank_known){
+      const rk=Number(r.sched.rank_key_us);
+      const rkv=(rk<0?'-':'')+fmtMsUs(Math.abs(rk));
+      rtt+=' <span class="dim">· '+t('sched.rank')+' '+rkv+'</span>';
+      rttTip+=(rttTip?' · ':'')+t('sched.rank')+' '+rkv+' ms';
+    }
+    // 上次探针重算时刻（unix ms）：fwd/ret 同一次重算一并发布，面板把它作为
+    // 新鲜度提示显示在"去/回"旁，一眼看出这个时延是多早之前算的；0=尚未收敛
+    // （首次发布前不显示），避免把"从未算过"误读成"刚算过"。
+    if(r.probeat>0){
+      const ago=Math.max(0,Math.round((Date.now()-r.probeat)/1000));
+      const at=t('dg.updated').replace('{t}',fmtDur(ago));
+      rtt+=' <span class="dim">· '+at+'</span>';
+      rttTip+=(rttTip?' · ':'')+at;
+    }
     // Brutal 列同时是"为什么没生效"的入口：速率生效显示双向速率，
     // 配置了但内核/平台不支持显示"未生效"，悬停看具体原因。
     let brutTxt='-',brutCls='b-off',brutTip='brutal off';
     if(r.brutErr){brutTxt=t('st.skip');brutCls='b-dup';brutTip='brutal skipped: '+r.brutErr;}
     else if(r.brut===true){brutTxt=r.up+'↑/'+r.down+'↓';brutCls='b-on';brutTip='brutal shaping '+r.up+' Mbps upstream / '+r.down+' Mbps downstream';}
     const brut='<span class="badge '+brutCls+'">'+brutTxt+'</span>';
-    const ops=(data.mode==='server'&&r.fullId)?'<button class="btn danger sm" onclick="kickClient(\''+r.fullId+'\')">'+t('th.kick')+'</button>':'';
+    const ops=(data.mode==='server'&&r.fullId)?'<button class="btn danger sm" data-act="kick" data-id="'+esc(r.fullId)+'">'+t('th.kick')+'</button>':'';
     const sniMeta=[r.tlsVer,r.tlsCipher,r.tlsAlpn].filter(Boolean).join(' · ');
     // 没错误时不能留空格：esc(undefined) 转成空串，同行其它占位列都是 '-'，
     // 唯独这里是个看得见的洞。
     const cerr=r.err||r.brutErr;
     const errCell=cerr?'<span style="color:var(--err)" title="'+esc(cerr)+'">'+esc(String(cerr).slice(0,40))+'</span>':'<span style="color:var(--sub)">-</span>';
-    return '<tr data-conn-id="'+esc(r.connid||'')+'"><td class="num dim">'+hi(esc(r.owner),f)+'</td><td class="hide-sm num dim" title="'+esc(r.connid||'')+'">'+(r.connid?hi(esc(shortId(r.connid,12)),f):'-')+'</td><td class="num hide-srv">'+hi(esc(r.target||'-'),f)+'</td><td class="num">'+hi(esc(r.remote||'-'),f)+'</td><td title="'+esc(brutTip)+'">'+st+'</td>'+
-      '<td class="num">'+rtt+'</td><td class="hide-sm">'+schedulerCell(r.sched)+'</td><td class="num">'+fmtBytes(r.tx)+'</td><td class="num">'+fmtBytes(r.rx)+'</td>'+
-      '<td class="hide-sm num speed">'+fmtBytes(r.sx,true)+'</td><td class="hide-sm num speed dn">'+fmtBytes(r.sr,true)+'</td>'+
-      '<td class="hide-sm dim" title="'+esc(sniMeta)+'">'+(r.sni?hi(esc(r.sni),f):'<span style="color:var(--sub)">-</span>')+'</td>'+
-      '<td class="hide-sm num dim">'+(r.age?fmtDur(r.age):'-')+'</td>'+
+    const rowActive=r.sched&&r.sched.active&&!r.stalled;
+    return '<tr'+(rowActive?' class="row-active"':'')+' data-conn-id="'+esc(r.connid||'')+'"><td class="num dim">'+hi(esc(r.owner),f)+'</td><td class="num dim" title="'+esc(r.connid||'')+'">'+(r.connid?hi(esc(shortId(r.connid,12)),f):'-')+'</td><td class="num hide-srv">'+hi(esc(r.target||'-'),f)+'</td><td class="num hide-srv" title="'+esc(t('th.serverSeen')+' = '+(r.serverSeen||'-'))+'">'+hi(esc(r.serverSeen||'-'),f)+'</td><td class="num">'+hi(esc(r.remote||'-'),f)+activePathMark(r.sched,r.stalled)+peerActiveMark(r.sched)+'</td><td title="'+esc(brutTip)+'">'+st+'</td>'+
+      '<td class="num'+rttCls+'" title="'+esc(rttTip)+'">'+rtt+'</td><td title="'+esc(schedulerTip(r))+'">'+schedulerCell(r.sched,r.stalled)+'</td><td class="num">'+fmtBytes(r.tx)+'</td><td class="num">'+fmtBytes(r.rx)+'</td>'+
+      '<td class="num speed">'+fmtBytes(r.sx,true)+'</td><td class="num speed dn">'+fmtBytes(r.sr,true)+'</td>'+
+	      '<td class="hide-sm dim" title="'+esc(sniMeta)+'">'+(r.sni?hi(esc(r.sni),f):'<span style="color:var(--sub)">-</span>')+'</td>'+
+	      '<td class="hide-sm dim" title="'+esc(r.cert||'')+'">'+(r.cert?hi(esc(shortId(r.cert,16)),f):'<span style="color:var(--sub)">-</span>')+'</td>'+
+	      '<td class="num dim">'+(r.age!==undefined?fmtDur(r.age||0):'-')+'</td>'+
       '<td class="hide-sm num dim" title="'+esc(r.epoch?'session key epoch '+r.epoch:'no epoch yet')+'">'+(r.epoch?r.epoch:'-')+'</td>'+
-      '<td class="hide-sm">'+encBadge(r.enc)+'</td><td class="hide-sm">'+badge(r.fec)+'</td>'+
+	      '<td class="hide-sm">'+encBadge(r.enc)+'</td><td class="hide-sm" title="'+esc(fecCellTip(r.fec,r.fecStrategy,r.fecNearWindowMs,fecParityPct(r.fecAsg,r.asg),data&&data.fec,(r.sched&&r.sched.near_state)||''))+'">'+badge(r.fec)+fecStratBadge(r.fecStrategy)+'</td>'+
       '<td class="hide-sm" title="'+esc(brutTip)+'">'+brut+'</td>'+
-      '<td class="hide-sm">'+errCell+'</td><td>'+ops+'</td></tr>';
-  }).join('')||emptyTableRow('conns',19,all);
+      '<td class="hide-sm">'+errCell+'</td><td>'+ops+'</td>'+
+      // 重连次数（后端 conns[].retries）：>0 才显示，0 涂淡——它是"这条路径
+      // 抖过几次"的直接信号，配合错误列定位不稳定链路。服务端视图无此字段。
+      '<td class="num hide-sm dim">'+(r.retries>0?fmtNum(r.retries):'<span style="color:var(--sub)">0</span>')+'</td></tr>';
+  }).join('')||emptyTableRow('conns',22,all);
   setCount('conn-count',f,total,all);
   renderPager('conns',total);
 }
@@ -1864,9 +2272,18 @@ function renderDrawer(){
       const pkts=(x.tx_packets!==undefined||x.rx_packets!==undefined)
         ?'<span class="dc-conn-k">'+esc(t('dc.pkt_up'))+' '+fmtNum(x.tx_packets||0)+' · '+esc(t('dc.pkt_dn'))+' '+fmtNum(x.rx_packets||0)+'</span>'
         :'';
+      // 逐连接调度观测：容量权重（饱和门控测量）、TCP 重传与探针超时连击，
+      // 与连接表调度单元格同口径。缺位不占位：未测得容量/无重传/无超时不渲染。
+      const sk=x.scheduler||{};
+      const dW=Number(sk.deliver_rate_mbps)||0;
+      const rtx=Number(sk.retrans_delta)||0;
+      const pto=Number(sk.probe_timeout_streak)||0;
+      const schedMeta=(dW>0?'<span class="dc-conn-k">'+esc(t('sched.weight'))+' '+dW.toFixed(dW<10?1:0)+' Mbps</span>':'')+
+        (rtx>0?'<span class="dc-conn-k" style="color:var(--err)">'+esc(t('sched.retrans'))+' ×'+rtx+'</span>':'')+
+        (pto>0?'<span class="dc-conn-k" style="color:var(--err)">'+esc(t('sched.probe_to'))+' ×'+pto+'</span>':'');
       return '<div class="dc-conn">'+
         '<div class="dc-conn-top">'+
-          '<span class="mono" title="'+esc(x.remote||'')+'">'+esc(x.remote||'-')+'</span>'+
+          '<span class="mono" title="'+esc(x.remote||'')+'">'+esc(x.remote||'-')+'</span>'+activePathMark(x.scheduler,!!x.stalled)+peerActiveMark(x.scheduler)+
           '<span class="dc-conn-rtt">'+(rtt>0&&rtt<100000?(rtt+' ms'):'-')+'</span>'+
           '<span class="dc-conn-rate"><span class="arr-up">↑</span> '+fmtBytes((srvDirection?x.rx_bytes:x.tx_bytes)||0)+
             '<span class="arr-down">↓</span> '+fmtBytes((srvDirection?x.tx_bytes:x.rx_bytes)||0)+'</span>'+
@@ -1874,10 +2291,14 @@ function renderDrawer(){
         '<div class="dc-conn-meta">'+
           '<span class="dc-conn-k">'+esc(t('th.age'))+' '+(x.age_sec?fmtDur(x.age_sec):'-')+'</span>'+
           '<span class="dc-conn-k">'+esc(t('th.epoch'))+' '+(x.session_epoch!==undefined?x.session_epoch:(data.session_epoch||0))+'</span>'+
-          encBadge(xEnc)+badge(x.fec||fec)+brut+pkts+
+          encBadge(xEnc)+
+          '<span title="'+esc(fecCellTip(x.fec||fec,x.fec_strategy||c.fec_strategy,x.fec_near_window_ms||c.fec_near_window_ms,fecParityPct((x.scheduler&&x.scheduler.fec_assigned_bytes)||0,(x.scheduler&&x.scheduler.assigned_bytes)||0),data.fec))+'">'+badge(x.fec||fec)+fecStratBadge(x.fec_strategy||c.fec_strategy)+'</span>'+
+          brut+pkts+schedMeta+
         '</div>'+
         (x.sni?'<div class="dc-conn-sni">'+esc(t('dc.sec_sni'))+': '+esc(x.sni)+'</div>':'')+
+        (x.cert_sha256?'<div class="dc-conn-sni" title="'+esc(t('dc.sec_cert'))+'">'+esc(t('dc.sec_cert'))+': <span class="mono">'+esc(x.cert_sha256)+'</span></div>':'')+
         (x.last_error?'<div class="dc-conn-err">'+esc(x.last_error)+'</div>':'')+
+        '<div class="dc-conn-sched" data-dc-sched="'+(x.conn_id!==undefined?esc(x.conn_id):'')+'" data-dc-sched-idx="'+String(x.index||0)+'"></div>'+
       '</div>';
     }).join('');
   } else {
@@ -1890,7 +2311,15 @@ function renderDrawer(){
   sr.push([t('dc.sec_enc'),encBadge(neg.enc_algo!==undefined?neg.enc_algo:data.enc_algo)]);
   sr.push([t('dc.sec_sess'),neg.session_encrypt===undefined?mtxt('-'):yn(!!neg.session_encrypt)]);
   sr.push([t('dc.sec_epoch'),mtxt(String(neg.session_epoch||data.session_epoch||0))]);
-  sr.push([t('dc.sec_fec'),badge(neg.fec||fec)]);
+  // FEC 安全行：协商徽章 + 分发策略徽章 + 会话级 recover/lost（FEC 解码是会话
+  // 级的，恢复跨连接合成，故 recover/lost 按会话统计而非单条连接）。策略取
+  // 首条连接的运行时值（neg.fec_strategy），比配置快照更准确。
+  const sFecStats=data.fec;
+  const sFecStrat=neg.fec_strategy||c.fec_strategy||data.fec_strategy||'';
+  let sFecVal=badge(neg.fec||fec)+fecStratBadge(sFecStrat);
+  if(sFecStats&&(sFecStats.recovered||sFecStats.lost))
+    sFecVal+=' <span class="dim" title="'+esc(t('fecstrat.rec').replace('{r}',String(sFecStats.recovered||0)).replace('{l}',String(sFecStats.lost||0)))+'">'+t('fecstrat.rec').replace('{r}',String(sFecStats.recovered||0)).replace('{l}',String(sFecStats.lost||0))+'</span>';
+  sr.push([t('dc.sec_fec'),sFecVal]);
   if(neg.tls_version||neg.tls_cipher||neg.tls_alpn||neg.sni){
     sr.push([t('dc.sec_tls'),mtxt(neg.tls_version||'-')]);
     sr.push([t('dc.sec_cipher'),mtxt(neg.tls_cipher||'-')]);
@@ -1909,13 +2338,30 @@ function renderDrawer(){
     '<div class="dc-sec">'+dcSec(t('dc.connections'),t('dc.conns_n').replace('{n}',String(conns.length)))+connHtml+'</div>'+
     '<div class="dc-sec">'+dcSec(t('dc.security'),t('dc.sec_hint'))+dcKV(sr)+'</div>';
 }
-// 交互：客户端表整行可点开；抽屉内动作按钮用 data-act 委托——
+// 交互：客户端表整行可点开；动作按钮统一 data-act 委托——
 // ClientID 里可能出现引号，拼进 onclick 属性有注入风险，集中委托更稳
 document.getElementById('clients-body').addEventListener('click',function(ev){
+  const b=ev.target.closest('button[data-act]');
+  if(b){
+    const id=b.getAttribute('data-id');
+    const act=b.getAttribute('data-act');
+    if(act==='kick')kickClient(id);
+    else if(act==='ban')banClient(id,0);
+    return;
+  }
   if(ev.target.closest('button'))return;
   const tr=ev.target.closest('tr[data-open]');
   if(!tr)return;
   openClient(tr.getAttribute('data-open'));
+});
+// 连接表操作列（服务端模式的踢出）与封禁表的解封按钮：同一委托纪律
+document.getElementById('conns-body').addEventListener('click',function(ev){
+  const b=ev.target.closest('button[data-act]');
+  if(b&&b.getAttribute('data-act')==='kick')kickClient(b.getAttribute('data-id'));
+});
+document.getElementById('bans-body').addEventListener('click',function(ev){
+  const b=ev.target.closest('button[data-act]');
+  if(b&&b.getAttribute('data-act')==='unban')unban(b.getAttribute('data-id'));
 });
 // 拓扑图里服务端模式的客户端节点同样可点开抽屉（共用 data-open 约定）
 document.getElementById('tpo').addEventListener('click',function(ev){
@@ -1957,8 +2403,7 @@ function drawerToTraffic(){
   showPane('traffic');
   const sel=document.getElementById('tr-client');
   if(sel&&Array.prototype.some.call(sel.options,function(o){return o.value===id;})){
-    sel.value=id;
-    syncSelect(sel);
+    sel.value=id; // 自绘下拉文案由原型级 value setter 劫持同步（见自定义下拉框处的注释）
   }
   renderTrafficView();
 }
@@ -2008,7 +2453,7 @@ function renderBansTable(data){
     const id=p[0],left=p[1];
     return '<tr><td class="num dim" title="'+esc(id)+'">'+esc(shortId(id,18))+'</td>'+
       '<td>'+(left===0?'<span class="badge b-dup">'+t('perm')+'</span>':'<span class="badge b-on">'+fmtDur(left)+'</span>')+'</td>'+
-      '<td><button class="btn ghost sm" onclick="unban(\''+id+'\')">'+t('th.unban')+'</button></td></tr>';
+      '<td><button class="btn ghost sm" data-act="unban" data-id="'+esc(id)+'">'+t('th.unban')+'</button></td></tr>';
   }).join('')||emptyRow('bans',3,data.banned?t('no_bans'):t('ov.no_data'));
   renderPager('bans',bans.length);
 }
@@ -2034,8 +2479,9 @@ function syncTrafficClients(){
     (lastClientTraffic||[]).forEach(function(ct){opts+='<option value="'+esc(ct.id)+'">'+esc(shortId(ct.id,14))+'</option>';});
     sel.innerHTML=opts;
   }
+  // 选项列表可能刚被 innerHTML 重建：写回原值即经 value setter 劫持同步自绘 UI
+  // （见自定义下拉框处的注释），无需再手动 syncSelect。
   sel.value=want;
-  syncSelect(sel);
 }
 function renderTrafficView(){
   if(!lastTraffic)return;
@@ -2099,33 +2545,79 @@ async function setLogLevel(v){
 }
 
 // ---------- 设置页：配置查看/保存/热应用 ----------
+// needs_restart 字段名 → 面板本地化标签。token 由两端 NeedsRestart 硬编码
+// （稳定契约），组合 token（v4/v6 网段、brutal 上/下行）在 restartLabel 内
+// 拼 cfgk 两段；缺映射回落原始 token——后端新增字段时面板不至于静默撒谎。
+const RESTART_LABELS={
+  tap:'cfgk.tap',mac:'cfgk.mac',socks5:'cfgk.socks5',
+  encrypt:'cfgk.encrypt',enc_algo:'cfgk.enc_algo',
+  psk:'set.restart_psk',
+  'server.cert/key':'set.restart_cert',
+  'client.conns':'cfgk.conns',
+  'client.fwmark':'cfgk.fwmark',
+  'client.interface_manager':'cfgk.interface_manager',
+};
+function restartLabel(tok){
+  const key=RESTART_LABELS[tok];
+  if(key){const v=t(key);if(v!==key)return v;}
+  if(tok==='server.v4_cidr/v6_cidr')return t('cfgk.v4_cidr')+'/'+t('cfgk.v6_cidr');
+  if(tok==='up/down')return t('cfgk.brutal_up')+'/'+t('cfgk.brutal_down');
+  return tok;
+}
+// loadConfig 拉取 /api/config（后端归一化+凭据脱敏后的真实落盘配置）回填
+// 编辑器；返回 true=编辑器已更新、false=拉取失败（cfg-status 显示原因）。
+// 返回值供 saveConfig 的保存后回显区分成败——失败时不能用保存消息覆盖错误。
 async function loadConfig(){
   const st=document.getElementById('cfg-status');
   try{
     const res=await fetch(url('/api/config'),AUTH_HDR);
-    if(!res.ok){st.textContent=t('set.loaded_err')+' HTTP '+res.status;return;}
+    if(!res.ok){st.textContent=t('set.loaded_err')+' HTTP '+res.status;return false;}
     document.getElementById('cfg-editor').value=await res.text();
     st.textContent='';
-  }catch(e){st.textContent=t('set.loaded_err')+' '+e;}
+    return true;
+  }catch(e){st.textContent=t('set.loaded_err')+' '+e;return false;}
 }
 async function saveConfig(apply){
   const st=document.getElementById('cfg-status');
   let cfg;
   try{cfg=JSON.parse(document.getElementById('cfg-editor').value);}
-  catch(e){st.textContent='JSON: '+e.message;toast(t('toast.fail')+' JSON','err');return;}
+  // 语法错误时 toast 带 e.message 前 80 字符（截断加 …）；cfg-status 保留完整信息。
+  catch(e){st.textContent='JSON: '+e.message;toast(t('toast.fail')+' JSON: '+String(e.message).slice(0,80)+(e.message.length>80?'…':''),'err');return;}
   try{
     const res=await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({action:apply?'save_apply':'save',config:cfg})});
-    const data=await res.json().catch(()=>({}));
-    if(!res.ok){st.textContent=(data.error||('HTTP '+res.status));toast(t('toast.fail')+' '+st.textContent.slice(0,120),'err');return;}
+    // fetch 的 Response body 只能读一次：先取文本，再尝试 JSON.parse。后端失败时
+    // http.Error 返回纯文本（如“configuration was not loaded from a file; specify -c
+    // to enable saving”），res.json() 解析不了且会消费掉 body，导致后续 res.text()
+    // 返回空——用户只看到笼统的 “HTTP 400” 而不知道根因。先读文本再解析，两者兼得。
+    const txtBody=await res.text().catch(function(){return '';});
+    let data={};try{data=JSON.parse(txtBody);}catch(_){/* 纯文本错误体 */}
+    if(!res.ok){
+      const txt=data.error||txtBody||('HTTP '+res.status);
+      st.textContent=txt;toast(t('toast.fail')+' '+txt.slice(0,120),'err');return;
+    }
+    // needs_restart 显示本地化标签（restartLabel 映射 cfgk / 专用键，缺映射
+    // 回落原始 token），替代用户看不懂的 "client.interface_manager" 这类字段名。
+    const nr=data.needs_restart&&data.needs_restart.length?(' · '+t('set.restart_nr')+' '+data.needs_restart.map(restartLabel).join(', ')):'';
     if(apply){
-      st.textContent=t('set.applied')+(data.needs_restart&&data.needs_restart.length?(' · '+t('set.restart_nr')+' '+data.needs_restart.join(', ')):'');
+      st.textContent=t('set.applied')+nr;
       toast(t('toast.applied'),'ok');
       setTimeout(function(){if(window.tlsvpnStreamRestart)window.tlsvpnStreamRestart();},500);
     }else{
-      st.textContent=t('set.saved');
+      // 仅保存：写回磁盘但未热应用。仍须提示"需重启生效"字段，否则用户以为
+      // 改动已生效而数据面实际跑旧配置（settings 页与 /api/stats 会不一致）。
+      st.textContent=t('set.saved')+nr;
       toast(t('toast.saved'),'ok');
     }
+    // 保存后回显归一化结果：保存响应只带 needs_restart；磁盘/运行态持有的是
+    // 后端归一化（applyDefaults+Validate+凭据保留+mode/SourcePath 固定）后的
+    // 配置，编辑器若停留在用户草稿，下一次保存提交的还是草稿形态——显示上
+    // 永远与真实落盘值差一拍。重新 GET /api/config 让编辑器对齐真实落盘值
+    // （调度/MCP 面板经包装链级联回填，400ms 轮询兜底）。loadConfig 成功会清
+    // cfg-status，保存消息（含本地化需重启字段）在回显后恢复；GET 失败则保留
+    // 其错误提示——此时编辑器维持草稿，静默吞掉错误会让人以为已对齐。
+    const savedMsg=st.textContent;
+    if(await loadConfig())st.textContent=savedMsg;
   }catch(e){st.textContent=String(e);toast(String(e),'err');}
 }
 
@@ -2275,7 +2767,7 @@ function scRun(data){
   const nEp=Object.keys(eps).length;
   if(data.mode==='server'){
     if(!cr.length)add('auth','a_epoch','skip',miss);
-    else if(nEp<=1)add('auth','a_epoch','ok','v'+cr[0].session_epoch);
+    else if(nEp<=1)add('auth','a_epoch','ok','v'+(cr[0].session_epoch||0));
     else add('auth','a_epoch','warn',t('sc.kinds').replace('{n}',String(nEp)));
   }else if(np.session_epoch>0)add('auth','a_epoch','ok','v'+np.session_epoch);
   else add('auth','a_epoch','skip',miss);
@@ -2292,7 +2784,7 @@ function scRun(data){
   else add('enc','e_algo','skip',miss);
   if(np.enc_algo===0&&cfg.encrypt===true)add('enc','e_algo_off','warn',t('sc.plaintext'));
   else if(np.enc_algo>0&&cfg.encrypt===true&&np.enc_algo!==cfg.enc_algo)
-    add('enc','e_algo_off','warn',cfg.enc_algo+' → '+np.enc_algo);
+    add('enc','e_algo_off','warn',esc(String(cfg.enc_algo))+' → '+esc(String(np.enc_algo)));
   else if(np.enc_algo>0)add('enc','e_algo_off','ok','v'+np.enc_algo);
   else add('enc','e_algo_off','skip',miss);
   if(cfg.session_encrypt===true)add('enc','e_session','ok',t('stt.yes'));
@@ -2377,7 +2869,7 @@ function scRun(data){
     add('mgmt','m_bind',allIf?'warn':'ok',esc(b));
   }else add('mgmt','m_bind','skip',miss);
   const nr=sm.needs_restart||[];
-  add('mgmt','m_restart',nr.length?'warn':'ok',nr.length?N(nr.length)+' 项':t('stt.no'));
+  add('mgmt','m_restart',nr.length?'warn':'ok',nr.length?t('sc.kinds').replace('{n}',N(nr.length)):t('stt.no'));
   if(ho&&ho.up_error)add('mgmt','ov.hook.fail','warn',esc(ho.up_error.slice(0,40)));
   else add('mgmt','ov.hook.fail','skip',miss);
   add('mgmt','dg.loglvl',(data.log_level||'')==='debug'?'warn':'ok',esc(data.log_level||''));
@@ -2641,7 +3133,7 @@ function tpEndpoints(data){
       const rs=[];
       rs.push([t('tp.target'),'<span class="mono">'+esc(c.target||'-')+'</span>']);
       rs.push([t('tp.state'),'<span class="mono">'+esc(c.state||'-')+'</span>']);
-      rs.push([t('tp.rtt'),'<span class="mono">'+(c.rtt_ms||0)+' ms</span>']);
+      rs.push([t('tp.rtt'),'<span class="mono">'+(c.rtt_ms>0&&c.rtt_ms<100000?c.rtt_ms+' ms':'-')+'</span>']);
       rs.push([t('tp.age'),'<span class="mono">'+fmtDur(c.age_sec||0)+'</span>']);
       rs.push([t('tp.byt'),'<span class="mono">'+fmtBytes(c.tx_bytes||0)+' / '+fmtBytes(c.rx_bytes||0)+'</span>']);
       if(c.last_error)rs.push([t('tp.err'),'<span class="neg">'+esc(c.last_error)+'</span>']);
@@ -2668,7 +3160,7 @@ function tpChain(data){
     if(s.length===2)return s.join('/');
     return t('sc.kinds').replace('{n}',String(s.length));
   };
-  const encS=function(a){return a===2?'AES-256-GCM':(a===4?'AES-128-GCM':'off');};
+  const encS=encLabel;
   const cliArr=function(){const o=data.clients;return o&&Object.prototype.toString.call(o)==='[object Object]'?Object.keys(o):[];};
   const vals=function(k){return uniq(cliArr().map(function(x){return data.clients[x][k];}));};
   const tlsV=uniq(cr.map(function(c){return c.tls_version;}));
@@ -2731,6 +3223,8 @@ function renderTopo(data){
 }
 
 let logSeq=0,logFilter='';
+// 日志 DOM 封顶：事件流有 EV_MAX，日志此前没有——debug 级长跑 DOM 无限增长。
+const LOG_DOM_MAX=500;
 function applyLogs(lines){
   if(!Array.isArray(lines)||!lines.length)return;
   lines=lines.filter(function(l){return l&&l.seq>logSeq;});
@@ -2739,7 +3233,17 @@ function applyLogs(lines){
     if(!lines.length)return;
     const box=document.getElementById('logbox');
     if(box.querySelector('.empty-box'))box.innerHTML='';
-    box.innerHTML+=lines.map(l=>'<div class="ln lv-'+l.level+'"><span class="ts">['+l.time+']</span><span class="lv">'+l.level+'</span><span class="msg">'+esc(l.msg)+'</span></div>').join('');
+    // time/level 一并转义：level 还会被拼进 class，注入会破坏样式隔离。
+    // insertAdjacentHTML 不重解析既有节点（innerHTML+= 会），滚动位置与事件都不丢。
+    box.insertAdjacentHTML('beforeend',lines.map(l=>{
+      const lv=String(l.level||'info');
+      return '<div class="ln lv-'+esc(lv)+'"><span class="ts">['+esc(l.time||'')+']</span><span class="lv">'+esc(lv)+'</span><span class="msg">'+esc(l.msg)+'</span></div>';
+    }).join(''));
+    const extra=box.querySelectorAll(':scope > .ln').length-LOG_DOM_MAX;
+    if(extra>0){
+      const all=box.querySelectorAll(':scope > .ln');
+      for(let i=0;i<extra&&i<all.length;i++)all[i].remove();
+    }
     logSeq=lines[lines.length-1].seq;
     applyLogFilter();
     if(document.getElementById('autoscroll').checked)box.scrollTop=box.scrollHeight;
@@ -2793,6 +3297,83 @@ function downloadLog(){
     timer=setTimeout(function(){logFilter=inp.value.trim();applyLogFilter();},140);
   });
   if(clr)clr.addEventListener('click',function(){inp.value='';logFilter='';clr.classList.remove('show');applyLogFilter();inp.focus();});
+  inp.addEventListener('keydown',function(ev){if(ev.key==='Escape'&&clr)clr.click();});
+})();
+
+// ---------- 近期 MCP 访问日志：独立面板，SSE mcp_logs frame 增量 ----------
+// 与 applyLogs 同构：seq 由服务端单调编号，重连回放与轮询续传都不重不丢。
+let mcpSeq=0,mcpFilter='';
+function mcpRow(l){
+  const lv=l.level==='error'?'error':(l.level==='warn'?'warn':'info');
+  const bits=[l.time||''];
+  if(l.remote)bits.push(l.remote);
+  if(l.tool||l.method)bits.push(l.tool||l.method);
+  if(l.status)bits.push(String(l.status));
+  if(l.durMs)bits.push(l.durMs+'ms');
+  if(l.msg)bits.push(l.msg);
+  return '<div class="ln lv-'+lv+'"><span class="ts">['+esc(bits[0])+']</span><span class="lv">'+lv+'</span><span class="msg">'+esc(bits.slice(1).join(' '))+'</span></div>';
+}
+function applyMcpLogs(lines){
+  if(!Array.isArray(lines)||!lines.length)return;
+  lines=lines.filter(function(l){return l&&l.seq>mcpSeq;});
+  if(!lines.length)return;
+  const box=document.getElementById('mcpbox');
+  if(!box)return;
+  if(box.querySelector('.empty-box'))box.innerHTML='';
+  box.insertAdjacentHTML('beforeend',lines.map(mcpRow).join(''));
+  const extra=box.querySelectorAll(':scope > .ln').length-LOG_DOM_MAX;
+  if(extra>0){
+    const all=box.querySelectorAll(':scope > .ln');
+    for(let i=0;i<extra&&i<all.length;i++)all[i].remove();
+  }
+  mcpSeq=lines[lines.length-1].seq;
+  applyMcpFilter();
+}
+function applyMcpFilter(){
+  const box=document.getElementById('mcpbox');
+  if(!box)return;
+  const f=mcpFilter.toLowerCase();
+  const all=box.querySelectorAll('.ln');
+  let shown=0;
+  all.forEach(function(l){
+    const hit=!f||l.textContent.toLowerCase().indexOf(f)>=0;
+    l.style.display=hit?'':'none';
+    if(hit)shown++;
+  });
+  const cnt=document.getElementById('mcp-count');
+  if(cnt)cnt.textContent=f?(shown+' / '+all.length):'';
+}
+function mcpEmptyBox(){
+  return '<div class="empty-box"><svg viewBox="0 0 24 24">'+EMPTY_ICON.logs+'</svg>'+
+    '<div>'+esc(t('mcp.empty'))+'</div></div>';
+}
+function clearMcpLog(){
+  mcpFilter='';
+  const inp=document.getElementById('mcp-filter');
+  const clr=document.getElementById('mcp-filter-clear');
+  if(inp)inp.value='';
+  if(clr)clr.classList.remove('show');
+  document.getElementById('mcpbox').innerHTML=mcpEmptyBox();
+  applyMcpFilter();
+  toast(t('toast.clear'),'ok');
+}
+function downloadMcpLog(){
+  const blob=new Blob([document.getElementById('mcpbox').innerText],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='tlsvpn-mcp-access-'+new Date().toISOString().replace(/[:.]/g,'-')+'.log';a.click();
+  toast(t('toast.download'),'ok');
+}
+(function(){
+  const inp=document.getElementById('mcp-filter');
+  const clr=document.getElementById('mcp-filter-clear');
+  if(!inp)return;
+  let timer=null;
+  inp.addEventListener('input',function(){
+    if(clr)clr.classList.toggle('show',!!inp.value);
+    clearTimeout(timer);
+    timer=setTimeout(function(){mcpFilter=inp.value.trim();applyMcpFilter();},140);
+  });
+  if(clr)clr.addEventListener('click',function(){inp.value='';mcpFilter='';clr.classList.remove('show');applyMcpFilter();inp.focus();});
   inp.addEventListener('keydown',function(ev){if(ev.key==='Escape'&&clr)clr.click();});
 })();
 
@@ -2869,6 +3450,8 @@ document.getElementById('evbox').addEventListener('click',function(ev){
 });
 setRefresh(REFRESH_S);setRange(chartRange);
 window.addEventListener('resize',redrawChart);
+// 初始激活标签的指示条就位；字体/主题/语言变化会改按钮宽度，切换时再校准
+moveTabInd();
 
 
 function platformAssetName(kind,value){
@@ -2918,8 +3501,11 @@ function resetDashboardPeriod(data){
   if(changed){
     prev={};lastT=0;globalPrev=null;prevPps={ok:false};lastSpeeds={};prevConns={};lastConnsT=0;lastConnSpeeds={};
     txHist.length=0;rxHist.length=0;txTimes.length=0;trendData=null;
-    logSeq=0;evSeq=0;evItems=[];
+    logSeq=0;evSeq=0;evItems=[];mcpSeq=0;
     const box=document.getElementById('logbox');if(box)box.innerHTML='';
+    const mbox=document.getElementById('mcpbox');if(mbox)mbox.innerHTML='';
+    // mcpSeq 必须一并归零：服务端在新实例上从 seq 0 重发全量，旧进程的高位
+    // 游标会把新进程所有记录滤掉且永不恢复（与 logSeq/evSeq 同一故障形态）。
   }
   if(data.instance_id)dashboardInstance=data.instance_id;
   if(data.uptime_sec!==undefined)dashboardUptime=data.uptime_sec;

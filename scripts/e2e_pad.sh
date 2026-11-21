@@ -34,6 +34,7 @@ CLI_BIN="$E2E_RS_BIN"; [ "$CLI" = go ] && CLI_BIN="$E2E_GO_BIN"
 
 e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
+CERT_SHA256="$(e2e_cert_sha256 "$CERT")"
 KEY="$E2E_KEY"
 
 e2e_kill_port "$PORT"
@@ -115,7 +116,7 @@ if [ "$CLI" = rs ]; then
     "\"pad_mode\": \"$PAD\"" \
     "\"mac\": \"$MAC\"" \
     "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\", \"auth\": \"e2e:web-test-password\"}" \
-    '"client": {"insecure": true, "conns": 1}'
+    '"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1}'
   "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$CLI_LOG" 2>&1 &
 else
   local_cfg="$TMP/cli.json"
@@ -126,7 +127,7 @@ else
     "\"pad_mode\": \"$PAD\"" \
     "\"mac\": \"$MAC\"" \
     "\"web\": {\"addr\": \"127.0.0.1:$WEB_BASE\", \"auth\": \"e2e:web-test-password\"}" \
-    '"client": {"insecure": true, "conns": 1}'
+    '"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1}'
   "$CLI_BIN" -c "$(e2e_winpath "$local_cfg")" >"$CLI_LOG" 2>&1 &
 fi
 sleep 8

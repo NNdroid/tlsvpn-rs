@@ -41,7 +41,23 @@ const RTT_PROBE_PENDING_TIMEOUT_MS: u64 = 2000;
 const RTT_PROBE_PENDING_MAX: usize = 256;
 
 /// 每周期发全生成集（更快收敛、更多填充帧）；false=每周期 2 个探针轮转。
+/// 稳态轮转不受影响——拓扑变化后的收敛爆发（RTT_PROBE_BURST_ROUNDS）与其独立叠加。
 const RTT_PROBE_FAST_MODE_ALL: bool = false;
+
+/// 拓扑变化（kick / 连接重拨）后的收敛爆发轮数（对齐 Go rttProbeBurstRounds）。
+/// 轮转模式每轮只测一对 (row[k],ref)+(ref,col[k])，n 条连接要 n 轮（~2.5s）才
+/// 覆盖全生成集，期间 fwd 门宽松放行、near 窗口 lenient、排名走 min_rtt/2 回退。
+/// 爆发期每轮发全生成集，bootstrap 从 ~2.5s 缩到 ~500ms；爆发结束回到轮转稳态。
+/// 每轮 2n+1 ≤ 33 个探针（16 槽上限），probe_ch 容量按此上限（33）。
+const RTT_PROBE_BURST_ROUNDS: u32 = 6;
+
+/// recent-typical 伴随指标参数（对齐 Go rttProbeRecentMinSamples /
+/// rttProbeJitterAllowMin/MaxUS）。decayed-min 是地板（慢升 0.5ms/s），"同连接内
+/// 持续劣化"（拥塞、路由漂移，不触发重连）最长 ~90s 才被排名反映；recent 是样本
+/// EWMA（α=1/2，约 2 个采样窗 ≈5s 跟随 75%），用于把排名键抬到"当前典型时延"。
+const RTT_PROBE_RECENT_MIN_SAMPLES: usize = 2;
+const RTT_PROBE_JITTER_ALLOW_MIN_US: i64 = 200;
+const RTT_PROBE_JITTER_ALLOW_MAX_US: i64 = 5000;
 
 const CLOCK_OFFSET_BASE_INTERVAL_MS: u64 = 500;
 const CLOCK_OFFSET_JITTER_MS: u64 = 250;
@@ -69,12 +85,22 @@ pub trait ProbeTarget: Send + Sync + 'static {
     fn push_probe(&self, payload: Vec<u8>) -> bool;
     /// 发布 RTT 探针分解结果到 Backend 原子。fwd/ret 为 None 表示该方向本轮
     /// 无测量（不覆盖旧值，对齐 Go recomputeAll 的 `if f, ok := fwdRaw[i]`）。
+    /// 选路 rank 为**有效值**（max(decayed-min 地板, recent-typical − 抖动容差)）
+    /// 编码；display 为纯地板 + δ 抬升（显示层）。ret_congest_us 为回程拥塞抬升
+    /// （回程有效值 − 回程地板，≥0；None=本轮回程无测量，保持旧值）。
     fn publish_one_way(
         &self,
         fwd: Option<(u64, u64)>, // (选路 rank 编码, 显示 µs)
         ret: Option<(u64, u64)>,
+        ret_congest_us: Option<i64>,
         updated_ms: u64,
     );
+    /// 探针超时（sweep_pending 清理过期 pending 时回调）：路径疑似黑洞，发出
+    /// 槽位累计连续超时（对齐 Go b.probeTimeoutStreak.Add(1)）。
+    fn note_probe_timeout(&self) {}
+    /// 探针回包到达（absorb 收到任何回包时回调，时间戳有效性不影响健康判定）：
+    /// 清零发出槽位的超时连击（对齐 Go b.probeTimeoutStreak.Store(0)）。
+    fn note_probe_reply(&self) {}
 }
 
 // ======================= 通用工具 =======================
@@ -170,8 +196,22 @@ struct RttState {
     pending: HashMap<u32, PendingProbe>,
     decay: HashMap<(u32, u32), u64>,      // decayed-min per (src,dst)，ns
     last_decay: HashMap<(u32, u32), Instant>, // 每 key 独立的慢升计时
+    // recent / recent_dev / recent_n per (src,dst) 的 recent-typical 伴随指标
+    // （对齐 Go recent/recentDev/recentN）：样本 EWMA（α=1/2）、|样本−EWMA| 的
+    // EWMA（≈MAD）、样本计数。recent 参与排名前须 ≥ RTT_PROBE_RECENT_MIN_SAMPLES
+    // 个样本（防首样本离群钉死典型值）。与 decay 同 key 同生命周期（重连一并
+    // 清除）。单位 ns，0=未建立。
+    recent: HashMap<(u32, u32), u64>,
+    recent_dev: HashMap<(u32, u32), u64>,
+    recent_n: HashMap<(u32, u32), usize>,
+    // last_target 上轮 resolve 的 connIndex→目标对象。槽位换新 Backend（断线
+    // 重拨/网络切换）时清 decay/recent 键并置满收敛爆发，防止新连接继承旧连接
+    // 的时延地板（对齐 Go lastBackend，Arc 指针等同性判定）。
+    last_target: HashMap<usize, Arc<dyn ProbeTarget>>,
     nonce: u32,
     rotate: usize,
+    /// 剩余收敛爆发轮数（kick/重拨时置满，每轮递减；对齐 Go burst）。
+    burst: u32,
     ref_conn: usize,
     active: Vec<usize>,
 }
@@ -200,8 +240,13 @@ impl RttProbeScheduler {
             pending: HashMap::with_capacity(16),
             decay: HashMap::with_capacity(32),
             last_decay: HashMap::with_capacity(32),
+            recent: HashMap::with_capacity(32),
+            recent_dev: HashMap::with_capacity(32),
+            recent_n: HashMap::with_capacity(32),
+            last_target: HashMap::with_capacity(8),
             nonce: 0,
             rotate: 0,
+            burst: 0,
             ref_conn: 0,
             active: Vec::new(),
         };
@@ -259,6 +304,10 @@ impl RttProbeScheduler {
             select! {
                 recv(kick_rx) -> _ => {
                     if self.enabled.load(Ordering::Relaxed) {
+                        // kick 语义=拓扑可能变了（后端注册/stall 恢复）：置满收敛
+                        // 爆发，让新路径的全生成集在数百毫秒内覆盖，而不是等轮转
+                        // ~2.5s（对齐 Go kick 分支）。
+                        state.burst = RTT_PROBE_BURST_ROUNDS;
                         self.issue_round(&mut state);
                     }
                 }
@@ -286,6 +335,9 @@ impl RttProbeScheduler {
 
     fn issue_round(&self, state: &mut RttState) {
         let active = (self.active_conns)();
+        // 重拨即拓扑变化：清该槽位全部探针状态并置满收敛爆发，新连接从无偏
+        // 估计快速重新收敛（full-set 覆盖 ~1 轮而非轮转 n 轮）。
+        self.detect_reconnected_conns(state, &active);
         if active.len() < 2 {
             // 少于 2 条连接时无跨路径可言，仅需 ref 基线（若存在）以维持锚定。
             if active.len() == 1 {
@@ -309,7 +361,12 @@ impl RttProbeScheduler {
             col.push(idx);
         }
 
-        if RTT_PROBE_FAST_MODE_ALL {
+        // 收敛爆发期（或稳态 fast 模式）：每轮发全生成集。爆发轮数随轮递减，
+        // 结束后回到低开销轮转（对齐 Go issueRound burst 分支）。
+        if state.burst > 0 || RTT_PROBE_FAST_MODE_ALL {
+            if state.burst > 0 {
+                state.burst -= 1;
+            }
             for &i in &row {
                 self.emit_probe(state, i, ref_c);
             }
@@ -334,6 +391,37 @@ impl RttProbeScheduler {
         }
     }
 
+    /// detect_reconnected_conns 槽位换新 Backend（断线重拨/网络切换）检测
+    /// （对齐 Go detectReconnectedConns）：按 resolve 的目标对象指针等同性判定，
+    /// 换新即清该槽位全部探针状态并置满收敛爆发。
+    fn detect_reconnected_conns(&self, state: &mut RttState, active: &[usize]) {
+        for &idx in active {
+            let Some(b) = (self.resolve)(idx) else {
+                continue;
+            };
+            if let Some(prev) = state.last_target.get(&idx) {
+                if Arc::ptr_eq(prev, &b) {
+                    continue;
+                }
+            }
+            state.last_target.insert(idx, b);
+            state.burst = RTT_PROBE_BURST_ROUNDS;
+            let keys: Vec<(u32, u32)> = state
+                .decay
+                .keys()
+                .filter(|k| k.0 == idx as u32 || k.1 == idx as u32)
+                .copied()
+                .collect();
+            for key in keys {
+                state.decay.remove(&key);
+                state.last_decay.remove(&key);
+                state.recent.remove(&key);
+                state.recent_dev.remove(&key);
+                state.recent_n.remove(&key);
+            }
+        }
+    }
+
     /// 在 src 连接上发起一个"对端回包到 reply_on"的探针。
     fn emit_probe(&self, state: &mut RttState, src_conn: usize, reply_on: usize) {
         let Some(b) = (self.resolve)(src_conn) else {
@@ -352,7 +440,7 @@ impl RttProbeScheduler {
                 issued: Instant::now(),
             },
         );
-        Self::sweep_pending(state);
+        self.sweep_pending(state);
         let mut payload = Vec::new();
         rp::append_rtt_probe_frame(&mut payload, nonce, reply_on as u32);
         if !b.push_probe(payload) {
@@ -361,19 +449,28 @@ impl RttProbeScheduler {
         }
     }
 
-    fn sweep_pending(state: &mut RttState) {
+    fn sweep_pending(&self, state: &mut RttState) {
         let now = Instant::now();
-        let keys: Vec<u32> = state
+        // 先收集（nonce, 发出槽位），再清理：清理时对发出槽位累计探针超时。
+        let expired: Vec<(u32, usize)> = state
             .pending
             .iter()
             .filter(|(_, p)| {
                 now.duration_since(p.issued)
                     > Duration::from_millis(RTT_PROBE_PENDING_TIMEOUT_MS)
             })
-            .map(|(k, _)| *k)
+            .map(|(k, p)| (*k, p.src_conn))
             .collect();
-        for k in keys {
+        for (k, src_conn) in expired {
             state.pending.remove(&k);
+            // 探针超时=路径疑似黑洞：对发出槽位累计连续超时（任一回包到达即
+            // 清零，见 absorb），选路层按 sched_health_penalty_us 施加递增罚时。
+            // 此前超时只被静默丢弃——黑洞路径的 decayed-min 地板保持陈旧低值、
+            // min_rtt 不变，会持续赢得排名。槽位换新 Backend 时计数随旧对象
+            // 废弃，无需显式清除（与 decay 键的 last_target 清理独立）。
+            if let Some(b) = (self.resolve)(src_conn) {
+                b.note_probe_timeout();
+            }
         }
         while state.pending.len() > RTT_PROBE_PENDING_MAX {
             // 保守裁剪：先删最旧的若干（HashMap 无插入序，删任意即可对齐"超量
@@ -398,11 +495,16 @@ impl RttProbeScheduler {
         let _ = b.push_probe(payload);
     }
 
-    /// 收到回包：查 nonce、算 RTT、更新 decayed-min、重算 fwd/ret。
+    /// 收到回包：查 nonce、算 RTT、更新 decayed-min 与 recent-typical、重算 fwd/ret。
     fn absorb(&self, state: &mut RttState, fr: RttFrame) {
         let Some(p) = state.pending.remove(&fr.nonce) else {
             return;
         };
+        // 回包到达即清零发出槽位的超时连击：即使时间戳无效（下方 return）也代表
+        // 往返可达——黑洞不带白，时间戳只影响样本质量不影响健康判定。
+        if let Some(b) = (self.resolve)(p.src_conn) {
+            b.note_probe_reply();
+        }
         let recv_ns = fr.recv_at_ns;
         if fr.send_ts == 0 || fr.send_ts > recv_ns {
             return; // 无有效 send_ts 或时钟异常，丢弃
@@ -412,7 +514,60 @@ impl RttProbeScheduler {
             rtt = 1; // 同机回环/同纳秒收发：clamp 到 1ns，防止 decay 存 0 与"未测量"哨兵混淆
         }
         Self::update_decay(state, p.src_conn as u32, p.reply_on as u32, rtt);
+        Self::update_recent(state, p.src_conn as u32, p.reply_on as u32, rtt);
         self.recompute_all(state);
+    }
+
+    /// update_recent recent-typical 伴随指标：样本 EWMA（α=1/2）+ |样本−EWMA| 的
+    /// EWMA（≈MAD）。decayed-min 是"历史最优地板"，对同连接内持续劣化（拥塞、
+    /// 路由漂移——不触发重连）只能靠 0.5ms/s 慢升追赶（45ms 劣化 ≈90s）；EWMA 约
+    /// 2 个采样窗（~5s）即可跟随 75%，供 recompute_all 把排名键抬到当前典型时延。
+    /// 与 update_decay 同 key 生命周期（重连一并清除，见 detect_reconnected_conns）。
+    fn update_recent(state: &mut RttState, src: u32, dst: u32, sample_ns: u64) {
+        let sample_ns = if sample_ns == 0 { 1 } else { sample_ns };
+        let key = (src, dst);
+        let n = state.recent_n.get(&key).copied().unwrap_or(0) + 1;
+        state.recent_n.insert(key, n);
+        let prev = state.recent.get(&key).copied().unwrap_or(0);
+        if n == 1 || prev == 0 {
+            // 首样本只建立基线不产出 typical：单个样本可能是离群值，等第二个样本
+            // 校准后才让 recent 参与排名（与 clockOffsetMinSamples 同思路）。
+            state.recent.insert(key, sample_ns);
+            state.recent_dev.insert(key, 0);
+            return;
+        }
+        let dev = if sample_ns >= prev {
+            sample_ns - prev
+        } else {
+            prev - sample_ns
+        };
+        state.recent.insert(key, (prev + sample_ns) / 2);
+        let prev_dev = state.recent_dev.get(&key).copied().unwrap_or(0);
+        state.recent_dev.insert(key, (prev_dev + dev) / 2);
+    }
+
+    /// recent_jitter_allow_us 由 recent_dev（≈MAD，ns）换算排名用的抖动容差
+    /// （µs）：排名键抬升量为 typical − 2·MAD，容差内的抖动不惩罚（稳定路径不受
+    /// EWMA 噪声影响），容差外（持续劣化）才抬升。钳制防 MAD 极端值（无线链路
+    /// mad 可达数十 ms）把排名键抬成等效"禁用该路径"。
+    fn recent_jitter_allow_us(dev_ns: u64) -> i64 {
+        let allow = one_way_us(dev_ns) as i64 * 2;
+        allow.clamp(RTT_PROBE_JITTER_ALLOW_MIN_US, RTT_PROBE_JITTER_ALLOW_MAX_US)
+    }
+
+    /// effective_one_way 选路用的有效单向值：地板与 recent-typical − 抖动容差取大
+    /// （对齐 Go effectiveOneWay）。typical 缺席（样本 < RTT_PROBE_RECENT_MIN_SAMPLES）
+    /// 时退纯地板——与历史行为一致，单样本可能是离群值。
+    fn effective_one_way(floor: i64, typ: i64, has_typ: bool, dev_ns: u64) -> i64 {
+        if !has_typ {
+            return floor;
+        }
+        let cand = typ - Self::recent_jitter_allow_us(dev_ns);
+        if cand > floor {
+            cand
+        } else {
+            floor
+        }
     }
 
     /// 慢升快降的 decayed-min。慢升量按 (src,dst) 独立累积。
@@ -453,15 +608,51 @@ impl RttProbeScheduler {
         }
         let now_ms = unix_ms();
 
+        // 双路发布：原始有符号相对量（可负）供选路，δ 抬升非负副本供面板显示。
+        // δ 只进显示——选路回退链（min_rtt/2、SRTT/2）不带 δ，混排时不抵消会
+        // 扭曲排名（见 decompose_one_way/display_delta_us 注释）。
+        //
+        // 选路值不是纯地板而是"有效去程"：max(decayed-min 地板, recent-typical −
+        // 抖动容差)。地板慢升 0.5ms/s，对同连接内持续劣化（拥塞/路由漂移，不触发
+        // 重连）最长 ~90s 才反映；EWMA typical ~5s 跟随，把这样的路径及时从排名
+        // 上压下去（near 窗口与 fwd 门消费同一有效值，慢路径同样拿不到 parity）。
+        // 显示层保持地板值：面板的 fwd_oneway_us 与 rank_key_us 本就是"面板读数 vs
+        // 调度依据"两条刻意分开的数。
         let (fwd_raw, ret_raw) = decompose_one_way(&state.decay, &state.active, ref_c, half_ref);
         let delta = display_delta_us(&fwd_raw, &ret_raw);
+        let (fwd_typ, ret_typ) = decompose_recent(&state.recent, &state.recent_n, &state.active, ref_c, half_ref);
         for &i in &state.active {
             let Some(b) = (self.resolve)(i) else {
                 continue;
             };
-            let fwd = fwd_raw.get(&i).map(|&f| (one_way_rank_encode(f), (f + delta) as u64));
-            let ret = ret_raw.get(&i).map(|&r| (one_way_rank_encode(r), (r + delta) as u64));
-            b.publish_one_way(fwd, ret, now_ms);
+            let fwd = fwd_raw.get(&i).map(|&f| {
+                let typ = fwd_typ.get(&i).copied();
+                let dev = state
+                    .recent_dev
+                    .get(&(i as u32, ref_c as u32))
+                    .copied()
+                    .unwrap_or(0);
+                let eff = Self::effective_one_way(f, typ.unwrap_or(f), typ.is_some(), dev);
+                (one_way_rank_encode(eff), (f + delta) as u64)
+            });
+            let ret_info = ret_raw.get(&i).map(|&r| {
+                let typ = ret_typ.get(&i).copied();
+                let dev = state
+                    .recent_dev
+                    .get(&(ref_c as u32, i as u32))
+                    .copied()
+                    .unwrap_or(0);
+                let eff = Self::effective_one_way(r, typ.unwrap_or(r), typ.is_some(), dev);
+                (one_way_rank_encode(eff), (r + delta) as u64, eff - r)
+            });
+            let ret = ret_info.map(|(rank, display, _)| (rank, display));
+            // 回程拥塞抬升 = 有效值 − 地板 = 探针回程的排队深度。探针回包从
+            // 对端的 writer 注入本连接（reply_on=i），与对端下行数据共用发送
+            // 队列——该抬升即"本端 ACK 在对端下行数据后面排了多深"，是双向
+            // 吞吐区间回程拥塞门（rttMode）的直接输入。typ 缺席时 eff=r ⇒
+            // 抬升 0（无拥塞证据，不制造伪信号）。
+            let ret_congest = ret_info.map(|(_, _, congest)| congest);
+            b.publish_one_way(fwd, ret, ret_congest, now_ms);
         }
     }
 
@@ -515,6 +706,50 @@ fn decompose_one_way(
     (fwd_x, ret_x)
 }
 
+/// decompose_recent recent-typical 的同锚分解（对齐 Go decomposeRecent）：与
+/// decompose_one_way 同一 halfRef 锚（地板尺度），把每对 (i,ref)/(ref,i) 的样本
+/// EWMA 换算成有符号相对量。仅包含样本数 ≥ RTT_PROBE_RECENT_MIN_SAMPLES 的方向；
+/// ref 自身用 (ref,ref) 的 typical 半值（当前自回包 RTT 的一半相对地板锚）。EWMA
+/// 是"当前典型"而地板是"历史最优"，二者相减保留同一相对序——持续劣化的路径
+/// typical 抬升、稳定路径 typical ≈ 地板，argmin/near 窗口差值中的公共项（B_ref
+/// 等）同样抵消。
+fn decompose_recent(
+    recent: &HashMap<(u32, u32), u64>,
+    recent_n: &HashMap<(u32, u32), usize>,
+    active: &[usize],
+    ref_c: usize,
+    half_ref: u64,
+) -> (HashMap<usize, i64>, HashMap<usize, i64>) {
+    let mut fwd_x = HashMap::with_capacity(active.len());
+    let mut ret_x = HashMap::with_capacity(active.len());
+    let has_typ = |k: (u32, u32)| -> bool {
+        recent_n.get(&k).copied().unwrap_or(0) >= RTT_PROBE_RECENT_MIN_SAMPLES
+    };
+    for &i in active {
+        if i == ref_c {
+            let key = (ref_c as u32, ref_c as u32);
+            if has_typ(key) {
+                let v = recent.get(&key).copied().unwrap_or(0);
+                let t = one_way_us(v) as i64 / 2 - half_ref as i64;
+                fwd_x.insert(i, t);
+                ret_x.insert(i, t);
+            }
+            continue;
+        }
+        let fk = (i as u32, ref_c as u32);
+        if has_typ(fk) {
+            let v = recent.get(&fk).copied().unwrap_or(0);
+            fwd_x.insert(i, one_way_us(v) as i64 - half_ref as i64);
+        }
+        let rk = (ref_c as u32, i as u32);
+        if has_typ(rk) {
+            let v = recent.get(&rk).copied().unwrap_or(0);
+            ret_x.insert(i, one_way_us(v) as i64 - half_ref as i64);
+        }
+    }
+    (fwd_x, ret_x)
+}
+
 // ======================= 时钟偏移估计器 =======================
 
 struct OffsetSample {
@@ -523,7 +758,14 @@ struct OffsetSample {
     t3: u64, // B 发送（回包注入时刻，对端显式回填，非 issued 近似）
     t4: u64, // A 接收
     _conn: usize,
+    /// 本端收到回包（采集）时刻，solve 按它做样本老化（对齐 Go offsetSample.at）。
+    at: Instant,
 }
+
+/// 样本最大年龄（对齐 Go clockOffsetSampleMaxAge）。256 样本 ≈2 分钟，网络切换
+/// 后旧 regime 会拖住 θ 中位数；超龄样本直接从估计集剔除，θ 在 ~1 分钟内完成向
+/// 新状态的收敛（其余寿命由 ref 切换时的整体重置兜底）。
+const CLOCK_OFFSET_SAMPLE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// 原子发布通道：快照读取不抢调度 goroutine 的锁。
 pub struct ClockPublish {
@@ -562,6 +804,10 @@ impl ClockEstimator {
         if self.samples.len() < CLOCK_OFFSET_SAMPLE_CAP {
             self.samples.push(s);
             self.head = 0;
+            // 两个分支都必须置 dirty（对齐 Go add）：否则缓冲未满时新样本永不
+            // 触发重解，θ 停在不可信态（新测试 estimator_ages_out_stale_samples
+            // 暴露的既有缺陷）。
+            self.dirty = true;
             return;
         }
         self.samples[self.head] = s;
@@ -595,13 +841,23 @@ impl ClockEstimator {
             return;
         }
         // 每个往返给出一个 θ 约束：θ_i = ((t2-t1) - (t4-t3))/2 = (B-F)/2。
+        let now = Instant::now();
         let mut est: Vec<i64> = Vec::with_capacity(n);
         for s in &self.samples {
-            if s.t1 == 0 || s.t2 < s.t1 || s.t3 == 0 || s.t4 < s.t3 {
-                continue; // 时钟异常样本丢弃
+            // 样本老化：超龄样本属于旧网络状态（路由切换、路径迁移），留在集合
+            // 里会让 θ 中位数在新旧 regime 之间拖 ~2 分钟。
+            if now.duration_since(s.at) > CLOCK_OFFSET_SAMPLE_MAX_AGE {
+                continue;
             }
-            let f = (s.t2 - s.t1) as i64; // 去程分量 F + θ
-            let b = (s.t4 - s.t3) as i64; // 回程分量 B - θ
+            // 只过滤缺时间戳的哨兵样本；t2<t1 / t4<t3 是跨钟（A↔B）比较，B 慢于
+            // A 属合法状态（θ<0），据此丢弃会让估计器对负偏移系统性失明（对齐
+            // Go solve 的过滤纪律；此前 Rust 多滤了跨钟样本，属前置偏差，本次
+            // 对齐修复）。
+            if s.t1 == 0 || s.t2 == 0 || s.t3 == 0 || s.t4 == 0 {
+                continue;
+            }
+            let f = (s.t2.wrapping_sub(s.t1)) as i64; // 去程分量 F + θ
+            let b = (s.t4.wrapping_sub(s.t3)) as i64; // 回程分量 B - θ
             est.push((f - b) / 2);
         }
         if est.len() < CLOCK_OFFSET_MIN_SAMPLES {
@@ -800,7 +1056,14 @@ impl ClockOffsetScheduler {
         }
         // 偏移估计针对 ref 连接（index 最小者），与 rttProbe 的 ref 选法一致。
         let ref_c = active[0];
-        state.target = ref_c;
+        if ref_c != state.target {
+            // ref 变化 = 被测链路换了：θ 是"该条链路的去/回程不对称度"，旧 ref 的
+            // 样本对新 ref 毫无意义——整体重置估计器，θ 从不可信态重新收敛（面板
+            // 显示同步丢失，~8 个样本 ≈4s 恢复），而不是让新旧链路的 θ 混合出
+            // 无人持有的伪值（对齐 Go issueRound 的 ref 切换重置）。
+            state.est = ClockEstimator::new(state.est.publish.clone());
+            state.target = ref_c;
+        }
         self.emit_probe(state, ref_c);
     }
 
@@ -854,13 +1117,18 @@ impl ClockOffsetScheduler {
 
     /// 收到对端探针请求：记接收时刻 t2（recv_ts），并把回包注入时刻 t3（off_ts）
     /// 显式写入帧，供对端精确解出回程分量，不用 issued 时刻近似。
+    ///
+    /// t2 必须取读循环的到达时刻（fr.recv_at_ns，与 absorb 的 t4 同一打点位置），
+    /// 而非本 goroutine 的 time.Now()：后者混入 replies 通道（cap 64）+ 线程
+    /// 唤醒延迟 d——负载下 d 系统性偏大且方差小，会让 θ 估计带 +d/2 的固定偏置
+    /// 却"低不确定度收敛"到错值。t3 依旧取注入时刻（writer 队列延迟属于回程
+    /// 链路，本来就该计入 B−θ 分量，off_ts 显式回填的意义所在）。
     fn respond(&self, _state: &mut ClockState, fr: ClockFrame) {
         let Some(b) = (self.resolve)(fr.conn as usize) else {
             return;
         };
-        let now_ns = unix_ns();
         let now_ms = unix_ms();
-        let recv_ts = now_ns;
+        let recv_ts = fr.recv_at_ns;
         let tx_ts = (now_ms & 0xFFFF_FFFF) as u32; // UnixMilli 低 32 位
         let mut payload = Vec::new();
         co::append_clock_offset_reply_frame(&mut payload, fr.nonce, fr.send_ts, recv_ts, tx_ts);
@@ -886,6 +1154,12 @@ impl ClockOffsetScheduler {
             t3: t3_ns,
             t4: recv_ns,
             _conn: p.target_conn,
+            // 采集时刻对齐读循环到达时刻（fr.recv_at_ns 反推 Instant），而非
+            // 本线程 now——absorb 已滞后 replies 通道 + 唤醒延迟。
+            at: Instant::now().checked_sub(Duration::from_nanos(
+                unix_ns().saturating_sub(recv_ns),
+            ))
+            .unwrap_or_else(Instant::now),
         });
         state.est.refresh();
     }
@@ -955,6 +1229,7 @@ mod tests {
                 t3: base + 5000,
                 t4: base + 10000,
                 _conn: 0,
+                at: Instant::now(),
             });
         }
         est.refresh();
@@ -976,6 +1251,7 @@ mod tests {
             t3: 6000,
             t4: 11000,
             _conn: 0,
+            at: Instant::now(),
         });
         est.refresh();
         assert!(!est.publish.converged.load(Ordering::Relaxed));
@@ -997,6 +1273,7 @@ mod tests {
                 t3: base + 5000,
                 t4: base + 11000, // 回程含 -θ
                 _conn: 0,
+                at: Instant::now(),
             });
         }
         est.refresh();
@@ -1011,5 +1288,142 @@ mod tests {
         assert_eq!(median(&[1, 2, 3]), 2);
         assert_eq!(median(&[1, 2, 3, 4]), 2);
         assert_eq!(median(&[]), 0);
+    }
+
+    // ---------- recent-typical 伴随指标（对齐 Go rtt_probe.go 新增块） ----------
+
+    #[test]
+    fn update_recent_ewma_and_mad_semantics() {
+        let mut state = RttState {
+            pending: HashMap::new(),
+            decay: HashMap::new(),
+            last_decay: HashMap::new(),
+            recent: HashMap::new(),
+            recent_dev: HashMap::new(),
+            recent_n: HashMap::new(),
+            last_target: HashMap::new(),
+            nonce: 0,
+            rotate: 0,
+            burst: 0,
+            ref_conn: 0,
+            active: Vec::new(),
+        };
+        // 首样本只建基线不产出 typical（防首样本离群钉死典型值）：recent 存
+        // 基线、MAD=0，参与排名须待 recentN ≥ RTT_PROBE_RECENT_MIN_SAMPLES。
+        RttProbeScheduler::update_recent(&mut state, 1, 0, 10_000_000);
+        assert_eq!(state.recent_n[&(1, 0)], 1);
+        assert_eq!(state.recent[&(1, 0)], 10_000_000);
+        assert_eq!(state.recent_dev[&(1, 0)], 0);
+        // 第二样本 12ms：EWMA = (10+12)/2 = 11ms；MAD = (0+2)/2 = 1ms。
+        RttProbeScheduler::update_recent(&mut state, 1, 0, 12_000_000);
+        assert_eq!(state.recent[&(1, 0)], 11_000_000);
+        assert_eq!(state.recent_dev[&(1, 0)], 1_000_000);
+        assert_eq!(state.recent_n[&(1, 0)], 2);
+        // 第三样本 8ms：EWMA = (11+8)/2 = 9.5ms；MAD = (1+3)/2 = 2ms。
+        RttProbeScheduler::update_recent(&mut state, 1, 0, 8_000_000);
+        assert_eq!(state.recent[&(1, 0)], 9_500_000);
+        assert_eq!(state.recent_dev[&(1, 0)], 2_000_000);
+    }
+
+    #[test]
+    fn recent_jitter_allow_us_is_clamped() {
+        // allow = 2×MAD(µs)，钳制到 [200, 5000]。
+        assert_eq!(RttProbeScheduler::recent_jitter_allow_us(0), 200);
+        assert_eq!(RttProbeScheduler::recent_jitter_allow_us(100_000), 200); // 2×100µs=200
+        assert_eq!(RttProbeScheduler::recent_jitter_allow_us(1_000_000), 2_000);
+        // 无线链路 MAD 可达数十 ms：钳到 5000µs 防止抬成等效禁用。
+        assert_eq!(RttProbeScheduler::recent_jitter_allow_us(40_000_000), 5_000);
+    }
+
+    #[test]
+    fn effective_one_way_takes_max_of_floor_and_typical() {
+        // typical 缺席 → 纯地板（历史行为）。
+        assert_eq!(RttProbeScheduler::effective_one_way(5_000, 9_000, false, 0), 5_000);
+        // typical − 2·MAD 低于地板 → 地板。
+        assert_eq!(RttProbeScheduler::effective_one_way(5_000, 6_000, true, 1_000_000), 5_000);
+        // typical − 容差高于地板 → 抬升生效（持续劣化路径被压下去）。
+        assert_eq!(RttProbeScheduler::effective_one_way(5_000, 40_000, true, 1_000_000), 38_000);
+    }
+
+    #[test]
+    fn decompose_recent_requires_min_samples() {
+        let mut recent = HashMap::new();
+        let mut recent_n = HashMap::new();
+        // (1,0) 有 2 个样本（达标）、(0,1) 只有 1 个（不达标）。
+        recent.insert((1u32, 0u32), 4_000_000);
+        recent_n.insert((1u32, 0u32), 2);
+        recent.insert((0u32, 1u32), 1_000_000);
+        recent_n.insert((0u32, 1u32), 1);
+        let (fwd, ret) = decompose_recent(&recent, &recent_n, &[0, 1], 0, 1_000);
+        // fwd_1 = 4ms(µs) − 1ms(µs) = 3000µs；ref 自身无 typical（不发布）。
+        assert_eq!(fwd[&1], 3000);
+        assert!(!fwd.contains_key(&0));
+        // ret_1 样本数不足 → 不发布。
+        assert!(!ret.contains_key(&1));
+    }
+
+    #[test]
+    fn estimator_accepts_cross_clock_negative_theta() {
+        // B 慢于 A（t2<t1、t4<t3）属合法跨钟状态，θ<0：不得据此丢弃样本
+        // （此前 Rust 多滤了跨钟样本，估计器对负偏移系统性失明）。
+        let mut est = ClockEstimator::new(Arc::new(ClockPublish {
+            theta_ns: AtomicI64::new(0),
+            unc_us: AtomicU64::new(0),
+            converged: AtomicBool::new(false),
+        }));
+        for i in 0..CLOCK_OFFSET_MIN_SAMPLES + 4 {
+            let base = 10_000u64 + (i as u64) * 10;
+            est.add(OffsetSample {
+                // F = t2−t1 = −1000（跨钟，B 钟慢 1µs）；B = t4−t3 = +1000。
+                t1: base + 2000,
+                t2: base + 1000, // t2 < t1：合法
+                t3: base + 1000,
+                t4: base + 2000, // t4 > t3
+                _conn: 0,
+                at: Instant::now(),
+            });
+        }
+        est.refresh();
+        assert!(est.publish.converged.load(Ordering::Relaxed));
+        // θ = ((t2−t1) − (t4−t3))/2 = (−1000 − 1000)/2 = −1000ns。
+        assert_eq!(est.publish.theta_ns.load(Ordering::Relaxed), -1000);
+    }
+
+    #[test]
+    fn estimator_ages_out_stale_samples() {
+        let mut est = ClockEstimator::new(Arc::new(ClockPublish {
+            theta_ns: AtomicI64::new(0),
+            unc_us: AtomicU64::new(0),
+            converged: AtomicBool::new(false),
+        }));
+        // 全部样本按 200s 前采集：超 CLOCK_OFFSET_SAMPLE_MAX_AGE(120s) 全剔除。
+        let stale = Instant::now() - Duration::from_secs(200);
+        for i in 0..CLOCK_OFFSET_MIN_SAMPLES + 4 {
+            let base = 1000u64 + (i as u64) * 10;
+            est.add(OffsetSample {
+                t1: base,
+                t2: base + 5000,
+                t3: base + 5000,
+                t4: base + 10000,
+                _conn: 0,
+                at: stale,
+            });
+        }
+        est.refresh();
+        assert!(!est.publish.converged.load(Ordering::Relaxed));
+        // 新鲜样本进来即可收敛（旧 regime 不再拖住中位数）。
+        for i in 0..CLOCK_OFFSET_MIN_SAMPLES {
+            let base = 1000u64 + (i as u64) * 10;
+            est.add(OffsetSample {
+                t1: base,
+                t2: base + 5000,
+                t3: base + 5000,
+                t4: base + 10000,
+                _conn: 0,
+                at: Instant::now(),
+            });
+        }
+        est.refresh();
+        assert!(est.publish.converged.load(Ordering::Relaxed));
     }
 }

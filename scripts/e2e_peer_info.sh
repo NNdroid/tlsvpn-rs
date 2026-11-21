@@ -14,6 +14,7 @@ for spec in "E2E_RS_BIN:$E2E_RS_BIN" "E2E_GO_BIN:$E2E_GO_BIN"; do
 done
 command -v python3 >/dev/null 2>&1 || { echo "peer-info e2e requires python3" >&2; exit 2; }
 e2e_ensure_cert || { echo "peer-info e2e requires cert/key or openssl" >&2; exit 2; }
+CERT_SHA256="$(e2e_cert_sha256 "$E2E_CERT")"
 
 TMP="$(mktemp -d)"
 WEB_AUTH='peercheck:S3curePeerInfo-2026'
@@ -53,7 +54,7 @@ run_case() {
     '"log_level": "info"' \
     "\"mac\": \"$mac\"" \
     "\"web\": {\"addr\": \"127.0.0.1:$cli_web\", \"auth\": \"$WEB_AUTH\"}" \
-    '"client": {"insecure": true, "conns": 1}'
+    '"client": {"insecure": true, "cert_sha256": "'"$CERT_SHA256"'", "conns": 1}'
   "$cli_bin" -c "$(e2e_winpath "$case_dir/client.json")" >"$cli_log" 2>&1 &
   e2e_wait_port 127.0.0.1 "$cli_web" 20 || { echo "FAIL $cli client WebUI did not start"; cat "$cli_log"; return 1; }
 

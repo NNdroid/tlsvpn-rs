@@ -20,7 +20,7 @@ fn dashboard_periodic_data_is_sse_only() {
             "legacy polling marker remains: {marker}"
         );
     }
-    let stream = fs::read_to_string(root.join("webui/stream.js")).unwrap();
+    let stream = fs::read_to_string(root.join("webui/sse.js")).unwrap();
     for marker in [
         "/api/stream",
         "EventSource",
@@ -29,7 +29,7 @@ fn dashboard_periodic_data_is_sse_only() {
         "applyLogs(payload)",
         "applyEvents(payload)",
     ] {
-        assert!(stream.contains(marker), "stream.js missing {marker}");
+        assert!(stream.contains(marker), "sse.js missing {marker}");
     }
     let api = fs::read_to_string(root.join("src/api.rs")).unwrap();
     assert!(api.contains("\"/api/stream\""));

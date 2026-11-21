@@ -230,6 +230,15 @@ e2e_ensure_cert() {
   return 0
 }
 
+# e2e_cert_sha256 CERT_PEM → 服务器隧道证书的 SHA-256 指纹（64 位 hex）。
+# Go 2026-11-16（68ae122）起要求 client.insecure=true 必须同时配置
+# client.cert_sha256；e2e 的自签证书没有第三方可钉，直接钉本套件生成的
+# 证书指纹，两端实现共用同一约束（insecure=true 的老写法会被 Go 客户端
+# 拒绝启动，tok/pad/cfg 全部 cli=go 用例 FATAL 就是这么来的）。
+e2e_cert_sha256() {
+  openssl x509 -in "$1" -outform DER 2>/dev/null | sha256sum | awk '{print $1}'
+}
+
 # Colour helpers; suppressed when stdout is not a terminal.
 if [ -t 1 ]; then
   E2E_GREEN="\033[32m"; E2E_RED="\033[31m"; E2E_YELLOW="\033[33m"; E2E_RESET="\033[0m"

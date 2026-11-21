@@ -7,7 +7,7 @@ fn parity_send_updates_scheduler_fec_telemetry() {
     assert!(net.contains("let parity_bytes = par.len() as u64;"));
     assert!(net.contains("scheduler.note_fec_assigned(parity_bytes)"));
 
-    let metrics = fs::read_to_string(format!("{root}/webui/metrics.js")).unwrap();
+    let metrics = fs::read_to_string(format!("{root}/webui/metric-corrections.js")).unwrap();
     assert!(metrics.contains("fec_assigned_bytes"));
     assert!(metrics.contains("dDataBytes + dFecBytes"));
 }

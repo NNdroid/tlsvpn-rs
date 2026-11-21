@@ -4,7 +4,8 @@ use std::path::Path;
 #[test]
 fn metric_formula_contract() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let js = fs::read_to_string(root.join("webui/metrics.js")).expect("webui/metrics.js");
+    let js = fs::read_to_string(root.join("webui/metric-corrections.js"))
+        .expect("webui/metric-corrections.js");
     for want in [
         "Math.ceil(v.length * 0.95) - 1",
         "const reorder = data.reorder || {}",
@@ -42,12 +43,12 @@ fn embedded_index_loads_metric_corrections_after_app() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let assets = fs::read_to_string(root.join("src/webui_assets.rs")).expect("webui_assets.rs");
     assert!(
-        assets.contains("\"/metrics.js\""),
-        "metrics.js route missing"
+        assets.contains("\"/metric-corrections.js\""),
+        "metric-corrections.js route missing"
     );
     assert!(
-        assets.contains("<script src=\\\"metrics.js\\\"></script>"),
-        "embedded index does not inject metrics.js"
+        assets.contains("<script src=\\\"metric-corrections.js\\\"></script>"),
+        "embedded index does not inject metric-corrections.js"
     );
 
     let html = fs::read_to_string(root.join("webui/index.html")).expect("index.html");
@@ -58,8 +59,11 @@ fn embedded_index_loads_metric_corrections_after_app() {
         .find("<script src=\"app.js\"></script>")
         .expect("app.js script");
     assert!(i18n < app, "i18n.js must load before app.js");
-    // webui_assets injects metrics.js at </body>, therefore it is guaranteed to
-    // execute after the static app.js script already present in index.html.
+    // webui_assets injects the runtime modules (frame-visualizer /
+    // metric-corrections / sse / scheduler-settings / mcp-settings /
+    // mcp-examples, 与 Go webui.go 同清单) at </body>, therefore they are
+    // guaranteed to execute after the static app.js script already present in
+    // index.html.
     let body_end = html.find("</body>").expect("body end");
     assert!(app < body_end);
 }

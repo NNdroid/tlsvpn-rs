@@ -1066,6 +1066,10 @@ pub fn start_client(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let tx_port = Arc::new(AsyncPort::new("client_tx_port".to_string()));
     tx_port.set_routing_algo(&args.routing_algo);
     tx_port.set_fec_strategy(&args.fec_strategy, args.fec_near_window_ms);
+    // 健康罚时与资格门窗口（对齐 Go NewClient 的 SetSchedHealthPenaltyUs/
+    // SetSchedEnvelopeMs）：调度器每批读取。
+    tx_port.set_sched_health_penalty_us(args.sched_health_penalty_us);
+    tx_port.set_sched_envelope_ms(args.sched_envelope_ms);
     {
         let dev = device.clone();
         let port = tx_port.clone();
@@ -1999,7 +2003,7 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
     let rtt_cache = Arc::new(AtomicU32::new(50000));
     let (tx, rx) = bounded(1024);
     // 跨路径探针投递通道（cap 8，对齐 Go backend.probeCh）。发送循环在下方排空。
-    let (probe_tx, probe_rx) = bounded(8);
+    let (probe_tx, probe_rx) = bounded(33);
     let backend = Arc::new(Backend {
         fec_fence_gen: std::sync::atomic::AtomicU64::new(0),
         scheduler: Arc::new(crate::adaptive_multipath::SchedulerBackendState::default()),
@@ -2141,25 +2145,54 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         // RTT 采样在连接线程内完成，消除每连接一个 200ms sleeper thread。
         // min_rtt（内核 tcpi_min_rtt，无拥塞地板）与 SRTT 同轮采样：排名/包络用
         // min_rtt，ETA 遥测用 SRTT（对齐 Go sampleRTT / path_quality.go）。
+        // 重传差分独立于 rtt>0 的引导门：rtt==0 期间也要建立基线，否则首个有效
+        // 窗会把握手期累积的重传全记进 delta（对齐 Go sampleRTT 的 noteRetrans）。
+        // 内核 RTT 有效化（decayed-min 地板）与容量结算（饱和门控 + BDP 下界）
+        // 同轮进行，见 adaptive_multipath::note_rtt_sample/note_capacity_sample。
         if !proxied && Instant::now() >= next_rtt_refresh {
             if let Some(s) = std_for_rtt.as_ref() {
                 match get_tcp_rtt_and_min(s) {
-                    Ok((rtt, min_rtt)) if rtt > 0 => {
-                        rtt_cache.store(rtt, Ordering::Relaxed);
-                        if min_rtt > 0 {
-                            backend
-                                .scheduler
-                                .min_rtt_cache
-                                .store(min_rtt, Ordering::Relaxed);
+                    Ok((rtt, min_rtt, total_retrans, cwnd, snd_mss)) => {
+                        backend.scheduler.note_retrans(total_retrans);
+                        if rtt > 0 {
+                            rtt_cache.store(rtt, Ordering::Relaxed);
+                            if min_rtt > 0 {
+                                backend
+                                    .scheduler
+                                    .min_rtt_cache
+                                    .store(min_rtt, Ordering::Relaxed);
+                            }
+                            backend.scheduler.note_rtt_success();
+                            // 内核 RTT 有效化只吃真实测量：非 Linux 桩返回
+                            // UNKNOWN_RTT_US 哨兵，不能让它污染有效地板。
+                            if rtt != crate::adaptive_multipath::UNKNOWN_RTT_US {
+                                backend.scheduler.note_rtt_sample(rtt);
+                            }
                         }
-                        backend.scheduler.note_rtt_success();
+                        // 容量结算放 TCP_INFO 之后：非饱和窗可顺带用 cwnd/mss/srtt
+                        // 做 BDP 容量下界。TCP_INFO 失败（连接将死）时 cwnd/mss/rtt
+                        // 全 0，饱和窗结算不受影响。
+                        backend.scheduler.note_capacity_sample(
+                            (crate::adaptive_multipath::RTT_SAMPLE_INTERVAL_MS * 1_000_000)
+                                as i64,
+                            cwnd,
+                            snd_mss,
+                            rtt,
+                        );
                     }
                     // rtt==0 是引导期正常状态（尚未取得采样），不算失败，不计入
                     // 失败计数（对齐 Go：err==nil && rtt==0 时既不 success 也不 failure）。
-                    Ok(_) => {}
                     Err(_) => {
                         // 连续多次 RTT 采样失败说明连接正在关闭/已不可用，尽早把
                         // 该后端标记为 stalled，调度器不再向其分配数据。
+                        // TCP_INFO 失败也要结算容量窗：写阻塞时长与 TCP_INFO 无关。
+                        backend.scheduler.note_capacity_sample(
+                            (crate::adaptive_multipath::RTT_SAMPLE_INTERVAL_MS * 1_000_000)
+                                as i64,
+                            0,
+                            0,
+                            0,
+                        );
                         backend.scheduler.note_rtt_failure();
                     }
                 }
@@ -2468,11 +2501,19 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
             if tx_packets_batch != 0 {
                 batch_cork.before_write(&sock, send_buf.len());
             }
+            // 容量采样：写阻塞时长 = socket 发送缓冲打满的时长（路径饱和信号，
+            // 见 SchedulerBackendState::note_capacity_sample）。加密写与下面的
+            // write_tls 冲刷循环逐段累计，入 note_write 窗口；WouldBlock 立即
+            // 返回耗时≈0，无害。
+            let w_start = Instant::now();
             if let Err(e) = tls.writer().write_all(&send_buf) {
                 close_reason = format!("tls plaintext writer failed: {e}");
                 backend.scheduler.mark_stalled();
                 break;
             }
+            backend
+                .scheduler
+                .note_write(w_start.elapsed().as_nanos() as i64, 0);
             if tx_packets_batch != 0 {
                 cl.tx_packets.fetch_add(tx_packets_batch, Ordering::Relaxed);
                 cl.written.record(written_batch);
@@ -2487,7 +2528,10 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
 
         // 冲刷写队列（非阻塞；WouldBlock 等下次 poll 后重试）
         while tls.wants_write() {
-            match tls.write_tls(&mut sock) {
+            let flush_start = Instant::now();
+            let flushed = tls.write_tls(&mut sock);
+            let flush_busy = (flush_start.elapsed().as_nanos() as i64).max(0);
+            match flushed {
                 Ok(0) => {
                     close_reason = "tls.write_tls returned zero".into();
                     backend.scheduler.mark_stalled();
@@ -2495,12 +2539,15 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
                     break;
                 }
                 Ok(_) => {
+                    // socket 写阻塞时长进容量采样窗（饱和门控的 busy 输入）。
+                    backend.scheduler.note_write(flush_busy, 0);
                     last_write_progress = Instant::now();
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    backend.scheduler.note_write(flush_busy, 0);
                     // Normally the data loop listens only for READABLE. Once
                     // the kernel socket backpressures, subscribe to WRITABLE so
                     // send-buffer recovery wakes us immediately instead of
@@ -2531,6 +2578,11 @@ fn dial_and_serve(cl: &Arc<Client>, conn_index: usize, ci: &Arc<ConnInfo>) -> Du
         }
 
         if !tls.wants_write() && queued_payload_pending != 0 {
+            // 本批成功载荷进容量采样窗（对齐 Go writeWindowBytes += queuedPayload，
+            // 与 completeQueuedBytes 同点位）。
+            backend
+                .scheduler
+                .note_write(0, queued_payload_pending);
             backend.scheduler.complete_queued(queued_payload_pending);
             backend.scheduler.observe_delivered(queued_payload_pending);
             queued_payload_pending = 0;

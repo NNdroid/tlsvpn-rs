@@ -5,7 +5,7 @@
   'use strict';
 
   let source=null,controller=null,retryTimer=null,retryMs=1000,generation=0;
-  const TYPES=['stats','trend','logs','events','diagnostics'];
+  const TYPES=['stats','trend','logs','events','diagnostics','mcp_logs'];
 
   function streamPath(){
     const q=new URLSearchParams();
@@ -13,6 +13,7 @@
     q.set('range',String(chartRange||'2m'));
     q.set('log_after',String(typeof logSeq==='number'?logSeq:0));
     q.set('event_after',String(typeof evSeq==='number'?evSeq:0));
+    q.set('mcp_after',String(typeof mcpSeq==='number'?mcpSeq:0));
     if(typeof dashboardInstance==='string')q.set('instance_id',dashboardInstance);
     return '/api/stream?'+q.toString();
   }
@@ -25,6 +26,7 @@
       else if(type==='trend')applyTrend(payload);
       else if(type==='logs')applyLogs(payload);
       else if(type==='events')applyEvents(payload);
+      else if(type==='mcp_logs')applyMcpLogs(payload);
       else if(type==='diagnostics'&&window.applyDiagnostics)window.applyDiagnostics(payload);
     }catch(err){
       console.error('dashboard SSE '+type+' decode failed',err);
@@ -91,10 +93,13 @@
       while(myGen===generation){
         const part=await reader.read();
         if(part.done)break;
-        buf+=dec.decode(part.value,{stream:true}).replace(/\r\n/g,'\n');
-        let cut;
-        while((cut=buf.indexOf('\n\n'))>=0){
-          const block=buf.slice(0,cut);buf=buf.slice(cut+2);
+        // 不按 chunk 做行尾归一：\r 若恰落在块边界、\n 在下一块开头，按块替换
+        // 会留下 \r\n\r\n，而帧分隔只认 \n\n —— 流会永久卡死。先拼接，再用
+        // /\r?\n\r?\n/ 找完整帧边界，块边界上的任何行尾组合都安全。
+        buf+=dec.decode(part.value,{stream:true});
+        let m;
+        while((m=/\r?\n\r?\n/.exec(buf))!==null){
+          const block=buf.slice(0,m.index);buf=buf.slice(m.index+m[0].length);
           if(!block||block[0]===':')continue;
           const frame=parseBlock(block);
           if(TYPES.indexOf(frame.event)>=0)applyFrame(frame.event,frame.data);

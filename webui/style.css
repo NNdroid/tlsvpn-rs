@@ -12,7 +12,7 @@
   --off:#39415a; --offfg:#8b93a7;
   --grad:linear-gradient(135deg,#6d5df6 0%,#9a6bff 100%);
   --shadow:0 1px 2px rgba(0,0,0,.35),0 10px 30px -14px rgba(0,0,0,.55);
-  --glow1:rgba(109,93,246,.16); --glow2:rgba(56,207,232,.10);
+  --glow1:rgba(109,93,246,.22); --glow2:rgba(56,207,232,.14);
 }
 :root[data-theme=light]{
   --bg:#f3f5fa; --card:#ffffff; --card2:#f7f9fd; --term:#f8fafd;
@@ -37,8 +37,8 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 body::before,body::after{content:""; position:fixed; z-index:-1; border-radius:50%; filter:blur(90px); pointer-events:none}
-body::before{width:640px;height:640px;left:-180px;top:-260px;background:var(--glow1)}
-body::after{width:560px;height:560px;right:-160px;bottom:-240px;background:var(--glow2)}
+body::before{width:760px;height:760px;left:-220px;top:-300px;background:var(--glow1)}
+body::after{width:680px;height:680px;right:-200px;bottom:-280px;background:var(--glow2)}
 .mono,code{font-family:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;font-variant-numeric:tabular-nums}
 .dim{color:var(--sub)}
 
@@ -66,7 +66,13 @@ body::after{width:560px;height:560px;right:-160px;bottom:-240px;background:var(-
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .chip.mode{background:var(--up-soft);color:var(--up)}
 .chip.mode.client{background:var(--cyan-soft);color:var(--cyan)}
-.topctl{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.topctl{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+/* 三段控件（语言/主题/刷新）之间加细分隔，让分组清晰、右侧不再是一团按钮 */
+.topctl .seg+.seg{margin-left:4px;position:relative}
+.topctl .seg+.seg::before{
+  content:"";position:absolute;left:-8px;top:50%;transform:translateY(-50%);
+  width:1px;height:16px;background:var(--border);border-radius:1px;
+}
 /* 窄屏收纳：三段控件折进右上角可展开菜单，不再把顶栏撑成三行 */
 .menu-btn{
   margin-left:auto;display:none;align-items:center;justify-content:center;
@@ -79,27 +85,36 @@ body::after{width:560px;height:560px;right:-160px;bottom:-240px;background:var(-
 .seg{display:inline-flex;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:3px;gap:2px}
 .seg button{
   border:none;background:transparent;color:var(--muted);font:inherit;font-size:.8em;
-  padding:4.5px 11px;border-radius:8px;cursor:pointer;transition:all .15s ease;white-space:nowrap;
+  padding:4.5px 11px;border-radius:8px;cursor:pointer;transition:all .18s ease;white-space:nowrap;
   display:inline-flex;align-items:center;gap:5px;
 }
 .seg button:hover{color:var(--fg)}
-.seg button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.seg button.on{background:var(--accent-soft);color:var(--accent);font-weight:600;
+  box-shadow:inset 0 0 0 1px var(--accent-soft),0 1px 3px -1px rgba(0,0,0,.25)}
 .seg svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 
 /* ---------- 布局与卡片 ---------- */
 .wrap{max-width:1240px;margin:0 auto;padding:22px 24px 10px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.03);padding:18px 20px;margin-bottom:14px}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:14px;margin-bottom:14px}
-.kpi-card{display:flex;flex-direction:column;gap:2px;margin-bottom:0;transition:border-color .15s ease}
-.kpi-card:hover{border-color:var(--border2)}
+.kpi-card{display:flex;flex-direction:column;gap:2px;margin-bottom:0;
+  transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease}
+.kpi-card:hover{border-color:var(--border2);transform:translateY(-2px);
+  box-shadow:var(--shadow),0 12px 28px -18px rgba(0,0,0,.5)}
+:root[data-theme=light] .kpi-card:hover{box-shadow:var(--shadow),0 12px 28px -20px rgba(16,24,40,.22)}
 /* 可点击 KPI 卡：流量卡直达流量页，丢帧卡直达日志页 */
 .kpi-link{cursor:pointer}
-.kpi-link:hover{border-color:var(--accent);box-shadow:var(--shadow),0 0 0 1px var(--accent-soft)}
+.kpi-link:hover{border-color:var(--accent);transform:translateY(-2px);
+  box-shadow:var(--shadow),0 0 0 1px var(--accent-soft),0 12px 28px -18px rgba(0,0,0,.5)}
+:root[data-theme=light] .kpi-link:hover{box-shadow:var(--shadow),0 0 0 1px var(--accent-soft),0 12px 28px -20px rgba(16,24,40,.22)}
 .kpi-link .kpi-go{margin-left:auto;color:var(--sub);opacity:0;transform:translateX(-4px);transition:opacity .15s ease,transform .15s ease;flex:none}
 .kpi-link:hover .kpi-go{opacity:1;transform:none;color:var(--accent)}
 .kpi-go svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
 .kpi-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.kpi-ico{width:30px;height:30px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center}
+.kpi-ico{width:30px;height:30px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
+  transition:transform .18s ease,box-shadow .18s ease}
+.kpi-card:hover .kpi-ico{transform:scale(1.06)}
+.kpi-link:hover .kpi-ico{box-shadow:0 4px 12px -4px rgba(109,93,246,.45)}
 .kpi-ico svg{width:16px;height:16px;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .kpi-ico.violet{background:var(--accent-soft)} .kpi-ico.violet svg{stroke:var(--accent)}
 .kpi-ico.green{background:var(--up-soft)}     .kpi-ico.green svg{stroke:var(--up)}
@@ -127,14 +142,35 @@ body::after{width:560px;height:560px;right:-160px;bottom:-240px;background:var(-
 #chart,#traffic-chart{cursor:crosshair;touch-action:pan-y}
 
 /* ---------- 标签页 ---------- */
-.tabs{display:flex;gap:4px;background:var(--card2);border:1px solid var(--border);border-radius:11px;padding:4px;width:fit-content;max-width:100%;overflow-x:auto;scrollbar-width:none;margin-bottom:14px}
+/* 窄屏 13 个标签溢出时，两侧箭头让用户能明确点击横向滚动（原实现仅靠被隐藏的
+   滚动条，溢出部分无从发现/操作）。.tabs-nav 是布局主体：fit-content 使不溢出时
+   紧凑，max-width:100% 在溢出时压到可用宽度，.tabs 在其中收缩并滚动。 */
+.tabs-nav{display:flex;align-items:center;gap:6px;width:fit-content;max-width:100%;margin-bottom:14px}
+.tabs-nav .tabs{flex:1 1 auto;min-width:0;margin-bottom:0}
+.tab-arrow{
+  flex:none;width:26px;height:34px;display:flex;align-items:center;justify-content:center;
+  border:1px solid var(--border);background:var(--card2);color:var(--muted);
+  border-radius:8px;cursor:pointer;font:inherit;font-size:1.05em;line-height:1;
+  padding:0;transition:color .15s ease,border-color .15s ease,opacity .15s ease;user-select:none;
+}
+.tab-arrow:hover:not(:disabled){color:var(--accent);border-color:var(--accent)}
+.tab-arrow:disabled{opacity:.35;cursor:default}
+.tabs{position:relative;display:flex;gap:4px;background:var(--card2);border:1px solid var(--border);border-radius:11px;padding:4px;overflow-x:auto;scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
 .tabs button{
   border:none;background:transparent;color:var(--muted);font:inherit;font-size:.86em;
   padding:7px 15px;border-radius:8px;cursor:pointer;transition:all .15s ease;white-space:nowrap;flex:none;
 }
 .tabs button:hover{color:var(--fg)}
-.tabs button.on{background:var(--accent-soft);color:var(--accent);font-weight:650}
+.tabs button.on{color:var(--accent);font-weight:650}
+/* 滑动指示条：跟随激活标签的胶囊高亮，切换时平滑滑到新位置。
+   用独立元素承载背景，避免按钮自身背景在滑动时出现两处同时亮起。 */
+.tab-ind{
+  position:absolute;left:4px;top:4px;bottom:4px;width:0;pointer-events:none;
+  background:var(--accent-soft);border-radius:8px;opacity:0;
+  transition:left .22s cubic-bezier(.4,0,.2,1),width .22s cubic-bezier(.4,0,.2,1),opacity .15s ease;
+}
+.tabs.ind-on .tab-ind{opacity:1}
 .pane{display:none}
 .pane.on{display:block;animation:fadein .18s ease}
 @keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
@@ -169,8 +205,11 @@ mark{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding
    选中项写回 select.value 再派一次 change，各处 onchange 调用方不用改 */
 .dl{position:relative;display:inline-flex;align-items:center;max-width:100%}
 .dl-native{
-  position:absolute;width:1px;height:1px;margin:0;padding:0;border:0;
-  opacity:0;visibility:hidden;overflow:hidden;pointer-events:none;
+  /* 移动端上 visibility:hidden/opacity:0 的 <select> 仍可能被系统原生 picker
+     触摸激活（iOS/Android 对 form 控件有绕过 pointer-events 的触摸处理）。
+     display:none 把它从渲染树彻底移除，任何端都不会再弹原生列表；
+     select 仍留在 DOM 里当唯一取值来源，JS 读 value/options 不受影响。 */
+  display:none;
 }
 .dl-btn{
   position:relative;display:inline-flex;align-items:center;gap:8px;min-width:0;
@@ -547,6 +586,9 @@ tbody tr[data-open]{cursor:pointer}
 .dc-conn-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .dc-conn-top .mono{font-size:.86em;word-break:break-all;overflow-wrap:anywhere}
 .dc-conn-rtt{font-size:.8em;color:var(--muted);font-family:ui-monospace,"Cascadia Mono",Consolas,monospace}
+/* 连接表"去/回"列：跨路径探针收敛后显示 fwd/ret 单向时延。方向明显不对称时
+   整格染成轻微琥珀色，一眼看出该走哪个方向；hover 看全量（含 roundtrip RTT）。 */
+td.rtt-asym{background:var(--warn-soft);color:var(--warn)}
 .dc-conn-rate{
   margin-left:auto;font-size:.8em;color:var(--sub);
   font-variant-numeric:tabular-nums;white-space:nowrap;
@@ -555,6 +597,12 @@ tbody tr[data-open]{cursor:pointer}
 .dc-conn-k{font-size:.78em;color:var(--sub);white-space:nowrap}
 .dc-conn-sni{margin-top:7px;font-size:.8em;color:var(--sub);overflow-wrap:anywhere}
 .dc-conn-err{margin-top:7px;font-size:.8em;color:var(--err);overflow-wrap:anywhere}
+.dc-conn-sched{margin-top:7px}
+.dc-conn-sched .sched-log summary{cursor:pointer;font-size:.78rem;color:var(--sub)}
+.dc-conn-sched .sched-log[open] summary{color:var(--fg)}
+.dc-conn-sched .slog-row{display:flex;align-items:center;gap:8px;padding:2px 0;border-top:1px solid var(--border)}
+.dc-conn-sched .slog-row:first-of-type{border-top:0}
+.dc-conn-sched .slog-row small{white-space:nowrap}
 .dc-empty{color:var(--sub);font-size:.84em;text-align:center;padding:14px 0}
 
 @media (max-width:720px){
@@ -752,8 +800,9 @@ tbody tr[data-open]{cursor:pointer}
 
 /* Adaptive multipath scheduler diagnostics */
 .tcp-button{white-space:nowrap}.tcp-button+small{display:block;white-space:nowrap;margin-top:4px}.tcp-dialog{width:min(900px,calc(100vw - 32px));max-height:85vh;overflow:auto;padding:20px;background:var(--card);color:var(--fg);border:1px solid var(--border2);border-radius:14px}.tcp-dialog::backdrop{background:rgba(0,0,0,.5)}.tcp-dialog .chart-head{justify-content:space-between;overflow-wrap:anywhere}.tcp-dialog h2{font-size:1rem;max-width:85%}.tcp-dialog p{font-size:.82rem;line-height:1.6;overflow-wrap:anywhere}.tcp-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tcp-field{padding:8px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:4px;overflow-wrap:anywhere}.tcp-field span{color:var(--muted);font-size:.78rem}.tcp-field strong{font-size:.85rem;font-weight:500}@media(max-width:600px){.tcp-fields{grid-template-columns:1fr}}
-.diagnostic-section{margin-top:16px}.diagnostic-section select{max-width:240px;padding:6px;background:var(--card);color:var(--fg);border:1px solid var(--border2);border-radius:6px}.diagnostic-section p{font-size:.8rem;line-height:1.5}.diagnostic-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.diagnostic-card{min-width:0;padding:12px;border:1px solid var(--border2);border-radius:10px}.diagnostic-card h3{margin:0 0 10px;font-size:.95rem}.diagnostic-card canvas{display:block;width:100%;height:150px;touch-action:pan-y}.diagnostic-legend{flex-wrap:wrap;gap:8px;font-size:.72rem;margin:6px 0 12px}.diagnostic-legend span{overflow-wrap:anywhere}@media(max-width:800px){.diagnostic-grid{grid-template-columns:1fr}.diagnostic-section .chart-head{flex-wrap:wrap}.diagnostic-section select{max-width:180px}}
+.diagnostic-section{margin-top:16px}.diagnostic-section select{max-width:240px;padding:6px;background:var(--card);color:var(--fg);border:1px solid var(--border2);border-radius:6px}.diagnostic-section p{font-size:.8rem;line-height:1.5}.diagnostic-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}.diagnostic-col{min-width:0;display:flex;flex-direction:column;gap:16px}.diagnostic-card{min-width:0;padding:12px;border:1px solid var(--border2);border-radius:10px;background:var(--card2);transition:border-color .15s ease,box-shadow .15s ease}.diagnostic-card:hover{border-color:var(--accent);box-shadow:0 8px 20px -12px rgba(0,0,0,.5)}.diagnostic-card h3{margin:0 0 10px;font-size:.95rem;color:var(--fg);font-weight:600;letter-spacing:.01em}.diagnostic-card canvas{display:block;width:100%;height:150px;touch-action:pan-y}.diagnostic-legend{flex-wrap:wrap;gap:8px;font-size:.72rem;margin:6px 0 12px}.diagnostic-legend span{overflow-wrap:anywhere}@media(max-width:800px){.diagnostic-grid{grid-template-columns:1fr}.diagnostic-section .chart-head{flex-wrap:wrap}.diagnostic-section select{max-width:180px}}
 .sched-cell{display:flex;flex-direction:column;gap:3px;min-width:132px}.sched-cell small{white-space:nowrap;font-size:.72rem}.sched-summary{white-space:nowrap}
+.sched-log{margin:8px 0 2px}.sched-log summary{cursor:pointer;font-size:.78rem;color:var(--muted)}.sched-log[open] summary{color:var(--fg)}.sched-log .slog-row{display:flex;align-items:center;gap:8px;padding:3px 0;border-top:1px solid var(--border)}.sched-log .slog-row:first-of-type{border-top:0}.sched-log .slog-row small{white-space:nowrap}
 
 /* Shared custom dropdown appearance for every selector. */
 .dl-btn{border-radius:14px;padding:8px 14px;gap:12px;background:var(--card2)}
@@ -766,3 +815,11 @@ tbody tr[data-open]{cursor:pointer}
 .diagnostic-section .chart-head>label{display:flex;align-items:center;gap:8px;min-width:0;color:var(--sub)}
 .diagnostic-section .dl{max-width:260px}
 .dl-menu.on{transform:none}
+
+/* 调度器当前选中的活跃路径：行级高亮 + 首列强调条。td 背景覆盖 tr 的
+   hover 底色（选择器同特异性、文件序在后），保证 hover 下高亮不丢。 */
+tbody tr.row-active td{background:var(--up-soft)}
+tbody tr.row-active td:first-child{box-shadow:inset 3px 0 0 var(--up)}
+
+/* 对端调度器选中标识（0x07 active-paths 位图，青色与本端绿色区分） */
+.b-peer{background:var(--cyan-soft);color:var(--cyan)}

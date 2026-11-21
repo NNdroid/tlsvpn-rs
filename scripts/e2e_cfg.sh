@@ -51,6 +51,7 @@ CLI_BIN="$E2E_RS_BIN"; [ "$CLI" = go ] && CLI_BIN="$E2E_GO_BIN"
 e2e_require RS_BIN "$SRV_BIN" "先构建：scripts/build.sh native" || exit 2
 e2e_ensure_cert || { echo "e2e_cfg: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
+CERT_SHA256="$(e2e_cert_sha256 "$CERT")"
 KEY="$E2E_KEY"
 
 # The client has no listening socket in this suite, so port-only cleanup cannot
@@ -191,23 +192,23 @@ esac
 SRV_LOGFRAG='"log_level": "info"'   # 与 SRV_FX 分开：serde_json 拒绝重复键，
 CLI_LOGFRAG='"log_level": "info"'   # 想覆盖 log_level 必须整段替换而不是追加
 SRV_FX=''        # 服务端额外顶层键
-CLI_FX='"client": {"insecure": true, "conns": 1}'
+CLI_FX='"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1}'
 WEB_FX='"auth": "e2e:web-test-password"' # Web 启用时认证是强制安全基线
 case "$CASE" in
   cidr)
     # req_v4/req_v6 落在池内 → 必须原样分配，而不是退回池的下一个空位
-    CLI_FX='"client": {"insecure": true, "conns": 1, "req_v4": "10.99.0.77", "req_v6": "fd99::77"}'
+    CLI_FX='"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1, "req_v4": "10.99.0.77", "req_v6": "fd99::77"}'
     ;;
   multi)
     # 客户端开 2 条 TCP 连接。服务端必须真的记到 2——面板 /api/stats 暴露
     # active_conns，两端（Rust stats_json / Go api.go）都有这个字段，所以这条
     # 断言可以跨语言。conns 是那种「配了但没人读」就会静默退化成单连接的字段。
-    CLI_FX='"client": {"insecure": true, "conns": 2}'
+    CLI_FX='"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 2}'
     ;;
   multifec)
     # 协议 v3 动态 FEC 的跨实现基线：先证明两条物理连接与 XOR FEC
     # 同时协商成功；2→1→2 的 fence/failover 由 Rust 单元故障测试覆盖。
-    CLI_FX='"client": {"insecure": true, "conns": 2, "fec": true, "fec_group": 4}'
+    CLI_FX='"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 2, "fec": true, "fec_group": 4}'
     SRV_LOGFRAG='"log_level": "debug"'
     CLI_LOGFRAG='"log_level": "debug"'
     ;;

@@ -29,6 +29,7 @@ case_mac()  { printf 'aa:bb:cc:dd:ee:%02x' "$(( ($1 - 1) % 250 + 1 ))"; }
 
 e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
+CERT_SHA256="$(e2e_cert_sha256 "$CERT")"
 KEY="$E2E_KEY"
 
 # run_case LABEL SRV_IMPL CLI_IMPL SRV_PAD SRV_MINENC CLI_EXTRA [SRV_CFG]
@@ -148,7 +149,7 @@ EOF
     cat > "$f" <<EOF
 {"mode": "client", "psk": "$PSK", "addr": "127.0.0.1:$port", "tap": "mem",
  "log_level": "info", "encrypt": true, "mac": "$mac",
- "min_enc": "$minenc", "pad_mode": "$pad", "client": {"insecure": true, "conns": 1}}
+ "min_enc": "$minenc", "pad_mode": "$pad", "client": {"insecure": true, "cert_sha256": "$CERT_SHA256", "conns": 1}}
 EOF
   fi
   CFGF="$f"

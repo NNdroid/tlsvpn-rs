@@ -28,6 +28,7 @@
     <div class="topctl" id="topctl">
       <div class="seg" id="lang-seg">
         <button data-v="zh-CN" onclick="setLang('zh-CN')">中文</button>
+        <button data-v="zh-TW" onclick="setLang('zh-TW')">繁中</button>
         <button data-v="en" onclick="setLang('en')">EN</button>
         <button data-v="de" onclick="setLang('de')">DE</button>
         <button data-v="fr" onclick="setLang('fr')">FR</button>
@@ -146,26 +147,32 @@
   </section>
 
   <section class="card">
-    <div class="tabs" id="tabs">
-      <button class="on" data-pane="clients" data-i18n="tab.clients">-</button>
-      <button data-pane="conns" data-i18n="tab.conns">-</button>
-      <button data-pane="macs" data-i18n="tab.macs">-</button>
-      <button data-pane="bans" data-i18n="tab.bans">-</button>
-      <button data-pane="traffic" data-i18n="tab.traffic">-</button>
-      <button data-pane="status" data-i18n="tab.status">-</button>
-      <button data-pane="diag" data-i18n="tab.diag">-</button>
-      <button data-pane="sec" data-i18n="tab.sc">-</button>
-      <button data-pane="topo" data-i18n="tab.tp">-</button>
-      <button data-pane="events" data-i18n="tab.ev">-</button>
-      <button data-pane="logs" data-i18n="tab.logs">-</button>
-      <button data-pane="settings" data-i18n="tab.settings">-</button>
+    <div class="tabs-nav">
+      <button class="tab-arrow" id="tab-prev" type="button" data-i18n-title="tab.prev" aria-hidden="true" tabindex="-1">‹</button>
+      <div class="tabs" id="tabs">
+        <i class="tab-ind" id="tab-ind" aria-hidden="true"></i>
+        <button class="on" data-pane="clients" data-i18n="tab.clients">-</button>
+        <button data-pane="conns" data-i18n="tab.conns">-</button>
+        <button data-pane="macs" data-srv="1" data-i18n="tab.macs">-</button>
+        <button data-pane="bans" data-srv="1" data-i18n="tab.bans">-</button>
+        <button data-pane="traffic" data-i18n="tab.traffic">-</button>
+        <button data-pane="status" data-i18n="tab.status">-</button>
+        <button data-pane="diag" data-i18n="tab.diag">-</button>
+        <button data-pane="sec" data-i18n="tab.sc">-</button>
+        <button data-pane="topo" data-i18n="tab.tp">-</button>
+        <button data-pane="events" data-i18n="tab.ev">-</button>
+        <button data-pane="mcp" data-i18n="tab.mcp">-</button>
+        <button data-pane="logs" data-i18n="tab.logs">-</button>
+        <button data-pane="settings" data-i18n="tab.settings">-</button>
+      </div>
+      <button class="tab-arrow" id="tab-next" type="button" data-i18n-title="tab.next" aria-hidden="true" tabindex="-1">›</button>
     </div>
 
     <div class="pane on" id="pane-clients">
       <div class="toolbar">
         <div class="search" id="search-clients" data-i18n-title="filter_tip">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input class="search-input" id="client-filter" data-i18n-ph="filter_ph">
+          <input class="search-input" data-i18n-ph="filter_ph">
           <button class="search-clear" onclick="clearFilter('clients')" aria-label="clear">×</button>
           <span class="search-count mono" id="client-count"></span>
         </div>
@@ -183,7 +190,7 @@
       <div class="toolbar">
         <div class="search" id="search-conns" data-i18n-title="filter_tip">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input class="search-input" id="conn-filter" data-i18n-ph="filter_ph">
+          <input class="search-input" data-i18n-ph="filter_ph">
           <button class="search-clear" onclick="clearFilter('conns')" aria-label="clear">×</button>
           <span class="search-count mono" id="conn-count"></span>
         </div>
@@ -192,8 +199,9 @@
         <button class="btn ghost sm" onclick="exportCSV('conns')" data-i18n="ov.export">-</button>
       </div>
       <div class="statstrip" id="conn-quality"></div>
+      <div id="sched-log"></div>
       <div class="twrap"><table>
-        <thead><tr><th data-sort="owner" data-i18n="th.owner">-</th><th class="hide-sm" data-sort="connid" data-i18n="th.connid">-</th><th class="hide-srv" data-sort="target" data-i18n="th.target">-</th><th data-sort="remote" data-i18n="th.remote">-</th><th data-i18n="th.state">-</th><th class="num" data-sort="rtt" data-i18n="th.rtt">-</th><th class="hide-sm" data-i18n="th.scheduler">-</th><th class="num" data-sort="tx" data-i18n="th.tx">-</th><th class="num" data-sort="rx" data-i18n="th.rx">-</th><th class="hide-sm num" data-sort="txs" data-i18n="th.txs">-</th><th class="hide-sm num" data-sort="rxs" data-i18n="th.rxs">-</th><th class="hide-sm" data-i18n="th.sni">-</th><th class="hide-sm num" data-sort="age" data-i18n="th.age">-</th><th class="hide-sm" data-i18n="th.epoch">-</th><th class="hide-sm" data-i18n="th.enc">-</th><th class="hide-sm" data-i18n="th.fec">-</th><th class="hide-sm" data-i18n="th.brutal">-</th><th class="hide-sm" data-i18n="th.err">-</th><th data-i18n="th.ops">-</th></tr></thead>
+        <thead><tr><th data-sort="owner" data-i18n="th.owner">-</th><th data-sort="connid" data-i18n="th.connid">-</th><th class="hide-srv" data-sort="target" data-i18n="th.target">-</th><th class="hide-srv" data-sort="serverSeen" data-i18n="th.serverSeen">-</th><th data-sort="remote" data-i18n="th.remote">-</th><th data-i18n="th.state">-</th><th class="num" data-sort="rtt" data-i18n="th.rtt">-</th><th data-i18n="th.scheduler">-</th><th class="num" data-sort="tx" data-i18n="th.tx">-</th><th class="num" data-sort="rx" data-i18n="th.rx">-</th><th class="num" data-sort="txs" data-i18n="th.txs">-</th><th class="num" data-sort="rxs" data-i18n="th.rxs">-</th><th class="hide-sm" data-i18n="th.sni">-</th><th class="hide-sm" data-i18n="th.cert">-</th><th class="num" data-sort="age" data-i18n="th.age">-</th><th class="hide-sm" data-i18n="th.epoch">-</th><th class="hide-sm" data-i18n="th.enc">-</th><th class="hide-sm" data-i18n="th.fec">-</th><th class="hide-sm" data-i18n="th.brutal">-</th><th class="hide-sm" data-i18n="th.err">-</th><th data-i18n="th.ops">-</th><th class="num hide-sm" data-sort="retries" data-i18n="th.retries">-</th></tr></thead>
         <tbody id="conns-body"></tbody>
       </table></div>
       <div class="pager" id="pager-conns"></div>
@@ -203,7 +211,7 @@
       <div class="toolbar">
         <div class="search" id="search-macs" data-i18n-title="filter_tip">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input class="search-input" id="mac-filter" data-i18n-ph="filter_ph">
+          <input class="search-input" data-i18n-ph="filter_ph">
           <button class="search-clear" onclick="clearFilter('macs')" aria-label="clear">×</button>
           <span class="search-count mono" id="mac-count"></span>
         </div>
@@ -395,6 +403,23 @@
         <button class="btn ghost sm" onclick="downloadLog()" data-i18n="logs.download">-</button>
       </div>
       <div id="logbox" class="term"></div>
+    </div>
+
+    <!-- 近期 MCP 访问日志：独立面板（独立内存环形缓冲 mcp_access，不混入
+         通用事件/日志面板）。SSE 通道经 mcp_logs frame 增量推送，?after 续传 -->
+    <div class="pane" id="pane-mcp">
+      <div class="toolbar">
+        <div class="search" style="width:230px">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="mcp-filter" data-i18n-ph="filter_ph">
+          <button class="search-clear" id="mcp-filter-clear" aria-label="clear">×</button>
+          <span class="search-count mono" id="mcp-count"></span>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" onclick="clearMcpLog()" data-i18n="logs.clear">-</button>
+        <button class="btn ghost sm" onclick="downloadMcpLog()" data-i18n="logs.download">-</button>
+      </div>
+      <div id="mcpbox" class="term"></div>
     </div>
 
     <div class="pane" id="pane-settings">

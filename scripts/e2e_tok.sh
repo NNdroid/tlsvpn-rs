@@ -34,6 +34,7 @@ CLI_BIN="$E2E_RS_BIN"; [ "$CLI" = go ] && CLI_BIN="$E2E_GO_BIN"
 
 e2e_ensure_cert || { echo "e2e: 需要 e2e_cert.pem/e2e_key.pem 或 openssl"; exit 2; }
 CERT="$E2E_CERT"
+CERT_SHA256="$(e2e_cert_sha256 "$CERT")"
 KEY="$E2E_KEY"
 
 # 两台客户端 + 一台服务端都会带 :PORT 命令行，按端口定位最稳。
@@ -97,7 +98,7 @@ start_cli() {
       '"log_level": "info"' \
       "\"mac\": \"$MAC\"" \
       "\"web\": {\"addr\": \"127.0.0.1:$webport\", \"auth\": \"e2e:web-test-password\"}" \
-      '"client": {"insecure": true, "conns": 1}'
+      '"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1}'
     "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   else
     # Go 客户端：flags 已移除（2026-09-19），一律走配置文件
@@ -108,7 +109,7 @@ start_cli() {
       '"log_level": "info"' \
       "\"mac\": \"$MAC\"" \
       "\"web\": {\"addr\": \"127.0.0.1:$webport\", \"auth\": \"e2e:web-test-password\"}" \
-      '"client": {"insecure": true, "conns": 1}'
+      '"client": {"insecure": true, "cert_sha256": "'$CERT_SHA256'", "conns": 1}'
     "$CLI_BIN" -c "$(e2e_winpath "$cfg")" >"$logf" 2>&1 &
   fi
 }

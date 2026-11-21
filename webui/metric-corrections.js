@@ -86,6 +86,12 @@
       const d = q.txDropPct;
       out.push(chip(t('ov.drop_pct'), d.toFixed(3) + '%', d > 1 ? 'bad' : (d > 0 ? 'warn' : 'good')));
     }
+    // reorder gap 超时冲刷：乱序严重度的直接信号（后端 reorder.timeout_flushes），
+    // >0 才占位，说明有帧等到了 50ms 窗口上限才放行。
+    const ro = data && data.reorder ? data.reorder : {};
+    if (num(ro.timeout_flushes) > 0) {
+      out.push(chip(t('ov.tflush'), fmtNum(ro.timeout_flushes), 'warn'));
+    }
     const fec = data && data.fec ? data.fec : {};
     if (fec.enabled && q.fecRecoveryPct !== null) {
       const p = q.fecRecoveryPct;
@@ -211,8 +217,11 @@
     return out;
   };
 
-  schedulerCell = function (s) {
+  schedulerCell = function (s, stalled) {
     if (!s) return '<span class="dim">-</span>';
+    // stalled 必须保留：连接被调度器判定不健康时独立于 active/standby 展示。
+    // 此前本覆盖丢掉了第二参数，失效连接显示成普通待命（回归）。
+    if (stalled) return '<div class="sched-cell"><span class="badge b-off" title="' + esc(t('sched.stalled_tip')) + '">' + esc(t('sched.stalled')) + '</span><small class="dim">' + esc(t('sched.stalled_note')) + '</small></div>';
     const cls = s.active ? 'b-on' : 'b-off';
     const state = s.active ? t('sched.active') : t('sched.standby');
     const capacity = num(s.rate_mbps);
@@ -221,16 +230,44 @@
     const share = sampled ? num(s._share_pct).toFixed(1) + '%' : '-';
     const batchRate = sampled ? num(s._batch_ps).toFixed(num(s._batch_ps) < 10 ? 1 : 0) + '/s' : '-';
     const eta = fmtSchedulerEta(num(s._queue_eta_us));
+    // 双向时钟偏移 θ/U（schedulerConnJSON，ns/µs）：只在收敛时显示。θ 的可信度
+    // 直接决定 fwd/ret 单向拆分的置信度，是判断探针读数能不能当真用的关键。
+    // θ ns→µs 后走 fmtMsUs；U 本身已是 µs。符号显式带出（偏移可负）。
+    let clock = '';
+    if (s.clock_offset_converged && s.clock_offset_ns !== undefined) {
+      const thUS = Number(s.clock_offset_ns) / 1000; // ns→µs（可为小数/负数）
+      clock = ' · θ ' + fmtMsUs(thUS) + 'ms ± U ' + fmtMsUs(num(s.clock_offset_unc_us)) + 'ms';
+    }
     const meta = t('sched.queue') + ' ' + fmtBytes(num(s.queued_bytes)) + ' · ' +
       t('sched.assign') + ' ' + alloc + ' (' + share + ') · ' +
-      t('sched.capacity') + ' ' + (capacity ? capacity.toFixed(capacity < 10 ? 1 : 0) + ' Mbps' : '-') + ' · ' +
+      t('sched.capacity') + ' ' + (capacity ? capacity.toFixed(capacity < 10 ? 1 : 0) + ' Mbps' : '-') +
+      // 容量权重（deliver_rate_mbps）：饱和门控测得的路径容量，WFQ 容量加权
+      // 的实际权重来源。仅在测得饱和窗后显示（0=未测得，权重走公平启动费率，
+      // 此时显示 "-" 会让人误以为权重为零）。与上面"负载写入 EWMA"并置才能
+      // 看出非饱和路径"被喂速率 ≠ 容量"的差别。
+      (num(s.deliver_rate_mbps) > 0 ? ' · ' + t('sched.weight') + ' ' + num(s.deliver_rate_mbps).toFixed(num(s.deliver_rate_mbps) < 10 ? 1 : 0) + ' Mbps' : '') + ' · ' +
       t('sched.qeta') + ' ' + eta + ' · ' + t('sched.batches') + ' ' + batchRate +
-      (s.carry_pending ? ' · ' + t('sched.carry') : '');
+      (s.carry_pending ? ' · ' + t('sched.carry') : '') + clock;
+    // TCP 重传（最近 200ms 采样窗的差分）：时延地板对丢包不敏感，重传是
+    // "正在丢段"的独立信号。>0 才显示，避免稳态路径的常驻噪音。meta 整体
+    // 走 esc()，着色片段必须在转义之外单独拼接（否则显示成字面 <span>）。
+    let retransHtml = '';
+    if (num(s.retrans_delta) > 0) {
+      retransHtml = ' · <span style="color:var(--err)">' + esc(t('sched.retrans')) + ' ×' + num(s.retrans_delta) + '</span>';
+    }
+    // 探针连续超时（黑洞嫌疑）：与重传并列的健康警告——写进本地发送缓冲成功
+    // 但对端收不到，旧 decayed-min 地板对它钝感，选路已按 streak 抬升其排名键。
+    let probeToHtml = '';
+    if (num(s.probe_timeout_streak) > 0) {
+      probeToHtml = ' · <span style="color:var(--err)">' + esc(t('sched.probe_to')) + ' ×' + num(s.probe_timeout_streak) + '</span>';
+    }
     const totalBytes = num(s.assigned_bytes) + num(s.fec_assigned_bytes);
     const totalBatches = num(s.assigned_batches) + num(s.fec_assigned_batches);
     const tip = t('sched.cumulative') + ': ' + fmtBytes(totalBytes) + ' / ' + totalBatches + ' ' + t('sched.batch_unit') +
       ' | DATA ' + fmtBytes(num(s.assigned_bytes)) + ' / ' + num(s.assigned_batches) +
-      ' | FEC ' + fmtBytes(num(s.fec_assigned_bytes)) + ' / ' + num(s.fec_assigned_batches);
-    return '<div class="sched-cell" title="' + esc(tip) + '"><span class="badge ' + cls + '">' + esc(state) + '</span><small class="dim">' + esc(meta) + '</small></div>';
+      ' | FEC ' + fmtBytes(num(s.fec_assigned_bytes)) + ' / ' + num(s.fec_assigned_batches) +
+      (num(s.retrans_delta) > 0 ? ' | ' + t('sched.retrans') + ' ×' + num(s.retrans_delta) + ' (' + t('sched.retrans_tip') + ')' : '') +
+      (num(s.probe_timeout_streak) > 0 ? ' | ' + t('sched.probe_to') + ' ×' + num(s.probe_timeout_streak) + ' (' + t('sched.probe_to_tip') + ')' : '') + clock;
+    return '<div class="sched-cell" title="' + esc(tip) + '"><span class="badge ' + cls + '">' + esc(state) + '</span><small class="dim">' + esc(meta) + retransHtml + probeToHtml + '</small></div>';
   };
 })();

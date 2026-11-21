@@ -10,7 +10,11 @@
     ja:['TCP 実測状態','測定待ち','読取失敗','非対応','有効','無効','ローカル TCP','ローカル → SOCKS5 プロキシ','測定時刻','閉じる','接続は終了しました','Linux socket API の値。CORK/QUICKACK は瞬時状態。バッファには管理領域が含まれ、TCP ウィンドウとは異なります。速度はローカル送信方向。','KeepAlive アイドル','KeepAlive 間隔','KeepAlive 回数','送信バッファ','受信バッファ','ユーザータイムアウト','未送信しきい値','輻輳制御','輻輳状態','RTT 変動','輻輳窓（セグメント）','未確認（セグメント）','再送中（セグメント）','累積再送','新規再送','未送信バイト','送信 MSS','受信 MSS','経路 MTU','相手の受信窓','ウィンドウスケール','送信窓スケール','受信窓スケール','配信速度推定','アプリ制限推定','Pacing 速度','累積稼働時間','累積受信窓制限時間','累積送信バッファ制限時間','累積再送バイト','古い測定値','無制限','測定間隔','システム既定']
   };
   const tr=i=>(words[typeof LANG==='string'?LANG:'en']||words.en)[i];
-  const fields=[['state','TCP'],['nodelay','NoDelay'],['congestion',19],['keepalive','KeepAlive'],['keepidle_sec',12,'s'],['keepintvl_sec',13,'s'],['keepcnt',14],['cork','TCP_CORK'],['quickack','TCP_QUICKACK'],['sndbuf_bytes',15,'bytes'],['rcvbuf_bytes',16,'bytes'],['mss_bytes','MSS','bytes'],['user_timeout_ms',17,'ms'],['notsent_lowat_bytes',18,'bytes'],['mark','SO_MARK'],['ca_state',20],['rtt_us','RTT','us'],['rttvar_us',21,'us'],['rto_us','RTO','us'],['snd_mss_bytes',28,'bytes'],['rcv_mss_bytes',29,'bytes'],['pmtu_bytes',30,'bytes'],['cwnd_segments',22],['unacked_segments',23],['retrans_segments',24],['total_retrans',25],['retrans_delta',26],['retrans_interval_ms',44,'ms'],['notsent_bytes',27,'bytes'],['snd_wnd_bytes',31,'bytes'],['sack','SACK'],['timestamps','Timestamps'],['ecn','ECN'],['window_scaling',32],['snd_wscale',33],['rcv_wscale',34],['delivery_rate_Bps',35,'rate'],['delivery_app_limited',36],['pacing_rate_Bps',37,'rate'],['busy_us',38,'us'],['rwnd_limited_us',39,'us'],['sndbuf_limited_us',40,'us'],['bytes_retrans',41,'bytes']];
+  // 与 tr 同样的 LANG 防御：i18n 加载失败时 LANG 是未绑定标识符，裸引用直接
+  // ReferenceError 炸掉整个面板。Invalid Date 也显式兜成 '-'。
+  const lang=()=>(typeof LANG==='string'?LANG:'en');
+  const dateText=ms=>{const d=new Date(ms);return isNaN(d.getTime())?'-':d.toLocaleString(lang());};
+  const fields=[['state','TCP'],['nodelay','NoDelay'],['congestion',19],['min_rtt_us','min RTT','us'],['keepalive','KeepAlive'],['keepidle_sec',12,'s'],['keepintvl_sec',13,'s'],['keepcnt',14],['cork','TCP_CORK'],['quickack','TCP_QUICKACK'],['sndbuf_bytes',15,'bytes'],['rcvbuf_bytes',16,'bytes'],['mss_bytes','MSS','bytes'],['user_timeout_ms',17,'ms'],['notsent_lowat_bytes',18,'bytes'],['mark','SO_MARK'],['ca_state',20],['rtt_us','RTT','us'],['rttvar_us',21,'us'],['rto_us','RTO','us'],['snd_mss_bytes',28,'bytes'],['rcv_mss_bytes',29,'bytes'],['pmtu_bytes',30,'bytes'],['cwnd_segments',22],['unacked_segments',23],['retrans_segments',24],['total_retrans',25],['retrans_delta',26],['retrans_interval_ms',44,'ms'],['notsent_bytes',27,'bytes'],['snd_wnd_bytes',31,'bytes'],['sack','SACK'],['timestamps','Timestamps'],['ecn','ECN'],['window_scaling',32],['snd_wscale',33],['rcv_wscale',34],['delivery_rate_Bps',35,'rate'],['delivery_app_limited',36],['pacing_rate_Bps',37,'rate'],['busy_us',38,'us'],['rwnd_limited_us',39,'us'],['sndbuf_limited_us',40,'us'],['bytes_retrans',41,'bytes']];
   let selected=null,lastData=null,lastReceipt=0;
   const dialog=document.createElement('dialog');dialog.id='tcp-dialog';dialog.className='tcp-dialog';dialog.innerHTML='<div class="chart-head"><h2 id="tcp-title"></h2><button class="btn ghost sm" id="tcp-close"></button></div><p id="tcp-scope" class="dim"></p><p id="tcp-note" class="dim"></p><div id="tcp-fields" class="tcp-fields"></div>';document.body.append(dialog);
   document.getElementById('tcp-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>{selected=null;});
@@ -33,7 +37,7 @@
     const scope=document.getElementById('tcp-scope');
     if(!c||c.state&&c.state!=='up'){scope.textContent=c?tr(1)+' · '+c.state:tr(10);document.getElementById('tcp-fields').replaceChildren();return;}
     const serverNow=Number(lastData?.sample_time_ms)||Date.now();
-    scope.textContent=s?(s.scope==='local_to_proxy'?tr(7):tr(6))+' · '+(s.peer||c.remote||'')+' · '+s.source+' · '+tr(8)+' '+new Date(s.sample_time_ms).toLocaleString(LANG)+(serverNow+Date.now()-lastReceipt-s.sample_time_ms>10000?' · '+tr(42):''):tr(1);
+    scope.textContent=s?(s.scope==='local_to_proxy'?tr(7):tr(6))+' · '+(s.peer||c.remote||'')+' · '+s.source+' · '+tr(8)+' '+dateText(s.sample_time_ms)+(serverNow+Date.now()-lastReceipt-s.sample_time_ms>10000?' · '+tr(42):''):tr(1);
     const content=document.getElementById('tcp-fields');content.replaceChildren();
     fields.forEach(([key,label,unit])=>{const row=document.createElement('div'),name=document.createElement('span'),data=document.createElement('strong');row.className='tcp-field';name.textContent=typeof label==='number'?tr(label):label;data.textContent=value(s,key,unit);data.dataset.tcpField=key;row.append(name,data);content.append(row);});
   }
@@ -45,10 +49,15 @@
       const cell=document.createElement('td');cell.dataset.tcpCell='';const button=document.createElement('button');button.className='btn ghost sm tcp-button';button.dataset.tcpId=id;
       button.textContent=tr(0);cell.append(button);
       const s=c.tcp;if(s){const summary=document.createElement('small');summary.className='dim';summary.textContent=(s.values?.congestion||'—')+' · NoDelay '+value(s,'nodelay');cell.append(summary);}
-      row.children[4].after(cell);
+      row.children[5].after(cell);
     });renderDetail();
-    let th=document.getElementById('tcp-heading');if(!th){th=document.createElement('th');th.id='tcp-heading';tbody.closest('table').querySelector('thead tr').children[4].after(th);}th.textContent=tr(0);
-    const empty=tbody.querySelector('tr:not([data-conn-id]) td[colspan]');if(empty)empty.colSpan=20;
+    let th=document.getElementById('tcp-heading');if(!th){th=document.createElement('th');th.id='tcp-heading';tbody.closest('table').querySelector('thead tr').children[5].after(th);}th.textContent=tr(0);
+    const empty=tbody.querySelector('tr:not([data-conn-id]) td[colspan]');
+    if(empty){
+      // colspan 跟着表头走（列数会增减），不硬编码 22
+      const headRow=tbody.closest('table').querySelector('thead tr');
+      empty.colSpan=headRow?headRow.children.length:empty.colSpan;
+    }
   }
   document.getElementById('conns-body').addEventListener('click',ev=>{const button=ev.target.closest('[data-tcp-id]');if(!button)return;selected=button.dataset.tcpId;renderDetail();if(!dialog.open)dialog.showModal();});
   const original=renderConnsTable;renderConnsTable=function(data,fresh){const result=original(data,fresh);augment(data);return result;};

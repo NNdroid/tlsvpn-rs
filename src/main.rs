@@ -118,6 +118,12 @@ pub struct Args {
     pub priority_data: i64,
     // 跨路径探针物理锚定下界（µs，默认 1000）。观察/分解用，不进线路格式。
     pub probe_min_half_rtt_us: i64,
+    // 候选资格门准入窗口（ms，[1,500]，默认 20）。双向吞吐区间（rttMode）回程
+    // 拥塞门的判定窗（对齐 Go sched_envelope_ms；fwd 门维度 Rust 尚未镜像）。
+    pub sched_envelope_ms: i64,
+    // 路径健康罚时单位值（µs，[0,60000]，默认 2000，0=禁用）：每次探针连续超时/
+    // 每个 200ms 窗重传段在排名键上加的微秒数（对齐 Go sched_health_penalty_us）。
+    pub sched_health_penalty_us: i64,
 }
 
 // ======================= JSON 配置文件（对齐 Go config.go） =======================
@@ -169,6 +175,13 @@ struct ConfigFile {
     // 跨路径探针的物理锚定下界（µs，[0,3600000]，默认 1000）。不进线路格式。
     #[serde(default)]
     probe_min_half_rtt_us: Option<i64>,
+    // 候选资格门准入窗口（ms，[1,500]，默认 20）。双向吞吐区间（rttMode）回程
+    // 拥塞门的判定窗（对齐 Go sched_envelope_ms）。
+    #[serde(default)]
+    sched_envelope_ms: Option<i64>,
+    // 路径健康罚时单位值（µs，[0,60000]，默认 2000，0=禁用）。
+    #[serde(default)]
+    sched_health_penalty_us: Option<i64>,
     workers: i32,
     mtu: u16,
     web: WebConfigFile,
@@ -462,6 +475,13 @@ fn load_config_file(path: &str) -> Result<Args, String> {
         priority_control: cfg.priority_control.unwrap_or(7),
         priority_data: cfg.priority_data.unwrap_or(5),
         probe_min_half_rtt_us: cfg.probe_min_half_rtt_us.unwrap_or(1000),
+        sched_envelope_ms: cfg.sched_envelope_ms.unwrap_or(
+            crate::adaptive_multipath::SCHED_ENVELOPE_DEFAULT_MS as i64,
+        ),
+        // 0 是"显式禁用健康罚时"的合法值，不是缺省（对齐 Go *int 语义）。
+        sched_health_penalty_us: cfg
+            .sched_health_penalty_us
+            .unwrap_or(crate::adaptive_multipath::SCHED_HEALTH_PENALTY_DEFAULT_US as i64),
     };
     if args.mode == "server" && args.addr.is_empty() {
         args.addr = "0.0.0.0:4000".into();
@@ -571,6 +591,27 @@ fn validate_args(args: &Args) -> Result<(), String> {
     // 物理锚定下界 [0,3600000]µs；对齐 Go config.go:437-439。
     if !(0..=3_600_000).contains(&args.probe_min_half_rtt_us) {
         return Err("probe_min_half_rtt_us must be in [0, 3600000]".into());
+    }
+    // 资格门准入窗口 [1,500]ms（对齐 Go sched_envelope_ms 校验）。
+    if !(crate::adaptive_multipath::SCHED_ENVELOPE_MIN_MS
+        ..=crate::adaptive_multipath::SCHED_ENVELOPE_MAX_MS)
+        .contains(&args.sched_envelope_ms)
+    {
+        return Err(format!(
+            "sched_envelope_ms must be in [{}, {}]",
+            crate::adaptive_multipath::SCHED_ENVELOPE_MIN_MS,
+            crate::adaptive_multipath::SCHED_ENVELOPE_MAX_MS
+        ));
+    }
+    // 健康罚时单位值 [0,60000]µs（对齐 Go sched_health_penalty_us 校验）：超过
+    // 上限单次事件即顶满总量封顶，等于把可调范围退化为开关。
+    if !(0..=crate::adaptive_multipath::SCHED_HEALTH_PENALTY_MAX_CONFIG_US)
+        .contains(&args.sched_health_penalty_us)
+    {
+        return Err(format!(
+            "sched_health_penalty_us must be in [0, {}]",
+            crate::adaptive_multipath::SCHED_HEALTH_PENALTY_MAX_CONFIG_US
+        ));
     }
     // log_level 是闭集（对齐 Go 的 zapcore.Level.UnmarshalText）。之前不校验，
     // 任意拼错的串都塞进 EnvFilter，只会得到「日志行为莫名变化」这种最难受的
@@ -728,6 +769,15 @@ fn validate_args(args: &Args) -> Result<(), String> {
             if cleaned.len() != 64 || !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("client cert_sha256 must be 64 hex chars (sha256)".into());
             }
+        }
+        // insecure=true 必须钉住证书指纹（对齐 Go config.go 68ae122）：
+        // 裸 insecure 关掉证书校验又没有任何锚点，等于对任意伪装站点裸奔；
+        // 允许它的唯一理由是与 cert_sha256 组合（跳过 CA 链校验、只认指纹）。
+        if args.insecure && args.cert_sha256.is_empty() {
+            return Err(
+                "client.insecure=true requires client.cert_sha256 (disable insecure or pin the server certificate fingerprint)"
+                    .into(),
+            );
         }
     }
     // 上限是拒绝服务阀值：负数无意义，超大值等于关掉保护（对齐 Go Validate）
@@ -1024,6 +1074,9 @@ mod tests {
         a.priority_control = 7;
         a.priority_data = 5;
         a.probe_min_half_rtt_us = 1000;
+        a.sched_envelope_ms = crate::adaptive_multipath::SCHED_ENVELOPE_DEFAULT_MS as i64;
+        a.sched_health_penalty_us =
+            crate::adaptive_multipath::SCHED_HEALTH_PENALTY_DEFAULT_US as i64;
     }
 
     #[test]

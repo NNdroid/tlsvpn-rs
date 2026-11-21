@@ -497,6 +497,10 @@ impl TrafficState {
 pub struct WebParityState {
     config_path: PathBuf,
     source_config: RwLock<Value>,
+    /// 启动时配置快照（对齐 Go bootCfg）：needs_restart 的差异基准。仅保存
+    /// （不热应用）多轮后，needs_restart 仍按"与启动配置相比要重启才能生效的
+    /// 字段"计算，而不是与上一轮保存值相比——否则用户改回启动值后提示不消失。
+    boot_config: Value,
     needs_restart: RwLock<Vec<String>>,
     trend: Mutex<TrendState>,
     traffic: Mutex<TrafficState>,
@@ -518,6 +522,7 @@ impl WebParityState {
         let traffic = TrafficState::new(&config_path, &source_config);
         Self {
             config_path,
+            boot_config: source_config.clone(),
             source_config: RwLock::new(source_config),
             needs_restart: RwLock::new(Vec::new()),
             trend: Mutex::new(TrendState::default()),
@@ -548,6 +553,11 @@ impl WebParityState {
         self.source_config.read().clone()
     }
 
+    /// 启动时配置快照（对齐 Go bootCfg 语义）：needs_restart 的差异基准。
+    pub fn boot_config(&self) -> Value {
+        self.boot_config.clone()
+    }
+
     pub fn current_auth(&self) -> String {
         self.source_config
             .read()
@@ -562,6 +572,20 @@ impl WebParityState {
         set_pointer_string(&mut cfg, &["psk"], "");
         set_pointer_string(&mut cfg, &["socks5"], "");
         set_pointer_string(&mut cfg, &["web", "auth"], "");
+        // MCP credential 是 sha256 验证器（防重放），但拿到验证器即可对弱口令
+        // 离线字典爆破；与其他秘密同等待遇，GET 一律脱敏。脱敏前派生
+        // credential_set 布尔量：面板此前拿不到任何"已配置"信号，保存成功后
+        // 状态也一直显示"尚未配置"（用户感知为保存不上）（对齐 Go
+        // GET /api/config 的 CredentialSet 派生）。
+        let credential_set = cfg
+            .pointer("/web/mcp/credential")
+            .and_then(Value::as_str)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        set_pointer_string(&mut cfg, &["web", "mcp", "credential"], "");
+        if let Some(obj) = cfg.pointer_mut("/web/mcp").and_then(Value::as_object_mut) {
+            obj.insert("credential_set".into(), Value::Bool(credential_set));
+        }
         cfg
     }
 
@@ -570,6 +594,31 @@ impl WebParityState {
         preserve_empty_string(&mut candidate, &current, &["psk"]);
         preserve_empty_string(&mut candidate, &current, &["socks5"]);
         preserve_empty_string(&mut candidate, &current, &["web", "auth"]);
+        // MCP credential 保全（对齐 Go mergeAndValidateConfig）：候选为空（面板
+        // 回显的是脱敏空串）且 auth_mode 未变时保留现有凭据；auth_mode 变化视为
+        // 显式重配，候选值生效（缺了会被校验拒绝）。
+        let mode_unchanged = candidate
+            .pointer("/web/mcp/auth_mode")
+            .and_then(Value::as_str)
+            == current
+                .pointer("/web/mcp/auth_mode")
+                .and_then(Value::as_str)
+            || (candidate.pointer("/web/mcp/auth_mode").is_none()
+                && current.pointer("/web/mcp/auth_mode").is_none());
+        let candidate_credential_empty = candidate
+            .pointer("/web/mcp/credential")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty();
+        if candidate_credential_empty && mode_unchanged {
+            preserve_empty_string(&mut candidate, &current, &["web", "mcp", "credential"]);
+        }
+        // credential_set 是 GET 回显的派生量，绝不接受面板回传/落盘——否则保存
+        // 的 JSON 里会固化一个可能与真实凭据脱节的陈旧标志（对齐 Go
+        // mergeAndValidateConfig 的 CredentialSet = false）。
+        if let Some(obj) = candidate.pointer_mut("/web/mcp").and_then(Value::as_object_mut) {
+            obj.remove("credential_set");
+        }
         candidate
     }
 

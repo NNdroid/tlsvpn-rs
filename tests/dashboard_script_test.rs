@@ -12,7 +12,7 @@ fn webui_matches_shared_static_asset_contract() {
     let app = fs::read_to_string(root.join("app.js")).expect("app.js");
     let i18n = fs::read_to_string(root.join("i18n.js")).expect("i18n.js");
     let css = fs::read_to_string(root.join("style.css")).expect("style.css");
-    let frameviz = fs::read_to_string(root.join("frameviz.js")).expect("frameviz.js");
+    let frameviz = fs::read_to_string(root.join("frame-visualizer.js")).expect("frame-visualizer.js");
     assert!(index.contains("/favicon.ico"));
     let i18n_pos = index.find("src=\"i18n.js\"").expect("i18n.js script");
     let app_pos = index.find("src=\"app.js\"").expect("app.js script");
@@ -37,7 +37,7 @@ fn webui_matches_shared_static_asset_contract() {
         assert!(i18n.contains(marker), "i18n.js missing {marker:?}");
     }
     assert!(app.contains("platformAssetName"));
-    assert!(!app.contains("fetch(url(\'/api/stats\')"));
+    assert!(!app.contains("fetch(url('/api/stats')"));
     assert!(css.contains("platform-badge"));
     for marker in [
         "FRAMEVIZ_I18N[LANG]",
@@ -54,12 +54,40 @@ fn webui_matches_shared_static_asset_contract() {
         "seq=0",
         "1 MiB",
     ] {
-        assert!(frameviz.contains(marker), "frameviz missing {marker:?}");
+        assert!(frameviz.contains(marker), "frame-visualizer missing {marker:?}");
+    }
+    // 与 Go 共享的三个运行时模块（对齐 Go webui.go 注入清单与
+    // mcp_webui_examples_test.go 的内容契约）。
+    let metric_corrections =
+        fs::read_to_string(root.join("metric-corrections.js")).expect("metric-corrections.js");
+    assert!(
+        metric_corrections.contains("Shared WebUI metric corrections for the Go and Rust implementations"),
+        "metric-corrections.js must keep the shared-file header"
+    );
+    let sse = fs::read_to_string(root.join("sse.js")).expect("sse.js");
+    assert!(
+        sse.contains("mcp_logs"),
+        "sse.js must carry the mcp_logs SSE channel type"
+    );
+    let sched_settings =
+        fs::read_to_string(root.join("scheduler-settings.js")).expect("scheduler-settings.js");
+    for marker in ["routing-algo", "fromEditor", "toEditor", "latency_strict"] {
+        assert!(sched_settings.contains(marker), "scheduler-settings missing {marker:?}");
+    }
+    let mcp_settings =
+        fs::read_to_string(root.join("mcp-settings.js")).expect("mcp-settings.js");
+    for marker in ["mcp-deploy", "applyDeployLock", "credential_set"] {
+        assert!(mcp_settings.contains(marker), "mcp-settings missing {marker:?}");
     }
     for file in [
         "favicon.ico",
         "i18n.js",
-        "frameviz.js",
+        "frame-visualizer.js",
+        "metric-corrections.js",
+        "sse.js",
+        "scheduler-settings.js",
+        "mcp-settings.js",
+        "mcp-examples.js",
         "tcp.js",
         "diagnostics.js",
         "icons/os-linux.svg",
@@ -73,7 +101,7 @@ fn webui_matches_shared_static_asset_contract() {
         let meta = fs::metadata(root.join(file)).unwrap_or_else(|e| panic!("missing {file}: {e}"));
         assert!(meta.len() > 0, "empty asset: {file}");
     }
-    for old in ["zh-tw.js", "frameviz-zh-tw.js"] {
+    for old in ["zh-tw.js", "frameviz-zh-tw.js", "frameviz.js", "metrics.js", "stream.js"] {
         assert!(!root.join(old).exists(), "obsolete asset remains: {old}");
     }
 }
@@ -88,9 +116,12 @@ fn rust_embed_table_covers_primary_assets() {
         "/style.css",
         "/i18n.js",
         "/app.js",
-        "/frameviz.js",
-        "/metrics.js",
-        "/stream.js",
+        "/frame-visualizer.js",
+        "/metric-corrections.js",
+        "/sse.js",
+        "/scheduler-settings.js",
+        "/mcp-settings.js",
+        "/mcp-examples.js",
         "/tcp.js",
         "/diagnostics.js",
         "/favicon.ico",
@@ -102,6 +133,8 @@ fn rust_embed_table_covers_primary_assets() {
         );
     }
     assert!(!src.contains("/zh-tw.js") && !src.contains("/frameviz-zh-tw.js"));
+    // 旧改名副本不得回潮。
+    assert!(!src.contains("/frameviz.js") && !src.contains("/metrics.js") && !src.contains("/stream.js"));
 }
 
 #[test]

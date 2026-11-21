@@ -595,11 +595,15 @@ struct KernelTcpInfoPrefix {
     tcpi_min_rtt: u32,
 }
 
-/// 一次 getsockopt 同时取 SRTT（tcpi_rtt）与内核 min_rtt（tcpi_min_rtt，µs）。
-/// 仅 Linux：非 Linux 无法测量，等效 Go 非 Linux 分支不采样。min_rtt 0 = 尚未
-/// 观测到（引导期），调用方按"未知"处理（对齐 Go adaptiveBackendMinRTT）。
+/// 一次 getsockopt 同时取 SRTT（tcpi_rtt）、内核 min_rtt（tcpi_min_rtt，µs）、
+/// 连接生命周期累计重传段数（tcpi_total_retrans，单调递增，调用方按 200ms 采样
+/// 窗做差）、拥塞窗口（tcpi_snd_cwnd）与发送端 MSS（tcpi_snd_mss）。
+/// snd_cwnd/snd_mss 供非饱和窗的 BDP 容量下界估计（cwnd×mss/srtt，对齐 Go
+/// getTCPRTTAndMinRTT 的五元组返回）。仅 Linux。
 #[cfg(target_os = "linux")]
-pub fn get_tcp_rtt_and_min<S: AsRawFd>(stream: &S) -> std::io::Result<(u32, u32)> {
+pub fn get_tcp_rtt_and_min<S: AsRawFd>(
+    stream: &S,
+) -> std::io::Result<(u32, u32, u32, u32, u32)> {
     let fd = stream.as_raw_fd();
     let mut info: KernelTcpInfoPrefix = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<KernelTcpInfoPrefix>() as libc::socklen_t;
@@ -613,16 +617,23 @@ pub fn get_tcp_rtt_and_min<S: AsRawFd>(stream: &S) -> std::io::Result<(u32, u32)
         )
     };
     if rc == 0 {
-        Ok((info.tcpi_rtt, info.tcpi_min_rtt))
+        Ok((
+            info.tcpi_rtt,
+            info.tcpi_min_rtt,
+            info.tcpi_total_retrans,
+            info.tcpi_snd_cwnd,
+            info.tcpi_snd_mss,
+        ))
     } else {
         Err(std::io::Error::last_os_error())
     }
 }
 
-/// 非 Linux：min_rtt 无法测量，返回 (UNKNOWN_RTT_US, 0)（0 = 未知）。
+/// 非 Linux：min_rtt 无法测量，返回 (UNKNOWN_RTT_US, 0)（0 = 未知）；重传/容量
+/// 量全 0（对齐 Go 非 Linux 分支不采样）。
 #[cfg(not(target_os = "linux"))]
-pub fn get_tcp_rtt_and_min<S>(_stream: &S) -> std::io::Result<(u32, u32)> {
-    Ok((crate::adaptive_multipath::UNKNOWN_RTT_US, 0))
+pub fn get_tcp_rtt_and_min<S>(_stream: &S) -> std::io::Result<(u32, u32, u32, u32, u32)> {
+    Ok((crate::adaptive_multipath::UNKNOWN_RTT_US, 0, 0, 0, 0))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1523,6 +1534,7 @@ impl crate::probe_scheduler::ProbeTarget for Backend {
         &self,
         fwd: Option<(u64, u64)>, // (选路 rank 编码, 显示 µs)
         ret: Option<(u64, u64)>,
+        ret_congest_us: Option<i64>,
         updated_ms: u64,
     ) {
         let st = &self.scheduler;
@@ -1534,7 +1546,20 @@ impl crate::probe_scheduler::ProbeTarget for Backend {
             st.ret_rank_us.store(rank, Ordering::Relaxed);
             st.ret_one_way_us.store(display, Ordering::Relaxed);
         }
+        if let Some(congest) = ret_congest_us {
+            st.ret_congest_us.store(congest, Ordering::Relaxed);
+        }
         st.probe_updated_at.store(updated_ms, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn note_probe_timeout(&self) {
+        self.scheduler.probe_timeout_streak.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn note_probe_reply(&self) {
+        self.scheduler.probe_timeout_streak.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1611,6 +1636,18 @@ impl AsyncPort {
     /// 读取，配置变更即生效）。未知值归一化为 auto。
     pub fn set_routing_algo(&self, algo: &str) {
         self.adaptive.set_routing_algo(algo);
+    }
+
+    /// 设定路径健康罚时单位值（µs，对齐 Go SetSchedHealthPenaltyUs）：每次探针
+    /// 连续超时/每个 200ms 窗重传段在排名键上加的微秒数。0=禁用。调度器每批读取。
+    pub fn set_sched_health_penalty_us(&self, us: i64) {
+        self.adaptive.set_sched_health_penalty_us(us);
+    }
+
+    /// 热更资格门准入窗口（ms，对齐 Go SetSchedEnvelopeMs）。rttMode 回程拥塞
+    /// 门按此窗口判定。
+    pub fn set_sched_envelope_ms(&self, ms: i64) {
+        self.adaptive.set_sched_envelope_ms(ms);
     }
 
     /// 注入本端口所属会话的双向时钟偏移 θ 读取器（供快照暴露收敛状态；对齐 Go
@@ -1914,11 +1951,15 @@ impl AsyncPort {
             return None;
         }
         let rtt = b.rtt_cache.load(Ordering::Relaxed);
-        let penalty = if q_len > 10 {
+        let mut penalty = if q_len > 10 {
             (q_len as u64 - 10) * 1000
         } else {
             0
         };
+        // TCP 重传惩罚（对齐 Go backendScore + retransPenaltyUS）：丢包路径的
+        // 时延地板对丢包不敏感，兜底选择与 parity 轮转要能避开正在丢段的路径。
+        penalty += b.scheduler.retrans_delta.load(Ordering::Relaxed) as u64
+            * crate::adaptive_multipath::RETRANS_PENALTY_US;
         Some((rtt as u64 + penalty).min(u32::MAX as u64) as u32)
     }
 

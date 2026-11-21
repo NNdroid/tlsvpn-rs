@@ -629,10 +629,18 @@ impl Default for RuntimeCtx {
 }
 
 impl RuntimeCtx {
-    /// 从最终生效的 Args 拍快照。只放"开关现在是开还是关"这类信息，
+    /// 从最终生效的 Args 拍配置快照。只放"开关现在是开还是关"这类信息，
     /// PSK 等凭据不进入面板：浏览器缓存一份可保存的凭据没有意义还多一个泄露面。
-    pub fn from_args(args: &crate::Args, cfg_path: &str) -> Self {
-        let pad_actual = crate::crypto::pad_mode_name();
+    /// 保存流复用同一函数回显"保存目标态"（对齐 Go snapshotCfg(savedCfg())）。
+    pub(crate) fn runtime_cfg_json(args: &crate::Args) -> serde_json::Value {
+        // pad_mode 从 args 派生而非读全局运行态：保存回显必须反映"保存目标态"
+        // （对齐 Go snapshotCfg(savedCfg)），空配置值映射到默认 bucket（与
+        // crypto::set_pad_mode 的回落一致）。
+        let pad_actual = if args.pad_mode.is_empty() {
+            crate::crypto::PAD_MODE_BUCKET.to_string()
+        } else {
+            args.pad_mode.clone()
+        };
         let web_https = !args.web_cert.is_empty() && !args.web_key.is_empty();
         let mut cfg = serde_json::json!({
             "mode": args.mode,
@@ -661,7 +669,10 @@ impl RuntimeCtx {
             "web_auth": !args.web_auth.is_empty(),
             "web_bind": args.web_bind,
             "web_https": web_https,
-            "encrypt_psk": true,
+            // EncryptPSK 回显"PSK 已配置"：此前硬编码 true，没配 PSK 的实例也在
+            // 生效配置快照里显示已配置（对齐 Go snapshotCfg 的 EncryptPSK =
+            // cfg.PSK != ""，与 credential_set 同类的"无数据源状态"修复）。
+            "encrypt_psk": !args.psk.is_empty(),
             "max_sessions": args.max_sessions,
             "v4_cidr": args.v4cidr,
             "v6_cidr": args.v6cidr,
@@ -679,6 +690,12 @@ impl RuntimeCtx {
             "extra_routes": args.extra_routes,
             "source_rules": args.source_rules,
             "encrypt_present": args.encrypt_present,
+            // 调度可观测配置（对齐 Go snapshotCfg 的 ProbeMinHalfRTTUs/
+            // SchedHealthPenaltyUs/SchedEnvelopeMs）：0 是合法值（显式禁用），
+            // 必须能出现在生效配置快照里核实它生效了。
+            "probe_min_half_rtt_us": args.probe_min_half_rtt_us,
+            "sched_envelope_ms": args.sched_envelope_ms,
+            "sched_health_penalty_us": args.sched_health_penalty_us,
         });
         // FEC 分组策略是服务端专属配置。客户端模式下这两个值是协议边界默认，
         // 显示出来会被误读成客户端策略，因此只在服务端模式下发。
@@ -686,6 +703,12 @@ impl RuntimeCtx {
             cfg["fec_group_min"] = serde_json::json!(args.fec_group_min);
             cfg["fec_group_max"] = serde_json::json!(args.fec_group_max);
         }
+        cfg
+    }
+
+    /// 从最终生效的 Args 拍快照。
+    pub fn from_args(args: &crate::Args, cfg_path: &str) -> Self {
+        let cfg = Self::runtime_cfg_json(args);
         Self {
             cfg: RwLock::new(cfg),
             system: system_info(cfg_path),
@@ -693,6 +716,14 @@ impl RuntimeCtx {
             mcp: args.web_mcp.clone(),
         }
     }
+}
+
+/// 保存后的状态卡回显：用刚保存（归一化校验通过）的配置整体重建 cfg 快照。
+/// 无论是否热应用，状态卡（/api/stats 的 cfg）立即反映"已保存"的值，与设置页
+/// 一致；数据面真实生效值见热应用路径（对齐 Go stats.Cfg = snapshotCfg(savedCfg())，
+/// 仅保存后 savedCfg 是磁盘目标态，curCfg 仍是数据面真实生效值）。
+fn echo_saved_config(ctx: &RuntimeCtx, validated: &crate::Args) {
+    *ctx.cfg.write() = RuntimeCtx::runtime_cfg_json(validated);
 }
 
 fn read_proc_trim(path: &str) -> String {
@@ -824,6 +855,20 @@ fn respond_json(req: tiny_http::Request, body: String, status: u16) {
     let resp = Response::from_string(body)
         .with_status_code(status)
         .with_header(http_header("Content-Type", "application/json"));
+    let _ = req.respond(resp);
+}
+
+/// respond_json + 追加 Cache-Control 头（回显接口禁缓存用）。
+fn respond_json_with_cache_control(
+    req: tiny_http::Request,
+    body: String,
+    status: u16,
+    cache_control: &str,
+) {
+    let resp = Response::from_string(body)
+        .with_status_code(status)
+        .with_header(http_header("Content-Type", "application/json"))
+        .with_header(http_header("Cache-Control", cache_control));
     let _ = req.respond(resp);
 }
 
@@ -1469,9 +1514,12 @@ fn serve_listener(
                 }
             }
             (&Method::Get, "/api/config") => {
+                // 回显接口禁缓存：保存（save/save_apply）后面板立即重新 GET 回显
+                // 归一化结果，中间层/浏览器若返回缓存旧值，编辑器会对齐到保存前
+                // 的状态（对齐 Go GET /api/config 的 Cache-Control: no-store）。
                 let body = serde_json::to_string_pretty(&ctx.web.redacted_config())
                     .unwrap_or_else(|_| "{}".to_string());
-                respond_json(request, body, 200);
+                respond_json_with_cache_control(request, body, 200, "no-store");
             }
             (&Method::Post, "/api/config") => {
                 const MAX_CONFIG_BODY: usize = 1024 * 1024;
@@ -1499,13 +1547,30 @@ fn serve_listener(
                     &merged,
                     ctx.web.config_path().to_string_lossy().as_ref(),
                 ) {
-                    Ok(_) => match atomic_write_json(ctx.web.config_path(), &merged) {
-                        Ok(()) => {
-                            ctx.web.replace_config(merged);
-                            respond_json(request, r#"{"status":"ok"}"#.to_string(), 200);
+                    Ok(validated) => {
+                        match atomic_write_json(ctx.web.config_path(), &merged) {
+                            Ok(()) => {
+                                ctx.web.replace_config(merged);
+                                // 与 /api/control save 分支同纪律：保存即更新
+                                // needs_restart（按启动配置基准）与状态卡目标态回显。
+                                let hot_fields =
+                                    ["log_level", "pad_mode", "traffic_days", "traffic_file"];
+                                let needs_restart: Vec<String> = diff_paths(
+                                    &ctx.web.boot_config(),
+                                    &ctx.web.current_config(),
+                                )
+                                .into_iter()
+                                .filter(|f| !hot_fields.contains(&f.as_str()))
+                                .collect();
+                                ctx.web.set_needs_restart(needs_restart);
+                                ctx.web
+                                    .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
+                                echo_saved_config(&ctx, &validated);
+                                respond_json(request, r#"{"status":"ok"}"#.to_string(), 200)
+                            }
+                            Err(e) => respond_json(request, json!({"error":e}).to_string(), 400),
                         }
-                        Err(e) => respond_json(request, json!({"error":e}).to_string(), 400),
-                    },
+                    }
                     Err(e) => respond_json(request, json!({"error":e}).to_string(), 400),
                 }
             }
@@ -1591,9 +1656,17 @@ fn serve_listener(
                         respond_json(request, json!({"error":e}).to_string(), 400);
                         continue;
                     }
-                    let changed = diff_paths(&old, &merged);
+                    // 运行态配置对象与磁盘保持一致（对齐 Go save 分支的
+                    // mgr.SetConfig）：save 即更新 web 持有的配置（GET /api/config
+                    // 立即反映刚保存的值），否则用户连续两次保存时，第二次提交的
+                    // 内容来自第一次保存前的旧运行态，第一次改的字段会被静默回滚。
+                    ctx.web.replace_config(merged.clone());
+                    // 数据面热应用仍只在 save_apply：仅保存不得重启隧道或断开
+                    // 现有连接。log_level/pad_mode 是可热更项，apply 时下发。
                     let mut needs_restart = Vec::new();
+                    let hot_fields = ["log_level", "pad_mode", "traffic_days", "traffic_file"];
                     if apply {
+                        let changed = diff_paths(&old, &merged);
                         for field in &changed {
                             match field.as_str() {
                                 "log_level" => {
@@ -1604,20 +1677,30 @@ fn serve_listener(
                                     let _ =
                                         provider.control("pad_mode", "", &validated.pad_mode, 0);
                                 }
-                                "traffic_days" | "traffic_file" => {}
+                                f if hot_fields.contains(&f) => {}
                                 _ => needs_restart.push(field.clone()),
                             }
                         }
-                        ctx.web
-                            .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
-                        if let Some(cfg) = ctx.cfg.write().as_object_mut() {
-                            cfg.insert("log_level".into(), json!(validated.loglevel));
-                            cfg.insert("pad_mode".into(), json!(crate::crypto::pad_mode_name()));
-                            cfg.insert("traffic_days".into(), json!(validated.traffic_days));
-                            cfg.insert("traffic_file".into(), json!(validated.traffic_file));
+                    }
+                    // needs_restart 只比较「启动时配置」与提交的目标配置，与 apply
+                    // 无关（对齐 Go mergeAndValidateConfig：NeedsRestart 以 bootCfg
+                    // 为基准）：即使仅保存（不热应用），用户也必须知道哪些字段要
+                    // 重启才能生效，否则面板提示"已保存"却无任何"需重启生效"提示。
+                    for field in diff_paths(&ctx.web.boot_config(), &merged) {
+                        if !hot_fields.contains(&field.as_str())
+                            && !needs_restart.contains(&field)
+                        {
+                            needs_restart.push(field);
                         }
                     }
-                    ctx.web.replace_config(merged);
+                    // dailyTraffic 只影响流量统计的保留天数与文件路径，不碰隧道，
+                    // 因此随保存一起生效，保证运行态与磁盘一致（对齐 Go save 分支
+                    // 的 dailyTraffic.OnConfig）。
+                    ctx.web
+                        .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
+                    // 保存目标态回显：无论是否热应用，状态卡立即反映"已保存"的值
+                    // （对齐 Go stats.Cfg = snapshotCfg(savedCfg())）。
+                    echo_saved_config(&ctx, &validated);
                     ctx.web.set_needs_restart(needs_restart.clone());
                     ctx.web.events.emit(
                         "config",

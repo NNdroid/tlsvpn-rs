@@ -810,8 +810,12 @@ fn main() {
                     if body.len() >= 7 && body[0] == CONTROL_KIND_FEC_PARITY {
                         got_parity += 1;
                         println!("RX: parity frame (len={})", body.len());
-                    } else if body.is_empty() {
-                        heartbeats += 1; // 服务端下行链路存活证明
+                    } else {
+                        // 下行链路存活证明。任何 seq=0 帧都算：除空心跳外，服务端
+                        // 还会周期下发 0x07 active-paths 等旁路控制帧，它们同样
+                        // 证明下行路径可用。只认空帧会在服务端改发旁路控制帧后
+                        // 永远数不到心跳，导致探针空等到读超时。
+                        heartbeats += 1;
                     }
                     continue;
                 }

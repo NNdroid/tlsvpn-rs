@@ -206,17 +206,22 @@ fn tool_config_validate(ctx: &McpCtx, params: &Value) -> Result<Value, String> {
         return Err("config must be an object".into());
     }
     let merged = ctx.ctx.web.merge_preserving_secrets(cfg.clone());
-    // 校验：这里做最小一致性检查（必须有 mode/psk 等关键字段），完整校验
-    // 走 config 解析路径（Rust 无热更，config_validate 只做结构检查）。
-    let missing: Vec<String> = ["mode", "psk"]
-        .iter()
-        .filter(|k| merged.get(**k).is_none())
-        .map(|s| s.to_string())
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!("config missing required fields: {}", missing.join(", ")));
-    }
-    let needs_restart = ctx.ctx.web.needs_restart();
+    // 校验走与启动完全相同的 loader+validator（对齐 Go mergeAndValidateConfig 的
+    // applyDefaults+Validate）。
+    crate::validate_config_value(
+        &merged,
+        ctx.ctx.web.config_path().to_string_lossy().as_ref(),
+    )?;
+    // needs_restart 只比较「启动时配置」与提交的目标配置，与 apply 无关
+    // （对齐 Go NeedsRestart 以 bootCfg 为基准）。
+    let hot_fields = ["log_level", "pad_mode", "traffic_days", "traffic_file"];
+    let needs_restart: Vec<String> = crate::web_parity::diff_paths(
+        &ctx.ctx.web.boot_config(),
+        &merged,
+    )
+    .into_iter()
+    .filter(|f| !hot_fields.contains(&f.as_str()))
+    .collect();
     Ok(json!({
         "valid": true,
         "needs_restart": needs_restart,
@@ -331,19 +336,33 @@ fn tool_config_save(ctx: &McpCtx, params: &Value) -> Result<Value, String> {
     }
     let apply = params.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
     let merged = ctx.ctx.web.merge_preserving_secrets(cfg.clone());
-    let missing: Vec<String> = ["mode", "psk"]
-        .iter()
-        .filter(|k| merged.get(**k).is_none())
-        .map(|s| s.to_string())
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!("config missing required fields: {}", missing.join(", ")));
-    }
-    // 原子写配置文件（对齐 Go SaveConfigFile）。
+    // 完整校验走与启动相同的 loader+validator（对齐 Go mergeAndValidateConfig）。
+    let validated = crate::validate_config_value(
+        &merged,
+        ctx.ctx.web.config_path().to_string_lossy().as_ref(),
+    )?;
+    // 原子写配置文件（对齐 Go SaveConfigFile）。运行态配置对象随保存更新：
+    // 连续两次 tlsvpn_config_save 会以第一次保存前的旧配置为 base，把第一次
+    // 的改动静默回滚（对齐 Go mcp save 的 w.SetConfig）。
     let path = ctx.ctx.web.config_path();
     crate::web_parity::atomic_write_json(path, &merged)?;
     ctx.ctx.web.replace_config(merged);
-    let needs_restart = ctx.ctx.web.needs_restart();
+    // needs_restart 只比较「启动时配置」与保存目标态，与 apply 无关。
+    let hot_fields = ["log_level", "pad_mode", "traffic_days", "traffic_file"];
+    let needs_restart: Vec<String> = crate::web_parity::diff_paths(
+        &ctx.ctx.web.boot_config(),
+        &ctx.ctx.web.current_config(),
+    )
+    .into_iter()
+    .filter(|f| !hot_fields.contains(&f.as_str()))
+    .collect();
+    ctx.ctx.web.set_needs_restart(needs_restart.clone());
+    // 保存目标态回显 + 流量统计策略随保存生效（对齐 Go mcp save 的
+    // dailyTraffic.OnConfig）。
+    *ctx.ctx.cfg.write() = crate::api::RuntimeCtx::runtime_cfg_json(&validated);
+    ctx.ctx
+        .web
+        .apply_traffic_config(validated.traffic_days, &validated.traffic_file);
     ctx.ctx.web.events.emit(
         "config",
         "info",

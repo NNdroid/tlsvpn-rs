@@ -490,6 +490,10 @@ pub struct ServerCore {
     // FEC parity 分发策略（对齐 Go fec_strategy）+ near 窗口（ms），会话端口构造时设置。
     pub fec_strategy: String,
     pub fec_near_window_ms: i64,
+    // 健康罚时单位值（µs）与资格门准入窗口（ms），会话端口构造时设置（对齐 Go
+    // SetSchedHealthPenaltyUs/SetSchedEnvelopeMs）。
+    pub sched_health_penalty_us: i64,
+    pub sched_envelope_ms: i64,
     // 本机 TLS 证书叶子证书 DER 的 SHA-256 指纹（hex，空=未加载）。对齐 Go
     // serverCertSHA256；server_conns 快照的 cert_sha256 展示本机证书供用户锁定。
     pub server_cert_sha256: String,
@@ -1114,6 +1118,8 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
         probe_min_half_rtt_us: args.probe_min_half_rtt_us.max(0) as u64,
         fec_strategy: args.fec_strategy.clone(),
         fec_near_window_ms: args.fec_near_window_ms,
+        sched_health_penalty_us: args.sched_health_penalty_us,
+        sched_envelope_ms: args.sched_envelope_ms,
         server_cert_sha256: server_cert_sha256_from_path(if !args.cert.is_empty() {
             &args.cert
         } else {
@@ -1185,6 +1191,9 @@ pub fn start_server(args: &Args, config_path: &str, ctx: Arc<RuntimeCtx>) -> Res
     let tap_port = Arc::new(AsyncPort::new(TAP_PORT_ID.to_string()));
     tap_port.set_routing_algo(&args.routing_algo);
     tap_port.set_fec_strategy(&args.fec_strategy, args.fec_near_window_ms);
+    // 健康罚时与资格门窗口（对齐 Go startServer 的 tapPort 设置）。
+    tap_port.set_sched_health_penalty_us(args.sched_health_penalty_us);
+    tap_port.set_sched_envelope_ms(args.sched_envelope_ms);
     if crate::net::port_dispatch_enabled() {
         // 下行热路径：TAP 读线程只做查表 + 入队，seq/成批/选路移交 dispatch 线程。
         AsyncPort::enable_dispatch(&tap_port);
@@ -1585,7 +1594,10 @@ fn worker_loop(
                 continue;
             }
 
-            // 每 200ms 刷新 RTT（对齐 Go startRTTPoller）
+            // 每 200ms 刷新 RTT（对齐 Go startRTTPoller）。重传差分独立于 rtt>0
+            // 的引导门：rtt==0 期间也要建立基线（对齐 Go sampleRTT 的 noteRetrans）。
+            // 内核 RTT 有效化（decayed-min 地板）与容量结算（饱和门控 + BDP 下界）
+            // 同轮进行。
             if sess.rtt_timer.elapsed() > Duration::from_millis(200) {
                 if let Some(backend) = &sess.tx_backend {
                     if idle_time >= 5 {
@@ -1593,19 +1605,43 @@ fn worker_loop(
                         backend.scheduler.note_rtt_failure();
                     } else {
                         match get_tcp_rtt_and_min(&sess.socket) {
-                            Ok((rtt, min_rtt)) if rtt > 0 => {
-                                backend.rtt_cache.store(rtt, Ordering::Relaxed);
-                                if min_rtt > 0 {
-                                    backend
-                                        .scheduler
-                                        .min_rtt_cache
-                                        .store(min_rtt, Ordering::Relaxed);
+                            Ok((rtt, min_rtt, total_retrans, cwnd, snd_mss)) => {
+                                backend.scheduler.note_retrans(total_retrans);
+                                if rtt > 0 {
+                                    backend.rtt_cache.store(rtt, Ordering::Relaxed);
+                                    if min_rtt > 0 {
+                                        backend
+                                            .scheduler
+                                            .min_rtt_cache
+                                            .store(min_rtt, Ordering::Relaxed);
+                                    }
+                                    backend.scheduler.note_rtt_success();
+                                    // 非 Linux 桩返回 UNKNOWN_RTT_US 哨兵，不能让
+                                    // 它污染有效地板。
+                                    if rtt != crate::adaptive_multipath::UNKNOWN_RTT_US {
+                                        backend.scheduler.note_rtt_sample(rtt);
+                                    }
                                 }
-                                backend.scheduler.note_rtt_success();
+                                backend.scheduler.note_capacity_sample(
+                                    (crate::adaptive_multipath::RTT_SAMPLE_INTERVAL_MS
+                                        * 1_000_000) as i64,
+                                    cwnd,
+                                    snd_mss,
+                                    rtt,
+                                );
                             }
-                            // rtt==0 引导期正常状态，不计失败。
-                            Ok(_) => {}
-                            Err(_) => backend.scheduler.note_rtt_failure(),
+                            Err(_) => {
+                                // TCP_INFO 失败也要结算容量窗：写阻塞时长与
+                                // TCP_INFO 无关（对齐 Go sampleRTT 失败分支）。
+                                backend.scheduler.note_capacity_sample(
+                                    (crate::adaptive_multipath::RTT_SAMPLE_INTERVAL_MS
+                                        * 1_000_000) as i64,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                                backend.scheduler.note_rtt_failure();
+                            }
                         }
                     }
                 }
@@ -2290,10 +2326,20 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
     if !sess.send_buf.is_empty() {
         sess.batch_cork
             .before_write(&sess.socket, sess.send_buf.len());
+        // 容量采样：写阻塞时长 = socket 发送缓冲打满的时长（路径饱和信号，
+        // 见 SchedulerBackendState::note_capacity_sample）。加密写与 drain_tls
+        // 的 write_tls 冲刷逐段累计入 note_write 窗口；WouldBlock 立即返回耗时
+        // ≈0，无害。
+        let w_start = Instant::now();
         if let Err(e) = sess.tls.writer().write_all(&sess.send_buf) {
             debug!("closing session: tls plaintext writer failed: {}", e);
             *close = true;
             return;
+        }
+        if let Some(backend) = &sess.tx_backend {
+            backend
+                .scheduler
+                .note_write(w_start.elapsed().as_nanos() as i64, 0);
         }
         if let Some(s) = &sess.client_session {
             if pulled != 0 {
@@ -2314,14 +2360,25 @@ fn flush_outbound(sess: &mut MioSession, close: &mut bool) {
 /// 冲刷 rustls 内部积压到 socket；遇 WouldBlock 记录卡死起点
 fn drain_tls(sess: &mut MioSession, close: &mut bool) {
     while sess.tls.wants_write() {
-        match sess.tls.write_tls(&mut sess.socket) {
+        let flush_start = Instant::now();
+        let flushed = sess.tls.write_tls(&mut sess.socket);
+        let flush_busy = (flush_start.elapsed().as_nanos() as i64).max(0);
+        match flushed {
             Ok(0) => {
                 debug!("closing session: tls.write_tls returned zero");
                 *close = true;
                 break;
             }
-            Ok(_) => {}
+            Ok(_) => {
+                // socket 写阻塞时长进容量采样窗（饱和门控的 busy 输入）。
+                if let Some(backend) = &sess.tx_backend {
+                    backend.scheduler.note_write(flush_busy, 0);
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(backend) = &sess.tx_backend {
+                    backend.scheduler.note_write(flush_busy, 0);
+                }
                 if sess.write_stalled.is_none() {
                     sess.write_stalled = Some(Instant::now());
                 }
@@ -2338,6 +2395,11 @@ fn drain_tls(sess: &mut MioSession, close: &mut bool) {
         sess.write_stalled = None;
         if sess.queued_payload_pending != 0 {
             if let Some(backend) = &sess.tx_backend {
+                // 本批成功载荷进容量采样窗（对齐 Go writeWindowBytes +=
+                // queuedPayload，与 completeQueuedBytes 同点位）。
+                backend
+                    .scheduler
+                    .note_write(0, sess.queued_payload_pending);
                 backend
                     .scheduler
                     .complete_queued(sess.queued_payload_pending);
@@ -2879,6 +2941,9 @@ fn handle_handshake(
             let port = Arc::new(AsyncPort::new(client_id.clone()));
             port.set_routing_algo(&core.routing_algo);
             port.set_fec_strategy(&core.fec_strategy, core.fec_near_window_ms);
+            // 健康罚时与资格门窗口（对齐 Go handleConnection 的 per-session port 设置）。
+            port.set_sched_health_penalty_us(core.sched_health_penalty_us);
+            port.set_sched_envelope_ms(core.sched_envelope_ms);
             if crate::net::port_dispatch_enabled() {
                 // 会话端口的下行分发同样移交 dispatch 线程（seq/成批/选路按批摊薄）。
                 AsyncPort::enable_dispatch(&port);
@@ -3047,7 +3112,7 @@ fn handle_handshake(
     // 按协商 enable。探针读循环/写循环在 worker 主循环处理。
     sess.conn_index = req.brutal_conn_index.max(0) as usize;
     if let Some(b) = sess.tx_backend.clone() {
-        let (probe_tx, probe_rx) = bounded(8);
+        let (probe_tx, probe_rx) = bounded(33);
         *b.probe_ch.lock() = Some(probe_tx.clone());
         // 登记本槽位：服务端下行调度器的活跃槽位广播（0x07）按 conn_index 构造
         // 位图，与客户端声明的下标（握手同步）一致。
